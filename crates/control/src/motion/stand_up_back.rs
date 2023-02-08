@@ -4,8 +4,8 @@ use filtering::LowPassFilter;
 use framework::MainOutput;
 use nalgebra::Vector2;
 use types::{
-    CycleTime, Facing, Joints, MotionCommand, MotionFile, MotionFileInterpolator, MotionSafeExits,
-    MotionSelection, MotionType, SensorData,
+    CycleTime, Facing, Joints, MotionCommand, MotionFile, MotionSafeExits,
+    MotionSelection, MotionType, SensorData, MotionFileInterpolator,
 };
 
 pub struct StandUpBack {

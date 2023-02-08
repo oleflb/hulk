@@ -59,6 +59,14 @@ where
     pub fn passed_duration(&self) -> Duration {
         self.duration.mul_f32(self.argument)
     }
+
+    pub fn start(&self) -> &T {
+        &self.start_value
+    }
+
+    pub fn end(&self) -> &T {
+        &self.end_value
+    }
 }
 
 #[cfg(test)]
