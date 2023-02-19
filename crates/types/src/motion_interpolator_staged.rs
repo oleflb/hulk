@@ -1,45 +1,88 @@
 #![allow(dead_code)]
 
+use image::imageops::FilterType::CatmullRom;
+use splines::{interpolate::Interpolator, Interpolation, Key, Spline};
+
 use crate::{
     interpolator_continue_conditions::{NoopContinue, WaitContinue},
-    Joints, MotionFile, MotionFileFrame, MotionFileInterpolator, LinearInterpolator,
+    Joints, LinearInterpolator, MotionFile, MotionFileFrame, MotionFileInterpolator,
 };
-use std::time::{Duration, Instant};
+use std::{
+    ops::AddAssign,
+    time::{Duration, Instant},
+};
 
 pub trait Condition: Send + Sync {
     fn is_finished(&self) -> bool;
 }
 
 pub struct ConditionMotionFileInterpolator {
-    interpolator: LinearInterpolator<Joints>,
+    interpolator: Spline<f32, Joints>,
     condition: Box<dyn Condition>,
+    current_time: Duration,
+    start_time: Duration,
+    end_time: Duration,
 }
 
 impl ConditionMotionFileInterpolator {
-    pub fn new(
-        interpolator: LinearInterpolator<Joints>,
-        condition: Box<dyn Condition>,
-    ) -> Self {
+    pub fn new(keys: Vec<Key<Duration, Joints>>, condition: Box<dyn Condition>) -> Self {
+        assert!(keys.len() >= 2, "need at least two keys to interpolate");
+        //NOTE: assume keys are sorted
+        let last_key_index = keys.len() - 1;
+        
+        let start_time = keys[0].t;
+        let current_time = start_time;
+        let end_time = keys[last_key_index].t;
+
+        let left_helper = Key::new(
+            (2 * keys[0].t - keys[1].t).as_secs_f32(),
+            keys[1].value,
+            Interpolation::CatmullRom,
+        );
+        let right_helper = Key::new(
+            (2 * keys[last_key_index].t - keys[last_key_index - 1].t).as_secs_f32(),
+            keys[last_key_index - 1].value,
+            Interpolation::CatmullRom,
+        );
+        
+        let mut interpolator = Spline::from_iter(
+            keys.into_iter()
+                .map(|key| Key::new(key.t.as_secs_f32(), key.value, Interpolation::CatmullRom)),
+        );
+        interpolator.add(left_helper);
+        interpolator.add(right_helper);
+        
         Self {
             interpolator,
             condition,
+            current_time,
+            start_time,
+            end_time,
         }
     }
 
     pub fn step(&mut self, time_step: Duration) -> Joints {
-        self.interpolator.step(time_step)
+        self.current_time.add_assign(time_step);
+        self.value()
     }
-
+    
     pub fn value(&self) -> Joints {
-        self.interpolator.value()
+        if self.current_time <= self.start_time {
+            self.interpolator.sample(self.start_time.as_secs_f32())
+        } else if self.current_time >= self.end_time {
+            self.interpolator.sample(self.end_time.as_secs_f32())
+        } else {
+            self.interpolator.sample(self.current_time.as_secs_f32())
+        }.expect("the interpolator was sampled at a time where no key is present")
     }
 
     pub fn is_finished(&self) -> bool {
-        self.interpolator.is_finished() && self.condition.is_finished()
+        self.current_time >= self.end_time && self.condition.is_finished()
     }
 
     pub fn reset(&mut self) {
-        self.interpolator.reset();
+        self.current_time = self.start_time;
+        //TODO: may add condition.reset()
     }
 }
 
@@ -75,7 +118,7 @@ impl StagedMotionFileInterpolator {
         //     let mut last_interpolator = staged_interpolators.last_mut().unwrap();
         //     if last_interpolator.end() == interpolator.start() {
         //         // Can compact both interpolators
-                
+
         //     }
         // }
 
