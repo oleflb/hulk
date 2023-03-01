@@ -5,11 +5,11 @@ use framework::MainOutput;
 use nalgebra::Vector2;
 use types::{
     CycleTime, Facing, Joints, MotionCommand, MotionFile, MotionSafeExits,
-    MotionSelection, MotionType, SensorData, MotionFileInterpolator,
+    MotionSelection, MotionType, SensorData, ConditionMotionFileInterpolator,
 };
 
 pub struct StandUpBack {
-    interpolator: MotionFileInterpolator,
+    interpolator: ConditionMotionFileInterpolator,
     filtered_gyro: LowPassFilter<Vector2<f32>>,
 }
 
