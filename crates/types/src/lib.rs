@@ -23,7 +23,6 @@ pub mod hardware;
 pub mod image;
 mod image_segments;
 mod initial_pose;
-pub mod interpolator_continue_conditions;
 mod joints;
 pub mod kalman_filter;
 mod kick_decision;
@@ -37,8 +36,8 @@ mod localization_update;
 mod message_event;
 pub mod messages;
 mod motion_command;
-pub mod motion_file;
-pub mod motion_interpolator_staged;
+mod motion_file;
+mod motion_file2;
 mod motion_selection;
 pub mod obstacle_filter_hypothesis;
 mod obstacles;
@@ -108,8 +107,8 @@ pub use motion_command::{
     ArmMotion, Facing, FallDirection, HeadMotion, JumpDirection, KickDirection, KickVariant,
     MotionCommand, OrientationMode, SitDirection,
 };
-pub use motion_file::{MotionFile, MotionFileInterpolator, MotionFileFrame};
-pub use motion_interpolator_staged::{ConditionMotionFileInterpolator, StagedMotionFileInterpolator};
+pub use motion_file::{MotionFile, MotionFileInterpolator};
+pub use motion_file2;
 pub use motion_selection::{MotionSafeExits, MotionSelection, MotionType};
 pub use obstacles::{Obstacle, ObstacleKind};
 pub use path_obstacles::{PathObstacle, PathObstacleShape};
