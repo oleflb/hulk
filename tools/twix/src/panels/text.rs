@@ -71,7 +71,13 @@ impl Widget for &mut TextPanel {
                                 Ok(pretty_string) => pretty_string,
                                 Err(error) => error.to_string(),
                             };
-                            ui.label(content)
+                            let label = ui.label(&content);
+
+                            if ui.button("Copy").clicked() {
+                                ui.output().copied_text = content;
+                            }
+                            
+                            label
                         }
                         Err(error) => ui.label(error),
                     })
