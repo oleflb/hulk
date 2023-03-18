@@ -22,7 +22,9 @@ use fern::{colors::ColoredLevelConfig, Dispatch, InitError};
 
 use nao::Nao;
 use panel::Panel;
-use panels::{ImagePanel, ImageSegmentsPanel, MapPanel, ParameterPanel, PlotPanel, TextPanel};
+use panels::{
+    ImagePanel, ImageSegmentsPanel, MapPanel, Nao3dPanel, ParameterPanel, PlotPanel, TextPanel,
+};
 use serde_json::{from_str, to_string, Value};
 use tokio::sync::mpsc;
 
@@ -69,6 +71,7 @@ enum SelectablePanel {
     ImageSegments(ImageSegmentsPanel),
     Map(MapPanel),
     Parameter(ParameterPanel),
+    Nao3d(Nao3dPanel),
 }
 
 impl SelectablePanel {
@@ -90,6 +93,7 @@ impl SelectablePanel {
             "image segments" => SelectablePanel::ImageSegments(ImageSegmentsPanel::new(nao, value)),
             "map" => SelectablePanel::Map(MapPanel::new(nao, value)),
             "parameter" => SelectablePanel::Parameter(ParameterPanel::new(nao, value)),
+            "nao3d" => SelectablePanel::Nao3d(Nao3dPanel::new(nao, value)),
             name => bail!("unexpected panel name: {name}"),
         })
     }
@@ -102,6 +106,7 @@ impl SelectablePanel {
             SelectablePanel::ImageSegments(panel) => panel.save(),
             SelectablePanel::Map(panel) => panel.save(),
             SelectablePanel::Parameter(panel) => panel.save(),
+            SelectablePanel::Nao3d(panel) => panel.save(),
         };
         value["_panel_type"] = Value::String(self.to_string());
 
@@ -118,6 +123,7 @@ impl Widget for &mut SelectablePanel {
             SelectablePanel::ImageSegments(panel) => panel.ui(ui),
             SelectablePanel::Map(panel) => panel.ui(ui),
             SelectablePanel::Parameter(panel) => panel.ui(ui),
+            SelectablePanel::Nao3d(panel) => panel.ui(ui),
         }
     }
 }
@@ -131,6 +137,7 @@ impl Display for SelectablePanel {
             SelectablePanel::ImageSegments(_) => ImageSegmentsPanel::NAME,
             SelectablePanel::Map(_) => MapPanel::NAME,
             SelectablePanel::Parameter(_) => ParameterPanel::NAME,
+            SelectablePanel::Nao3d(_) => Nao3dPanel::NAME,
         };
         f.write_str(panel_name)
     }
@@ -262,6 +269,7 @@ impl App for TwixApp {
                         "Image Segments".to_string(),
                         "Map".to_string(),
                         "Parameter".to_string(),
+                        "Nao3d".to_string(),
                     ],
                 )
                 .ui(ui);
@@ -277,6 +285,9 @@ impl App for TwixApp {
                     ) {
                         if let Some(active_panel) = self.active_panel() {
                             *active_panel = panel;
+                        }
+                        if let Some(SelectablePanel::Nao3d(ref mut panel)) = self.active_panel() {
+                            panel.set_gl(_frame.gl().expect("No glow backend found"));
                         }
                     }
                 }
