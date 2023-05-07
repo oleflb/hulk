@@ -1,7 +1,8 @@
 use std::{
     fmt::{self, Display, Formatter},
     net::Ipv4Addr,
-    path::Path,
+    path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use color_eyre::{
@@ -126,6 +127,41 @@ impl Nao {
         }
 
         Ok(())
+    }
+
+    pub async fn ls_logs(&self) -> Result<Vec<PathBuf>> {
+        let output = self
+            .ssh_to_nao()
+            .arg("ls -d hulk/logs/*")
+            .output()
+            .await
+            .wrap_err("failed to ls logs")?;
+
+        if !output.status.success() {
+            bail!("could not ls log files");
+        }
+
+        let output = String::from_utf8(output.stdout)?;
+        Ok(output
+            .lines()
+            .map(|line| PathBuf::from_str(line).expect("infallible conversion from str to path"))
+            .collect())
+    }
+
+    pub async fn get_file(&self, path: impl AsRef<Path>) -> Result<String> {
+        let output = self
+            .ssh_to_nao()
+            .arg("cat")
+            .arg(path.as_ref().to_str().unwrap())
+            .output()
+            .await
+            .wrap_err(format!("failed to cat file {:?}", path.as_ref()))?;
+
+        if !output.status.success() {
+            bail!("rsync command exited with {}", output.status);
+        }
+
+        Ok(String::from_utf8(output.stdout)?)
     }
 
     pub async fn download_logs(&self, local_directory: impl AsRef<Path>) -> Result<()> {
