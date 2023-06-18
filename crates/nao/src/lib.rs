@@ -2,15 +2,16 @@ use std::{
     fmt::{self, Display, Formatter},
     net::{IpAddr, Ipv4Addr},
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 
 use color_eyre::{
     eyre::{bail, eyre, WrapErr},
-    Report, Result,
+    Result,
 };
-use surge_ping::SurgeError;
-use tokio::{process::Command, time};
+use ping_rs::{send_ping_async, PingError};
+use tokio::process::Command;
 
 pub const PING_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PING_RETRIES: usize = 2;
@@ -35,19 +36,15 @@ impl Nao {
     ) -> Result<Self> {
         let pinger = async {
             for _ in 0..retries {
-                let ping_result = surge_ping::ping(IpAddr::V4(host), &[]).await;
-                match ping_result {
-                    Ok(_) => return Ok(Nao::new(host)),
-                    Err(SurgeError::Timeout { .. }) => continue,
-                    surge_error @ Err(_) => return surge_error.wrap_err("could not execute ping"),
+                match send_ping_async(&IpAddr::V4(host), timeout, Arc::new(&[]), None).await {
+                    Ok(_) => return Ok(Self::new(host)),
+                    Err(PingError::TimedOut) => continue,
+                    Err(error) => bail!("ping failed with {error:?}"),
                 }
             }
             bail!("No route to {host}")
         };
-
-        time::timeout(timeout, pinger)
-            .await
-            .map_err(|_| Report::msg(format!("No route to {host}")))?
+        pinger.await
     }
 
     pub async fn get_os_version(&self) -> Result<String> {
