@@ -9,6 +9,7 @@ use color_eyre::{
     eyre::{bail, eyre, WrapErr},
     Report, Result,
 };
+use surge_ping::SurgeError;
 use tokio::{process::Command, time};
 
 pub const PING_TIMEOUT: Duration = Duration::from_secs(2);
@@ -34,9 +35,12 @@ impl Nao {
     ) -> Result<Self> {
         let pinger = async {
             for _ in 0..retries {
-                if surge_ping::ping(IpAddr::V4(host), &[]).await.is_ok() {
-                    return Ok(Nao::new(host));
-                };
+                let ping_result = surge_ping::ping(IpAddr::V4(host), &[]).await;
+                match ping_result {
+                    Ok(_) => return Ok(Nao::new(host)),
+                    Err(SurgeError::Timeout { .. }) => continue,
+                    surge_error @ Err(_) => return surge_error.wrap_err("could not execute ping"),
+                }
             }
             bail!("No route to {host}")
         };
