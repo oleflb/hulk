@@ -5,14 +5,15 @@ use std::{
 };
 
 use color_eyre::Result;
-use nalgebra::{vector, Isometry2, Point2, UnitComplex, Vector2};
+use nalgebra::{point, vector, Isometry2, Point2, UnitComplex, Vector2};
+use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
 use serialize_hierarchy::SerializeHierarchy;
 use spl_network_messages::{GamePhase, GameState, HulkMessage, PlayerNumber, Team};
 use types::{
     messages::{IncomingMessage, OutgoingMessage},
     BallPosition, FilteredGameState, GameControllerState, HeadMotion, KickVariant, LineSegment,
-    MotionCommand, OrientationMode, PathSegment, Players, PrimaryState, Side,
+    MotionCommand, Obstacle, OrientationMode, PathSegment, Players, PrimaryState, Side,
 };
 
 use crate::{
@@ -216,6 +217,12 @@ impl State {
                 BTreeMap::from_iter([(now, incoming_messages.iter().collect())]);
 
             robot.database.main_outputs.cycle_time.start_time = now;
+            let mut rng = thread_rng();
+            robot.database.main_outputs.obstacles = vec![Obstacle::robot(
+                robot_to_field.inverse() * point![0.1, rng.gen_range(-0.1..0.1)],
+                0.3,
+                0.3,
+            )];
 
             robot.database.main_outputs.ball_position = self
                 .ball
@@ -230,7 +237,7 @@ impl State {
                         robot.database.main_outputs.sensor_data.positions.head.yaw,
                     );
                     let ball_in_head = head_rotation.inverse() * ball.position.coords;
-                    let field_of_view = robot.field_of_view();
+                    let field_of_view = 3. * robot.field_of_view();
                     let angle_to_ball = ball_in_head.angle(&Vector2::x_axis());
 
                     angle_to_ball.abs() < field_of_view / 2.0 && ball_in_head.norm() < 3.0
