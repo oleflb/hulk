@@ -19,6 +19,8 @@ hardware = { workspace = true }
 itertools = { workspace = true }
 linear_algebra = { workspace = true }
 nalgebra = { workspace = true }
+ndarray = { workspace = true }
+openvino = { workspace = true }
 ordered-float = { workspace = true }
 projection = { workspace = true }
 rand = { workspace = true }

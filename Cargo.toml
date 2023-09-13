@@ -140,6 +140,7 @@ openvino = { git = "https://github.com/intel/openvino-rs.git", rev = "6f1f823", 
 opn = { path = "crates/opn" }
 object_detection = { path = "crates/object_detection" }
 opusfile-ng = "0.1.0"
+# Pinned git version since the latest release does not contained https://github.com/nix-rust/nix/pull/2022 yet
 ordered-float = "3.1.0"
 parameters = { path = "crates/parameters" }
 parking_lot = "0.12.1"
