@@ -27,6 +27,7 @@ fn main() -> Result<()> {
                     "vision::perspective_grid_candidates_provider",
                     "vision::robot_detection",
                     "vision::segment_filter",
+                    "vision::semantic_segmentation",
                 ],
             },
             CyclerManifest {

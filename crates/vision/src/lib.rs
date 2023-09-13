@@ -11,3 +11,4 @@ pub mod perspective_grid_candidates_provider;
 mod ransac;
 pub mod robot_detection;
 pub mod segment_filter;
+pub mod semantic_segmentation;
