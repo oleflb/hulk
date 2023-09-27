@@ -29,6 +29,7 @@ mod overlays;
 enum ImageKind {
     YCbCr422,
     Luminance,
+    SemanticSegmentation,
 }
 
 impl ImageKind {
@@ -39,6 +40,9 @@ impl ImageKind {
             },
             ImageKind::Luminance => Output::Additional {
                 path: "robot_detection.luminance_image.jpeg".to_string(),
+            },
+            ImageKind::SemanticSegmentation => Output::Additional {
+                path: "segmented_output.jpeg".to_string(),
             },
         }
     }
@@ -137,6 +141,12 @@ impl Widget for &mut ImagePanel {
                     {
                         image_selection_changed = true;
                     }
+                    if ui
+                        .selectable_value(&mut self.image_kind, ImageKind::SemanticSegmentation, "SemanticSegmentation")
+                        .changed()
+                    {
+                        image_selection_changed = true;
+                    }
                 });
             if image_selection_changed {
                 let output = CyclerOutput {
@@ -169,6 +179,7 @@ impl ImagePanel {
             .map_err(|error| eyre!("{error}"))?
             .with_options(TextureOptions::NEAREST);
         let image_size = image.size_vec2();
+        dbg!(&image_size);
         let width_scale = ui.available_width() / image_size.x;
         let height_scale = ui.available_height() / image_size.y;
         let scale = width_scale.min(height_scale);
@@ -176,7 +187,7 @@ impl ImagePanel {
         let displayed_image_size = image_size * scale;
         let image_rect = Rect::from_min_size(image_response.rect.left_top(), displayed_image_size);
         let painter = TwixPainter::paint_at(ui, image_rect).with_camera(
-            vector![640.0, 480.0],
+            vector![image_size.x, image_size.y],
             Similarity2::identity(),
             CoordinateSystem::LeftHand,
         );
