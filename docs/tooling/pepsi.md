@@ -94,6 +94,9 @@ Terminate the root ssh session and change to your user ssh connection ```{name}@
 Back on your local machine do ```ssh-copy-id {name}@134.28.57.226``` to copy your public ssh key to the remote-compiler.
 And add the compiler to your git remote: ```git remote add compiler {name}@134.28.57.226:{hulk}``` where ```{hulk}``` refers to the path where you cloned the repository.
 
+Finally you to install `rustup` on your user.
+To install `rustup`, head to [https://rustup.rs/](https://rustup.rs/) and follow the instructions.
+
 To use the remote compile with pepsi:
 
 ```bash
