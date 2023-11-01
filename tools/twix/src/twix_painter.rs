@@ -5,8 +5,8 @@ use std::{
 
 use eframe::{
     egui::{Painter, Response, Sense, Ui},
-    emath::{Pos2, Rect},
-    epaint::{Color32, PathShape, Shape, Stroke},
+    emath::{Align2, Pos2, Rect},
+    epaint::{Color32, FontId, PathShape, Rounding, Shape, Stroke},
 };
 use nalgebra::{Rotation2, SMatrix, Similarity2};
 
