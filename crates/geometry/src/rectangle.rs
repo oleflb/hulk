@@ -1,7 +1,7 @@
 use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use serde::{Deserialize, Serialize};
 
-use linear_algebra::{Point2, Vector2};
+use linear_algebra::{point, Point2, Vector2};
 
 #[derive(
     Clone,
@@ -20,6 +20,13 @@ pub struct Rectangle<Frame> {
 }
 
 impl<Frame> Rectangle<Frame> {
+    pub fn from_cxcywh(center_x: f32, center_y: f32, width: f32, height: f32) -> Self {
+        Self {
+            min: point![center_x - width / 2.0, center_y - height / 2.0],
+            max: point![center_x + width / 2.0, center_y + height / 2.0],
+        }
+    }
+
     pub fn new_with_center_and_size(center: Point2<Frame>, size: Vector2<Frame>) -> Self {
         Self {
             min: center - size / 2.0,
