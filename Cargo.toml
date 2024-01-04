@@ -31,6 +31,7 @@ members = [
   "crates/object_detection",
   "crates/opn",
   "crates/parameter_tester",
+  "crates/object_detection",
   "crates/parameters",
   "crates/path_serde",
   "crates/path_serde_derive",
