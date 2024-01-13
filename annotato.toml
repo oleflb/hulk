@@ -4,7 +4,7 @@ rsync_path = "rsync://10.1.24.185/labelparty/output"
 [leaderboard]
 enable = true
 host = "10.1.24.185:3000"
-githubname = ""
+githubname = "okiwi6"
 
 [keybindings]
 next = { primary = "Space" }
