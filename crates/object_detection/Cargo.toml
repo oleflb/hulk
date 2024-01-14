@@ -25,3 +25,4 @@ projection = { workspace = true }
 serde = { workspace = true }
 spl_network_messages = { workspace = true }
 types = { workspace = true }
+ittapi = { workspace = true }
