@@ -46,7 +46,11 @@ impl<Frame> Rectangle<Frame> {
     }
 
     pub fn area(self) -> f32 {
-        let dimensions = self.max - self.min;
+        let dimensions = self.dimensions();
         dimensions.x() * dimensions.y()
+    }
+
+    pub fn dimensions(&self) -> Vector2<f32> {
+        self.max - self.min
     }
 }
