@@ -24,6 +24,7 @@ members = [
   "crates/hulk_replayer",
   "crates/hulk_webots",
   "crates/hulk",
+  "crates/hungarian_algorithm",
   "crates/kinematics",
   "crates/linear_algebra",
   "crates/motionfile",
@@ -115,6 +116,7 @@ home = "0.5.4"
 hula-types = { path = "tools/hula/types" }
 hulk = { path = "crates/hulk" }
 hulk_manifest = { path = "crates/hulk_manifest" }
+hungarian_algorithm = { path = "crates/hungarian_algorithm" }
 i2cdev = "0.5.1"
 image = "0.24.4"
 indicatif = "0.17.2"
@@ -145,6 +147,7 @@ opusfile-ng = "0.1.0"
 # Pinned git version since the latest release does not contained https://github.com/nix-rust/nix/pull/2022 yet
 ordered-float = "3.1.0"
 parameters = { path = "crates/parameters" }
+pathfinding = "4.9.1"
 parking_lot = "0.12.1"
 path_serde = { path = "crates/path_serde" }
 path_serde_derive = { path = "crates/path_serde_derive" }
