@@ -74,6 +74,7 @@ pub struct MapPanel {
     path: EnabledLayer<layers::Path, Ground>,
     behavior_simulator: EnabledLayer<layers::BehaviorSimulator, Field>,
     robot_pose: EnabledLayer<layers::RobotPose, Ground>,
+    robot_filter: EnabledLayer<layers::RobotFilter, Ground>,
     referee_position: EnabledLayer<layers::RefereePosition, Field>,
     pose_detection: EnabledLayer<layers::PoseDetection, Field>,
     ball_position: EnabledLayer<layers::BallPosition, Field>,
@@ -106,6 +107,7 @@ impl Panel for MapPanel {
         let ball_filter = EnabledLayer::new(nao.clone(), value, false);
         let obstacle_filter = EnabledLayer::new(nao.clone(), value, false);
         let walking = EnabledLayer::new(nao.clone(), value, false);
+        let robot_filter = EnabledLayer::new(nao.clone(), value, false);
 
         let field_dimensions = nao.subscribe_parameter("field_dimensions");
         let ground_to_field =
@@ -134,6 +136,7 @@ impl Panel for MapPanel {
             ball_filter,
             obstacle_filter,
             walking,
+            robot_filter,
         }
     }
 
@@ -158,6 +161,7 @@ impl Panel for MapPanel {
             "ball_filter": self.ball_filter.save(),
             "obstacle_filter": self.obstacle_filter.save(),
             "walking": self.walking.save(),
+            "robot_filter": self.robot_filter.save(),
         })
     }
 }
@@ -177,6 +181,7 @@ impl Widget for &mut MapPanel {
                 self.behavior_simulator.checkbox(ui);
                 self.pose_detection.checkbox(ui);
                 self.robot_pose.checkbox(ui);
+                self.robot_filter.checkbox(ui);
                 self.referee_position.checkbox(ui);
                 self.ball_position.checkbox(ui);
                 self.kick_decisions.checkbox(ui);
@@ -246,6 +251,9 @@ impl Widget for &mut MapPanel {
             .generic_paint(&painter, ground_to_field, &field_dimensions);
         let _ = self
             .robot_pose
+            .generic_paint(&painter, ground_to_field, &field_dimensions);
+        let _ = self
+            .robot_filter
             .generic_paint(&painter, ground_to_field, &field_dimensions);
         let _ = self
             .referee_position
