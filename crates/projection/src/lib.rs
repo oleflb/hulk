@@ -1,4 +1,5 @@
 use approx::relative_eq;
+use nalgebra::{matrix, Matrix2, Matrix3};
 use thiserror::Error;
 
 use coordinate_systems::{Camera, Ground, Pixel, Robot};
@@ -13,6 +14,8 @@ pub enum Error {
     BehindCamera,
     #[error("the pixel position cannot be projected onto the projection plane")]
     NotOnProjectionPlane,
+    #[error("camera matrix is not invertible")]
+    NotInvertible,
 }
 
 pub trait Projection {
@@ -42,11 +45,38 @@ pub trait Projection {
         pixel_coordinates: Point2<Pixel>,
         resolution: Point2<Pixel, u32>,
     ) -> Result<f32, Error>;
+    fn camera_matrix_for_z(&self, z: f32) -> Matrix3<f32>;
+    fn project_noise_to_ground_with_z(
+        &self,
+        ground_coordinates: Point2<f32>,
+        noise: nalgebra::Vector2<f32>,
+        z: f32,
+    ) -> Result<Matrix2<f32>, Error>;
 }
 
 impl Projection for CameraMatrix {
     fn pixel_to_camera(&self, pixel_coordinates: Point2<Pixel>) -> Vector3<Camera> {
-        (self.intrinisic_pixel_to_camera * pixel_coordinates.inner.to_homogeneous()).framed()
+        (self.intrinsic_pixel_to_camera * pixel_coordinates.inner.to_homogeneous()).framed()
+    }
+
+    fn camera_matrix_for_z(&self, z: f32) -> Matrix3<f32> {
+        let remove_homogeneous = matrix![
+            1.0, 0.0, 0.0, 0.0;
+            0.0, 1.0, 0.0, 0.0;
+            0.0, 0.0, 1.0, 0.0;
+        ];
+
+        let total_camera_matrix =
+            self.intrinsic_camera_to_pixel * remove_homogeneous * self.ground_to_camera.inner.to_matrix();
+
+        let projection = matrix![
+            1.0, 0.0, 0.0;
+            0.0, 1.0, 0.0;
+            0.0, 0.0, z;
+            0.0, 0.0, 1.0;
+        ];
+
+        total_camera_matrix * projection
     }
 
     fn camera_to_pixel(&self, camera_ray: Vector3<Camera>) -> Result<Point2<Pixel>, Error> {
@@ -108,10 +138,16 @@ impl Projection for CameraMatrix {
         ground_coordinates: Point2<Ground>,
         z: f32,
     ) -> Result<Point2<Pixel>, Error> {
-        self.camera_to_pixel(
-            (self.ground_to_camera * point![ground_coordinates.x(), ground_coordinates.y(), z])
-                .coords(),
-        )
+        let camera_matrix = self.camera_matrix_for_z(z);
+        let projected = camera_matrix * ground_coordinates.inner.to_homogeneous();
+
+        let pixel = point![projected.x / projected.z, projected.y / projected.z];
+
+        Ok(pixel)
+
+        // self.camera_to_pixel(
+        //     (self.ground_to_camera * point![ground_coordinates.x, ground_coordinates.y, z]).coords,
+        // )
     }
 
     fn pixel_to_robot_with_x(
@@ -155,5 +191,28 @@ impl Projection for CameraMatrix {
         }
         let angle = (radius_in_robot_coordinates / distance).asin();
         Ok(resolution.y() as f32 * angle / self.field_of_view.y)
+    }
+
+    fn project_noise_to_ground_with_z(
+        &self,
+        ground_coordinates: Point2<f32>,
+        noise: nalgebra::Vector2<f32>,
+        z: f32,
+    ) -> Result<Matrix2<f32>, Error> {
+        let camera_matrix = self.camera_matrix_for_z(z);
+
+        let gamma = (camera_matrix * ground_coordinates.inner.to_homogeneous()).z;
+        let inverse_camera_matrix = camera_matrix.try_inverse().ok_or(Error::NotInvertible)?;
+
+        let x = ground_coordinates.x();
+        let y = ground_coordinates.y();
+
+        let noise_projection = gamma
+            * matrix![
+                inverse_camera_matrix[(0,0)] - inverse_camera_matrix[(2,0)] * x, inverse_camera_matrix[(0,1)] - inverse_camera_matrix[(2,1)] * x;
+                inverse_camera_matrix[(1,0)] - inverse_camera_matrix[(2,0)] * y, inverse_camera_matrix[(1,1)] - inverse_camera_matrix[(2,1)] * y;
+            ];
+
+        Ok(noise_projection * Matrix2::from_diagonal(&noise) * noise_projection.transpose())
     }
 }
