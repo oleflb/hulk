@@ -7,8 +7,7 @@ use linear_algebra::{vector, Point};
 use serialize_hierarchy::SerializeHierarchy;
 
 use crate::{
-    ball_position::BallPosition, multivariate_normal_distribution::MultivariateNormalDistribution,
-    parameters::BallFilterParameters,
+    ball_position::BallPosition, multivariate_normal_distribution::MultivariateNormalDistribution, parameters::BallFilterParameters
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, SerializeHierarchy)]
@@ -49,3 +48,4 @@ impl Hypothesis {
         }
     }
 }
+

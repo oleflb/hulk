@@ -16,6 +16,7 @@ use types::{
     ball_filter::Hypothesis,
     ball_position::BallPosition,
     camera_matrix::{CameraMatrices, CameraMatrix},
+    camera_position::CameraPosition,
     cycle_time::CycleTime,
     field_dimensions::FieldDimensions,
     limb::{is_above_limbs, Limb, ProjectedLimbs},
@@ -72,19 +73,23 @@ impl BallFilter {
 
     fn persistent_balls_in_control_cycle<'a>(
         context: &'a CycleContext,
+        camera_position: CameraPosition,
     ) -> Vec<(&'a SystemTime, Vec<&'a Ball>)> {
-        context
-            .balls_top
-            .persistent
+        let balls = &match camera_position {
+            CameraPosition::Top => &context.balls_top,
+            CameraPosition::Bottom => &context.balls_bottom,
+        }
+        .persistent;
+
+        balls
             .iter()
-            .zip(context.balls_bottom.persistent.values())
-            .map(|((detection_time, balls_top), balls_bottom)| {
-                let balls = balls_top
+            .map(|(detection_time, balls)| {
+                let balls = balls
                     .iter()
-                    .chain(balls_bottom.iter())
-                    .filter_map(|data| data.as_ref())
-                    .flat_map(|data| data.iter())
+                    .filter_map(|balls| balls.as_ref())
+                    .flat_map(|balls| balls.iter())
                     .collect();
+
                 (detection_time, balls)
             })
             .collect()
@@ -94,27 +99,33 @@ impl BallFilter {
         &mut self,
         measurements: Vec<(&SystemTime, Vec<&Ball>)>,
         context: &CycleContext,
+        camera_position: CameraPosition,
     ) {
         for (detection_time, balls) in measurements {
             let current_odometry_to_last_odometry = context
                 .current_odometry_to_last_odometry
                 .get(detection_time)
                 .expect("current_odometry_to_last_odometry should not be None");
+
             self.predict_hypotheses_with_odometry(
                 context.ball_filter_configuration.velocity_decay_factor,
                 current_odometry_to_last_odometry.inverse(),
                 Matrix4::from_diagonal(&context.ball_filter_configuration.process_noise),
             );
 
-            let camera_matrices = context.historic_camera_matrices.get(detection_time);
+            let camera_matrices = context
+                .historic_camera_matrices
+                .get(detection_time)
+                .expect("camera_matrices should not be None");
             let projected_limbs_bottom = context
                 .projected_limbs
                 .persistent
                 .get(detection_time)
                 .and_then(|limbs| limbs.last())
                 .and_then(|limbs| *limbs);
+
             self.decay_hypotheses(
-                camera_matrices,
+                Some(camera_matrices),
                 projected_limbs_bottom,
                 context.field_dimensions.ball_radius,
                 context.ball_filter_configuration,
@@ -124,6 +135,7 @@ impl BallFilter {
                 self.update_hypotheses_with_measurement(
                     ball.position,
                     *detection_time,
+                    &camera_matrices[camera_position],
                     context.ball_filter_configuration,
                 );
             }
@@ -137,8 +149,13 @@ impl BallFilter {
     }
 
     pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
-        let persistent_updates = Self::persistent_balls_in_control_cycle(&context);
-        self.advance_all_hypotheses(persistent_updates, &context);
+        let persistent_updates_top =
+            Self::persistent_balls_in_control_cycle(&context, CameraPosition::Top);
+        self.advance_all_hypotheses(persistent_updates_top, &context, CameraPosition::Top);
+
+        let persistent_updates_bottom =
+            Self::persistent_balls_in_control_cycle(&context, CameraPosition::Bottom);
+        self.advance_all_hypotheses(persistent_updates_bottom, &context, CameraPosition::Bottom);
 
         context
             .ball_filter_hypotheses
@@ -264,25 +281,42 @@ impl BallFilter {
     fn update_hypothesis_with_measurement(
         hypothesis: &mut Hypothesis,
         detected_position: Point2<Ground>,
+        camera_matrix: &CameraMatrix,
         detection_time: SystemTime,
         configuration: &BallFilterParameters,
     ) {
+        let moving_state_measurement_covariance = camera_matrix
+            .project_noise_to_ground_with_z(
+                detected_position,
+                configuration.measurement_noise_moving,
+                0.0,
+            )
+            .expect("failed to compute inverse");
+
         hypothesis.moving_state.update(
             Matrix2x4::identity(),
-            detected_position.inner.coords,
-            Matrix2::from_diagonal(&configuration.measurement_noise_moving)
-                * detected_position.coords().norm_squared(),
+            detected_position.coords().inner,
+            moving_state_measurement_covariance,
         );
+
+        let resting_state_measurement_covariance = camera_matrix
+            .project_noise_to_ground_with_z(
+                detected_position,
+                configuration.measurement_noise_resting,
+                0.0,
+            )
+            .expect("failed to compute inverse");
+
         hypothesis.resting_state.update(
             Matrix2x4::identity(),
-            detected_position.inner.coords,
-            Matrix2::from_diagonal(&configuration.measurement_noise_resting)
-                * detected_position.coords().norm_squared(),
+            detected_position.coords().inner,
+            resting_state_measurement_covariance,
         );
 
         if !hypothesis.is_resting(configuration) {
             hypothesis.resting_state.mean = hypothesis.moving_state.mean;
         }
+
         hypothesis.last_update = detection_time;
         hypothesis.validity += 1.0;
     }
@@ -291,6 +325,7 @@ impl BallFilter {
         &mut self,
         detected_position: Point2<Ground>,
         detection_time: SystemTime,
+        camera_matrix: &CameraMatrix,
         configuration: &BallFilterParameters,
     ) {
         let mut matching_hypotheses = self
@@ -312,6 +347,7 @@ impl BallFilter {
             Self::update_hypothesis_with_measurement(
                 hypothesis,
                 detected_position,
+                camera_matrix,
                 detection_time,
                 configuration,
             )
