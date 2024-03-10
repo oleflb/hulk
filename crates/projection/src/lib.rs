@@ -1,9 +1,8 @@
-use approx::relative_eq;
 use nalgebra::{matrix, Matrix2, Matrix3};
 use thiserror::Error;
 
 use coordinate_systems::{Camera, Ground, Pixel, Robot};
-use linear_algebra::{point, vector, IntoFramed, Isometry3, Point, Point2, Point3, Vector3};
+use linear_algebra::{point, IntoFramed, Point2, Point3, Vector2, Vector3};
 use types::camera_matrix::CameraMatrix;
 
 #[derive(Debug, Error)]
@@ -48,8 +47,8 @@ pub trait Projection {
     fn camera_matrix_for_z(&self, z: f32) -> Matrix3<f32>;
     fn project_noise_to_ground_with_z(
         &self,
-        ground_coordinates: Point2<f32>,
-        noise: nalgebra::Vector2<f32>,
+        ground_coordinates: Point2<Ground>,
+        noise: Vector2<Pixel>,
         z: f32,
     ) -> Result<Matrix2<f32>, Error>;
 }
@@ -101,32 +100,32 @@ impl Projection for CameraMatrix {
         pixel_coordinates: Point2<Pixel>,
         z: f32,
     ) -> Result<Point2<Ground>, Error> {
-        struct ElevatedGround;
+        // let camera_ray = self.pixel_to_camera(pixel_coordinates);
+        // let camera_to_elevated_ground = Isometry3::translation(0., 0., -z) * self.camera_to_ground;
 
-        let camera_ray = self.pixel_to_camera(pixel_coordinates);
-        let camera_to_elevated_ground =
-            Isometry3::<Ground, ElevatedGround>::from(vector![0., 0., -z]) * self.camera_to_ground;
+        // let camera_position = camera_to_elevated_ground * Point3::origin();
+        // let camera_ray_over_ground = camera_to_elevated_ground * camera_ray;
 
-        let camera_position = Point::from(camera_to_elevated_ground.translation());
-        let camera_ray_over_ground = camera_to_elevated_ground * camera_ray;
+        // if relative_eq!(camera_ray_over_ground.z, 0.0) {
+        //     return Err(Error::NotOnProjectionPlane);
+        // }
 
-        if relative_eq!(camera_ray_over_ground.z(), 0.0) {
-            return Err(Error::NotOnProjectionPlane);
-        }
+        // let intersection_scalar = -camera_position.z / camera_ray_over_ground.z;
 
-        let intersection_scalar = -camera_position.z() / camera_ray_over_ground.z();
+        // if intersection_scalar < 0.0 {
+        //     return Err(Error::BehindCamera);
+        // }
 
-        if intersection_scalar < 0.0 {
-            return Err(Error::BehindCamera);
-        }
+        // let intersection_point = camera_position + camera_ray_over_ground * intersection_scalar;
 
-        let intersection_point = camera_position + camera_ray_over_ground * intersection_scalar;
+        // Ok(intersection_point.xy())
 
-        let elevated_ground_to_ground =
-            Isometry3::<ElevatedGround, Ground>::from(vector![0.0, 0.0, -z]);
-        let intersection_point_in_ground = elevated_ground_to_ground * intersection_point;
+        let camera_matrix = self.camera_matrix_for_z(z);
+        let inverse_camera_matrix = camera_matrix.try_inverse().ok_or(Error::NotInvertible)?;
 
-        Ok(intersection_point_in_ground.xy())
+        let ground = inverse_camera_matrix * pixel_coordinates.inner.to_homogeneous();
+
+        Ok(point![ground.x, ground.y] / ground.z)
     }
 
     fn ground_to_pixel(&self, ground_coordinates: Point2<Ground>) -> Result<Point2<Pixel>, Error> {
@@ -195,8 +194,8 @@ impl Projection for CameraMatrix {
 
     fn project_noise_to_ground_with_z(
         &self,
-        ground_coordinates: Point2<f32>,
-        noise: nalgebra::Vector2<f32>,
+        ground_coordinates: Point2<Ground>,
+        noise: Vector2<Pixel>,
         z: f32,
     ) -> Result<Matrix2<f32>, Error> {
         let camera_matrix = self.camera_matrix_for_z(z);
@@ -209,10 +208,10 @@ impl Projection for CameraMatrix {
 
         let noise_projection = gamma
             * matrix![
-                inverse_camera_matrix[(0,0)] - inverse_camera_matrix[(2,0)] * x, inverse_camera_matrix[(0,1)] - inverse_camera_matrix[(2,1)] * x;
-                inverse_camera_matrix[(1,0)] - inverse_camera_matrix[(2,0)] * y, inverse_camera_matrix[(1,1)] - inverse_camera_matrix[(2,1)] * y;
+                inverse_camera_matrix.m11 - inverse_camera_matrix.m31 * x, inverse_camera_matrix.m12 - inverse_camera_matrix.m32 * x;
+                inverse_camera_matrix.m21 - inverse_camera_matrix.m31 * y, inverse_camera_matrix.m22 - inverse_camera_matrix.m32 * y;
             ];
 
-        Ok(noise_projection * Matrix2::from_diagonal(&noise) * noise_projection.transpose())
+        Ok(noise_projection * Matrix2::from_diagonal(&noise.inner) * noise_projection.transpose())
     }
 }

@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use color_eyre::Result;
-use nalgebra::{matrix, Matrix2, Matrix2x4, Matrix4, Matrix4x2};
+use nalgebra::{matrix, Matrix2x4, Matrix4, Matrix4x2};
 use serde::{Deserialize, Serialize};
 
 use context_attribute::context;
@@ -37,11 +37,9 @@ pub struct CycleContext {
     ball_filter_hypotheses: AdditionalOutput<Vec<Hypothesis>, "ball_filter_hypotheses">,
     best_ball_hypothesis: AdditionalOutput<Option<Hypothesis>, "best_ball_hypothesis">,
     best_ball_state: AdditionalOutput<Option<MultivariateNormalDistribution<4>>, "best_ball_state">,
-    chooses_resting_model: AdditionalOutput<bool, "chooses_resting_model">,
-    filtered_balls_in_image_bottom:
-        AdditionalOutput<Vec<Circle<Pixel>>, "filtered_balls_in_image_bottom">,
-    filtered_balls_in_image_top:
-        AdditionalOutput<Vec<Circle<Pixel>>, "filtered_balls_in_image_top">,
+    chooses_resting_model: AdditionalOutput<Option<bool>, "chooses_resting_model">,
+    filtered_balls_in_image_bottom: AdditionalOutput<Vec<Circle<Pixel>>, "filtered_balls_in_image_bottom">,
+    filtered_balls_in_image_top: AdditionalOutput<Vec<Circle<Pixel>>, "filtered_balls_in_image_top">,
 
     current_odometry_to_last_odometry:
         HistoricInput<Option<nalgebra::Isometry2<f32>>, "current_odometry_to_last_odometry?">,
@@ -113,10 +111,10 @@ impl BallFilter {
                 Matrix4::from_diagonal(&context.ball_filter_configuration.process_noise),
             );
 
-            let camera_matrices = context
-                .historic_camera_matrices
-                .get(detection_time)
-                .expect("camera_matrices should not be None");
+            let Some(camera_matrices) = context.historic_camera_matrices.get(detection_time) else {
+                continue;
+            };
+
             let projected_limbs_bottom = context
                 .projected_limbs
                 .persistent
@@ -180,21 +178,24 @@ impl BallFilter {
                 )
             });
 
+        let best_hypothesis = self.find_best_hypothesis();
+
         context
             .best_ball_hypothesis
-            .fill_if_subscribed(|| self.find_best_hypothesis().cloned());
+            .fill_if_subscribed(|| best_hypothesis.cloned());
 
         context.best_ball_state.fill_if_subscribed(|| {
-            self.find_best_hypothesis()
+            best_hypothesis
                 .map(|hypothesis| hypothesis.selected_state(context.ball_filter_configuration))
         });
 
-        let ball_position = self.find_best_hypothesis().map(|hypothesis| {
-            context
-                .chooses_resting_model
-                .fill_if_subscribed(|| hypothesis.is_resting(context.ball_filter_configuration));
-            hypothesis.selected_ball_position(context.ball_filter_configuration)
+        context.chooses_resting_model.fill_if_subscribed(|| {
+            best_hypothesis
+                .map(|hypothesis| hypothesis.is_resting(context.ball_filter_configuration))
         });
+
+        let ball_position = best_hypothesis
+            .map(|hypothesis| hypothesis.selected_ball_position(context.ball_filter_configuration));
 
         Ok(MainOutputs {
             ball_position: ball_position.into(),

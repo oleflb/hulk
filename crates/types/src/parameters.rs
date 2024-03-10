@@ -1,7 +1,7 @@
 use std::ops::{Index, Range};
 use std::{path::PathBuf, time::Duration};
 
-use coordinate_systems::{Field, Ground};
+use coordinate_systems::{Field, Ground, Pixel};
 use linear_algebra::{Point2, Vector2};
 use nalgebra::{Vector3, Vector4};
 use serde::{Deserialize, Serialize};
@@ -302,8 +302,8 @@ pub struct BallFilterParameters {
     pub measurement_matching_distance: f32,
     pub hypothesis_merge_distance: f32,
     pub process_noise: Vector4<f32>,
-    pub measurement_noise_moving: nalgebra::Vector2<f32>,
-    pub measurement_noise_resting: nalgebra::Vector2<f32>,
+    pub measurement_noise_moving: Vector2<Pixel>,
+    pub measurement_noise_resting: Vector2<Pixel>,
     pub initial_covariance: Vector4<f32>,
     pub visible_validity_exponential_decay_factor: f32,
     pub hidden_validity_exponential_decay_factor: f32,
