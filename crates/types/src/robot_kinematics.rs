@@ -4,10 +4,7 @@ use linear_algebra::Isometry3;
 use serialize_hierarchy::SerializeHierarchy;
 
 use coordinate_systems::{
-    Head, LeftAnkle, LeftElbow, LeftFoot, LeftForearm, LeftHip, LeftPelvis, LeftShoulder, LeftSole,
-    LeftThigh, LeftTibia, LeftUpperArm, LeftWrist, Neck, RightAnkle, RightElbow, RightFoot,
-    RightForearm, RightHip, RightPelvis, RightShoulder, RightSole, RightThigh, RightTibia,
-    RightUpperArm, RightWrist, Robot, Torso,
+    Head, LeftAnkle, LeftElbow, LeftFoot, LeftForearm, LeftHip, LeftPelvis, LeftShoulder, LeftSole, LeftThigh, LeftTibia, LeftUpperArm, LeftWrist, Neck, RightAnkle, RightElbow, RightFoot, RightForearm, RightHip, RightPelvis, RightShoulder, RightSole, RightThigh, RightTibia, RightUpperArm, RightWrist, Robot, Torso
 };
 
 #[derive(Debug, Clone, Default, SerializeHierarchy, Serialize, Deserialize)]
@@ -46,3 +43,4 @@ pub struct RobotKinematics {
     pub right_foot_to_robot: Isometry3<RightFoot, Robot>,
     pub right_sole_to_robot: Isometry3<RightSole, Robot>,
 }
+
