@@ -284,33 +284,23 @@ impl BallFilter {
         camera_matrix: &CameraMatrix,
         detection_time: SystemTime,
         configuration: &BallFilterParameters,
+        ball_radius: f32,
     ) {
-        let moving_state_measurement_covariance = camera_matrix
-            .project_noise_to_ground_with_z(
-                detected_position,
-                configuration.measurement_noise_moving,
-                0.0,
-            )
-            .expect("failed to compute inverse");
+        let measurement_variance = configuration.measurement_noise.map(|x| x * x);
+        let projected_measurement_variance = camera_matrix
+            .project_noise_to_ground_with_z(detected_position, measurement_variance, ball_radius)
+            .expect("compute projected noise");
 
         hypothesis.moving_state.update(
             Matrix2x4::identity(),
             detected_position.coords().inner,
-            moving_state_measurement_covariance,
+            projected_measurement_variance,
         );
-
-        let resting_state_measurement_covariance = camera_matrix
-            .project_noise_to_ground_with_z(
-                detected_position,
-                configuration.measurement_noise_resting,
-                0.0,
-            )
-            .expect("failed to compute inverse");
 
         hypothesis.resting_state.update(
             Matrix2x4::identity(),
             detected_position.coords().inner,
-            resting_state_measurement_covariance,
+            projected_measurement_variance,
         );
 
         if !hypothesis.is_resting(configuration) {
