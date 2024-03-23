@@ -39,6 +39,12 @@ pub trait Projection {
         pixel_coordinates: Point2<Pixel>,
     ) -> Result<f32, Error>;
     fn camera_matrix_for_z(&self, z: f32) -> Matrix3<f32>;
+    fn project_noise_to_ground_with_z(
+        &self,
+        ground_coordinates: Point2<Ground>,
+        noise: Vector2<Pixel>,
+        z: f32,
+    ) -> Result<Matrix2<f32>, Error>;
 }
 
 impl Projection for CameraMatrix {
@@ -156,6 +162,29 @@ impl Projection for CameraMatrix {
         );
 
         Ok(self.image_size.y() as f32 * angle / self.field_of_view.y)
+    }
+
+    fn project_noise_to_ground_with_z(
+        &self,
+        ground_coordinates: Point2<Ground>,
+        noise: Vector2<Pixel>,
+        z: f32,
+    ) -> Result<Matrix2<f32>, Error> {
+        let camera_matrix = self.camera_matrix_for_z(z);
+
+        let gamma = (camera_matrix * ground_coordinates.inner.to_homogeneous()).z;
+        let inverse_camera_matrix = camera_matrix.try_inverse().ok_or(Error::NotInvertible)?;
+
+        let x = ground_coordinates.x();
+        let y = ground_coordinates.y();
+
+        let noise_projection = gamma
+            * matrix![
+                inverse_camera_matrix.m11 - inverse_camera_matrix.m31 * x, inverse_camera_matrix.m12 - inverse_camera_matrix.m32 * x;
+                inverse_camera_matrix.m21 - inverse_camera_matrix.m31 * y, inverse_camera_matrix.m22 - inverse_camera_matrix.m32 * y;
+            ];
+
+        Ok(noise_projection * Matrix2::from_diagonal(&noise.inner) * noise_projection.transpose())
     }
 
     fn bearing(&self, pixel_coordinates: Point2<Pixel>) -> Vector3<Camera> {
