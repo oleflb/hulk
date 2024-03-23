@@ -197,7 +197,7 @@ mod tests {
         );
         let minimum_radius = 5.0;
 
-        assert!(!generate_rows(&camera_matrix, vector![512, 512], minimum_radius, 42.0).is_empty());
+        assert!(!generate_rows(&camera_matrix, point![512, 512], minimum_radius, 42.0).is_empty());
     }
 
     #[test]

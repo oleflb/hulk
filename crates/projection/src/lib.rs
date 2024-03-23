@@ -2,7 +2,7 @@ use nalgebra::{matrix, Matrix3};
 use thiserror::Error;
 
 use coordinate_systems::{Camera, Ground, Pixel, Robot};
-use linear_algebra::{point, vector, Isometry3, Point2, Point3, Vector3};
+use linear_algebra::{point, vector, Isometry3, Point2, Point3, Vector2, Vector3};
 use types::camera_matrix::CameraMatrix;
 
 #[derive(Debug, Error)]
@@ -159,6 +159,7 @@ impl Projection for CameraMatrix {
     }
 
     fn bearing(&self, pixel_coordinates: Point2<Pixel>) -> Vector3<Camera> {
+        // TODO: test case for this
         vector![
             (pixel_coordinates.x() - self.optical_center.x()) / self.focal_length.x,
             (pixel_coordinates.y() - self.optical_center.y()) / self.focal_length.y,

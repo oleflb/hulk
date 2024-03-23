@@ -335,7 +335,6 @@
     "process_noise": [0.000005, 0.000005, 0.0002, 0.0002],
     "measurement_noise": [50.0, 50.0],
     "initial_covariance": [0.5, 0.5, 0.5, 0.5],
-    "resting_ball_velocity_threshold": 0.25,
     "visible_validity_exponential_decay_factor": 0.96,
     "hidden_validity_exponential_decay_factor": 0.999,
     "validity_discard_threshold": 0.5,

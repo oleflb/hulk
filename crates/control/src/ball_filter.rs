@@ -9,7 +9,7 @@ use coordinate_systems::{Ground, Pixel};
 use filtering::kalman_filter::KalmanFilter;
 use framework::{AdditionalOutput, HistoricInput, MainOutput, PerceptionInput};
 use geometry::circle::Circle;
-use linear_algebra::Point2;
+use linear_algebra::{distance, Point2};
 use projection::Projection;
 use types::{
     ball::Ball,
@@ -36,8 +36,6 @@ pub struct CreationContext {}
 pub struct CycleContext {
     ball_filter_hypotheses: AdditionalOutput<Vec<Hypothesis>, "ball_filter_hypotheses">,
     best_ball_hypothesis: AdditionalOutput<Option<Hypothesis>, "best_ball_hypothesis">,
-    best_ball_state: AdditionalOutput<Option<MultivariateNormalDistribution<4>>, "best_ball_state">,
-    chooses_resting_model: AdditionalOutput<bool, "chooses_resting_model">,
     filtered_balls_in_image_bottom:
         AdditionalOutput<Vec<Circle<Pixel>>, "filtered_balls_in_image_bottom">,
     filtered_balls_in_image_top:
@@ -110,7 +108,12 @@ impl BallFilter {
             self.predict_hypotheses_with_odometry(
                 context.ball_filter_configuration.velocity_decay_factor,
                 current_odometry_to_last_odometry.inverse(),
-                Matrix4::from_diagonal(&context.ball_filter_configuration.process_noise),
+                Matrix4::from_diagonal(
+                    &context
+                        .ball_filter_configuration
+                        .process_noise
+                        .map(|x| x * x),
+                ),
             );
 
             let camera_matrices = context
@@ -137,6 +140,7 @@ impl BallFilter {
                     *detection_time,
                     &camera_matrices[camera_position],
                     context.ball_filter_configuration,
+                    context.field_dimensions.ball_radius,
                 );
             }
         }
@@ -165,8 +169,9 @@ impl BallFilter {
         let ball_positions = self
             .hypotheses
             .iter()
-            .map(|hypothesis| hypothesis.selected_ball_position(context.ball_filter_configuration))
+            .map(|hypothesis| hypothesis.position())
             .collect::<Vec<_>>();
+
         context.filtered_balls_in_image_top.fill_if_subscribed(|| {
             project_to_image(&ball_positions, &context.camera_matrices.top, ball_radius)
         });
@@ -184,17 +189,7 @@ impl BallFilter {
             .best_ball_hypothesis
             .fill_if_subscribed(|| self.find_best_hypothesis().cloned());
 
-        context.best_ball_state.fill_if_subscribed(|| {
-            self.find_best_hypothesis()
-                .map(|hypothesis| hypothesis.selected_state(context.ball_filter_configuration))
-        });
-
-        let ball_position = self.find_best_hypothesis().map(|hypothesis| {
-            context
-                .chooses_resting_model
-                .fill_if_subscribed(|| hypothesis.is_resting(context.ball_filter_configuration));
-            hypothesis.selected_ball_position(context.ball_filter_configuration)
-        });
+        let ball_position = self.find_best_hypothesis().map(Hypothesis::position);
 
         Ok(MainOutputs {
             ball_position: ball_position.into(),
@@ -216,13 +211,11 @@ impl BallFilter {
                         &camera_matrices.bottom,
                         ball_radius,
                         &projected_limbs.limbs,
-                        configuration,
                     ) || is_visible_to_camera(
                         hypothesis,
                         &camera_matrices.top,
                         ball_radius,
                         &[],
-                        configuration,
                     )
                 }
                 _ => false,
@@ -263,13 +256,7 @@ impl BallFilter {
             let state_prediction = constant_velocity_prediction * state_rotation;
             let control_input_model = Matrix4x2::identity();
             let odometry_translation = last_odometry_to_current_odometry.translation.vector;
-            hypothesis.moving_state.predict(
-                state_prediction,
-                control_input_model,
-                odometry_translation,
-                process_noise,
-            );
-            hypothesis.resting_state.predict(
+            hypothesis.state.predict(
                 state_prediction,
                 control_input_model,
                 odometry_translation,
@@ -291,21 +278,11 @@ impl BallFilter {
             .project_noise_to_ground_with_z(detected_position, measurement_variance, ball_radius)
             .expect("compute projected noise");
 
-        hypothesis.moving_state.update(
+        hypothesis.state.update(
             Matrix2x4::identity(),
             detected_position.coords().inner,
             projected_measurement_variance,
         );
-
-        hypothesis.resting_state.update(
-            Matrix2x4::identity(),
-            detected_position.coords().inner,
-            projected_measurement_variance,
-        );
-
-        if !hypothesis.is_resting(configuration) {
-            hypothesis.resting_state.mean = hypothesis.moving_state.mean;
-        }
 
         hypothesis.last_update = detection_time;
         hypothesis.validity += 1.0;
@@ -317,15 +294,14 @@ impl BallFilter {
         detection_time: SystemTime,
         camera_matrix: &CameraMatrix,
         configuration: &BallFilterParameters,
+        ball_radius: f32,
     ) {
         let mut matching_hypotheses = self
             .hypotheses
             .iter_mut()
             .filter(|hypothesis| {
-                (hypothesis.moving_state.mean.xy() - detected_position.inner.coords).norm()
+                (hypothesis.state.mean.xy() - detected_position.inner.coords).norm()
                     < configuration.measurement_matching_distance
-                    || (hypothesis.resting_state.mean.xy() - detected_position.inner.coords).norm()
-                        < configuration.measurement_matching_distance
             })
             .peekable();
 
@@ -340,6 +316,7 @@ impl BallFilter {
                 camera_matrix,
                 detection_time,
                 configuration,
+                ball_radius,
             )
         });
     }
@@ -359,11 +336,7 @@ impl BallFilter {
         let initial_state =
             nalgebra::vector![detected_position.x(), detected_position.y(), 0.0, 0.0];
         let new_hypothesis = Hypothesis {
-            moving_state: MultivariateNormalDistribution {
-                mean: initial_state,
-                covariance: Matrix4::from_diagonal(&configuration.initial_covariance),
-            },
-            resting_state: MultivariateNormalDistribution {
+            state: MultivariateNormalDistribution {
                 mean: initial_state,
                 covariance: Matrix4::from_diagonal(&configuration.initial_covariance),
             },
@@ -380,7 +353,7 @@ impl BallFilter {
         field_dimensions: &FieldDimensions,
     ) {
         self.hypotheses.retain(|hypothesis| {
-            let selected_position = hypothesis.selected_ball_position(configuration).position;
+            let selected_position = hypothesis.position().position;
             let is_inside_field = {
                 selected_position.x().abs()
                     < field_dimensions.length / 2.0 + field_dimensions.border_strip_width
@@ -399,25 +372,17 @@ impl BallFilter {
                 deduplicated_hypotheses
                     .iter_mut()
                     .find(|existing_hypothesis| {
-                        (existing_hypothesis
-                            .selected_ball_position(configuration)
-                            .position
-                            - hypothesis.selected_ball_position(configuration).position)
-                            .norm()
-                            < configuration.hypothesis_merge_distance
+                        distance(
+                            existing_hypothesis.position().position,
+                            hypothesis.position().position,
+                        ) < configuration.hypothesis_merge_distance
                     });
             match hypothesis_in_merge_distance {
                 Some(existing_hypothesis) => {
-                    let update_state = hypothesis.selected_state(configuration);
-                    existing_hypothesis.moving_state.update(
+                    existing_hypothesis.state.update(
                         Matrix4::identity(),
-                        update_state.mean,
-                        update_state.covariance,
-                    );
-                    existing_hypothesis.resting_state.update(
-                        Matrix4::identity(),
-                        update_state.mean,
-                        update_state.covariance,
+                        hypothesis.state.mean,
+                        hypothesis.state.covariance,
                     );
                 }
                 None => deduplicated_hypotheses.push(hypothesis),
@@ -454,9 +419,8 @@ fn is_visible_to_camera(
     camera_matrix: &CameraMatrix,
     ball_radius: f32,
     projected_limbs: &[Limb],
-    configuration: &BallFilterParameters,
 ) -> bool {
-    let position_on_ground = hypothesis.selected_ball_position(configuration).position;
+    let position_on_ground = hypothesis.position().position;
     let position_in_image =
         match camera_matrix.ground_with_z_to_pixel(position_on_ground, ball_radius) {
             Ok(position_in_image) => position_in_image,

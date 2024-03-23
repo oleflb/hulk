@@ -17,7 +17,7 @@ use crate::{
 
 pub struct BallFilter {
     ground_to_field: ValueBuffer,
-    ball_state: ValueBuffer,
+    ball_hypotheses: ValueBuffer,
 }
 
 impl Layer for BallFilter {
@@ -36,9 +36,10 @@ impl Layer for BallFilter {
                 path: "best_ball_state".to_string(),
             },
         });
+
         Self {
             ground_to_field,
-            ball_state,
+            ball_hypotheses,
         }
     }
 
@@ -49,12 +50,17 @@ impl Layer for BallFilter {
     ) -> Result<()> {
         let ground_to_field: Option<Isometry2<Ground, Field>> =
             self.ground_to_field.parse_latest()?;
-        let ball_state: Option<MultivariateNormalDistribution<4>> =
-            self.ball_state.parse_latest()?;
 
-        if let Some(state) = ball_state {
-            let position = ground_to_field.unwrap_or_default() * Point::from(state.mean.xy());
-            let covariance = state.covariance.fixed_view::<2, 2>(0, 0).into_owned();
+        let ball_hypotheses: Vec<Hypothesis> =
+            self.ball_hypotheses.parse_latest().unwrap_or_default();
+
+        for hypothesis in ball_hypotheses {
+            let position = ground_to_field.unwrap_or_default() * hypothesis.position().position;
+            let covariance = hypothesis
+                .state
+                .covariance
+                .fixed_view::<2, 2>(0, 0)
+                .into_owned();
             let stroke = Stroke::new(0.01, Color32::BLACK);
             let fill_color = Color32::from_rgba_unmultiplied(255, 255, 0, 100);
             painter.covariance(position, covariance, stroke, fill_color);
