@@ -1,4 +1,4 @@
-use nalgebra::{matrix, Matrix3};
+use nalgebra::{matrix, Matrix2, Matrix3};
 use thiserror::Error;
 
 use coordinate_systems::{Camera, Ground, Pixel, Robot};

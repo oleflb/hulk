@@ -1,7 +1,7 @@
 use std::ops::{Index, Range};
 use std::{path::PathBuf, time::Duration};
 
-use coordinate_systems::{Field, Ground};
+use coordinate_systems::{Field, Ground, Pixel};
 use linear_algebra::{Point2, Vector2};
 use nalgebra::{Vector3, Vector4};
 use serde::{Deserialize, Serialize};

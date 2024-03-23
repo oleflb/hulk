@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use color_eyre::Result;
-use nalgebra::{matrix, Matrix2, Matrix2x4, Matrix4, Matrix4x2};
+use nalgebra::{matrix, Matrix2x4, Matrix4, Matrix4x2};
 use serde::{Deserialize, Serialize};
 
 use context_attribute::context;
@@ -164,6 +164,7 @@ impl BallFilter {
         context
             .ball_filter_hypotheses
             .fill_if_subscribed(|| self.hypotheses.clone());
+
         let ball_radius = context.field_dimensions.ball_radius;
 
         let ball_positions = self
@@ -211,12 +212,7 @@ impl BallFilter {
                         &camera_matrices.bottom,
                         ball_radius,
                         &projected_limbs.limbs,
-                    ) || is_visible_to_camera(
-                        hypothesis,
-                        &camera_matrices.top,
-                        ball_radius,
-                        &[],
-                    )
+                    ) || is_visible_to_camera(hypothesis, &camera_matrices.top, ball_radius, &[])
                 }
                 _ => false,
             };
