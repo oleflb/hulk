@@ -19,10 +19,10 @@ use types::{
     ycbcr422_image::YCbCr422Image,
 };
 
-const DETECTION_IMAGE_HEIGHT: usize = 96;
-const DETECTION_IMAGE_WIDTH: usize = 128;
+const DETECTION_IMAGE_HEIGHT: usize = 128;
+const DETECTION_IMAGE_WIDTH: usize = 192;
 const DETECTION_NUMBER_CHANNELS: usize = 3;
-const NUMBER_OF_CLASSES: usize = 1;
+const NUMBER_OF_CLASSES: usize = 2;
 
 const MAX_DETECTION: usize = 252;
 
