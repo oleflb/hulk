@@ -1,15 +1,12 @@
 use std::sync::Arc;
 
 use color_eyre::Result;
+use communication::client::{Cycler, CyclerOutput, Output};
 use eframe::epaint::{Color32, Stroke};
 
-use communication::client::{Cycler, CyclerOutput, Output};
 use coordinate_systems::{Field, Ground};
-use linear_algebra::{Isometry2, Point};
-use types::{
-    field_dimensions::FieldDimensions,
-    multivariate_normal_distribution::MultivariateNormalDistribution,
-};
+use linear_algebra::Isometry2;
+use types::{ball_filter::Hypothesis, field_dimensions::FieldDimensions};
 
 use crate::{
     nao::Nao, panels::map::layer::Layer, twix_painter::TwixPainter, value_buffer::ValueBuffer,
@@ -30,10 +27,10 @@ impl Layer for BallFilter {
                 path: "ground_to_field".to_string(),
             },
         });
-        let ball_state = nao.subscribe_output(CyclerOutput {
+        let ball_hypotheses = nao.subscribe_output(CyclerOutput {
             cycler: Cycler::Control,
             output: Output::Additional {
-                path: "best_ball_state".to_string(),
+                path: "ball_filter_hypotheses".to_string(),
             },
         });
 

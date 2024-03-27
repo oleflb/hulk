@@ -301,7 +301,7 @@ pub struct BallFilterParameters {
     pub hypothesis_timeout: Duration,
     pub measurement_matching_distance: f32,
     pub hypothesis_merge_distance: f32,
-    pub process_noise: Vector4<f32>,
+    pub process_noise: Vector2<f32>,
     pub measurement_noise: Vector2<Pixel>,
     pub initial_covariance: Vector4<f32>,
     pub visible_validity_exponential_decay_factor: f32,

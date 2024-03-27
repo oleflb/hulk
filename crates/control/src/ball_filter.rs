@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use color_eyre::Result;
-use nalgebra::{matrix, Matrix2x4, Matrix4, Matrix4x2};
+use nalgebra::{matrix, Matrix2, Matrix2x4, Matrix4, Matrix4x2};
 use serde::{Deserialize, Serialize};
 
 use context_attribute::context;
@@ -99,27 +99,30 @@ impl BallFilter {
         context: &CycleContext,
         camera_position: CameraPosition,
     ) {
+        let dt: f32 = 0.012;
         for (detection_time, balls) in measurements {
             let current_odometry_to_last_odometry = context
                 .current_odometry_to_last_odometry
                 .get(detection_time)
                 .expect("current_odometry_to_last_odometry should not be None");
 
+            let process_noise = matrix![
+                dt.powi(4) / 4.0, dt.powi(3) / 2.0;
+                dt.powi(3) / 2.0, dt.powi(2); 
+            ].kronecker(&Matrix2::from_diagonal(
+                &context.ball_filter_configuration.process_noise.map(|x| x * x).inner,
+            ));
+
             self.predict_hypotheses_with_odometry(
                 context.ball_filter_configuration.velocity_decay_factor,
                 current_odometry_to_last_odometry.inverse(),
-                Matrix4::from_diagonal(
-                    &context
-                        .ball_filter_configuration
-                        .process_noise
-                        .map(|x| x * x),
-                ),
+                process_noise
             );
 
-            let camera_matrices = context
-                .historic_camera_matrices
-                .get(detection_time)
-                .expect("camera_matrices should not be None");
+            let Some(camera_matrices) = context.historic_camera_matrices.get(detection_time) else {
+                println!("Das sieht ja garnicht gut aus");
+                continue;
+            };
             let projected_limbs_bottom = context
                 .projected_limbs
                 .persistent
@@ -269,7 +272,14 @@ impl BallFilter {
         configuration: &BallFilterParameters,
         ball_radius: f32,
     ) {
-        let measurement_variance = configuration.measurement_noise.map(|x| x * x);
+        let detected_pixel = camera_matrix.ground_to_pixel(detected_position).unwrap();
+        let ball_radius_image = camera_matrix
+            .get_pixel_radius(ball_radius, detected_pixel)
+            .unwrap();
+
+        let measurement_variance = configuration
+            .measurement_noise
+            .map(|x| (x * ball_radius_image).powi(2));
         let projected_measurement_variance = camera_matrix
             .project_noise_to_ground_with_z(detected_position, measurement_variance, ball_radius)
             .expect("compute projected noise");
