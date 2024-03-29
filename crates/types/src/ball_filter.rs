@@ -12,7 +12,8 @@ use crate::{
 
 #[derive(Clone, Debug, Serialize, Deserialize, SerializeHierarchy)]
 pub struct Hypothesis {
-    pub state: MultivariateNormalDistribution<4>,
+    pub rolling_state: MultivariateNormalDistribution<4>,
+    pub resting_state: MultivariateNormalDistribution<2>,
 
     pub validity: f32,
     pub last_update: SystemTime,
@@ -21,8 +22,8 @@ pub struct Hypothesis {
 impl Hypothesis {
     pub fn position(&self) -> BallPosition<Ground> {
         BallPosition {
-            position: Point2::from(self.state.mean.xy()),
-            velocity: vector![self.state.mean.z, self.state.mean.w],
+            position: Point2::from(self.rolling_state.mean.xy()),
+            velocity: vector![self.rolling_state.mean.z, self.rolling_state.mean.w],
             last_seen: self.last_update,
         }
     }

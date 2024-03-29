@@ -106,23 +106,40 @@ impl BallFilter {
                 .get(detection_time)
                 .expect("current_odometry_to_last_odometry should not be None");
 
-            let process_noise = matrix![
+            let rolling_ball_process_noise = matrix![
                 dt.powi(4) / 4.0, dt.powi(3) / 2.0;
-                dt.powi(3) / 2.0, dt.powi(2); 
-            ].kronecker(&Matrix2::from_diagonal(
-                &context.ball_filter_configuration.process_noise.map(|x| x * x).inner,
+                dt.powi(3) / 2.0, dt.powi(2);
+            ]
+            .kronecker(&Matrix2::from_diagonal(
+                &context
+                    .ball_filter_configuration
+                    .rolling_ball_process_noise
+                    .map(|x| x * x)
+                    .inner,
             ));
+
+            let resting_ball_process_noise = matrix![
+                dt.powi(2), 0.0;
+                0.0, dt.powi(2);
+            ] * Matrix2::from_diagonal(
+                &context
+                    .ball_filter_configuration
+                    .resting_ball_process_noise
+                    .map(|x| x * x)
+                    .inner,
+            );
 
             self.predict_hypotheses_with_odometry(
                 context.ball_filter_configuration.velocity_decay_factor,
                 current_odometry_to_last_odometry.inverse(),
-                process_noise
+                rolling_ball_process_noise,
+                resting_ball_process_noise,
             );
 
             let Some(camera_matrices) = context.historic_camera_matrices.get(detection_time) else {
-                println!("Das sieht ja garnicht gut aus");
                 continue;
             };
+
             let projected_limbs_bottom = context
                 .projected_limbs
                 .persistent
@@ -233,7 +250,8 @@ impl BallFilter {
         &mut self,
         velocity_decay_factor: f32,
         last_odometry_to_current_odometry: nalgebra::Isometry2<f32>,
-        process_noise: Matrix4<f32>,
+        rolling_ball_process_noise: Matrix4<f32>,
+        resting_ball_process_noise: Matrix2<f32>,
     ) {
         for hypothesis in self.hypotheses.iter_mut() {
             let cycle_time = 0.012;
@@ -246,20 +264,24 @@ impl BallFilter {
             let rotation = last_odometry_to_current_odometry
                 .rotation
                 .to_rotation_matrix();
-            let state_rotation = matrix![
-                rotation[(0, 0)], rotation[(0, 1)], 0.0, 0.0;
-                rotation[(1, 0)], rotation[(1, 1)], 0.0, 0.0;
-                0.0, 0.0, rotation[(0, 0)], rotation[(0, 1)];
-                0.0, 0.0, rotation[(1, 0)], rotation[(1, 1)];
-            ];
-            let state_prediction = constant_velocity_prediction * state_rotation;
+
+            let state_prediction =
+                constant_velocity_prediction * Matrix2::identity().kronecker(rotation.matrix());
             let control_input_model = Matrix4x2::identity();
             let odometry_translation = last_odometry_to_current_odometry.translation.vector;
-            hypothesis.state.predict(
+
+            hypothesis.rolling_state.predict(
                 state_prediction,
                 control_input_model,
                 odometry_translation,
-                process_noise,
+                rolling_ball_process_noise,
+            );
+
+            hypothesis.resting_state.predict(
+                *rotation.matrix(),
+                Matrix2::identity(),
+                odometry_translation,
+                resting_ball_process_noise,
             );
         }
     }
@@ -284,8 +306,14 @@ impl BallFilter {
             .project_noise_to_ground_with_z(detected_position, measurement_variance, ball_radius)
             .expect("compute projected noise");
 
-        hypothesis.state.update(
+        hypothesis.rolling_state.update(
             Matrix2x4::identity(),
+            detected_position.coords().inner,
+            projected_measurement_variance,
+        );
+
+        hypothesis.resting_state.update(
+            Matrix2::identity(),
             detected_position.coords().inner,
             projected_measurement_variance,
         );
@@ -306,8 +334,10 @@ impl BallFilter {
             .hypotheses
             .iter_mut()
             .filter(|hypothesis| {
-                (hypothesis.state.mean.xy() - detected_position.inner.coords).norm()
+                (hypothesis.rolling_state.mean.xy() - detected_position.inner.coords).norm()
                     < configuration.measurement_matching_distance
+                    || (hypothesis.resting_state.mean - detected_position.inner.coords).norm()
+                        < configuration.measurement_matching_distance
             })
             .peekable();
 
@@ -342,9 +372,15 @@ impl BallFilter {
         let initial_state =
             nalgebra::vector![detected_position.x(), detected_position.y(), 0.0, 0.0];
         let new_hypothesis = Hypothesis {
-            state: MultivariateNormalDistribution {
+            rolling_state: MultivariateNormalDistribution {
                 mean: initial_state,
                 covariance: Matrix4::from_diagonal(&configuration.initial_covariance),
+            },
+            resting_state: MultivariateNormalDistribution {
+                mean: initial_state.fixed_rows::<2>(0).into(),
+                covariance: Matrix2::from_diagonal(
+                    &configuration.initial_covariance.fixed_rows::<2>(0),
+                ),
             },
             validity: 1.0,
             last_update: detection_time,
@@ -385,10 +421,15 @@ impl BallFilter {
                     });
             match hypothesis_in_merge_distance {
                 Some(existing_hypothesis) => {
-                    existing_hypothesis.state.update(
+                    existing_hypothesis.rolling_state.update(
                         Matrix4::identity(),
-                        hypothesis.state.mean,
-                        hypothesis.state.covariance,
+                        hypothesis.rolling_state.mean,
+                        hypothesis.rolling_state.covariance,
+                    );
+                    existing_hypothesis.resting_state.update(
+                        Matrix2::identity(),
+                        hypothesis.resting_state.mean,
+                        hypothesis.resting_state.covariance,
                     );
                 }
                 None => deduplicated_hypotheses.push(hypothesis),

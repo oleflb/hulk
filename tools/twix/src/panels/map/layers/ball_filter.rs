@@ -5,7 +5,7 @@ use communication::client::{Cycler, CyclerOutput, Output};
 use eframe::epaint::{Color32, Stroke};
 
 use coordinate_systems::{Field, Ground};
-use linear_algebra::Isometry2;
+use linear_algebra::{IntoFramed, Isometry2};
 use types::{ball_filter::Hypothesis, field_dimensions::FieldDimensions};
 
 use crate::{
@@ -52,15 +52,22 @@ impl Layer for BallFilter {
             self.ball_hypotheses.parse_latest().unwrap_or_default();
 
         for hypothesis in ball_hypotheses {
-            let position = ground_to_field.unwrap_or_default() * hypothesis.position().position;
-            let covariance = hypothesis
-                .state
+            let rolling_state = &hypothesis.rolling_state;
+            let rolling_position = ground_to_field.unwrap_or_default() * rolling_state.mean.xy().framed().as_point();
+            let rolling_covariance = rolling_state
                 .covariance
                 .fixed_view::<2, 2>(0, 0)
                 .into_owned();
             let stroke = Stroke::new(0.01, Color32::BLACK);
-            let fill_color = Color32::from_rgba_unmultiplied(255, 255, 0, 100);
-            painter.covariance(position, covariance, stroke, fill_color);
+            painter.covariance(rolling_position, rolling_covariance, stroke, Color32::YELLOW.gamma_multiply(0.5));
+
+            let resting_state = &hypothesis.resting_state;
+            let resting_position = ground_to_field.unwrap_or_default() * resting_state.mean.xy().framed().as_point();
+            let resting_covariance = resting_state
+                .covariance
+                .into_owned();
+            let stroke = Stroke::new(0.01, Color32::BLACK);
+            painter.covariance(resting_position, resting_covariance, stroke, Color32::BLUE.gamma_multiply(0.5));
         }
 
         Ok(())
