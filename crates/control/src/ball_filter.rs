@@ -267,12 +267,11 @@ impl BallFilter {
 
             let state_prediction =
                 constant_velocity_prediction * Matrix2::identity().kronecker(rotation.matrix());
-            let control_input_model = Matrix4x2::identity();
             let odometry_translation = last_odometry_to_current_odometry.translation.vector;
 
             hypothesis.rolling_state.predict(
                 state_prediction,
-                control_input_model,
+                Matrix4x2::identity(),
                 odometry_translation,
                 rolling_ball_process_noise,
             );

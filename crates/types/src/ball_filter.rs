@@ -22,8 +22,8 @@ pub struct Hypothesis {
 impl Hypothesis {
     pub fn position(&self) -> BallPosition<Ground> {
         BallPosition {
-            position: Point2::from(self.rolling_state.mean.xy()),
-            velocity: vector![self.rolling_state.mean.z, self.rolling_state.mean.w],
+            position: Point2::from(self.resting_state.mean.xy()),
+            velocity: vector![0.0, 0.0],
             last_seen: self.last_update,
         }
     }
