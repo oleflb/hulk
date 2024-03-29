@@ -8,6 +8,15 @@ pub fn collect_hulk_cyclers() -> Result<Cyclers, Error> {
     let manifest = FrameworkManifest {
         cyclers: vec![
             CyclerManifest {
+                name: "Detection",
+                kind: CyclerKind::Perception,
+                instances: vec!["Top"],
+                setup_nodes: vec!["object_detection::image_receiver"],
+                nodes: vec![
+                    "object_detection::single_shot_detection",
+                ],
+            },
+            CyclerManifest {
                 name: "Vision",
                 kind: CyclerKind::Perception,
                 instances: vec!["Top", "Bottom"],

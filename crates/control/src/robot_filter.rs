@@ -2,12 +2,14 @@ use std::{collections::BTreeSet, time::SystemTime};
 
 use color_eyre::{eyre::ContextCompat, Result};
 use context_attribute::context;
+use coordinate_systems::Ground;
 use filtering::kalman_filter::KalmanFilter;
 use framework::{HistoricInput, MainOutput, PerceptionInput};
 use hungarian_algorithm::AssignmentProblem;
 use itertools::{Either, Itertools};
+use linear_algebra::{IntoFramed, Point2};
 use nalgebra::{
-    matrix, vector, Isometry2, Matrix2, Matrix2x4, Matrix4, Matrix4x2, Point2, Vector4,
+    matrix, vector, Isometry2, Matrix2, Matrix2x4, Matrix4, Matrix4x2, Vector4,
 };
 use ndarray::Array2;
 use ordered_float::NotNan;
@@ -49,7 +51,7 @@ pub struct CycleContext {
 #[context]
 #[derive(Default)]
 pub struct MainOutputs {
-    pub robot_positions: MainOutput<Vec<Point2<f32>>>,
+    pub robot_positions: MainOutput<Vec<Point2<Ground>>>,
 }
 
 impl RobotFilter {
@@ -111,11 +113,12 @@ impl RobotFilter {
         let persistent_updates = Self::persistent_robots_in_control_cycle(&context);
         self.advance_all_hypotheses(persistent_updates, &context)?;
 
-        let robot_positions: Vec<Point2<f32>> = self
+        let robot_positions: Vec<Point2<Ground>> = self
             .hypotheses
             .iter()
             .filter(|hypothesis| hypothesis.validity > *context.validity_threshold)
             .map(|hypothesis| hypothesis.robot_state.mean.xy().into())
+            .map(IntoFramed::framed)
             .collect();
 
         Ok(MainOutputs {
@@ -174,11 +177,9 @@ impl RobotFilter {
                     .pixel_to_ground_with_z(detection.bottom_center(), 0.0)
                     .ok()
                     .map(|location| {
-                        let projected_error = Matrix2::identity();
                         Measurement {
                             location,
                             score: detection.score,
-                            projected_error,
                         }
                     })
             })
@@ -199,12 +200,12 @@ impl RobotFilter {
 
                 // Instead could also do: Matrix2::from_diagonal(&hypothesis.bounding_box.mean.xy())
                 let residual_distance =
-                    measurement.location.coords - observation_matrix * observation.mean;
+                    measurement.location.coords().inner - observation_matrix * observation.mean;
 
                 // Same here
                 let residual_covariance =
-                    observation_matrix * observation.covariance * observation_matrix.transpose()
-                        + measurement.projected_error;
+                    observation_matrix * observation.covariance * observation_matrix.transpose();
+                        // + measurement.projected_error;
 
                 let normalized_mahalanobis_distance = (residual_distance.transpose()
                     * residual_covariance.lu().solve(&residual_distance).unwrap())
@@ -254,8 +255,8 @@ impl RobotFilter {
         for (mut hypothesis, measurement) in associated_hypotheses {
             hypothesis.robot_state.update(
                 Matrix2x4::identity(),
-                measurement.location.coords,
-                measurement.projected_error,
+                measurement.location.coords().inner,
+                Matrix2::identity(), // TODO: use projected noise here
             );
             self.hypotheses.push(hypothesis);
         }
@@ -301,7 +302,7 @@ impl RobotFilter {
         measurement: &Measurement,
         detection_time: SystemTime,
     ) {
-        let initial_state = vector![measurement.location.x, measurement.location.y, 0.0, 0.0];
+        let initial_state = vector![measurement.location.x(), measurement.location.y(), 0.0, 0.0];
         let new_hypothesis = Hypothesis {
             robot_state: MultivariateNormalDistribution {
                 mean: initial_state,

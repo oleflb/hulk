@@ -1,7 +1,9 @@
 use geometry::rectangle::Rectangle;
-use nalgebra::{vector, Point2};
 use serde::{Deserialize, Serialize};
+use linear_algebra::{Point2, vector};
 use serialize_hierarchy::SerializeHierarchy;
+
+use coordinate_systems::Pixel;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, SerializeHierarchy)]
 pub enum DetectedObject {
@@ -19,13 +21,13 @@ impl DetectedObject {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, SerializeHierarchy)]
 pub struct BoundingBox {
-    pub bounding_box: Rectangle,
+    pub bounding_box: Rectangle<Pixel>,
     pub class: DetectedObject,
     pub score: f32,
 }
 
 impl BoundingBox {
-    pub const fn new(class: DetectedObject, score: f32, bounding_box: Rectangle) -> Self {
+    pub const fn new(class: DetectedObject, score: f32, bounding_box: Rectangle<Pixel>) -> Self {
         Self {
             bounding_box,
             class,
@@ -33,8 +35,8 @@ impl BoundingBox {
         }
     }
 
-    pub fn bottom_center(&self) -> Point2<f32> {
-        self.bounding_box.max - vector![self.bounding_box.dimensions().x / 2.0, 0.0]
+    pub fn bottom_center(&self) -> Point2<Pixel> {
+        self.bounding_box.max - vector![self.bounding_box.dimensions().x() / 2.0, 0.0]
     }
 
     pub fn iou(&self, other: &Self) -> f32 {

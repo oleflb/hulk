@@ -50,7 +50,7 @@ impl<Frame> Rectangle<Frame> {
         dimensions.x() * dimensions.y()
     }
 
-    pub fn dimensions(&self) -> Vector2<f32> {
-        self.max - self.min
+    pub fn dimensions(&self) -> Vector2<Frame> {
+        self.max.coords() - self.min.coords()
     }
 }

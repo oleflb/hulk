@@ -19,10 +19,10 @@ use types::{
     ycbcr422_image::YCbCr422Image,
 };
 
-const DETECTION_IMAGE_HEIGHT: usize = 128;
-const DETECTION_IMAGE_WIDTH: usize = 192;
+const DETECTION_IMAGE_HEIGHT: usize = 96;
+const DETECTION_IMAGE_WIDTH: usize = 128;
 const DETECTION_NUMBER_CHANNELS: usize = 3;
-const NUMBER_OF_CLASSES: usize = 2;
+const NUMBER_OF_CLASSES: usize = 1;
 
 const MAX_DETECTION: usize = 252;
 
@@ -87,6 +87,7 @@ impl SingleShotDetection {
         let neural_network_folder = paths.neural_networks;
 
         let model_xml_name = PathBuf::from("yolov8n-mobilenet.xml");
+        // let model_xml_name = PathBuf::from("yolov8n.xml");
 
         let model_path = neural_network_folder.join(&model_xml_name);
         let weights_path = neural_network_folder.join(model_xml_name.with_extension("bin"));
@@ -102,7 +103,7 @@ impl SingleShotDetection {
                     .wrap_err("failed to get detection weights path")?,
             )
             .wrap_err("failed to create detection network")?;
-
+        
         let input_name = network.get_input_name(0)?;
         let output_name = network.get_output_name(0)?;
 
@@ -204,7 +205,7 @@ impl SingleShotDetection {
             .columns()
             .into_iter()
             .filter_map(|row| {
-                let confidence = row[4];
+                let confidence = row[5];
 
                 if confidence < confidence_threshold {
                     return None;
@@ -283,7 +284,7 @@ fn multiclass_non_maximum_suppression(
 mod tests {
     use approx::assert_relative_eq;
     use geometry::rectangle::Rectangle;
-    use nalgebra::point;
+    use linear_algebra::point;
     use types::object_detection::{BoundingBox, DetectedObject};
 
     use super::multiclass_non_maximum_suppression;

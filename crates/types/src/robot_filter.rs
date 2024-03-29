@@ -1,8 +1,10 @@
 use std::time::SystemTime;
 
-use nalgebra::{Matrix2, Point2};
 use serde::{Deserialize, Serialize};
 use serialize_hierarchy::SerializeHierarchy;
+
+use linear_algebra::Point2;
+use coordinate_systems::Ground;
 
 use crate::multivariate_normal_distribution::MultivariateNormalDistribution;
 
@@ -17,8 +19,6 @@ pub struct Hypothesis {
 
 #[derive(Clone, Debug, Serialize, Deserialize, SerializeHierarchy)]
 pub struct Measurement {
-    pub location: Point2<f32>,
+    pub location: Point2<Ground>,
     pub score: f32,
-    #[serialize_hierarchy(leaf)]
-    pub projected_error: Matrix2<f32>,
 }

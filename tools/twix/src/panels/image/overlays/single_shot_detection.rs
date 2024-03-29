@@ -2,6 +2,7 @@ use std::{str::FromStr, sync::Arc};
 
 use color_eyre::Result;
 use communication::client::{Cycler, CyclerOutput};
+use coordinate_systems::Pixel;
 use eframe::{
     emath::Align2,
     epaint::{Color32, FontId, Stroke},
@@ -29,14 +30,14 @@ impl Overlay for SingleShotDetection {
         Self {
             detections: nao.subscribe_output(
                 CyclerOutput::from_str(format!("{cycler}.main_outputs.detections").as_str())
-                    .expect("failed to subscripe cycler"),
+                    .expect("failed to subscribe cycler"),
             ),
         }
     }
 
-    fn paint(&self, painter: &TwixPainter) -> Result<()> {
-        let detections: Vec<BoundingBox> = self.detections.require_latest()?;
-        for detection in detections.iter() {
+    fn paint(&self, painter: &TwixPainter<Pixel>) -> Result<()> {
+        let detections: Option<Vec<BoundingBox>> = self.detections.parse_latest()?;
+        for detection in detections.unwrap_or(vec![]).iter() {
             painter.rect_stroke(
                 detection.bounding_box.min,
                 detection.bounding_box.max,
