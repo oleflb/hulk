@@ -6,7 +6,7 @@ use std::{
 use eframe::{
     egui::{Painter, Response, Sense, Ui},
     emath::{Align2, Pos2, Rect},
-    epaint::{Color32, FontId, PathShape, Rounding, Shape, Stroke},
+    epaint::{Color32, FontId, PathShape, Shape, Stroke},
 };
 use nalgebra::{Rotation2, SMatrix, Similarity2};
 

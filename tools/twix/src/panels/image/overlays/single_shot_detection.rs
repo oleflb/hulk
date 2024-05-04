@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub struct SingleShotDetection {
-    detections: ValueBuffer,
+    detections: Option<ValueBuffer>,
 }
 
 impl Overlay for SingleShotDetection {
@@ -22,21 +22,26 @@ impl Overlay for SingleShotDetection {
 
     fn new(nao: Arc<Nao>, selected_cycler: Cycler) -> Self {
         let cycler = match selected_cycler {
-            Cycler::VisionTop => Cycler::DetectionTop,
-            Cycler::VisionBottom => Cycler::DetectionBottom,
-            _ => panic!("SingleShotDetection only works with vision cyclers"),
+            Cycler::VisionTop => Some(Cycler::ObjectDetectionTop),
+            _ => None,
         };
 
         Self {
-            detections: nao.subscribe_output(
-                CyclerOutput::from_str(format!("{cycler}.main_outputs.detections").as_str())
-                    .expect("failed to subscribe cycler"),
-            ),
+            detections: cycler.map(|cycler| {
+                nao.subscribe_output(
+                    CyclerOutput::from_str(format!("{cycler}.main_outputs.detections").as_str())
+                        .expect("failed to subscribe cycler"),
+                )
+            }),
         }
     }
 
     fn paint(&self, painter: &TwixPainter<Pixel>) -> Result<()> {
-        let detections: Option<Vec<BoundingBox>> = self.detections.parse_latest()?;
+        let Some(buffer) = self.detections.as_ref() else {
+            return Ok(());
+        };
+        
+        let detections: Option<Vec<BoundingBox>> = dbg!(buffer.parse_latest()?);
         for detection in detections.unwrap_or(vec![]).iter() {
             painter.rect_stroke(
                 detection.bounding_box.min,

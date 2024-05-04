@@ -1,19 +1,25 @@
 use geometry::rectangle::Rectangle;
+use linear_algebra::{vector, Point2};
 use serde::{Deserialize, Serialize};
-use linear_algebra::{Point2, vector};
 use serialize_hierarchy::SerializeHierarchy;
 
 use coordinate_systems::Pixel;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, SerializeHierarchy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, SerializeHierarchy, PartialEq, Eq)]
 pub enum DetectedObject {
+    Ball,
     Robot,
+    GoalPost,
+    PenaltySpot,
 }
 
 impl DetectedObject {
-    pub fn from_u8(index: u8) -> Option<DetectedObject> {
+    pub fn from_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(DetectedObject::Robot),
+            0 => Some(Self::Ball),
+            1 => Some(Self::Robot),
+            2 => Some(Self::GoalPost),
+            3 => Some(Self::PenaltySpot),
             _ => None,
         }
     }
@@ -22,16 +28,16 @@ impl DetectedObject {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, SerializeHierarchy)]
 pub struct BoundingBox {
     pub bounding_box: Rectangle<Pixel>,
-    pub class: DetectedObject,
     pub score: f32,
+    pub class: DetectedObject,
 }
 
 impl BoundingBox {
     pub const fn new(class: DetectedObject, score: f32, bounding_box: Rectangle<Pixel>) -> Self {
         Self {
             bounding_box,
-            class,
             score,
+            class,
         }
     }
 

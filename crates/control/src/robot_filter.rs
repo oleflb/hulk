@@ -13,10 +13,9 @@ use nalgebra::{
 };
 use ndarray::Array2;
 use ordered_float::NotNan;
-use projection::Projection;
+use projection::{camera_matrices::CameraMatrices, camera_matrix::CameraMatrix, Projection};
 use serde::{Deserialize, Serialize};
 use types::{
-    camera_matrix::{CameraMatrices, CameraMatrix},
     cycle_time::CycleTime,
     multivariate_normal_distribution::MultivariateNormalDistribution,
     object_detection::BoundingBox,
@@ -45,7 +44,7 @@ pub struct CycleContext {
     camera_matrices: RequiredInput<Option<CameraMatrices>, "camera_matrices?">,
     cycle_time: Input<CycleTime, "cycle_time">,
 
-    robot_detections: PerceptionInput<Option<Vec<BoundingBox>>, "DetectionTop", "detections?">,
+    robot_detections: PerceptionInput<Option<Vec<BoundingBox>>, "ObjectDetectionTop", "detections?">,
 }
 
 #[context]

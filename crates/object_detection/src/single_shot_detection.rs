@@ -24,8 +24,6 @@ const DETECTION_IMAGE_WIDTH: usize = 128;
 const DETECTION_NUMBER_CHANNELS: usize = 3;
 const NUMBER_OF_CLASSES: usize = 1;
 
-const MAX_DETECTION: usize = 252;
-
 const DETECTION_SCRATCHPAD_SIZE: usize =
     DETECTION_IMAGE_WIDTH * DETECTION_IMAGE_HEIGHT * DETECTION_NUMBER_CHANNELS;
 
@@ -70,9 +68,13 @@ pub struct CycleContext {
     image: Input<YCbCr422Image, "image">,
     hardware_interface: HardwareInterface,
 
-    iou_threshold: Parameter<f32, "detection.$cycler_instance.iou_threshold">,
-    confidence_threshold: Parameter<f32, "detection.$cycler_instance.confidence_threshold">,
-    enable: Parameter<bool, "detection.$cycler_instance.enable">,
+    iou_threshold:
+        Parameter<f32, "object_detection.$cycler_instance.single_shot_detection.iou_threshold">,
+    confidence_threshold: Parameter<
+        f32,
+        "object_detection.$cycler_instance.single_shot_detection.confidence_threshold",
+    >,
+    enable: Parameter<bool, "object_detection.$cycler_instance.single_shot_detection.enable">,
 }
 
 #[context]
@@ -86,8 +88,7 @@ impl SingleShotDetection {
         let paths = context.hardware_interface.get_paths();
         let neural_network_folder = paths.neural_networks;
 
-        let model_xml_name = PathBuf::from("yolov8n-mobilenet.xml");
-        // let model_xml_name = PathBuf::from("yolov8n.xml");
+        let model_xml_name = PathBuf::from("yolov8n-mobilenet-robot-only.xml");
 
         let model_path = neural_network_folder.join(&model_xml_name);
         let weights_path = neural_network_folder.join(model_xml_name.with_extension("bin"));
@@ -103,7 +104,7 @@ impl SingleShotDetection {
                     .wrap_err("failed to get detection weights path")?,
             )
             .wrap_err("failed to create detection network")?;
-        
+
         let input_name = network.get_input_name(0)?;
         let output_name = network.get_output_name(0)?;
 
@@ -157,9 +158,10 @@ impl SingleShotDetection {
         let prediction = unsafe { prediction.buffer_mut_as_type::<f32>().unwrap() };
 
         let earlier = context.hardware_interface.get_now();
+
         let detections = self.parse_outputs(prediction, *context.confidence_threshold)?;
 
-        let bounding_boxes = multiclass_non_maximum_suppression(detections, *context.iou_threshold);
+        let bounding_boxes = non_maximum_suppression(detections, *context.iou_threshold);
 
         context.postprocess_time.fill_if_subscribed(|| {
             context
@@ -199,13 +201,27 @@ impl SingleShotDetection {
         prediction: &[f32],
         confidence_threshold: f32,
     ) -> Result<Vec<BoundingBox>> {
-        let prediction = ArrayView::from_shape((4 + NUMBER_OF_CLASSES, MAX_DETECTION), prediction)?;
+        let record_length = 4 + NUMBER_OF_CLASSES;
+        assert!(
+            prediction.len() % record_length == 0,
+            "invalid prediction length"
+        );
+
+        let prediction = ArrayView::from_shape(
+            (record_length, prediction.len() / record_length),
+            prediction,
+        )?;
 
         let detections = prediction
             .columns()
             .into_iter()
             .filter_map(|row| {
-                let confidence = row[5];
+                let confidences = row.slice(s![4..]);
+                let (class_index, &confidence) = confidences.iter().enumerate().max_by(
+                    |(_, confidence_a), (_, confidence_b)| {
+                        confidence_a.partial_cmp(confidence_b).unwrap()
+                    },
+                )?;
 
                 if confidence < confidence_threshold {
                     return None;
@@ -216,7 +232,7 @@ impl SingleShotDetection {
                 const Y_SCALE: f32 = 480.0 / DETECTION_IMAGE_HEIGHT as f32;
 
                 Some(BoundingBox::new(
-                    DetectedObject::Robot,
+                    DetectedObject::from_index(class_index).expect("invalid class index"),
                     confidence,
                     Rectangle::from_cxcywh(
                         bbox[0] * X_SCALE,
@@ -258,7 +274,7 @@ fn as_bytes(float_slice: &[f32]) -> &[u8] {
     }
 }
 
-fn multiclass_non_maximum_suppression(
+fn non_maximum_suppression(
     mut candidate_detections: Vec<BoundingBox>,
     iou_threshold: f32,
 ) -> Vec<BoundingBox> {
@@ -287,7 +303,7 @@ mod tests {
     use linear_algebra::point;
     use types::object_detection::{BoundingBox, DetectedObject};
 
-    use super::multiclass_non_maximum_suppression;
+    use super::non_maximum_suppression;
 
     const BOX_1: BoundingBox = BoundingBox::new(
         DetectedObject::Robot,
@@ -332,14 +348,14 @@ mod tests {
 
     #[test]
     fn test_non_maximum_suppression_for_single_box() {
-        let results = multiclass_non_maximum_suppression(vec![BOX_1], 0.6);
+        let results = non_maximum_suppression(vec![BOX_1], 0.6);
         assert!(results.len() == 1);
         assert_approx_bbox_equality(results[0], BOX_1);
     }
 
     #[test]
     fn test_non_maximum_suppression_non_overlapping_boxes() {
-        let results = multiclass_non_maximum_suppression(vec![BOX_1, BOX_2], 0.6);
+        let results = non_maximum_suppression(vec![BOX_1, BOX_2], 0.6);
         assert!(results.len() == 2);
 
         assert_approx_bbox_equality(results[0], BOX_1);
@@ -348,14 +364,14 @@ mod tests {
 
     #[test]
     fn test_non_maximum_suppression_overlapping_boxes() {
-        let results = multiclass_non_maximum_suppression(vec![BOX_1, BOX_3], 0.6);
+        let results = non_maximum_suppression(vec![BOX_1, BOX_3], 0.6);
         assert!(results.len() == 1);
         assert_approx_bbox_equality(results[0], BOX_1);
     }
 
     #[test]
     fn test_non_maximum_suppression_overlapping_boxes_with_stricter_threshold() {
-        let results = multiclass_non_maximum_suppression(vec![BOX_1, BOX_3], 1.0);
+        let results = non_maximum_suppression(vec![BOX_1, BOX_3], 1.0);
         assert!(results.len() == 2);
         assert_approx_bbox_equality(results[0], BOX_1);
         assert_approx_bbox_equality(results[1], BOX_3);
@@ -363,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_non_maximum_suppression_all_boxes() {
-        let results = multiclass_non_maximum_suppression(vec![BOX_1, BOX_2, BOX_3], 0.6);
+        let results = non_maximum_suppression(vec![BOX_1, BOX_2, BOX_3], 0.6);
         assert!(results.len() == 2);
         assert_approx_bbox_equality(results[0], BOX_1);
         assert_approx_bbox_equality(results[1], BOX_2);

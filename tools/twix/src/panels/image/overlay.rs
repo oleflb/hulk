@@ -102,7 +102,7 @@ impl Overlays {
         let feet_detection = EnabledOverlay::new(nao.clone(), storage, true, selected_cycler);
         let field_border = EnabledOverlay::new(nao.clone(), storage, true, selected_cycler);
         let limb_projector = EnabledOverlay::new(nao.clone(), storage, false, selected_cycler);
-        let pose_detection = EnabledOverlay::new(nao, storage, true, selected_cycler);
+        let pose_detection = EnabledOverlay::new(nao.clone(), storage, true, selected_cycler);
         let single_shot_detection = EnabledOverlay::new(nao, storage, true, selected_cycler);
 
         Self {
