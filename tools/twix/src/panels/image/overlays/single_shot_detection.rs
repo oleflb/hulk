@@ -40,9 +40,9 @@ impl Overlay for SingleShotDetection {
         let Some(buffer) = self.detections.as_ref() else {
             return Ok(());
         };
-        
-        let detections: Option<Vec<BoundingBox>> = dbg!(buffer.parse_latest()?);
-        for detection in detections.unwrap_or(vec![]).iter() {
+
+        let detections: Vec<BoundingBox> = buffer.parse_latest()?;
+        for detection in detections.iter() {
             painter.rect_stroke(
                 detection.bounding_box.min,
                 detection.bounding_box.max,

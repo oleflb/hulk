@@ -64,10 +64,14 @@ pub struct CycleContext {
     image: Input<YCbCr422Image, "image">,
     motion_command: Input<MotionCommand, "Control", "motion_command">,
 
-    intersection_over_union_threshold:
-        Parameter<f32, "object_detection.$cycler_instance.visual_referee.intersection_over_union_threshold">,
-    keypoint_confidence_threshold:
-        Parameter<f32, "object_detection.$cycler_instance.visual_referee.keypoint_confidence_threshold">,
+    intersection_over_union_threshold: Parameter<
+        f32,
+        "object_detection.$cycler_instance.visual_referee.intersection_over_union_threshold",
+    >,
+    keypoint_confidence_threshold: Parameter<
+        f32,
+        "object_detection.$cycler_instance.visual_referee.keypoint_confidence_threshold",
+    >,
     enable: Parameter<bool, "object_detection.$cycler_instance.visual_referee.enable">,
 }
 

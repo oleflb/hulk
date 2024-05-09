@@ -8,9 +8,7 @@ use framework::{HistoricInput, MainOutput, PerceptionInput};
 use hungarian_algorithm::AssignmentProblem;
 use itertools::{Either, Itertools};
 use linear_algebra::{IntoFramed, Point2};
-use nalgebra::{
-    matrix, vector, Isometry2, Matrix2, Matrix2x4, Matrix4, Matrix4x2, Vector4,
-};
+use nalgebra::{matrix, vector, Isometry2, Matrix2, Matrix2x4, Matrix4, Matrix4x2, Vector4};
 use ndarray::Array2;
 use ordered_float::NotNan;
 use projection::{camera_matrices::CameraMatrices, camera_matrix::CameraMatrix, Projection};
@@ -44,7 +42,8 @@ pub struct CycleContext {
     camera_matrices: RequiredInput<Option<CameraMatrices>, "camera_matrices?">,
     cycle_time: Input<CycleTime, "cycle_time">,
 
-    robot_detections: PerceptionInput<Option<Vec<BoundingBox>>, "ObjectDetectionTop", "detections?">,
+    robot_detections:
+        PerceptionInput<Option<Vec<BoundingBox>>, "ObjectDetectionTop", "detections?">,
 }
 
 #[context]
@@ -102,7 +101,11 @@ impl RobotFilter {
             );
 
             let measurements = Self::collect_measurements(robots, &last_camera_matrices.top);
-            self.update_hypotheses_with_measurements(context.initial_covariance, &measurements, *detection_time);
+            self.update_hypotheses_with_measurements(
+                context.initial_covariance,
+                &measurements,
+                *detection_time,
+            );
         }
 
         Ok(())
@@ -175,11 +178,9 @@ impl RobotFilter {
                 camera_matrix
                     .pixel_to_ground_with_z(detection.bottom_center(), 0.0)
                     .ok()
-                    .map(|location| {
-                        Measurement {
-                            location,
-                            score: detection.score,
-                        }
+                    .map(|location| Measurement {
+                        location,
+                        score: detection.score,
                     })
             })
             .collect()
@@ -204,7 +205,7 @@ impl RobotFilter {
                 // Same here
                 let residual_covariance =
                     observation_matrix * observation.covariance * observation_matrix.transpose();
-                        // + measurement.projected_error;
+                // + measurement.projected_error;
 
                 let normalized_mahalanobis_distance = (residual_distance.transpose()
                     * residual_covariance.lu().solve(&residual_distance).unwrap())
@@ -225,12 +226,12 @@ impl RobotFilter {
             return;
         }
         if self.hypotheses.is_empty() {
-            measurements.into_iter().filter(|measurement| {
-                measurement.score > 0.5
-            })
-            .for_each(|measurement| {
-                self.spawn_hypothesis(initial_covariance, measurement, detection_time);
-            })
+            measurements
+                .into_iter()
+                .filter(|measurement| measurement.score > 0.5)
+                .for_each(|measurement| {
+                    self.spawn_hypothesis(initial_covariance, measurement, detection_time);
+                })
         }
         let distance_metrics = self.compute_distance_matrix(measurements);
 
@@ -272,7 +273,7 @@ impl RobotFilter {
         }
 
         let mut remaining_detections: BTreeSet<usize> =
-        (0..measurements.len()).into_iter().collect();
+            (0..measurements.len()).into_iter().collect();
         for task in assignment {
             if let Some(task) = task {
                 remaining_detections.remove(&task);

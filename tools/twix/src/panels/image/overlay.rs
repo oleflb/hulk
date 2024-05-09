@@ -11,7 +11,7 @@ use crate::{nao::Nao, twix_painter::TwixPainter};
 
 use super::overlays::{
     BallDetection, FeetDetection, FieldBorder, Horizon, LimbProjector, LineDetection, PenaltyBoxes,
-    PerspectiveGrid, PoseDetection, SingleShotDetection
+    PerspectiveGrid, PoseDetection, SingleShotDetection,
 };
 pub trait Overlay {
     const NAME: &'static str;

@@ -3,8 +3,8 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use serialize_hierarchy::SerializeHierarchy;
 
-use linear_algebra::Point2;
 use coordinate_systems::Ground;
+use linear_algebra::Point2;
 
 use crate::multivariate_normal_distribution::MultivariateNormalDistribution;
 

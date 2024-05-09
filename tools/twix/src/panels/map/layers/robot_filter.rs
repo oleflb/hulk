@@ -26,9 +26,7 @@ impl Layer<Ground> for RobotFilter {
             },
         });
 
-        Self {
-            filtered_robots,
-        }
+        Self { filtered_robots }
     }
 
     fn paint(
