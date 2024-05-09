@@ -1,0 +1,20 @@
+version: '3'
+services:
+  replay:
+    image: openvino-test:latest
+    ports:
+      - 1337:1337
+    volumes:
+      - .:/hulk
+      - cargo:/root/.cargo/registry
+      - target:/hulk/target
+      - $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:/tmp/$WAYLAND_DISPLAY
+    # entrypoint: /hulk/entrypoint.sh
+    environment:
+      - XDG_RUNTIME_DIR=/tmp
+      - WAYLAND_DISPLAY=$WAYLAND_DISPLAY
+    # user: 
+
+volumes:
+  target:
+  cargo:
