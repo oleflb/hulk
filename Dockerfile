@@ -1,7 +1,7 @@
 FROM ubuntu:jammy
 
 RUN apt update
-RUN apt install curl wget gnupg git git-lfs clang python3 zstd xz-utils file rsync libhdf5-dev micro -y
+RUN apt install curl wget gnupg git git-lfs clang python3 zstd xz-utils file rsync libhdf5-dev micro gedit xauth -y
 
 RUN wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
 RUN apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB

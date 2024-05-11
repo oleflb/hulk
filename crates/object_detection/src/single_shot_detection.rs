@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use color_eyre::{
     eyre::{Context, ContextCompat},
@@ -127,49 +130,37 @@ impl SingleShotDetection {
         let image = context.image;
 
         {
-            let earlier = context.hardware_interface.get_now();
+            let earlier = Instant::now();
             SingleShotDetection::load_into_scratchpad(&mut self.scratchpad, image);
-            context.preprocess_time.fill_if_subscribed(|| {
-                context
-                    .hardware_interface
-                    .get_now()
-                    .duration_since(earlier)
-                    .expect("time ran backwards")
-            });
+            context
+                .preprocess_time
+                .fill_if_subscribed(|| earlier.elapsed());
         }
 
         let mut prediction = {
             let mut infer_request = self.set_network_inputs()?;
 
-            let earlier = context.hardware_interface.get_now();
+            let earlier = Instant::now();
             infer_request.infer()?;
 
-            context.inference_time.fill_if_subscribed(|| {
-                context
-                    .hardware_interface
-                    .get_now()
-                    .duration_since(earlier)
-                    .expect("time ran backwards")
-            });
+            context
+                .inference_time
+                .fill_if_subscribed(|| earlier.elapsed());
 
             infer_request.get_blob(&self.output_name)?
         };
 
         let prediction = unsafe { prediction.buffer_mut_as_type::<f32>().unwrap() };
 
-        let earlier = context.hardware_interface.get_now();
+        let earlier = Instant::now();
 
         let detections = self.parse_outputs(prediction, *context.confidence_threshold)?;
 
         let bounding_boxes = non_maximum_suppression(detections, *context.iou_threshold);
 
-        context.postprocess_time.fill_if_subscribed(|| {
-            context
-                .hardware_interface
-                .get_now()
-                .duration_since(earlier)
-                .expect("time ran backwards")
-        });
+        context
+            .postprocess_time
+            .fill_if_subscribed(|| earlier.elapsed());
 
         Ok(MainOutputs {
             detections: bounding_boxes.into(),

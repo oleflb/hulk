@@ -1,11 +1,22 @@
 use geometry::rectangle::Rectangle;
 use linear_algebra::{vector, Point2};
+use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use serde::{Deserialize, Serialize};
-use serialize_hierarchy::SerializeHierarchy;
 
 use coordinate_systems::Pixel;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, SerializeHierarchy, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PathSerialize,
+    PathDeserialize,
+    PathIntrospect,
+    PartialEq,
+    Eq,
+)]
 pub enum DetectedObject {
     Ball,
     Robot,
@@ -25,7 +36,9 @@ impl DetectedObject {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, SerializeHierarchy)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect,
+)]
 pub struct BoundingBox {
     pub bounding_box: Rectangle<Pixel>,
     pub score: f32,

@@ -9,11 +9,14 @@ services:
       - cargo:/root/.cargo/registry
       - target:/hulk/target
       - $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:/tmp/$WAYLAND_DISPLAY
+      - /tmp/.X11-unix:/tmp/.X11-unix
     # entrypoint: /hulk/entrypoint.sh
+    network_mode: host
     environment:
+      - DISPLAY=${DISPLAY}
       - XDG_RUNTIME_DIR=/tmp
       - WAYLAND_DISPLAY=$WAYLAND_DISPLAY
-    # user: 
+    user: "${UID_GID}"
 
 volumes:
   target:
