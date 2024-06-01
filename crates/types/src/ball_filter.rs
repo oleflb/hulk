@@ -7,43 +7,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ball_position::BallPosition, multivariate_normal_distribution::MultivariateNormalDistribution,
-    parameters::BallFilterParameters,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect)]
 pub struct Hypothesis {
     pub moving_state: MultivariateNormalDistribution<4>,
-    pub resting_state: MultivariateNormalDistribution<4>,
+    pub resting_state: MultivariateNormalDistribution<2>,
 
     pub validity: f32,
     pub last_update: SystemTime,
 }
 
 impl Hypothesis {
-    pub fn is_resting(&self, configuration: &BallFilterParameters) -> bool {
-        self.moving_state.mean.rows(2, 2).norm() < configuration.resting_ball_velocity_threshold
+    pub fn is_resting(&self, velocity_threshold: f32) -> bool {
+        self.moving_state.mean.rows(2, 2).norm() < velocity_threshold
     }
 
-    pub fn selected_state(
-        &self,
-        configuration: &BallFilterParameters,
-    ) -> MultivariateNormalDistribution<4> {
-        if self.is_resting(configuration) {
-            self.resting_state
+    pub fn selected_ball_position(&self, velocity_threshold: f32) -> BallPosition<Ground> {
+        let (position, velocity) = if self.is_resting(velocity_threshold) {
+            (Point::from(self.resting_state.mean.xy()), vector![0.0, 0.0])
         } else {
-            self.moving_state
-        }
-    }
-
-    pub fn selected_ball_position(
-        &self,
-        configuration: &BallFilterParameters,
-    ) -> BallPosition<Ground> {
-        let selected_state = self.selected_state(configuration);
+            (
+                Point::from(self.moving_state.mean.xy()),
+                vector![self.moving_state.mean.z, self.moving_state.mean.w],
+            )
+        };
 
         BallPosition {
-            position: Point::from(selected_state.mean.xy()),
-            velocity: vector![selected_state.mean.z, selected_state.mean.w],
+            position,
+            velocity,
             last_seen: self.last_update,
         }
     }
