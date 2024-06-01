@@ -31,7 +31,9 @@
       "correction_proximity_merge_factor": 1.0,
       "image_containment_merge_factor": 1.0,
       "cluster_merge_radius_factor": 1.5,
-      "ball_radius_enlargement_factor": 2.0
+      "ball_radius_enlargement_factor": 2.0,
+      "measurement_noise": [2.0, 2.0],
+      "gyro_velocity_filter_smoothing_factor": 0.1
     },
     "vision_bottom": {
       "minimal_radius": 42.0,
@@ -45,7 +47,9 @@
       "correction_proximity_merge_factor": 1.0,
       "image_containment_merge_factor": 1.0,
       "cluster_merge_radius_factor": 1.5,
-      "ball_radius_enlargement_factor": 2.0
+      "ball_radius_enlargement_factor": 2.0,
+      "measurement_noise": [2.0, 2.0],
+      "gyro_velocity_filter_smoothing_factor": 0.1
     }
   },
   "camera_matrix_parameters": {
@@ -328,7 +332,6 @@
     "noise": {
       "process_noise_moving": [0.005, 0.005, 0.2, 0.2],
       "process_noise_resting": [0.001, 0.001],
-      "measurement_noise": [0.5, 2.0],
       "initial_covariance": [0.5, 0.5, 10.0, 10.0]
     }
   },

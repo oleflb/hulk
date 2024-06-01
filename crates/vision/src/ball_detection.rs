@@ -1,18 +1,21 @@
 use color_eyre::Result;
 use compiled_nn::CompiledNN;
+use filtering::low_pass_filter::LowPassFilter;
 use serde::{Deserialize, Serialize};
 
 use context_attribute::context;
-use coordinate_systems::Pixel;
+use coordinate_systems::{Pixel, Robot};
 use framework::{deserialize_not_implemented, AdditionalOutput, MainOutput};
 use geometry::{circle::Circle, rectangle::Rectangle};
 use hardware::PathsInterface;
-use linear_algebra::{point, vector, Vector2};
+use linear_algebra::{point, vector, IntoFramed, Vector2, Vector3};
 use projection::{camera_matrix::CameraMatrix, Projection};
 use types::{
-    ball::{Ball, CandidateEvaluation},
+    ball::{BallMeasurement, CandidateEvaluation},
+    multivariate_normal_distribution::MultivariateNormalDistribution,
     parameters::BallDetectionParameters,
     perspective_grid_candidates::PerspectiveGridCandidates,
+    sensor_data::SensorData,
     ycbcr422_image::YCbCr422Image,
 };
 
@@ -37,6 +40,7 @@ struct BallCluster<'a> {
 pub struct BallDetection {
     #[serde(skip, default = "deserialize_not_implemented")]
     neural_networks: NeuralNetworks,
+    gyro_velocity_filter: LowPassFilter<Vector3<Robot>>,
 }
 
 #[context]
@@ -53,6 +57,7 @@ pub struct CycleContext {
     perspective_grid_candidates:
         RequiredInput<Option<PerspectiveGridCandidates>, "perspective_grid_candidates?">,
     image: Input<YCbCr422Image, "image">,
+    sensor_data: Input<SensorData, "Control", "sensor_data">,
 
     parameters: Parameter<BallDetectionParameters, "ball_detection.$cycler_instance">,
     ball_radius: Parameter<f32, "field_dimensions.ball_radius">,
@@ -61,7 +66,7 @@ pub struct CycleContext {
 #[context]
 #[derive(Default)]
 pub struct MainOutputs {
-    pub balls: MainOutput<Option<Vec<Ball>>>,
+    pub balls: MainOutput<Option<Vec<BallMeasurement>>>,
 }
 
 impl BallDetection {
@@ -94,11 +99,26 @@ impl BallDetection {
             classifier,
             positioner,
         };
-        Ok(Self { neural_networks })
+
+        Ok(Self {
+            neural_networks,
+            gyro_velocity_filter: LowPassFilter::with_smoothing_factor(
+                Vector3::default(),
+                context.parameters.gyro_velocity_filter_smoothing_factor,
+            ),
+        })
     }
 
     pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
         let candidates = &context.perspective_grid_candidates.candidates;
+
+        self.gyro_velocity_filter.update(
+            context
+                .sensor_data
+                .inertial_measurement_unit
+                .angular_velocity,
+        );
+        let filtered_gyro_velocity = self.gyro_velocity_filter.state().norm();
 
         let evaluations = evaluate_candidates(
             candidates,
@@ -134,7 +154,13 @@ impl BallDetection {
             context.parameters.cluster_merge_radius_factor,
         );
 
-        let balls = project_balls_to_ground(&clusters, context.camera_matrix, *context.ball_radius);
+        let balls = project_balls_to_ground(
+            &clusters,
+            context.camera_matrix,
+            *context.ball_radius,
+            context.parameters.measurement_noise,
+            filtered_gyro_velocity,
+        );
 
         Ok(MainOutputs {
             balls: Some(balls).into(),
@@ -332,18 +358,40 @@ fn project_balls_to_ground(
     clusters: &[BallCluster],
     camera_matrix: &CameraMatrix,
     ball_radius: f32,
-) -> Vec<Ball> {
+    measurement_noise: Vector2<Pixel>,
+    filtered_gyro_velocity: f32,
+) -> Vec<BallMeasurement> {
     clusters
         .iter()
         .filter_map(|cluster| {
-            let position = point![cluster.circle.center.x(), cluster.circle.center.y()];
-            match camera_matrix.pixel_to_ground_with_z(position, ball_radius) {
-                Ok(position) => Some(Ball {
-                    position,
-                    image_location: cluster.circle,
-                }),
-                Err(_) => None,
+            let position = camera_matrix
+                .pixel_to_ground_with_z(
+                    point![cluster.circle.center.x(), cluster.circle.center.y()],
+                    ball_radius,
+                )
+                .ok()?;
+            let projected_noise = {
+                let noise_in_image: Vector2<Pixel> = vector![
+                    measurement_noise.x() * (1.0 + filtered_gyro_velocity.abs()),
+                    measurement_noise.y() * (1.0 + filtered_gyro_velocity.abs())
+                ];
+
+                let scaled_noise = noise_in_image
+                    .inner
+                    .map(|x| (cluster.circle.radius * x).powi(2))
+                    .framed();
+
+                camera_matrix.project_noise_to_ground(position, scaled_noise)
             }
+            .ok()?;
+
+            Some(BallMeasurement {
+                detection: MultivariateNormalDistribution {
+                    mean: position.inner.coords,
+                    covariance: projected_noise,
+                },
+                image_location: cluster.circle,
+            })
         })
         .collect()
 }
@@ -490,6 +538,8 @@ mod tests {
             image_containment_merge_factor: 1.0,
             cluster_merge_radius_factor: 1.5,
             ball_radius_enlargement_factor: 2.0,
+            measurement_noise: vector![0.0, 0.0],
+            gyro_velocity_filter_smoothing_factor: 1.0,
         };
         let perspective_grid_candidates = PerspectiveGridCandidates {
             candidates: vec![Circle {
@@ -525,6 +575,7 @@ mod tests {
             camera_matrix: &camera_matrix,
             image: &image,
             perspective_grid_candidates: &perspective_grid_candidates,
+            sensor_data: &SensorData::default(),
         };
         let mut preclassifier = CompiledNN::default();
         preclassifier.compile(&context.parameters.preclassifier_neural_network);
@@ -540,22 +591,29 @@ mod tests {
             classifier,
             positioner,
         };
-        let mut node = BallDetection { neural_networks };
+        let mut node = BallDetection {
+            neural_networks,
+            gyro_velocity_filter: LowPassFilter::default(),
+        };
         let balls = node.cycle(context)?.balls;
         assert!(balls.value.is_some());
 
         assert_eq!(balls.value.as_ref().unwrap().len(), 1);
+        let ball = &balls.value.as_ref().unwrap()[0];
         assert_relative_eq!(
-            balls.value.unwrap()[0],
-            Ball {
-                position: point![1.53, 0.02],
-                image_location: Circle {
-                    center: point![308.93, 176.42],
-                    radius: 42.92,
-                }
-            },
-            epsilon = 0.01,
+            ball.detection.mean,
+            nalgebra::vector![1.53, 0.02],
+            epsilon = 0.01
         );
+        assert_relative_eq!(
+            ball.image_location,
+            Circle {
+                center: point![308.93, 176.42],
+                radius: 42.92,
+            },
+            epsilon = 0.01
+        );
+
         Ok(())
     }
 }

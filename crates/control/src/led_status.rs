@@ -5,7 +5,7 @@ use context_attribute::context;
 use framework::{MainOutput, PerceptionInput};
 use serde::{Deserialize, Serialize};
 use types::{
-    ball::Ball,
+    ball::BallMeasurement,
     color::Rgb,
     cycle_time::CycleTime,
     filtered_whistle::FilteredWhistle,
@@ -35,8 +35,8 @@ pub struct CycleContext {
     filtered_whistle: Input<FilteredWhistle, "filtered_whistle">,
     role: Input<Role, "role">,
 
-    balls_bottom: PerceptionInput<Option<Vec<Ball>>, "VisionBottom", "balls?">,
-    balls_top: PerceptionInput<Option<Vec<Ball>>, "VisionTop", "balls?">,
+    balls_bottom: PerceptionInput<Option<Vec<BallMeasurement>>, "VisionBottom", "balls?">,
+    balls_top: PerceptionInput<Option<Vec<BallMeasurement>>, "VisionTop", "balls?">,
     network_message: PerceptionInput<Option<IncomingMessage>, "SplNetwork", "filtered_message?">,
     sensor_data: Input<SensorData, "sensor_data">,
 }

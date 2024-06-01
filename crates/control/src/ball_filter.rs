@@ -9,10 +9,10 @@ use coordinate_systems::{Ground, Pixel};
 use filtering::kalman_filter::KalmanFilter;
 use framework::{AdditionalOutput, HistoricInput, MainOutput, PerceptionInput};
 use geometry::circle::Circle;
-use linear_algebra::Point2;
+use linear_algebra::{IntoFramed, Point2};
 use projection::{camera_matrices::CameraMatrices, camera_matrix::CameraMatrix, Projection};
 use types::{
-    ball::Ball,
+    ball::BallMeasurement,
     ball_filter::Hypothesis,
     ball_position::{BallPosition, HypotheticalBallPosition},
     cycle_time::CycleTime,
@@ -53,8 +53,8 @@ pub struct CycleContext {
     field_dimensions: Parameter<FieldDimensions, "field_dimensions">,
     ball_filter_configuration: Parameter<BallFilterParameters, "ball_filter">,
 
-    balls_bottom: PerceptionInput<Option<Vec<Ball>>, "VisionBottom", "balls?">,
-    balls_top: PerceptionInput<Option<Vec<Ball>>, "VisionTop", "balls?">,
+    balls_bottom: PerceptionInput<Option<Vec<BallMeasurement>>, "VisionBottom", "balls?">,
+    balls_top: PerceptionInput<Option<Vec<BallMeasurement>>, "VisionTop", "balls?">,
     projected_limbs: PerceptionInput<Option<ProjectedLimbs>, "VisionBottom", "projected_limbs?">,
 }
 
@@ -188,7 +188,7 @@ impl BallFilter {
 
     fn persistent_balls_in_control_cycle<'a>(
         context: &'a CycleContext,
-    ) -> Vec<(&'a SystemTime, Vec<&'a Ball>)> {
+    ) -> Vec<(&'a SystemTime, Vec<&'a BallMeasurement>)> {
         context
             .balls_top
             .persistent
@@ -208,7 +208,7 @@ impl BallFilter {
 
     fn advance_all_hypotheses(
         hypotheses: &mut Vec<Hypothesis>,
-        measurements: Vec<(&SystemTime, Vec<&Ball>)>,
+        measurements: Vec<(&SystemTime, Vec<&BallMeasurement>)>,
         context: &CycleContext,
     ) -> RemovedHypotheses {
         let cycle_time = Duration::from_secs_f32(0.012);
@@ -248,7 +248,7 @@ impl BallFilter {
             for ball in balls {
                 let new_hypothesis = Self::update_hypotheses_with_measurement(
                     hypotheses,
-                    ball.position,
+                    ball.detection,
                     *detection_time,
                     &filter_parameters.noise,
                     context
@@ -433,15 +433,11 @@ impl BallFilter {
 
     fn update_hypothesis_with_measurement(
         hypothesis: &mut Hypothesis,
-        detected_position: Point2<Ground>,
+        detection: MultivariateNormalDistribution<2>,
         detection_time: SystemTime,
-        noise: &BallFilterNoise,
     ) {
-        let measurement_noise = Matrix2::from_diagonal(&noise.measurement_noise)
-            * detected_position.coords().norm_squared();
-
-        hypothesis.update_resting(detected_position.inner.coords, measurement_noise);
-        hypothesis.update_moving(detected_position.inner.coords, measurement_noise);
+        hypothesis.update_resting(detection.mean, detection.covariance);
+        hypothesis.update_moving(detection.mean, detection.covariance);
 
         hypothesis.last_update = detection_time;
         hypothesis.validity += 1.0;
@@ -449,7 +445,7 @@ impl BallFilter {
 
     fn update_hypotheses_with_measurement(
         hypotheses: &mut [Hypothesis],
-        detected_position: Point2<Ground>,
+        detection: MultivariateNormalDistribution<2>,
         detection_time: SystemTime,
         noise: &BallFilterNoise,
         measurement_matching_distance: f32,
@@ -457,16 +453,16 @@ impl BallFilter {
         let mut matching_hypotheses = hypotheses
             .iter_mut()
             .filter(|hypothesis| {
-                (hypothesis.moving_state.mean.xy() - detected_position.inner.coords).norm()
+                (hypothesis.moving_state.mean.xy() - detection.mean).norm()
                     < measurement_matching_distance
-                    || (hypothesis.resting_state.mean.xy() - detected_position.inner.coords).norm()
+                    || (hypothesis.resting_state.mean.xy() - detection.mean).norm()
                         < measurement_matching_distance
             })
             .peekable();
 
         if matching_hypotheses.peek().is_none() {
             return Some(Self::spawn_hypothesis(
-                detected_position,
+                detection.mean.framed().as_point(),
                 detection_time,
                 Matrix4::from_diagonal(&noise.initial_covariance),
                 Matrix2::from_diagonal(&noise.initial_covariance.xy()),
@@ -474,12 +470,7 @@ impl BallFilter {
         }
 
         matching_hypotheses.for_each(|hypothesis| {
-            Self::update_hypothesis_with_measurement(
-                hypothesis,
-                detected_position,
-                detection_time,
-                noise,
-            )
+            Self::update_hypothesis_with_measurement(hypothesis, detection, detection_time)
         });
 
         None
