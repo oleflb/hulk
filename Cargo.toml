@@ -5,6 +5,7 @@ members = [
   "crates/approx_derive",
   "crates/argument_parsers",
   "crates/audio",
+  "crates/ball_filter",
   "crates/buffered_watch",
   "crates/calibration",
   "crates/code_generation",
