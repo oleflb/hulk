@@ -1,5 +1,6 @@
 use std::time::{Duration, SystemTime};
 
+use ball_filter::FilteredBall;
 use color_eyre::Result;
 use context_attribute::context;
 use coordinate_systems::{Field, Ground};
@@ -8,7 +9,7 @@ use linear_algebra::{distance, Isometry2, Point2, Vector2};
 use serde::{Deserialize, Serialize};
 use spl_network_messages::{GamePhase, GameState, Team};
 use types::{
-    ball_position::BallPosition, cycle_time::CycleTime, field_dimensions::FieldDimensions,
+    cycle_time::CycleTime, field_dimensions::FieldDimensions,
     filtered_game_controller_state::FilteredGameControllerState,
     filtered_game_state::FilteredGameState, filtered_whistle::FilteredWhistle,
     game_controller_state::GameControllerState, parameters::GameStateFilterParameters,
@@ -24,7 +25,7 @@ pub struct CreationContext {}
 
 #[context]
 pub struct CycleContext {
-    ball_position: Input<Option<BallPosition<Ground>>, "ball_position?">,
+    ball_position: Input<Option<FilteredBall<Ground>>, "ball_position?">,
     cycle_time: Input<CycleTime, "cycle_time">,
     filtered_whistle: Input<FilteredWhistle, "filtered_whistle">,
     is_referee_ready_pose_detected: Input<bool, "majority_vote_is_referee_ready_pose_detected">,
@@ -90,7 +91,7 @@ struct FilteredGameStates {
 #[allow(clippy::too_many_arguments)]
 fn filter_game_states(
     ground_to_field: Isometry2<Ground, Field>,
-    ball_position: Option<&BallPosition<Ground>>,
+    ball_position: Option<&FilteredBall<Ground>>,
     field_dimensions: &FieldDimensions,
     config: &GameStateFilterParameters,
     game_controller_state: &GameControllerState,
@@ -280,7 +281,7 @@ fn next_filtered_state(
 
 fn ball_detected_far_from_any_goal(
     ground_to_field: Isometry2<Ground, Field>,
-    ball: Option<&BallPosition<Ground>>,
+    ball: Option<&FilteredBall<Ground>>,
     field_dimensions: &FieldDimensions,
     whistle_acceptance_goal_distance: Vector2<Field>,
 ) -> bool {

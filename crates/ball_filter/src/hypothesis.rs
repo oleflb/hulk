@@ -20,10 +20,32 @@ pub struct BallHypothesis {
     moving_hypothesis: MovingHypothesis,
     resting_hypothesis: RestingHypothesis,
     last_seen: SystemTime,
+    validity: f32,
 }
 
 impl BallHypothesis {
-    pub fn choose_ball(&self, velocity_threshold: f32) -> FilteredBall {
+    pub fn new(
+        moving_hypothesis: MovingHypothesis,
+        resting_hypothesis: RestingHypothesis,
+        last_seen: SystemTime,
+    ) -> Self {
+        Self {
+            moving_hypothesis,
+            resting_hypothesis,
+            last_seen,
+            validity: 1.0,
+        }
+    }
+
+    pub fn validity(&self) -> f32 {
+        self.validity
+    }
+
+    pub fn decay_validity(&mut self, decay_factor: f32) {
+        self.validity *= decay_factor;
+    }
+
+    pub fn choose_ball(&self, velocity_threshold: f32) -> FilteredBall<Ground> {
         if self.moving_hypothesis.velocity().norm() < velocity_threshold {
             return FilteredBall {
                 position: self.resting_hypothesis.position(),
@@ -71,15 +93,11 @@ impl BallHypothesis {
         self.last_seen = detection_time;
         self.moving_hypothesis.update(measurement, noise);
         self.resting_hypothesis.update(measurement, noise);
+        self.validity += 1.0;
     }
 
-    pub fn merge(
-        &mut self,
-        other: BallHypothesis,
-    ) {
-        self.moving_hypothesis
-            .merge(other.moving_hypothesis);
-        self.resting_hypothesis
-            .merge(other.resting_hypothesis);
+    pub fn merge(&mut self, other: BallHypothesis) {
+        self.moving_hypothesis.merge(other.moving_hypothesis);
+        self.resting_hypothesis.merge(other.resting_hypothesis);
     }
 }

@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
+use ball_filter::FilteredBall;
 use color_eyre::Result;
 use linear_algebra::Isometry2;
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,7 @@ use coordinate_systems::{Field, Ground};
 use framework::MainOutput;
 use spl_network_messages::HulkMessage;
 use types::{
-    ball_position::{BallPosition, HypotheticalBallPosition},
+    ball_position::HypotheticalBallPosition,
     cycle_time::CycleTime,
     fall_state::FallState,
     filtered_whistle::FilteredWhistle,
@@ -46,7 +47,7 @@ pub struct CycleContext {
 #[context]
 #[derive(Default)]
 pub struct MainOutputs {
-    pub ball_position: MainOutput<Option<BallPosition<Ground>>>,
+    pub ball_position: MainOutput<Option<FilteredBall<Ground>>>,
     pub cycle_time: MainOutput<CycleTime>,
     pub fall_state: MainOutput<FallState>,
     pub filtered_whistle: MainOutput<FilteredWhistle>,

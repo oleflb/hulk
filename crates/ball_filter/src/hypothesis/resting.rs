@@ -10,6 +10,10 @@ use types::multivariate_normal_distribution::MultivariateNormalDistribution;
 pub struct RestingHypothesis(pub MultivariateNormalDistribution<2>);
 
 impl RestingHypothesis {
+    pub fn new(mean: nalgebra::Vector2<f32>, covariance: Matrix2<f32>) -> Self {
+        Self(MultivariateNormalDistribution { mean, covariance })
+    }
+
     pub fn position(&self) -> Point2<Ground> {
         point![self.0.mean.x, self.0.mean.y]
     }
@@ -41,6 +45,7 @@ impl RestingHypothesis {
     }
 
     pub fn merge(&mut self, other: Self) {
-        self.0.update(Matrix2::identity(), other.0.mean, other.0.covariance)
+        self.0
+            .update(Matrix2::identity(), other.0.mean, other.0.covariance)
     }
 }

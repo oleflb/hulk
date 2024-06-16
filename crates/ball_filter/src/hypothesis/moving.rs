@@ -12,6 +12,10 @@ use types::multivariate_normal_distribution::MultivariateNormalDistribution;
 pub struct MovingHypothesis(pub MultivariateNormalDistribution<4>);
 
 impl MovingHypothesis {
+    pub fn new(mean: nalgebra::Vector4<f32>, covariance: Matrix4<f32>) -> Self {
+        Self(MultivariateNormalDistribution { mean, covariance })
+    }
+
     pub fn position(&self) -> Point2<Ground> {
         point![self.0.mean.x, self.0.mean.y]
     }
@@ -61,6 +65,7 @@ impl MovingHypothesis {
     }
 
     pub fn merge(&mut self, other: Self) {
-        self.0.update(Matrix4::identity(), other.0.mean, other.0.covariance)
+        self.0
+            .update(Matrix4::identity(), other.0.mean, other.0.covariance)
     }
 }

@@ -8,13 +8,13 @@ use std::{
 use color_eyre::Result;
 use serde::{Deserialize, Serialize};
 
+use ball_filter::FilteredBall;
 use coordinate_systems::{Field, Head};
 use geometry::line_segment::LineSegment;
 use linear_algebra::{vector, Isometry2, Orientation2, Point2, Rotation2, Vector2};
 use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use spl_network_messages::{GamePhase, GameState, HulkMessage, PlayerNumber, Team};
 use types::{
-    ball_position::BallPosition,
     game_controller_state::GameControllerState,
     messages::OutgoingMessage,
     motion_command::{HeadMotion, KickVariant, MotionCommand, OrientationMode},
@@ -205,7 +205,7 @@ impl State {
                     now.duration_since(last_seen).expect("time ran backwards")
                         < robot.parameters.ball_filter.hypothesis_timeout
                 }) {
-                    self.ball.as_ref().map(|ball| BallPosition {
+                    self.ball.as_ref().map(|ball| FilteredBall {
                         position: ground_to_field.inverse() * ball.position,
                         velocity: ground_to_field.inverse() * ball.velocity,
                         last_seen: now,

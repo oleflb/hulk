@@ -1,10 +1,14 @@
 use std::time::SystemTime;
 
-use coordinate_systems::Ground;
 use linear_algebra::{Point2, Vector2};
+use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
+use serde::{Deserialize, Serialize};
 
-pub struct FilteredBall {
-    pub position: Point2<Ground>,
-    pub velocity: Vector2<Ground>,
+#[derive(
+    Debug, Clone, Copy, PathDeserialize, PathSerialize, PathIntrospect, Serialize, Deserialize,
+)]
+pub struct FilteredBall<Frame> {
+    pub position: Point2<Frame>,
+    pub velocity: Vector2<Frame>,
     pub last_seen: SystemTime,
 }

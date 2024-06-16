@@ -1,3 +1,4 @@
+use ball_filter::FilteredBall;
 use color_eyre::Result;
 use context_attribute::context;
 use coordinate_systems::Ground;
@@ -5,8 +6,7 @@ use framework::MainOutput;
 use serde::{Deserialize, Serialize};
 use spl_network_messages::{GamePhase, SubState, Team};
 use types::{
-    ball_position::BallPosition, field_dimensions::FieldDimensions,
-    filtered_game_controller_state::FilteredGameControllerState,
+    field_dimensions::FieldDimensions, filtered_game_controller_state::FilteredGameControllerState,
     penalty_shot_direction::PenaltyShotDirection, primary_state::PrimaryState,
 };
 
@@ -24,7 +24,7 @@ pub struct CycleContext {
     moving_distance_threshold:
         Parameter<f32, "penalty_shot_direction_estimation.moving_distance_threshold">,
 
-    ball_position: RequiredInput<Option<BallPosition<Ground>>, "ball_position?">,
+    ball_position: RequiredInput<Option<FilteredBall<Ground>>, "ball_position?">,
     filtered_game_controller_state:
         RequiredInput<Option<FilteredGameControllerState>, "filtered_game_controller_state?">,
     primary_state: Input<PrimaryState, "primary_state">,

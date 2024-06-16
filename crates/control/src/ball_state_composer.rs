@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use ball_filter::FilteredBall;
 use color_eyre::Result;
 use context_attribute::context;
 use coordinate_systems::{Field, Ground};
@@ -9,7 +10,7 @@ use linear_algebra::{point, Isometry2, Point2, Vector2};
 use serde::{Deserialize, Serialize};
 use spl_network_messages::{SubState, Team};
 use types::{
-    ball_position::BallPosition, cycle_time::CycleTime, field_dimensions::FieldDimensions,
+    cycle_time::CycleTime, field_dimensions::FieldDimensions,
     filtered_game_controller_state::FilteredGameControllerState,
     penalty_shot_direction::PenaltyShotDirection, primary_state::PrimaryState, support_foot::Side,
     world_state::BallState,
@@ -26,10 +27,10 @@ pub struct CreationContext {}
 #[context]
 pub struct CycleContext {
     cycle_time: Input<CycleTime, "cycle_time">,
-    ball_position: Input<Option<BallPosition<Ground>>, "ball_position?">,
+    ball_position: Input<Option<FilteredBall<Ground>>, "ball_position?">,
     penalty_shot_direction: Input<Option<PenaltyShotDirection>, "penalty_shot_direction?">,
     ground_to_field: Input<Option<Isometry2<Ground, Field>>, "ground_to_field?">,
-    team_ball: Input<Option<BallPosition<Field>>, "team_ball?">,
+    team_ball: Input<Option<FilteredBall<Field>>, "team_ball?">,
     primary_state: Input<PrimaryState, "primary_state">,
     filtered_game_controller_state:
         Input<Option<FilteredGameControllerState>, "filtered_game_controller_state?">,

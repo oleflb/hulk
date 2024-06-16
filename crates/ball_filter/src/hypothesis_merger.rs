@@ -1,28 +1,58 @@
-use crate::hypothesis::{self, BallHypothesis};
+use crate::{hypothesis::BallHypothesis, BallFilter};
 
-pub struct RemovedHypotheses(Vec<BallHypothesis>);
+pub struct RemovedHypotheses(pub(crate) Vec<BallHypothesis>);
 
-pub fn remove_hypotheses(
-    hypotheses: &mut Vec<BallHypothesis>,
-    hypothesis_filter: impl Fn(&BallHypothesis) -> bool,
-    should_merge_hypothesis: impl Fn(&BallHypothesis, &BallHypothesis) -> bool,
-) -> RemovedHypotheses {
-    let (retained, removed): (Vec<_>, Vec<_>) = hypotheses
-        .drain(..)
-        .partition(|hypothesis| hypothesis_filter(hypothesis));
+impl RemovedHypotheses {
+    pub fn inner(self) -> Vec<BallHypothesis> {
+        self.0
+    }
+}
 
-    let mut deduplicated = Vec::new();
-    for hypothesis in retained {
-        let mergeable_hypothesis = deduplicated.iter_mut().find(|existing_hypothesis| {
-            should_merge_hypothesis(existing_hypothesis, &hypothesis)
-        });
+pub struct ValidHypotheses(Vec<BallHypothesis>);
 
-        if let Some(mergeable_hypothesis) = mergeable_hypothesis {
-            mergeable_hypothesis.merge(hypothesis);
-        } else {
-            deduplicated.push(hypothesis);
-        }
+pub trait HypothesisMerger {
+    fn partition(
+        &mut self,
+        is_valid: impl Fn(&BallHypothesis) -> bool,
+    ) -> (ValidHypotheses, RemovedHypotheses);
+    fn merge(
+        &mut self,
+        valid_hypotheses: ValidHypotheses,
+        merge_criterion: impl Fn(&BallHypothesis, &BallHypothesis) -> bool,
+    );
+}
+
+impl HypothesisMerger for BallFilter {
+    fn partition(
+        &mut self,
+        is_valid: impl Fn(&BallHypothesis) -> bool,
+    ) -> (ValidHypotheses, RemovedHypotheses) {
+        let (valid, removed) = self.hypotheses.drain(..).partition(is_valid);
+        (ValidHypotheses(valid), RemovedHypotheses(removed))
     }
 
-    todo!();
-} 
+    fn merge(
+        &mut self,
+        mut valid_hypotheses: ValidHypotheses,
+        merge_criterion: impl Fn(&BallHypothesis, &BallHypothesis) -> bool,
+    ) {
+        self.hypotheses =
+            valid_hypotheses
+                .0
+                .drain(..)
+                .fold(vec![], |mut deduplicated, hypothesis| {
+                    let mergeable_hypothesis =
+                        deduplicated.iter_mut().find(|existing_hypothesis| {
+                            merge_criterion(existing_hypothesis, &hypothesis)
+                        });
+
+                    if let Some(mergeable_hypothesis) = mergeable_hypothesis {
+                        mergeable_hypothesis.merge(hypothesis)
+                    } else {
+                        deduplicated.push(hypothesis);
+                    }
+
+                    deduplicated
+                })
+    }
+}
