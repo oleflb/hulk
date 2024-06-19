@@ -8,7 +8,7 @@ use nalgebra::{Matrix2, Matrix4};
 use serde::{Deserialize, Serialize};
 
 use ball_filter::{
-    BallFilter as BallFiltering, BallHypothesis, FilteredBall, HypothesisDecayer, HypothesisMerger,
+    BallFilter as BallFiltering, BallHypothesis, BallPosition, HypothesisDecayer, HypothesisMerger,
     HypothesisPredicter, HypothesisSpawner, HypothesisUpdater, RemovedHypotheses,
 };
 use context_attribute::context;
@@ -62,7 +62,7 @@ pub struct CycleContext {
 #[context]
 #[derive(Default)]
 pub struct MainOutputs {
-    pub ball_position: MainOutput<Option<FilteredBall<Ground>>>,
+    pub ball_position: MainOutput<Option<BallPosition<Ground>>>,
     pub removed_ball_positions: MainOutput<Vec<Point2<Ground>>>,
     pub hypothetical_ball_positions: MainOutput<Vec<HypotheticalBallPosition<Ground>>>,
 }
@@ -74,64 +74,46 @@ impl BallFilter {
         })
     }
 
-    fn time_ordered_balls<'a>(
-        balls_top: &'a BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
-        balls_bottom: &'a BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
-    ) -> Vec<(&'a SystemTime, Vec<&'a Ball>)> {
-        balls_top
-            .iter()
-            .zip(balls_bottom.values())
-            .map(|((detection_time, balls_top), balls_bottom)| {
-                let balls = balls_top
-                    .iter()
-                    .chain(balls_bottom.iter())
-                    .filter_map(|data| data.as_ref())
-                    .flat_map(|data| data.iter())
-                    .collect();
-                (detection_time, balls)
-            })
-            .collect()
-    }
-
     fn advance_all_hypotheses(
         &mut self,
-        measurements: Vec<(&SystemTime, Vec<&Ball>)>,
-        context: &CycleContext,
+        measurements: Vec<(SystemTime, Vec<&Ball>)>,
+        current_to_last_odometry: HistoricInput<Option<&nalgebra::Isometry2<f32>>>,
+        camera_matrices: HistoricInput<Option<&CameraMatrices>>,
+        projected_limbs: PerceptionInput<Vec<Option<&ProjectedLimbs>>>,
+        filter_parameters: &BallFilterParameters,
+        field_dimensions: &FieldDimensions,
+        cycle_time: &CycleTime,
     ) -> RemovedHypotheses {
-        let cycle_time = Duration::from_secs_f32(0.012);
-        let filter_parameters = &context.ball_filter_configuration;
-        let velocity_threshold = filter_parameters.measurement_matching_distance;
+        let delta_time = Duration::from_secs_f32(0.012);
 
         for (detection_time, balls) in measurements {
-            let current_odometry_to_last_odometry: Isometry2<Ground, Ground> = (*context
-                .current_odometry_to_last_odometry
-                .get(detection_time)
+            let current_to_last_odometry: Isometry2<Ground, Ground> = (*current_to_last_odometry
+                .get(&detection_time)
                 .expect("current_odometry_to_last_odometry should not be None"))
             .framed_transform();
 
             self.ball_filter.predict(
-                cycle_time,
-                current_odometry_to_last_odometry.inverse(),
+                delta_time,
+                current_to_last_odometry.inverse(),
                 filter_parameters.velocity_decay_factor,
                 Matrix4::from_diagonal(&filter_parameters.noise.process_noise_moving),
                 Matrix2::from_diagonal(&filter_parameters.noise.process_noise_resting),
                 filter_parameters.resting_ball_velocity_threshold,
             );
 
-            let camera_matrices = context.historic_camera_matrices.get(detection_time);
-            let projected_limbs_bottom = context
-                .projected_limbs
+            let camera_matrices = camera_matrices.get(&detection_time);
+            let projected_limbs_bottom = projected_limbs
                 .persistent
-                .get(detection_time)
+                .get(&detection_time)
                 .and_then(|limbs| limbs.last())
                 .and_then(|limbs| *limbs);
 
             self.ball_filter.decay_hypotheses(|hypothesis| {
-                Self::decide_validity_decay_for_hypothesis(
+                decide_validity_decay_for_hypothesis(
                     hypothesis,
                     camera_matrices,
                     projected_limbs_bottom,
-                    context.field_dimensions.ball_radius,
+                    field_dimensions.ball_radius,
                     filter_parameters,
                 )
             });
@@ -139,47 +121,48 @@ impl BallFilter {
             for ball in balls {
                 let matching = self.ball_filter.find_matching_hypotheses(|hypothesis| {
                     distance(
-                        hypothesis.choose_ball(velocity_threshold).position,
+                        hypothesis
+                            .choose_ball(filter_parameters.resting_ball_velocity_threshold)
+                            .position,
                         ball.position,
                     ) < filter_parameters.measurement_matching_distance
                 });
-                if !matching.is_empty() {
+                if matching.is_empty() {
+                    self.ball_filter.spawn(
+                        detection_time,
+                        ball.position,
+                        Matrix4::from_diagonal(&filter_parameters.noise.initial_covariance),
+                        Matrix2::from_diagonal(&filter_parameters.noise.initial_covariance.xy()),
+                    )
+                } else {
                     let measurement_noise =
                         Matrix2::from_diagonal(&filter_parameters.noise.measurement_noise)
                             * ball.position.coords().norm_squared();
 
                     BallFiltering::update(
                         matching,
-                        *detection_time,
+                        detection_time,
                         ball.position,
                         measurement_noise,
                     );
-                } else {
-                    self.ball_filter.spawn(
-                        *detection_time,
-                        ball.position,
-                        Matrix4::from_diagonal(&filter_parameters.noise.initial_covariance),
-                        Matrix2::from_diagonal(&filter_parameters.noise.initial_covariance.xy()),
-                    )
                 }
             }
         }
 
         let is_hypothesis_valid = |hypothesis: &BallHypothesis| {
             let ball = hypothesis.choose_ball(filter_parameters.resting_ball_velocity_threshold);
-            let duration_since_last_observation = context
-                .cycle_time
+            let duration_since_last_observation = cycle_time
                 .start_time
                 .duration_since(ball.last_seen)
                 .expect("time ran backwards");
-            is_ball_inside_field(ball, context.field_dimensions)
+            is_ball_inside_field(ball, field_dimensions)
                 && duration_since_last_observation < filter_parameters.hypothesis_timeout
         };
 
         let (valid, removed) = self.ball_filter.partition(is_hypothesis_valid);
         self.ball_filter.merge(valid, |hypothesis1, hypothesis2| {
-            let ball1 = hypothesis1.choose_ball(velocity_threshold);
-            let ball2 = hypothesis2.choose_ball(velocity_threshold);
+            let ball1 = hypothesis1.choose_ball(filter_parameters.resting_ball_velocity_threshold);
+            let ball2 = hypothesis2.choose_ball(filter_parameters.resting_ball_velocity_threshold);
 
             distance(ball1.position, ball2.position) < filter_parameters.hypothesis_merge_distance
         });
@@ -188,13 +171,22 @@ impl BallFilter {
     }
 
     pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
-        let persistent_updates = Self::time_ordered_balls(
-            &context.balls_top.persistent,
-            &context.balls_bottom.persistent,
+        let persistent_updates = time_ordered_balls(
+            context.balls_top.persistent,
+            context.balls_bottom.persistent,
         );
-        let removed_hypotheses = self.advance_all_hypotheses(persistent_updates, &context);
 
         let filter_parameters = context.ball_filter_configuration;
+        let removed_hypotheses = self.advance_all_hypotheses(
+            persistent_updates,
+            context.current_odometry_to_last_odometry,
+            context.historic_camera_matrices,
+            context.projected_limbs,
+            &filter_parameters,
+            &context.field_dimensions,
+            &context.cycle_time,
+        );
+
         let velocity_threshold = filter_parameters.resting_ball_velocity_threshold;
 
         context
@@ -234,7 +226,7 @@ impl BallFilter {
             .inner()
             .into_iter()
             .filter(|hypothesis| {
-                hypothesis.validity() >= context.ball_filter_configuration.validity_output_threshold
+                hypothesis.validity >= context.ball_filter_configuration.validity_output_threshold
             })
             .map(|hypothesis| hypothesis.choose_ball(velocity_threshold).position)
             .collect::<Vec<_>>();
@@ -260,10 +252,10 @@ impl BallFilter {
             .hypotheses()
             .iter()
             .filter_map(|hypothesis| {
-                if hypothesis.validity() < validity_limit {
+                if hypothesis.validity < validity_limit {
                     Some(HypotheticalBallPosition {
                         position: hypothesis.choose_ball(velocity_threshold).position,
-                        validity: hypothesis.validity(),
+                        validity: hypothesis.validity,
                     })
                 } else {
                     None
@@ -271,17 +263,38 @@ impl BallFilter {
             })
             .collect()
     }
+}
 
-    fn decide_validity_decay_for_hypothesis(
-        hypothesis: &BallHypothesis,
-        camera_matrices: Option<&CameraMatrices>,
-        projected_limbs: Option<&ProjectedLimbs>,
-        ball_radius: f32,
-        configuration: &BallFilterParameters,
-    ) -> f32 {
-        let is_ball_in_view = camera_matrices.zip(projected_limbs).map_or(
-            false,
-            |(camera_matrices, projected_limbs)| {
+fn time_ordered_balls<'a>(
+    balls_top: BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
+    balls_bottom: BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
+) -> Vec<(SystemTime, Vec<&'a Ball>)> {
+    balls_top
+        .into_iter()
+        .zip(balls_bottom.into_values())
+        .map(|((detection_time, balls_top), balls_bottom)| {
+            let balls = balls_top
+                .iter()
+                .chain(balls_bottom.iter())
+                .filter_map(|data| data.as_ref())
+                .flat_map(|data| data.iter())
+                .collect();
+            (detection_time, balls)
+        })
+        .collect()
+}
+
+fn decide_validity_decay_for_hypothesis(
+    hypothesis: &BallHypothesis,
+    camera_matrices: Option<&CameraMatrices>,
+    projected_limbs: Option<&ProjectedLimbs>,
+    ball_radius: f32,
+    configuration: &BallFilterParameters,
+) -> f32 {
+    let is_ball_in_view =
+        camera_matrices
+            .zip(projected_limbs)
+            .map_or(false, |(camera_matrices, projected_limbs)| {
                 let ball = hypothesis.choose_ball(configuration.resting_ball_velocity_threshold);
                 is_visible_to_camera(
                     &ball,
@@ -289,23 +302,21 @@ impl BallFilter {
                     ball_radius,
                     &projected_limbs.limbs,
                 ) || is_visible_to_camera(&ball, &camera_matrices.top, ball_radius, &[])
-            },
-        );
+            });
 
-        match is_ball_in_view {
-            true => configuration.visible_validity_exponential_decay_factor,
-            false => configuration.hidden_validity_exponential_decay_factor,
-        }
+    match is_ball_in_view {
+        true => configuration.visible_validity_exponential_decay_factor,
+        false => configuration.hidden_validity_exponential_decay_factor,
     }
 }
 
-fn is_ball_inside_field(ball: FilteredBall<Ground>, field_dimensions: &FieldDimensions) -> bool {
+fn is_ball_inside_field(ball: BallPosition<Ground>, field_dimensions: &FieldDimensions) -> bool {
     ball.position.x().abs() < field_dimensions.length / 2.0
         && ball.position.y().abs() < field_dimensions.width / 2.0
 }
 
 fn project_to_image(
-    filtered_balls: &[FilteredBall<Ground>],
+    filtered_balls: &[BallPosition<Ground>],
     camera_matrix: &CameraMatrix,
     ball_radius: f32,
 ) -> Vec<Circle<Pixel>> {
@@ -327,7 +338,7 @@ fn project_to_image(
 }
 
 fn is_visible_to_camera(
-    ball: &FilteredBall<Ground>,
+    ball: &BallPosition<Ground>,
     camera_matrix: &CameraMatrix,
     ball_radius: f32,
     projected_limbs: &[Limb],

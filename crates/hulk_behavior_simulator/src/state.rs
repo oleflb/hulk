@@ -8,7 +8,7 @@ use std::{
 use color_eyre::Result;
 use serde::{Deserialize, Serialize};
 
-use ball_filter::FilteredBall;
+use ball_filter::BallPosition;
 use coordinate_systems::{Field, Head};
 use geometry::line_segment::LineSegment;
 use linear_algebra::{vector, Isometry2, Orientation2, Point2, Rotation2, Vector2};
@@ -205,7 +205,7 @@ impl State {
                     now.duration_since(last_seen).expect("time ran backwards")
                         < robot.parameters.ball_filter.hypothesis_timeout
                 }) {
-                    self.ball.as_ref().map(|ball| FilteredBall {
+                    self.ball.as_ref().map(|ball| BallPosition {
                         position: ground_to_field.inverse() * ball.position,
                         velocity: ground_to_field.inverse() * ball.velocity,
                         last_seen: now,

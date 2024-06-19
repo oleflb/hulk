@@ -6,19 +6,17 @@ use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use serde::{Deserialize, Serialize};
 use types::multivariate_normal_distribution::MultivariateNormalDistribution;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect)]
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect,
+)]
 pub struct RestingHypothesis(pub MultivariateNormalDistribution<2>);
 
 impl RestingHypothesis {
-    pub fn new(mean: nalgebra::Vector2<f32>, covariance: Matrix2<f32>) -> Self {
-        Self(MultivariateNormalDistribution { mean, covariance })
-    }
-
     pub fn position(&self) -> Point2<Ground> {
         point![self.0.mean.x, self.0.mean.y]
     }
 
-    pub fn move_to(&mut self, position: Point2<Ground>) {
+    pub fn reset(&mut self, position: Point2<Ground>) {
         self.0.mean.x = position.x();
         self.0.mean.y = position.y();
     }

@@ -3,7 +3,7 @@ use std::{str::FromStr, sync::Arc};
 use color_eyre::Result;
 use eframe::epaint::Color32;
 
-use ball_filter::FilteredBall;
+use ball_filter::BallPosition;
 use communication::client::CyclerOutput;
 use coordinate_systems::{Field, Ground};
 use linear_algebra::Isometry2;
@@ -41,7 +41,7 @@ impl Layer<Field> for BallPosition {
     ) -> Result<()> {
         let ground_to_fields: Vec<Option<Isometry2<Ground, Field>>> =
             self.ground_to_field.parse_buffered()?;
-        let ball_positions: Vec<Option<FilteredBall<Ground>>> =
+        let ball_positions: Vec<Option<BallPosition<Ground>>> =
             self.ball_position.parse_buffered()?;
 
         for (ball, ground_to_field) in ball_positions

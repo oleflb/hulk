@@ -1,6 +1,6 @@
 use std::ops::{Index, IndexMut};
 
-use ball_filter::FilteredBall;
+use ball_filter::BallPosition;
 use color_eyre::Result;
 use context_attribute::context;
 use coordinate_systems::{Field, Ground};
@@ -27,7 +27,7 @@ pub struct CreationContext {
 #[context]
 pub struct CycleContext {
     search_suggestor_configuration: Parameter<SearchSuggestorParameters, "search_suggestor">,
-    ball_position: Input<Option<FilteredBall<Ground>>, "ball_position?">,
+    ball_position: Input<Option<BallPosition<Ground>>, "ball_position?">,
     hypothetical_ball_positions:
         Input<Vec<HypotheticalBallPosition<Ground>>, "hypothetical_ball_positions">,
     ground_to_field: Input<Option<Isometry2<Ground, Field>>, "ground_to_field?">,
@@ -80,7 +80,7 @@ impl SearchSuggestor {
 
     fn update_heatmap(
         &mut self,
-        ball_position: Option<&FilteredBall<Ground>>,
+        ball_position: Option<&BallPosition<Ground>>,
         hypothetical_ball_positions: &Vec<HypotheticalBallPosition<Ground>>,
         ground_to_field: Option<Isometry2<Ground, Field>>,
         heatmap_decay_factor: f32,

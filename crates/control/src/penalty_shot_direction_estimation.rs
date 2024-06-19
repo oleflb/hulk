@@ -1,4 +1,4 @@
-use ball_filter::FilteredBall;
+use ball_filter::BallPosition;
 use color_eyre::Result;
 use context_attribute::context;
 use coordinate_systems::Ground;
@@ -24,7 +24,7 @@ pub struct CycleContext {
     moving_distance_threshold:
         Parameter<f32, "penalty_shot_direction_estimation.moving_distance_threshold">,
 
-    ball_position: RequiredInput<Option<FilteredBall<Ground>>, "ball_position?">,
+    ball_position: RequiredInput<Option<BallPosition<Ground>>, "ball_position?">,
     filtered_game_controller_state:
         RequiredInput<Option<FilteredGameControllerState>, "filtered_game_controller_state?">,
     primary_state: Input<PrimaryState, "primary_state">,

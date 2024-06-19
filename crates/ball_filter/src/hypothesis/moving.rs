@@ -8,14 +8,12 @@ use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use serde::{Deserialize, Serialize};
 use types::multivariate_normal_distribution::MultivariateNormalDistribution;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect)]
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect,
+)]
 pub struct MovingHypothesis(pub MultivariateNormalDistribution<4>);
 
 impl MovingHypothesis {
-    pub fn new(mean: nalgebra::Vector4<f32>, covariance: Matrix4<f32>) -> Self {
-        Self(MultivariateNormalDistribution { mean, covariance })
-    }
-
     pub fn position(&self) -> Point2<Ground> {
         point![self.0.mean.x, self.0.mean.y]
     }

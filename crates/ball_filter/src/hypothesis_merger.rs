@@ -33,13 +33,13 @@ impl HypothesisMerger for BallFilter {
 
     fn merge(
         &mut self,
-        mut valid_hypotheses: ValidHypotheses,
+        valid_hypotheses: ValidHypotheses,
         merge_criterion: impl Fn(&BallHypothesis, &BallHypothesis) -> bool,
     ) {
         self.hypotheses =
             valid_hypotheses
                 .0
-                .drain(..)
+                .into_iter()
                 .fold(vec![], |mut deduplicated, hypothesis| {
                     let mergeable_hypothesis =
                         deduplicated.iter_mut().find(|existing_hypothesis| {

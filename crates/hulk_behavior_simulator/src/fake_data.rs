@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use ball_filter::FilteredBall;
+use ball_filter::BallPosition;
 use color_eyre::Result;
 use linear_algebra::Isometry2;
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ pub struct CycleContext {
 #[context]
 #[derive(Default)]
 pub struct MainOutputs {
-    pub ball_position: MainOutput<Option<FilteredBall<Ground>>>,
+    pub ball_position: MainOutput<Option<BallPosition<Ground>>>,
     pub cycle_time: MainOutput<CycleTime>,
     pub fall_state: MainOutput<FallState>,
     pub filtered_whistle: MainOutput<FilteredWhistle>,

@@ -3,6 +3,7 @@ use std::time::SystemTime;
 use coordinate_systems::Ground;
 use linear_algebra::Point2;
 use nalgebra::{Matrix2, Matrix4};
+use types::multivariate_normal_distribution::MultivariateNormalDistribution;
 
 use crate::{
     hypothesis::{moving::MovingHypothesis, resting::RestingHypothesis},
@@ -29,9 +30,14 @@ impl HypothesisSpawner for BallFilter {
     ) {
         let initial_state = nalgebra::vector![measurement.x(), measurement.y(), 0.0, 0.0];
 
-        let moving_hypothesis = MovingHypothesis::new(initial_state, initial_moving_covariance);
-        let resting_hypothesis =
-            RestingHypothesis::new(initial_state.xy(), initial_resting_covariance);
+        let moving_hypothesis = MovingHypothesis(MultivariateNormalDistribution {
+            mean: initial_state,
+            covariance: initial_moving_covariance,
+        });
+        let resting_hypothesis = RestingHypothesis(MultivariateNormalDistribution {
+            mean: initial_state.xy(),
+            covariance: initial_resting_covariance,
+        });
 
         self.hypotheses.push(BallHypothesis::new(
             moving_hypothesis,

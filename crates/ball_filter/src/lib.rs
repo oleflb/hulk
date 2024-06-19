@@ -9,7 +9,7 @@ mod hypothesis_predicter;
 mod hypothesis_spawner;
 mod hypothesis_updater;
 
-pub use filtered_ball::FilteredBall;
+pub use filtered_ball::BallPosition;
 pub use hypothesis::BallHypothesis;
 pub use hypothesis_decayer::HypothesisDecayer;
 pub use hypothesis_merger::{HypothesisMerger, RemovedHypotheses, ValidHypotheses};
@@ -28,8 +28,8 @@ impl BallFilter {
     pub fn best_hypothesis(&self, validity_threshold: f32) -> Option<&BallHypothesis> {
         self.hypotheses
             .iter()
-            .filter(|hypothesis| hypothesis.validity() >= validity_threshold)
-            .max_by(|a, b| a.validity().partial_cmp(&b.validity()).unwrap())
+            .filter(|hypothesis| hypothesis.validity >= validity_threshold)
+            .max_by(|a, b| a.validity.partial_cmp(&b.validity).unwrap())
     }
 
     pub fn hypotheses(&self) -> &Vec<BallHypothesis> {
