@@ -76,7 +76,7 @@ impl BallFilter {
 
     fn advance_all_hypotheses(
         &mut self,
-        measurements: Vec<(SystemTime, Vec<&Ball>)>,
+        measurements: BTreeMap<SystemTime, Vec<&Ball>>,
         current_to_last_odometry: HistoricInput<Option<&nalgebra::Isometry2<f32>>>,
         camera_matrices: HistoricInput<Option<&CameraMatrices>>,
         projected_limbs: PerceptionInput<Vec<Option<&ProjectedLimbs>>>,
@@ -268,20 +268,19 @@ impl BallFilter {
 fn time_ordered_balls<'a>(
     balls_top: BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
     balls_bottom: BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
-) -> Vec<(SystemTime, Vec<&'a Ball>)> {
-    balls_top
-        .into_iter()
-        .zip(balls_bottom.into_values())
-        .map(|((detection_time, balls_top), balls_bottom)| {
-            let balls = balls_top
-                .iter()
-                .chain(balls_bottom.iter())
-                .filter_map(|data| data.as_ref())
-                .flat_map(|data| data.iter())
-                .collect();
-            (detection_time, balls)
-        })
-        .collect()
+) -> BTreeMap<SystemTime, Vec<&'a Ball>> {
+    let mut time_ordered_balls = BTreeMap::new();
+    for (detection_time, balls) in balls_top.into_iter().chain(balls_bottom) {
+        let balls = balls
+            .into_iter()
+            .flatten()
+            .flat_map(|balls| balls.iter());
+        time_ordered_balls
+            .entry(detection_time)
+            .or_insert(vec![])
+            .extend(balls);
+    }
+    time_ordered_balls
 }
 
 fn decide_validity_decay_for_hypothesis(
