@@ -267,12 +267,12 @@ fn time_ordered_balls<'a>(
     balls_top: BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
     balls_bottom: BTreeMap<SystemTime, Vec<Option<&'a Vec<Ball>>>>,
 ) -> BTreeMap<SystemTime, Vec<&'a Ball>> {
-    let mut time_ordered_balls = BTreeMap::new();
+    let mut time_ordered_balls = BTreeMap::<SystemTime, Vec<&Ball>>::new();
     for (detection_time, balls) in balls_top.into_iter().chain(balls_bottom) {
-        let balls = balls.into_iter().flatten().flat_map(|balls| balls.iter());
+        let balls = balls.into_iter().flatten().flatten();
         time_ordered_balls
             .entry(detection_time)
-            .or_insert(vec![])
+            .or_default()
             .extend(balls);
     }
     time_ordered_balls
