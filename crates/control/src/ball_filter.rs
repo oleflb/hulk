@@ -7,10 +7,7 @@ use color_eyre::Result;
 use nalgebra::{Matrix2, Matrix4};
 use serde::{Deserialize, Serialize};
 
-use ball_filter::{
-    BallFilter as BallFiltering, BallHypothesis, BallPosition, HypothesisDecayer, HypothesisMerger,
-    HypothesisPredicter, HypothesisSpawner, HypothesisUpdater, RemovedHypotheses,
-};
+use ball_filter::{BallFilter as BallFiltering, BallHypothesis, BallPosition};
 use context_attribute::context;
 use coordinate_systems::{Ground, Pixel};
 use framework::{AdditionalOutput, HistoricInput, MainOutput, PerceptionInput};
@@ -83,7 +80,7 @@ impl BallFilter {
         filter_parameters: &BallFilterParameters,
         field_dimensions: &FieldDimensions,
         cycle_time: &CycleTime,
-    ) -> RemovedHypotheses {
+    ) -> Vec<BallHypothesis> {
         let delta_time = Duration::from_secs_f32(0.012);
 
         for (detection_time, balls) in measurements {
@@ -119,32 +116,30 @@ impl BallFilter {
             });
 
             for ball in balls {
-                let matching = self.ball_filter.find_matching_hypotheses(|hypothesis| {
+                let is_hypothesis_detected = |hypothesis: &BallHypothesis| {
                     distance(
                         hypothesis
                             .choose_ball(filter_parameters.resting_ball_velocity_threshold)
                             .position,
                         ball.position,
                     ) < filter_parameters.measurement_matching_distance
-                });
-                if matching.is_empty() {
+                };
+                let measurement_noise =
+                    Matrix2::from_diagonal(&filter_parameters.noise.measurement_noise)
+                        * ball.position.coords().norm_squared();
+                let is_any_hypothesis_updated = self.ball_filter.update(
+                    detection_time,
+                    ball.position,
+                    measurement_noise,
+                    is_hypothesis_detected,
+                );
+                if is_any_hypothesis_updated {
                     self.ball_filter.spawn(
                         detection_time,
                         ball.position,
                         Matrix4::from_diagonal(&filter_parameters.noise.initial_covariance),
                         Matrix2::from_diagonal(&filter_parameters.noise.initial_covariance.xy()),
                     )
-                } else {
-                    let measurement_noise =
-                        Matrix2::from_diagonal(&filter_parameters.noise.measurement_noise)
-                            * ball.position.coords().norm_squared();
-
-                    BallFiltering::update(
-                        matching,
-                        detection_time,
-                        ball.position,
-                        measurement_noise,
-                    );
                 }
             }
         }
@@ -159,15 +154,19 @@ impl BallFilter {
                 && duration_since_last_observation < filter_parameters.hypothesis_timeout
         };
 
-        let (valid, removed) = self.ball_filter.partition(is_hypothesis_valid);
-        self.ball_filter.merge(valid, |hypothesis1, hypothesis2| {
-            let ball1 = hypothesis1.choose_ball(filter_parameters.resting_ball_velocity_threshold);
-            let ball2 = hypothesis2.choose_ball(filter_parameters.resting_ball_velocity_threshold);
+        let should_merge_hypotheses =
+            |hypothesis1: &BallHypothesis, hypothesis2: &BallHypothesis| {
+                let ball1 =
+                    hypothesis1.choose_ball(filter_parameters.resting_ball_velocity_threshold);
+                let ball2 =
+                    hypothesis2.choose_ball(filter_parameters.resting_ball_velocity_threshold);
 
-            distance(ball1.position, ball2.position) < filter_parameters.hypothesis_merge_distance
-        });
+                distance(ball1.position, ball2.position)
+                    < filter_parameters.hypothesis_merge_distance
+            };
 
-        removed
+        self.ball_filter
+            .remove_hypotheses(is_hypothesis_valid, should_merge_hypotheses)
     }
 
     pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
@@ -223,7 +222,6 @@ impl BallFilter {
             });
 
         let removed_ball_positions = removed_hypotheses
-            .inner()
             .into_iter()
             .filter(|hypothesis| {
                 hypothesis.validity >= context.ball_filter_configuration.validity_output_threshold
@@ -271,10 +269,7 @@ fn time_ordered_balls<'a>(
 ) -> BTreeMap<SystemTime, Vec<&'a Ball>> {
     let mut time_ordered_balls = BTreeMap::new();
     for (detection_time, balls) in balls_top.into_iter().chain(balls_bottom) {
-        let balls = balls
-            .into_iter()
-            .flatten()
-            .flat_map(|balls| balls.iter());
+        let balls = balls.into_iter().flatten().flat_map(|balls| balls.iter());
         time_ordered_balls
             .entry(detection_time)
             .or_insert(vec![])

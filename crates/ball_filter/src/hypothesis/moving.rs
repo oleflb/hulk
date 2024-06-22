@@ -2,27 +2,26 @@ use std::time::Duration;
 
 use coordinate_systems::Ground;
 use filtering::kalman_filter::KalmanFilter;
-use linear_algebra::{point, vector, Isometry2, Point2, Vector2};
+use linear_algebra::{Isometry2, Point2};
 use nalgebra::{matrix, Matrix2, Matrix2x4, Matrix4, Matrix4x2};
-use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
-use serde::{Deserialize, Serialize};
 use types::multivariate_normal_distribution::MultivariateNormalDistribution;
 
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PathSerialize, PathDeserialize, PathIntrospect,
-)]
-pub struct MovingHypothesis(pub MultivariateNormalDistribution<4>);
+pub(super) trait MovingPredict {
+    fn predict(
+        &mut self,
+        delta_time: Duration,
+        last_to_current_odometry: Isometry2<Ground, Ground>,
+        velocity_decay: f32,
+        process_noise: Matrix4<f32>,
+    );
+}
 
-impl MovingHypothesis {
-    pub fn position(&self) -> Point2<Ground> {
-        point![self.0.mean.x, self.0.mean.y]
-    }
+pub(super) trait MovingUpdate {
+    fn update(&mut self, measurement: Point2<Ground>, noise: Matrix2<f32>);
+}
 
-    pub fn velocity(&self) -> Vector2<Ground> {
-        vector![self.0.mean.z, self.0.mean.w]
-    }
-
-    pub fn predict(
+impl MovingPredict for MultivariateNormalDistribution<4> {
+    fn predict(
         &mut self,
         delta_time: Duration,
         last_to_current_odometry: Isometry2<Ground, Ground>,
@@ -49,21 +48,18 @@ impl MovingHypothesis {
         ];
 
         let state_prediction = constant_velocity_prediction * state_rotation;
-        self.0.predict(
+        KalmanFilter::predict(
+            self,
             state_prediction,
             Matrix4x2::identity(),
             translation,
             process_noise,
         );
     }
+}
 
-    pub fn update(&mut self, measurement: Point2<Ground>, noise: Matrix2<f32>) {
-        self.0
-            .update(Matrix2x4::identity(), measurement.inner.coords, noise)
-    }
-
-    pub fn merge(&mut self, other: Self) {
-        self.0
-            .update(Matrix4::identity(), other.0.mean, other.0.covariance)
+impl MovingUpdate for MultivariateNormalDistribution<4> {
+    fn update(&mut self, measurement: Point2<Ground>, noise: Matrix2<f32>) {
+        KalmanFilter::update(self, Matrix2x4::identity(), measurement.inner.coords, noise)
     }
 }
