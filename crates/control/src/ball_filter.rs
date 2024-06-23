@@ -71,6 +71,7 @@ impl BallFilter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn advance_all_hypotheses(
         &mut self,
         measurements: BTreeMap<SystemTime, Vec<&Ball>>,
@@ -181,9 +182,9 @@ impl BallFilter {
             context.current_odometry_to_last_odometry,
             context.historic_camera_matrices,
             context.projected_limbs,
-            &filter_parameters,
-            &context.field_dimensions,
-            &context.cycle_time,
+            filter_parameters,
+            context.field_dimensions,
+            context.cycle_time,
         );
 
         let velocity_threshold = filter_parameters.resting_ball_velocity_threshold;
