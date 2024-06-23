@@ -50,7 +50,8 @@ members = [
   "tools/depp",
   "tools/fanta",
   "tools/hula/types",
-  "tools/pepsi",
+  "tools/pepsi", 
+  "tools/segmentator",
   "tools/twix",
 ]
 # HuLA and Aliveness are built independently by yocto
