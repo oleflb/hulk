@@ -133,7 +133,7 @@ impl BallFilter {
                     measurement_noise,
                     is_hypothesis_detected,
                 );
-                if is_any_hypothesis_updated {
+                if !is_any_hypothesis_updated {
                     self.ball_filter.spawn(
                         detection_time,
                         ball.position,
@@ -202,23 +202,27 @@ impl BallFilter {
         let filtered_ball =
             best_hypothesis.map(|hypothesis| hypothesis.choose_ball(velocity_threshold));
 
-        let balls: Vec<_> = self
+        let output_balls: Vec<_> = self
             .ball_filter
             .hypotheses()
             .iter()
-            .map(|hypothesis| {
-                hypothesis.choose_ball(filter_parameters.resting_ball_velocity_threshold)
+            .filter_map(|hypothesis| {
+                if hypothesis.validity >= filter_parameters.validity_output_threshold {
+                    Some(hypothesis.choose_ball(velocity_threshold))
+                } else {
+                    None
+                }
             })
             .collect();
 
         let ball_radius = context.field_dimensions.ball_radius;
         context.filtered_balls_in_image_top.fill_if_subscribed(|| {
-            project_to_image(&balls, &context.camera_matrices.top, ball_radius)
+            project_to_image(&output_balls, &context.camera_matrices.top, ball_radius)
         });
         context
             .filtered_balls_in_image_bottom
             .fill_if_subscribed(|| {
-                project_to_image(&balls, &context.camera_matrices.bottom, ball_radius)
+                project_to_image(&output_balls, &context.camera_matrices.bottom, ball_radius)
             });
 
         let removed_ball_positions = removed_hypotheses

@@ -13,12 +13,12 @@ use crate::{
     nao::Nao, panels::map::layer::Layer, twix_painter::TwixPainter, value_buffer::ValueBuffer,
 };
 
-pub struct BallPosition {
+pub struct BallPositionLayer {
     ground_to_field: ValueBuffer,
     ball_position: ValueBuffer,
 }
 
-impl Layer<Field> for BallPosition {
+impl Layer<Field> for BallPositionLayer {
     const NAME: &'static str = "Ball Position";
 
     fn new(nao: Arc<Nao>) -> Self {
