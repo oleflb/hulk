@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use eframe::egui::{
     emath::RectTransform, Color32, Image, PointerButton, Pos2, Rect, Sense, Widget,
 };
+use serde::Serialize;
 
 use crate::polygon::paint_polygon;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Class {
     Field,
     Line,
