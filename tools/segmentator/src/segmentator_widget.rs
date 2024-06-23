@@ -6,6 +6,7 @@ use eframe::egui::{
 
 use crate::polygon::paint_polygon;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
     Field,
     Line,

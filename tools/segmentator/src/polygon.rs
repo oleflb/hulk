@@ -1,5 +1,5 @@
 use eframe::{
-    egui::{Color32, Mesh, Painter, Pos2, Shape, Stroke, TextureId},
+    egui::{pos2, Color32, Mesh, Painter, Pos2, Rect, Stroke, TextureId},
     emath::RectTransform,
     epaint::{PathShape, Vertex, WHITE_UV},
 };
@@ -19,6 +19,21 @@ impl Polygon {
 
     pub fn add_point(&mut self, point: Pos2) {
         self.points.push(point);
+    }
+
+    pub fn triangles(&self) -> Vec<[Pos2; 3]> {
+        let identity = RectTransform::identity(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+        let mesh = meshify(&self.points, identity, Color32::TRANSPARENT);
+
+        mesh.indices
+            .chunks_exact(3)
+            .map(|indices| {
+                let a = mesh.vertices[indices[0] as usize].pos;
+                let b = mesh.vertices[indices[1] as usize].pos;
+                let c = mesh.vertices[indices[2] as usize].pos;
+                [a, b, c]
+            })
+            .collect()
     }
 }
 

@@ -10,4 +10,5 @@ color-eyre = { workspace = true }
 eframe = { workspace = true }
 egui_extras = { workspace = true, features = ["image", "file"] }
 lyon_tessellation = "*"
-glob ={ workspace = true }
+glob = { workspace = true }
+serde_json = { workspace = true }

@@ -1,6 +1,7 @@
 pub mod polygon;
 mod preview_widget;
 pub mod segmentator_widget;
+mod export;
 
 use std::path::PathBuf;
 

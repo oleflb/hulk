@@ -5207,6 +5207,7 @@ dependencies = [
  "egui_extras",
  "glob",
  "lyon_tessellation",
+ "serde_json",
 ]
 
 [[package]]
