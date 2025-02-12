@@ -59,6 +59,13 @@ def main(*, throw_tomatoes: bool, load_policy: str | None) -> None:
     gyro_figure.add_line("Y Gyro")
     gyro_figure.add_line("Z Gyro")
 
+    acceleration_plot = viewer.figure("acceleration_plot")
+    acceleration_plot.set_title("Acceleration Plot")
+    acceleration_plot.set_x_label("Step")
+    acceleration_plot.add_line("accel x")
+    acceleration_plot.add_line("accel y")
+    acceleration_plot.add_line("accel z")
+
     while viewer.is_alive:
         start_time = time.time()
         # viewer.track_with_camera("Nao")
@@ -66,6 +73,16 @@ def main(*, throw_tomatoes: bool, load_policy: str | None) -> None:
         if model:
             action, _ = model.predict(observation, deterministic=True)
         # print(action)
+
+        acceleration_plot.push_data_to_line(
+            "accel x", env.nao.accelerometer()[0]
+        )
+        acceleration_plot.push_data_to_line(
+            "accel y", env.nao.accelerometer()[1]
+        )
+        acceleration_plot.push_data_to_line(
+            "accel z", env.nao.accelerometer()[2]
+        )
 
         fsr_figure.push_data_to_line("Left FSR", env.nao.left_fsr().sum())
         fsr_figure.push_data_to_line("Right FSR", env.nao.right_fsr().sum())

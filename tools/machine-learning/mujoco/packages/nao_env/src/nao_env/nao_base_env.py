@@ -147,8 +147,8 @@ class NaoBaseEnv(MujocoEnv):
                 positions,
                 gyroscopes,
                 accelerometer,
-                force_sensing_resistors_left,
-                force_sensing_resistors_right,
+                # force_sensing_resistors_left,
+                # force_sensing_resistors_right,
             ]
         )
 
