@@ -9,6 +9,7 @@ from gymnasium.wrappers import RecordVideo
 class SingleEpisodeVideoRecorder(RecordVideo):
     def __init__(self, env: Env, video_folder: str) -> None:
         super().__init__(env, video_folder, episode_trigger=lambda _: True)
+        self.current_step = 0
 
     @override
     def stop_recording(self) -> None:

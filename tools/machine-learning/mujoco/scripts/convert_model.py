@@ -47,14 +47,13 @@ class OnnxableSB3Policy(nn.Module):
         else:
             actions = self.clip_action(actions)
 
-        return actions + self.offset
+        return (actions + self.offset).to(torch.float32)
 
 
 @click.command()
 @click.argument(
     "policy",
     type=click.Path(exists=True),
-    help="The policy to convert to ONNX.",
 )
 @click.argument(
     "environment-type",
@@ -74,7 +73,7 @@ def main(policy: str, environment_type: str) -> None:
 
     offset = {
         "NaoStanding": torch.from_numpy(nao_standing.OFFSET_QPOS),
-        "NaoStandup": torch.zeros(action_size),
+        "NaoStandup": torch.zeros(1, *action_size),
         "NaoWalking": torch.from_numpy(nao_walking.OFFSET_QPOS),
     }[environment_type]
 
@@ -84,12 +83,15 @@ def main(policy: str, environment_type: str) -> None:
     with torch.inference_mode():
         torch.onnx.export(
             network,
-            (torch.randn(observation_size),),
+            (torch.randn(1, *observation_size),),
             f"result/{name}-model.onnx",
             input_names=["input"],
             output_names=["output"],
             opset_version=17,
         )
+        example_input = torch.ones(1, *observation_size)
+        print("Input", example_input)
+        print("Output", network(example_input))
 
     ov_model = ov.convert_model(f"result/{name}-model.onnx")
     ov.save_model(ov_model, f"result/{name}-policy-ov.xml")

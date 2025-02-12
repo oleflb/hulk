@@ -65,6 +65,7 @@ def main(*, throw_tomatoes: bool, load_policy: str | None) -> None:
         observation, reward, _terminated, _truncated, infos = env.step(action)
         if model:
             action, _ = model.predict(observation, deterministic=True)
+        # print(action)
 
         fsr_figure.push_data_to_line("Left FSR", env.nao.left_fsr().sum())
         fsr_figure.push_data_to_line("Right FSR", env.nao.right_fsr().sum())

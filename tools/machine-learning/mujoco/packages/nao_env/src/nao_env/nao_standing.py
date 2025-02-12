@@ -5,13 +5,14 @@ from gymnasium import utils
 from nao_interface.poses import READY_POSE
 from numpy.typing import NDArray
 from rewards import (
+    ActionRatePenalty,
+    ClippedHeadHeightReward,
     ConstantReward,
-    ControlAmplitudePenalty,
-    HeadOverTorsoPenalty,
+    HeadOverFeetPenalty,
     RewardComposer,
     RewardContext,
-    TorqueChangeRatePenalty,
 )
+from rewards.rewards import FootPressureReward, OnlyFeetHaveGroundContactPenalty
 
 from .nao_base_env import NaoBaseEnv
 
@@ -27,21 +28,30 @@ class NaoStanding(NaoBaseEnv, utils.EzPickle):
     ) -> None:
         super().__init__(
             throw_tomatoes=throw_tomatoes,
-            sensor_delay=3,
+            sensor_delay=2,
             **kwargs,
         )
 
         self.current_step = 0
-        self.next_throw_at = 500
-        self.expected_number_of_frames_between_throws = 120
+        self.next_throw_at = 60
+        self.expected_number_of_frames_between_throws = 80
         self.rng = np.random.default_rng()
+        self.termination_penalty = 10.0
 
         self.reward = (
             RewardComposer()
             .add(0.02, ConstantReward())
-            .add(-0.001, TorqueChangeRatePenalty(self.model.nu, self.dt))
-            .add(-0.001, ControlAmplitudePenalty())
-            .add(-0.5, HeadOverTorsoPenalty())
+            # .add(0.0, TorqueChangeRatePenalty(self.model.nu, self.dt))
+            .add(-0.003, ActionRatePenalty(self.action_space_size))
+            # .add(1.0, FootPressureReward())
+            .add(-1.0, HeadOverFeetPenalty())
+            # .add(
+            #     -1.0,
+            #     OnlyFeetHaveGroundContactPenalty(
+            #         "floor", "Nao", ["left_foot", "right_foot"]
+            #     ),
+            # )
+            .add(4.0, ClippedHeadHeightReward(HEAD_SET_HEIGHT))
         )
         utils.EzPickle.__init__(self, **kwargs)
 
@@ -63,7 +73,7 @@ class NaoStanding(NaoBaseEnv, utils.EzPickle):
 
         if self.throw_tomatoes and self._should_throw_tomato():
             target = self.data.site("Robot").xpos
-            time_to_reach = 0.15
+            time_to_reach = self.rng.uniform(0.15, 0.25)
             self.projectile.random_throw(
                 target,
                 time_to_reach=time_to_reach,
@@ -78,7 +88,12 @@ class NaoStanding(NaoBaseEnv, utils.EzPickle):
         distinct_rewards = self.reward.rewards(RewardContext(self.nao, action))
         reward = sum(distinct_rewards.values())
 
+        # head_height = self.nao.data.site("head_center").xpos[2]
+        # terminated = head_height < 0.3
         terminated = False
+        # if terminated:
+        #     reward -= self.termination_penalty
+
         self.current_step += 1
         return (
             self._get_obs(),
@@ -103,7 +118,7 @@ class NaoStanding(NaoBaseEnv, utils.EzPickle):
     @override
     def reset_model(self) -> NDArray[np.floating]:
         self.current_step = 0
-        self.next_throw_at = 500
+        self.next_throw_at = 0
         self.reward.reset()
         self.set_state(
             self.init_qpos,

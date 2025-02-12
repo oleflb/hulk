@@ -5,6 +5,18 @@ description = "Add your description here"
 requires-python = ">=3.12"
 
 dependencies = [
+  # Project dependencies
+  "common_types",
+  "kinematics",
+  "mujoco-interactive-viewer",
+  "nao-env",
+  "nao-interface",
+  "rewards",
+  "robot-dimensions",
+  "throwing",
+  "transforms",
+  "walking-engine",
+  # External dependencies
   "click>=8.1.7",
   "gymnasium[mujoco]>=1.0.0",
   "mediapy>=1.2.2",
@@ -17,17 +29,7 @@ dependencies = [
   "stable-baselines3[extra]==2.4.1",
   "tensorboard>=2.18.0",
   "wandb>=0.19.1",
-  # Project dependencies
-  "common_types",
-  "kinematics",
-  "mujoco-interactive-viewer",
-  "nao-env",
-  "nao-interface",
-  "rewards",
-  "robot-dimensions",
-  "throwing",
-  "transforms",
-  "walking-engine",
+  "sbx-rl>=0.19.0",
 ]
 
 [tool.uv.sources]

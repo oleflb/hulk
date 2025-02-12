@@ -21,6 +21,8 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
+
+# from sbx import PPO
 from stable_baselines3.ppo import PPO
 
 
@@ -51,6 +53,7 @@ def make_env(config: Hyperparameters) -> Callable[..., gym.Env]:
         "NaoStanding": nao_env.NaoStanding,
         "NaoStandup": nao_env.NaoStandup,
         "NaoWalking": nao_env.NaoWalking,
+        "simple": nao_env.SimpleNaoEnv,
     }
 
     def _init(**kwargs: Any) -> gym.Env:
@@ -94,6 +97,7 @@ def setup_algorithm(
     match config.algorithm:
         case "ppo":
             policy_kwargs = None
+            pretrained_ppo = None
             if config.transfer_weights_from is not None:
                 pretrained_ppo = PPO.load(config.transfer_weights_from)
                 policy_kwargs = {"net_arch": pretrained_ppo.policy.net_arch}
@@ -109,7 +113,7 @@ def setup_algorithm(
                 policy_kwargs=policy_kwargs,
                 verbose=1,
             )
-            if config.transfer_weights_from is not None:
+            if pretrained_ppo is not None:
                 ppo.policy.load_state_dict(pretrained_ppo.policy.state_dict())
 
             return ppo
@@ -120,7 +124,7 @@ def setup_algorithm(
 @click.command()
 @click.option(
     "--environment",
-    type=click.Choice(["NaoStanding", "NaoStandup", "NaoWalking"]),
+    type=click.Choice(["NaoStanding", "NaoStandup", "NaoWalking", "simple"]),
     default="NaoStanding",
 )
 @click.option("--algorithm", type=click.Choice(["ppo"]), default="ppo")
@@ -130,7 +134,7 @@ def setup_algorithm(
 @click.option("--nsteps", type=click.INT, default=2048)
 @click.option("--throw-tomatoes", is_flag=True)
 @click.option("--learning-rate", type=click.FLOAT, default=3e-4)
-@click.option("--entropy-coefficient", type=click.FLOAT, default=1e-3)
+@click.option("--entropy-coefficient", type=click.FLOAT, default=2e-3)
 @click.option("--max-grad-norm", type=click.FLOAT, default=0.5)
 @click.option("--num-envs", type=click.INT, default=1)
 @click.option("--time-limit", type=click.INT, default=4000)
@@ -179,6 +183,8 @@ def main(
     train_env = build_train_env(config)
     eval_env = build_eval_env(run, config)
     rl_algorithm = setup_algorithm(run, config, train_env)
+
+    # train_env.set_options
 
     rl_algorithm.learn(
         total_timesteps=config.epochs * config.steps_per_epoch,

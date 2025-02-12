@@ -7,7 +7,7 @@ from numpy.typing import NDArray
 from rewards import (
     ControlAmplitudePenalty,
     ExternalImpactForcesPenalty,
-    HeadHeightReward,
+    ClippedHeadHeightReward,
     RewardComposer,
     TorqueChangeRatePenalty,
 )
@@ -21,7 +21,7 @@ class NaoStandup(NaoBaseEnv, utils.EzPickle):
         super().__init__(throw_tomatoes=throw_tomatoes, **kwargs)
         self.reward = (
             RewardComposer()
-            .add(1.0, HeadHeightReward())
+            .add(1.0, ClippedHeadHeightReward())
             .add(-0.1, ControlAmplitudePenalty())
             .add(-0.5e-6, ExternalImpactForcesPenalty())
             .add(-0.01, TorqueChangeRatePenalty(self.model.nu, self.dt))

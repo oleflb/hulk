@@ -8,6 +8,11 @@ from walking_engine import Side, State
 from .base import BaseReward, RewardContext
 
 
+class NoWalkStateError(Exception):
+    def __init__(self) -> None:
+        super().__init__("walk_state is None")
+
+
 def order_support_swing[T](state: State, left: T, right: T) -> tuple[T, T]:
     if state.support_side == Side.LEFT:
         return left, right
@@ -41,6 +46,9 @@ class SwingFootDestinationReward(BaseReward):
         self.dt = dt
 
     def reward(self, context: RewardContext) -> np.floating:
+        if context.walk_state is None:
+            raise NoWalkStateError()
+
         if (
             self.last_state is None
             or context.walk_state.support_side != self.last_state.support_side
@@ -86,6 +94,9 @@ class ConstantSupportFootPositionPenalty(BaseReward):
         self.last_support_foot_position = np.zeros(3)
 
     def reward(self, context: RewardContext) -> np.floating:
+        if context.walk_state is None:
+            raise NoWalkStateError()
+
         if (
             self.last_state is None
             or context.walk_state.support_side != self.last_state.support_side
@@ -119,6 +130,9 @@ class ConstantSupportFootOrientationPenalty(BaseReward):
         self.last_support_foot_orientation = np.zeros(4)
 
     def reward(self, context: RewardContext) -> np.floating:
+        if context.walk_state is None:
+            raise NoWalkStateError()
+
         if (
             self.last_state is None
             or context.walk_state.support_side != self.last_state.support_side
