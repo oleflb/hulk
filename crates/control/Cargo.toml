@@ -19,6 +19,7 @@ framework = { workspace = true }
 geometry = { workspace = true }
 hardware = { workspace = true }
 hungarian_algorithm = { workspace = true }
+inference = { workspace = true }
 itertools = { workspace = true }
 kinematics = { workspace = true }
 linear_algebra = { workspace = true }

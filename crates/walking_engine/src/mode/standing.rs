@@ -62,7 +62,7 @@ impl Standing {
     pub fn compute_commands(&self, context: &Context) -> MotorCommands<BodyJoints> {
         let feet = Feet::end_from_request(context.parameters, Step::ZERO, Side::Left);
 
-        let zero_step_state = StepState {
+        let mut zero_step_state = StepState {
             plan: StepPlan {
                 step_duration: Duration::from_secs(1),
                 start_feet: feet,
@@ -75,6 +75,8 @@ impl Standing {
             gyro_balancing: Default::default(),
             foot_leveling: Default::default(),
         };
+        zero_step_state.gyro_balancing.tick(context);
+
         zero_step_state.compute_joints(context).apply_stiffness(
             context.parameters.stiffnesses.leg_stiffness_stand,
             context.parameters.stiffnesses.arm_stiffness,

@@ -57,6 +57,7 @@ pub fn collect_hulk_cyclers() -> Result<Cyclers, Error> {
                     "control::game_controller_state_filter",
                     "control::ground_contact_detector",
                     "control::ground_provider",
+                    "control::joint_prediction",
                     "control::kick_selector",
                     "control::kinematics_provider",
                     "control::led_status",

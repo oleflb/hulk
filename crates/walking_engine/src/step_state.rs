@@ -94,6 +94,7 @@ impl StepState {
             right_sole_to_robot * right_foot,
         )
         .balance_using_gyro(&self.gyro_balancing, self.plan.support_side)
+        .balance_using_gyro(&self.gyro_balancing, self.plan.support_side.opposite())
         .level_swing_foot(&self.foot_leveling, self.plan.support_side);
 
         let left_arm = swinging_arm(

@@ -466,12 +466,12 @@
       },
       "low_pass_factor": 0.4,
       "max_delta": {
-        "hip_yaw_pitch": 0.05,
-        "hip_roll": 0.05,
-        "hip_pitch": 0.05,
-        "knee_pitch": 0.05,
-        "ankle_pitch": 0.05,
-        "ankle_roll": 0.05
+        "hip_yaw_pitch": 10.05,
+        "hip_roll": 10.05,
+        "hip_pitch": 10.05,
+        "knee_pitch": 10.05,
+        "ankle_pitch": 10.05,
+        "ankle_roll": 10.05
       }
     },
     "max_level_delta": 10000.0,

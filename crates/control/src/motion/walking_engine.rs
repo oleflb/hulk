@@ -57,6 +57,7 @@ pub struct CycleContext {
     last_actuated_joints: AdditionalOutput<BodyJoints, "walking.last_actuated_joints">,
     robot_to_walk: AdditionalOutput<Isometry3<Robot, Walk>, "walking.robot_to_walk">,
     walking_engine_mode: CyclerState<Mode, "walking_engine_mode">,
+    gyroscope_y: Input<f32, "gyroscope_y">,
 }
 
 #[context]
@@ -78,13 +79,14 @@ impl WalkingEngine {
     }
 
     pub fn cycle(&mut self, mut cycle_context: CycleContext) -> Result<MainOutputs> {
-        self.filtered_gyro.update(
-            cycle_context
-                .sensor_data
-                .inertial_measurement_unit
-                .angular_velocity
-                .inner,
-        );
+        let mut update = cycle_context
+            .sensor_data
+            .inertial_measurement_unit
+            .angular_velocity
+            .inner;
+        update.y = *cycle_context.gyroscope_y;
+
+        self.filtered_gyro.update(update);
 
         let torso_tilt_compensation_factor = cycle_context
             .parameters
