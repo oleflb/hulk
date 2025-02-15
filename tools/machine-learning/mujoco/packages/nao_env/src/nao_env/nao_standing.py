@@ -7,7 +7,6 @@ from numpy.typing import NDArray
 from rewards import (
     ActionRatePenalty,
     ClippedHeadHeightReward,
-    ConstantReward,
     HeadOverFeetPenalty,
     RewardComposer,
     RewardContext,
@@ -40,10 +39,9 @@ class NaoStanding(NaoBaseEnv, utils.EzPickle):
 
         self.reward = (
             RewardComposer()
-            .add(0.02, ConstantReward())
             # .add(0.0, TorqueChangeRatePenalty(self.model.nu, self.dt))
-            .add(-0.003, ActionRatePenalty(self.action_space_size))
-            # .add(1.0, FootPressureReward())
+            .add(-0.01, ActionRatePenalty(self.action_space.shape[0]))
+            .add(0.005, FootPressureReward())
             .add(-1.0, HeadOverFeetPenalty())
             # .add(
             #     -1.0,
@@ -51,7 +49,7 @@ class NaoStanding(NaoBaseEnv, utils.EzPickle):
             #         "floor", "Nao", ["left_foot", "right_foot"]
             #     ),
             # )
-            .add(4.0, ClippedHeadHeightReward(HEAD_SET_HEIGHT))
+            .add(1.0, ClippedHeadHeightReward(HEAD_SET_HEIGHT))
         )
         utils.EzPickle.__init__(self, **kwargs)
 

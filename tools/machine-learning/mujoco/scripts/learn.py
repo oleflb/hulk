@@ -9,7 +9,7 @@ import gymnasium as gym
 import nao_env
 import torch
 import wandb
-from gymnasium.wrappers import TimeLimit
+from gymnasium.wrappers import FrameStackObservation, TimeLimit
 from nao_env.wrappers import (
     SingleEpisodeVideoRecorder,
 )
@@ -46,6 +46,7 @@ class Hyperparameters:
     time_limit: int
     num_envs: int
     transfer_weights_from: str | None
+    n_observation_frames: int
 
 
 def make_env(config: Hyperparameters) -> Callable[..., gym.Env]:
@@ -66,6 +67,7 @@ def make_env(config: Hyperparameters) -> Callable[..., gym.Env]:
         )
 
         env = env_cls(**kwargs)
+        env = FrameStackObservation(env, config.n_observation_frames)
         return TimeLimit(env, max_episode_steps=config.time_limit)
 
     return _init
@@ -140,6 +142,7 @@ def setup_algorithm(
 @click.option("--time-limit", type=click.INT, default=4000)
 @click.option("--wandb-project", type=click.STRING, default=None)
 @click.option("--transfer-weights-from", type=click.STRING, default=None)
+@click.option("--n-observation-frames", type=click.INT, default=1)
 def main(
     *,
     environment: str,
@@ -156,6 +159,7 @@ def main(
     time_limit: int,
     wandb_project: str | None,
     transfer_weights_from: str | None,
+    n_observation_frames: int,
 ) -> None:
     config = Hyperparameters(
         environment=environment,
@@ -171,6 +175,7 @@ def main(
         time_limit=time_limit,
         num_envs=num_envs,
         transfer_weights_from=transfer_weights_from,
+        n_observation_frames=n_observation_frames,
     )
     run = wandb.init(
         project=wandb_project,

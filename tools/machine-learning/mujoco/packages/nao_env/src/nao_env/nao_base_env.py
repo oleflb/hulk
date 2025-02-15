@@ -64,7 +64,7 @@ class NaoBaseEnv(MujocoEnv):
         observation_space = Box(
             low=-np.inf,
             high=np.inf,
-            shape=(31,),
+            shape=(29,),
             dtype=np.float64,
         )
         self.actuator_names = actuator_names

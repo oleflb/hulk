@@ -3,7 +3,7 @@ import time
 import click
 import numpy as np
 from mujoco_interactive_viewer import Viewer
-from nao_env import NaoWalking
+from nao_env import NaoStanding, NaoStandup, NaoWalking
 from stable_baselines3 import PPO
 
 
@@ -17,8 +17,22 @@ from stable_baselines3 import PPO
     default=None,
     help="Load a policy from a file.",
 )
-def main(*, throw_tomatoes: bool, load_policy: str | None) -> None:
-    env = NaoWalking(throw_tomatoes=throw_tomatoes)
+@click.option(
+    "--environment",
+    type=click.Choice(["NaoWalking", "NaoStanding", "NaoStandup"]),
+    default="NaoWalking",
+    help="The environment to run.",
+)
+def main(
+    *, throw_tomatoes: bool, load_policy: str | None, environment: str
+) -> None:
+    env_cls = {
+        "NaoWalking": NaoWalking,
+        "NaoStanding": NaoStanding,
+        "NaoStandup": NaoStandup,
+    }[environment]
+
+    env = env_cls(throw_tomatoes=throw_tomatoes)
     action_space_size = env.action_space.shape[0]
     action = np.zeros(action_space_size)
     _, _, _, _, infos = env.step(action)
