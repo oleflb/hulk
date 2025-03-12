@@ -46,9 +46,9 @@ pub struct DrawnLine {
 }
 
 pub struct SavedMeasurement {
-    camera_position: CameraPosition,
-    camera_matrix: CameraMatrix,
-    drawn_lines: Vec<DrawnLine>,
+    pub camera_position: CameraPosition,
+    pub camera_matrix: CameraMatrix,
+    pub drawn_lines: Vec<DrawnLine>,
 }
 
 enum OptimizationState {
