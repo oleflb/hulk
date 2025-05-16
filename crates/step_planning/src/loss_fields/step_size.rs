@@ -160,10 +160,11 @@ fn walk_volume_gradient(
     let normalized_turn = (step.step.turn * costs.turn).abs();
 
     let normalized_forward_powf_t =
-        normalized_forward.powf(walk_volume_coefficients.translation_exponent);
+        normalized_forward.powf(walk_volume_coefficients.translation_exponent - 2.0);
     let normalized_left_powf_t =
-        normalized_left.powf(walk_volume_coefficients.translation_exponent);
-    let normalized_turn_powf_r = normalized_turn.powf(walk_volume_coefficients.rotation_exponent);
+        normalized_left.powf(walk_volume_coefficients.translation_exponent - 2.0);
+    let normalized_turn_powf_r =
+        normalized_turn.powf(walk_volume_coefficients.rotation_exponent - 2.0);
 
     let translation_norm = (normalized_forward.powf(walk_volume_coefficients.translation_exponent)
         + normalized_left.powf(walk_volume_coefficients.translation_exponent))
@@ -174,35 +175,20 @@ fn walk_volume_gradient(
     );
 
     Step {
-        forward: if step.step.forward == 0.0 {
-            0.0
-        } else {
-            walk_volume_coefficients.rotation_exponent
-                * costs.forward.powi(2)
-                * step.step.forward
-                * translation_norm
-                * normalized_forward_powf_t
-                / normalized_forward.powi(2)
-        },
-        left: if step.step.left == 0.0 {
-            0.0
-        } else {
-            walk_volume_coefficients.rotation_exponent
-                * costs.left.powi(2)
-                * step.step.left
-                * translation_norm
-                * normalized_left_powf_t
-                / normalized_left.powi(2)
-        },
-        turn: if step.step.turn == 0.0 {
-            0.0
-        } else {
-            walk_volume_coefficients.rotation_exponent
-                * costs.turn.powi(2)
-                * step.step.turn
-                * normalized_turn_powf_r
-                / normalized_turn.powi(2)
-        },
+        forward: walk_volume_coefficients.rotation_exponent
+            * costs.forward.powi(2)
+            * step.step.forward
+            * translation_norm
+            * normalized_forward_powf_t,
+        left: walk_volume_coefficients.rotation_exponent
+            * costs.left.powi(2)
+            * step.step.left
+            * translation_norm
+            * normalized_left_powf_t,
+        turn: (walk_volume_coefficients.rotation_exponent
+            * costs.turn.powi(2)
+            * step.step.turn
+            * normalized_turn_powf_r),
     }
 }
 
