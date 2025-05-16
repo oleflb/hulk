@@ -1,8 +1,8 @@
-use color_eyre::{eyre::bail, Result};
-use geometry::line_segment::LineSegment;
-use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt, TerminationReason};
+use color_eyre::Result;
+use geometry::{angle::Angle, arc::Arc, circle::Circle, line_segment::LineSegment};
+use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use linear_algebra::point;
-use nalgebra::{vector, DVector, Dyn, Matrix, Owned, U1};
+use nalgebra::{dvector, vector, DVector, Dyn, Matrix, Owned, U1};
 use num_dual::{Derivative, DualNum, DualNumFloat, DualVec};
 
 use step_planning::{
@@ -69,7 +69,7 @@ impl LeastSquaresProblem<f32, U1, Dyn> for StepPlanningProblem {
             .map(|planned_step| step_planning_loss.loss(planned_step))
             .sum();
 
-        // dbg!(&self.variables, loss);
+        // eprintln!("loss: {loss}\n\t({:.4?})", self.variables.as_slice());
 
         Some(vector![loss])
     }
@@ -103,6 +103,28 @@ impl LeastSquaresProblem<f32, U1, Dyn> for StepPlanningProblem {
             })
             .sum();
 
+        let step_planning_loss = self.step_planning.loss_field();
+
+        let step_plan = StepPlan::from(self.variables.as_slice());
+
+        let loss: f32 = self
+            .step_planning
+            .planned_steps(
+                self.step_planning
+                    .initial_pose
+                    .clone()
+                    .with_support_foot(self.step_planning.initial_support_foot),
+                &step_plan,
+            )
+            .map(|planned_step| step_planning_loss.loss(planned_step))
+            .sum();
+
+        // eprintln!(
+        //     "grad: {loss}\n\t({:.4?})\n\t[{:.4?}]",
+        //     self.variables.as_slice(),
+        //     &gradient.as_slice()
+        // );
+
         Some(gradient.transpose())
     }
 }
@@ -113,7 +135,7 @@ pub fn plan_steps(
     initial_support_foot: Side,
     initial_parameter_guess: DVector<f32>,
 ) -> Result<DVector<f32>> {
-    let problem = StepPlanningProblem {
+    let mut problem = StepPlanningProblem {
         step_planning: StepPlanning {
             path: path.clone(),
             initial_pose: initial_pose.clone(),
@@ -138,31 +160,45 @@ pub fn plan_steps(
         variables: initial_parameter_guess,
     };
 
-    let (result, report) = LevenbergMarquardt::new()
-        .with_patience(5000)
-        .minimize(problem.clone());
+    // let (result, report) = LevenbergMarquardt::new()
+    //     .with_patience(5000)
+    //     .minimize(problem.clone());
+
+    gradient_decent(&mut problem);
 
     // if !matches!(report.termination, TerminationReason::Converged { .. }) {
     //     dbg!(&report);
     // }
 
-    if result.variables.iter().all(|&x| x == 0.0) {
-        dbg!(&report, problem.step_planning);
-    }
+    // if result.variables.iter().all(|&x| x == 0.0) {
+    //     dbg!(&report, problem.step_planning);
+    // }
 
-    if !report.termination.was_successful() {
-        eprintln!("kagge! {report:?}");
-    }
+    // if !report.termination.was_successful() {
+    //     eprintln!("kagge! {report:?}");
+    // }
 
-    Ok(result.variables)
+    Ok(problem.variables)
 }
 
-#[test]
+fn gradient_decent(problem: &mut StepPlanningProblem) {
+    for i in 0..100 {
+        let gradient = problem.jacobian().unwrap().transpose();
+
+        if gradient[0].is_nan() {
+            dbg!(problem, gradient);
+            panic!();
+        }
+        problem.variables -= gradient * 0.0001;
+    }
+}
+
+// #[test]
 fn foo() {
     let path = Path {
         segments: vec![PathSegment::LineSegment(LineSegment(
             point![0.0, 0.0],
-            point![0.49826843, 0.00059887767],
+            point![0.49826843, -0.005],
         ))],
     };
 
@@ -197,12 +233,84 @@ fn foo() {
         variables: DVector::zeros(15),
     };
 
-    let (result, report) = LevenbergMarquardt::new().minimize(problem);
+    let (result, report) = LevenbergMarquardt::new()
+        .with_stepbound(0.01)
+        .minimize(problem);
 
     if result.variables.iter().all(|&x| x == 0.0) {
         dbg!(result, report);
-        panic!();
     }
+    panic!();
+}
+
+#[test]
+fn foo2() {
+    let problem = StepPlanningProblem {
+        step_planning: StepPlanning {
+            path: Path {
+                segments: vec![
+                    PathSegment::LineSegment(LineSegment(
+                        point![0.0, 0.0],
+                        point![0.63413036, -4.4703484e-7,],
+                    )),
+                    PathSegment::Arc(Arc {
+                        circle: Circle {
+                            center: point![0.6341301, -0.35000044,],
+                            radius: 0.35,
+                        },
+                        start: Angle(1.5707957),
+                        end: Angle(1.5694388),
+                        direction: geometry::direction::Direction::Clockwise,
+                    }),
+                    PathSegment::LineSegment(LineSegment(
+                        point![0.6346052, -7.4505806e-7,],
+                        point![0.79499525, -0.00021849573,],
+                    )),
+                ],
+            },
+            initial_pose: Pose {
+                position: point![-0.0, 0.0,],
+                orientation: -0.0,
+            },
+            initial_support_foot: Side::Right,
+            path_progress_smoothness: 1.0,
+            path_progress_reward: 5.0,
+            path_distance_penalty: 50.0,
+            step_size_penalty: 0.5,
+            walk_volume_coefficients: WalkVolumeCoefficients {
+                forward_cost: 22.222221,
+                backward_cost: 25.0,
+                outward_cost: 10.0,
+                inward_cost: 100.0,
+                outward_rotation_cost: 1.0,
+                inward_rotation_cost: 1.0,
+                translation_exponent: 1.5,
+                rotation_exponent: 2.0,
+            },
+        },
+        variables: dvector![
+            0.007884634,
+            -5.5583076e-9,
+            -6.4623485e-27,
+            0.0063005835,
+            -4.4416417e-9,
+            -1.9984014e-19,
+            0.004721283,
+            -3.3283027e-9,
+            8.881784e-20,
+            0.003145544,
+            -2.2174744e-9,
+            -3.330669e-20,
+            0.0015721788,
+            -1.108319e-9,
+            0.0,
+        ],
+    };
+
+    let gradient = problem.jacobian().unwrap().transpose();
+
+    dbg!(&gradient);
+    assert!(gradient.iter().all(|x| !x.is_nan()));
 }
 
 // #[cfg(test)]
