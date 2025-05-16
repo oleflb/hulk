@@ -79,8 +79,6 @@ aliveness = { path = "crates/aliveness" }
 alsa = "0.9.1"
 approx = "0.5.1"
 approx_derive = { path = "crates/approx_derive" }
-argmin = "0.10.0"
-argmin-math = { version = "0.4.0", features = ["nalgebra_latest"] }
 argument_parsers = { path = "crates/argument_parsers" }
 audio = { path = "crates/audio" }
 awaitgroup = "0.7.0"

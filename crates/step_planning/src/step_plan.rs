@@ -32,7 +32,7 @@ impl<'a, T: RealField> StepPlan<'a, T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StepPlanning {
     pub path: Path,
     pub initial_pose: Pose<f32>,

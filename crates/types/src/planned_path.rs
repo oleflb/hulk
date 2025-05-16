@@ -14,7 +14,7 @@ pub enum PathSegment {
     Arc(Arc<Ground>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Path {
     pub segments: Vec<PathSegment>,
 }

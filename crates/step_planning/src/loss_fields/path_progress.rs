@@ -22,7 +22,7 @@ impl LossField for PathProgressField<'_> {
 
         let clamped_progress = smoothmin(progress, self.path.length(), self.smoothness);
 
-        -clamped_progress
+        self.path.length() - clamped_progress
     }
 
     fn grad(&self, point: Self::Parameter) -> Self::Gradient {

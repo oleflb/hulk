@@ -38,8 +38,6 @@ impl LossField for StepPlanningLossField<'_> {
         let progress_loss = self.path_progress_field.loss(pose.position);
         let step_size_loss = self.step_size_field.loss(step.clone());
 
-        dbg!(pose, step, distance_loss, progress_loss, step_size_loss);
-
         distance_loss * self.path_distance_penalty
             + progress_loss * self.path_progress_reward
             + step_size_loss * self.step_size_penalty

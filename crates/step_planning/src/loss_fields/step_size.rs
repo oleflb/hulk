@@ -9,7 +9,7 @@ pub struct StepSizeField {
     pub walk_volume_coefficients: WalkVolumeCoefficients,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WalkVolumeCoefficients {
     pub forward_cost: f32,
     pub backward_cost: f32,
