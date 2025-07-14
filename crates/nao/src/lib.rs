@@ -263,8 +263,7 @@ impl Nao {
     pub async fn retrieve_logs(&self) -> Result<String> {
         let output = self
             .ssh_to_nao()?
-            .arg("tail")
-            .arg("-n+1")
+            .arg("cat")
             .arg("hulk/logs/hulk.{out,err}")
             .output()
             .await
