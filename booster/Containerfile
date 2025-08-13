@@ -1,0 +1,10 @@
+FROM ubuntu:22.04
+
+RUN apt update -y
+RUN apt install -y git lsb-release iproute2
+
+RUN git clone https://github.com/BoosterRobotics/booster_robotics_sdk.git
+
+WORKDIR booster_robotics_sdk
+
+RUN yes | ./install.sh
