@@ -1,10 +1,13 @@
 FROM ubuntu:22.04
 
 RUN apt update -y
-RUN apt install -y git lsb-release iproute2
+RUN apt install -y git lsb-release  cmake ninja-build libgtest-dev libgoogle-glog-dev libboost-dev libeigen3-dev liblua5.3-dev graphviz libgraphviz-dev python3-pip libcurl4-openssl-dev libsdl2-dev joystick libspdlog-dev libqt5widgets5 qtwayland5
 
 RUN git clone https://github.com/BoosterRobotics/booster_robotics_sdk.git
+COPY booster-runner-full-webots-k1-0.0.1.run .
 
 WORKDIR booster_robotics_sdk
 
 RUN yes | ./install.sh
+RUN mkdir build && cd build && cmake .. && make
+WORKDIR /
