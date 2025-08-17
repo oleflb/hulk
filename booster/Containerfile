@@ -1,13 +1,88 @@
-FROM ubuntu:22.04
+FROM ros:humble-perception-jammy
 
-RUN apt update -y
-RUN apt install -y git lsb-release  cmake ninja-build libgtest-dev libgoogle-glog-dev libboost-dev libeigen3-dev liblua5.3-dev graphviz libgraphviz-dev python3-pip libcurl4-openssl-dev libsdl2-dev joystick libspdlog-dev libqt5widgets5 qtwayland5
+# Prevent apt from asking questions
+ENV DEBIAN_FRONTEND=noninteractive
 
+# Update and install dependencies
+RUN apt update -y && \
+    apt install -y \
+    unzip \
+    sudo \
+    gdebi-core \
+    git \
+    lsb-release \
+    cmake \
+    ninja-build \
+    libgtest-dev \
+    libgoogle-glog-dev \
+    libboost-dev \
+    libeigen3-dev \
+    liblua5.3-dev \
+    graphviz \
+    libgraphviz-dev \
+    python3-pip \
+    libcurl4-openssl-dev \
+    libsdl2-dev \
+    joystick \
+    libspdlog-dev \
+    libqt5widgets5 \
+    qtwayland5 \
+    libqt5waylandclient5 \
+    libqt5waylandcompositor5 \
+    libxkbcommon0 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-render-util0 \
+    libxcb-xkb1 \
+    libxcb-xinput0 \
+    xkb-data \
+    libwayland-client0 \
+    libwayland-egl1 \
+    libwayland-cursor0 \
+    libwayland-server0 \
+    libxcb1 \
+    libx11-xcb1
+
+
+# COPY assets-2023b.zip .
+# COPY webots-2023b-amd64.deb .
+
+# RUN gdebi -n webots-2023b-amd64.deb
+# RUN apt clean && rm -rf /var/lib/apt/lists/*
+
+# RUN  mkdir -p /root/.cache/Cyberbotics/Webots/assets \
+#     && unzip /assets-2023b.zip -d /root/.cache/Cyberbotics/Webots/assets/
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone SDK
 RUN git clone https://github.com/BoosterRobotics/booster_robotics_sdk.git
-COPY booster-runner-full-webots-k1-0.0.1.run .
 
-WORKDIR booster_robotics_sdk
+# # Copy binary installer
+# COPY booster-runner-full-webots-k1-0.0.1.run .
 
+# Set working directory to the SDK
+WORKDIR /booster_robotics_sdk
+
+# Install SDK
 RUN yes | ./install.sh
-RUN mkdir build && cd build && cmake .. && make
+
+# Build SDK
+RUN mkdir build && cd build && cmake .. && make -j$(nproc)
+
+# Return to root
 WORKDIR /
+
+RUN git clone https://gitee.com/booster_robotics/booster_robotics_sdk_ros2
+WORKDIR /booster_robotics_sdk_ros2/booster_ros2_interface
+# RUN colcon build
+
+# # Default to Wayland, allow override
+# ENV QT_QPA_PLATFORM=wayland \
+#     XDG_RUNTIME_DIR=/run/user/1000 \
+#     WAYLAND_DISPLAY=wayland-0
+
+# # Ensure runtime dir exists for mapped UID (works with --userns=keep-id)
+# RUN mkdir -p /run/user/1000 && chmod 700 /run/user/1000
