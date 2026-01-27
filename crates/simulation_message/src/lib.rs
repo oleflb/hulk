@@ -30,6 +30,29 @@ pub enum ServerMessageKind {
     CameraInfo(Box<CameraInfo>),
     SceneUpdate(SceneUpdate),
     SceneDescription(SceneDescription),
+    EntityUpdate(MujocoEntity, EntityData),
+}
+
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(frozen, get_all))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MujocoEntity {
+    name: String,
+    kind: MujocoEntityKind,
+}
+
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(frozen, get_all))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MujocoEntityKind {
+    Site,
+    Body,
+    Geom,
+}
+
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(frozen))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityData {
+    position: [f32; 3],
+    quat: [f32; 4],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,6 +72,7 @@ pub enum TaskName {
     Invalid,
     RequestSceneState,
     RequestSceneDescription,
+    RequestEntityState,
 }
 
 #[cfg_attr(feature = "pyo3", pyo3::pyclass(frozen))]
@@ -495,7 +519,7 @@ impl ConnectionInfo {
             .collect()
     }
 
-    pub fn due_tasks(&self, range: Range<SystemTime>) -> Vec<PeriodicalTask> {
+    pub fn due_tasks(&self, range: Range<SystemTime>) -> Vec<&PeriodicalTask> {
         self.schedule
             .iter()
             .filter_map(|task| match task {
@@ -507,7 +531,6 @@ impl ConnectionInfo {
                 TaskSchedule::OnStep(task_name) => Some(task_name),
                 _ => None,
             })
-            .copied()
             .collect()
     }
 }
@@ -518,7 +541,7 @@ pub enum OnceTask {
     Reset,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PeriodicalTask {
     ApplyLowCommand,
     RequestLowState,
@@ -526,6 +549,7 @@ pub enum PeriodicalTask {
     RequestCameraInfo,
     RequestSceneState,
     RequestSceneDescription,
+    RequestEntity(MujocoEntity),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

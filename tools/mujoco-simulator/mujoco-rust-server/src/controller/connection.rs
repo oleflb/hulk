@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use tokio::sync::{mpsc, Mutex};
 
 use booster::LowCommand;
-use simulation_message::{ConnectionInfo, OnceTask, PeriodicalTask};
+use simulation_message::{ConnectionInfo, MujocoEntity, OnceTask, PeriodicalTask};
 
 use super::{messages::SimulationData, SimulationTask};
 
@@ -24,7 +24,7 @@ impl Connection {
         self.connection_info.initial_tasks()
     }
 
-    pub(super) fn due_tasks(&self, range: Range<SystemTime>) -> Vec<PeriodicalTask> {
+    pub(super) fn due_tasks(&self, range: Range<SystemTime>) -> Vec<&PeriodicalTask> {
         self.connection_info.due_tasks(range)
     }
 
@@ -46,6 +46,20 @@ impl Connection {
     ) -> Result<()> {
         simulation_sender
             .send(SimulationTask::RequestImage {
+                sender: self.websocket_sender.clone(),
+            })
+            .await
+            .wrap_err("channel closed")
+    }
+
+    pub(super) async fn request_entity(
+        &self,
+        entity: MujocoEntity,
+        simulation_sender: &mpsc::Sender<SimulationTask>,
+    ) -> Result<()> {
+        simulation_sender
+            .send(SimulationTask::RequestEntityState {
+                entity,
                 sender: self.websocket_sender.clone(),
             })
             .await

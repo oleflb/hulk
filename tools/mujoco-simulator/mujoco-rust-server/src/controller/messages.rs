@@ -8,7 +8,9 @@ use booster::{LowCommand, LowState};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, Bound, Py, PyAny, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use ros2::sensor_msgs::{camera_info::CameraInfo, image::Image};
-use simulation_message::{ConnectionInfo, SceneDescription, SceneUpdate, TaskName};
+use simulation_message::{
+    ConnectionInfo, EntityData, MujocoEntity, SceneDescription, SceneUpdate, TaskName,
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -52,13 +54,17 @@ pub enum SimulationTask {
     ApplyLowCommand {
         receiver: oneshot::Receiver<LowCommand>,
     },
-    Invalid,
     RequestSceneDescription {
         sender: mpsc::Sender<SimulationData>,
     },
     RequestSceneState {
         sender: mpsc::Sender<SimulationData>,
     },
+    RequestEntityState {
+        entity: MujocoEntity,
+        sender: mpsc::Sender<SimulationData>,
+    },
+    Invalid,
 }
 
 pub enum SimulationData {
@@ -81,6 +87,11 @@ pub enum SimulationData {
     CameraInfo {
         time: SystemTime,
         data: Box<CameraInfo>,
+    },
+    EntityData {
+        time: SystemTime,
+        entity: MujocoEntity,
+        data: EntityData,
     },
 }
 
@@ -108,6 +119,7 @@ impl PySimulationTask {
             SimulationTask::RequestSceneState { .. } => TaskName::RequestSceneState,
             SimulationTask::RequestImage { .. } => TaskName::RequestImage,
             SimulationTask::RequestCameraInfo { .. } => TaskName::RequestCameraInfo,
+            SimulationTask::RequestEntityState { .. } => TaskName::RequestEntityState,
         }
     }
 
@@ -188,6 +200,16 @@ impl PySimulationTask {
                 future_into_py(py, async move {
                     // Channel may be closed if websocket disconnects
                     let _ = sender.send(SimulationData::SceneState { time, data }).await;
+                    Ok(())
+                })
+            }
+            SimulationTask::RequestEntityState { entity, sender } => {
+                let data = response.extract(py)?;
+                future_into_py(py, async move {
+                    // Channel may be closed if websocket disconnects
+                    let _ = sender
+                        .send(SimulationData::EntityData { time, entity, data })
+                        .await;
                     Ok(())
                 })
             }

@@ -15,6 +15,7 @@ class PySimulationTask:
         response: booster_types.LowState
         | ros2_types.Image
         | ros2_types.CameraInfo
+        | EntityData
         | bytes
         | str
         | None,
@@ -29,8 +30,22 @@ class TaskName(Enum):
     RequestSceneState = auto()
     RequestSceneDescription = auto()
     StepSimulation = auto()
+    RequestEntityState = auto()
     Reset = auto()
     Invalid = auto()
+
+class EntityData:
+    pos: tuple[float, float, float]
+    quat: tuple[float, float, float, float]
+
+class MujocoEntity:
+    name: str
+    kind: MujocoEntityKind
+
+class MujocoEntityKind(Enum):
+    Site = auto()
+    Geom = auto()
+    Body = auto()
 
 class Body:
     id: int

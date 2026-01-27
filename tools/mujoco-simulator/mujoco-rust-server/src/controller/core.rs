@@ -179,6 +179,9 @@ impl Controller {
                         PeriodicalTask::RequestSceneDescription => {
                             connection.request_scene_description(&sender).await
                         }
+                        PeriodicalTask::RequestEntity(entity) => {
+                            connection.request_entity(entity.clone(), &sender).await
+                        }
                     };
                     log_result_info(result);
                 }

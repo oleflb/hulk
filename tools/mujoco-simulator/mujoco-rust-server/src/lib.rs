@@ -111,8 +111,8 @@ mod python_module {
 
     #[pymodule_export]
     use simulation_message::{
-        Body, BodyUpdate, Geom, Light, Material, PbrMaterial, SceneDescription, SceneMesh,
-        SceneUpdate, TaskName, Texture,
+        Body, BodyUpdate, EntityData, Geom, Light, Material, MujocoEntity, MujocoEntityKind,
+        PbrMaterial, SceneDescription, SceneMesh, SceneUpdate, TaskName, Texture,
     };
 
     #[pymodule_export(name = "booster_types")]

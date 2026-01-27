@@ -106,6 +106,10 @@ async fn handle_send_message(
             time,
             payload: ServerMessageKind::CameraInfo(data),
         }),
+        SimulationData::EntityData { time, entity, data } => serialize(&SimulatorMessage {
+            time,
+            payload: ServerMessageKind::EntityUpdate(entity, data),
+        }),
     }?;
     websocket
         .send(message)
