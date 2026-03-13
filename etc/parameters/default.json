@@ -453,7 +453,7 @@
     },
     "maximum_lookaround_duration": {
       "nanos": 0,
-      "secs": 50
+      "secs": 5
     },
     "look_action": {
       "angle_threshold": 0.95,
@@ -593,7 +593,14 @@
     "minimum_yaw": -0.785,
     "injected_head_joints": null
   },
-  "recorded_primary_states": ["Initial", "Ready", "Set", "Playing", "Stop", "Penalized"],
+  "recorded_primary_states": [
+    "Initial",
+    "Ready",
+    "Set",
+    "Playing",
+    "Stop",
+    "Penalized"
+  ],
   "safe_mode_handler": {
     "joint_position_threshold": 0.1,
     "joint_velocity_threshold": 0.1,
@@ -926,7 +933,7 @@
       "secs": 2
     },
     "quick_search_timeout": {
-      "nanos": 300000000,
+      "nanos": 600000000,
       "secs": 0
     },
     "middle_positions": {
