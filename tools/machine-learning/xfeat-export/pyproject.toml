@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 export-xfeat-onnx = "xfeat_export.export_xfeat_onnx:main"
 export-lighterglue-onnx = "xfeat_export.export_lighterglue_onnx:main"
+export-xfeat-lighterglue-onnx = "xfeat_export.export_xfeat_lighterglue_onnx:main"
 
 [tool.uv.sources]
 accelerated-features = { git = "https://github.com/oleflb/accelerated_features.git" }
