@@ -117,6 +117,7 @@ members = [
   "tools/annotato",
   "tools/depp",
   "tools/fanta",
+  "tools/intrinsic-calibration",
   "tools/mujoco-simulator/mujoco-rust-server",
   "tools/parameter_tester",
   "tools/pepsi",

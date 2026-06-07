@@ -30,7 +30,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let right_image_pub = node
-        .publisher::<Image>("inputs/right_image")?
+        .publisher::<TimeWrapper<Image>>("inputs/right_image")?
         .build()
         .await?;
     let camera_info_pub = node
@@ -72,9 +72,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 )
                 .await?;
             }
-            left_image = right_frame_receiver.recv() => {
+            right_image = right_frame_receiver.recv() => {
                 let now = node.clock().now();
-                let received = ReceivedImage::new(now, left_image);
+                let received = ReceivedImage::new(now, right_image);
                 handle_right_image(
                     &right_image_pub,
                     &stereo_image_pair_pub,
@@ -135,12 +135,17 @@ async fn handle_left_image(
 }
 
 async fn handle_right_image(
-    right_image_pub: &Publisher<Image>,
+    right_image_pub: &Publisher<TimeWrapper<Image>>,
     stereo_image_pair_pub: &Publisher<TimeWrapper<StereoImagePair>>,
     stereo_image_pairer: &mut StereoImagePairer,
     received_image: ReceivedImage,
 ) -> Result<()> {
-    right_image_pub.publish(&received_image.image).await?;
+    right_image_pub
+        .publish(&TimeWrapper {
+            time: received_image.image_time,
+            inner: received_image.image.clone(),
+        })
+        .await?;
 
     maybe_publish_stereo_image_pair(
         stereo_image_pair_pub,
