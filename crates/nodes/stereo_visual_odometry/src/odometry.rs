@@ -3,7 +3,7 @@ use kornia_algebra::{Vec2F32, Vec3AF32};
 use nalgebra as na;
 
 use crate::{
-    feature_extractor::{FrameFeatures, KEYPOINTS, Matches},
+    feature_extractor::{CurrentLeft, FrameFeatures, KEYPOINTS, Matches, PreviousLeft},
     triangulator::{StereoPoint, StereoTriangulator},
 };
 
@@ -60,8 +60,8 @@ fn fill_points_by_left_index(
 
 pub fn estimate_previous_to_current(
     previous: &PreviousFrame,
-    current_left: &FrameFeatures<'_>,
-    temporal_matches: &Matches<'_>,
+    current_left: &FrameFeatures<'_, CurrentLeft>,
+    temporal_matches: &Matches<'_, PreviousLeft, CurrentLeft>,
     triangulator: &StereoTriangulator,
     scratch: &mut OdometryScratch,
 ) -> Option<na::Isometry3<f32>> {

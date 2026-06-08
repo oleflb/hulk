@@ -8,14 +8,15 @@ homepage.workspace = true
 [dependencies]
 color-eyre = { workspace = true }
 nalgebra = { workspace = true }
+projection = { workspace = true }
 ros-z = { workspace = true }
 ros2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 types = { workspace = true }
 ort = { workspace = true, features = ["cuda", "tensorrt"] }
 tracing = { workspace = true }
-kornia-3d = { git = "https://github.com/oleflb/kornia-rs", rev = "7659356f10fbafcf75bd82bd7f41fe786b4ec34e" }
-kornia-algebra = { git = "https://github.com/oleflb/kornia-rs", rev = "7659356f10fbafcf75bd82bd7f41fe786b4ec34e" }
+kornia-3d = { workspace = true }
+kornia-algebra = { workspace = true }
 
 [features]
 ort-dynamic = ["ort/load-dynamic"]

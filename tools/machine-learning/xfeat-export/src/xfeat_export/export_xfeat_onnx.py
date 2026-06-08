@@ -77,7 +77,7 @@ class XFeatNv12TopKWrapper(nn.Module):
         image_data = raw_bytes_input.to(torch.float32)
         batch_size, half_height, half_width, _ = image_data.shape
         height, width = half_height * 2, half_width * 2
-        flat = image_data.reshape(batch_size, -1)
+        flat = image_data.flatten(start_dim=1)
         luminance = flat[:, : width * height].reshape(batch_size, height, width, 1)
         chroma_subsampled = flat[:, width * height :].reshape(batch_size, half_height, half_width, 2)
         chroma = chroma_subsampled.repeat_interleave(2, dim=1).repeat_interleave(2, dim=2)
@@ -94,40 +94,67 @@ class XFeatNv12TopKWrapper(nn.Module):
     def _score_map(self, keypoint_heatmap: Tensor, reliability: Tensor) -> Tensor:
         local_max = F.max_pool2d(keypoint_heatmap, kernel_size=5, stride=1, padding=2)
         nms_mask = (keypoint_heatmap == local_max) & (keypoint_heatmap > self.detection_threshold)
-        keypoint_scores = self._sample_map(keypoint_heatmap, keypoint_heatmap, mode="nearest")
-        reliability = self._sample_map(reliability, keypoint_heatmap, mode="bilinear")
+        keypoint_scores = keypoint_heatmap
+        reliability = F.interpolate(
+            reliability,
+            scale_factor=8.0,
+            mode="bilinear",
+            align_corners=False,
+        )
         scores = keypoint_scores * reliability
         return torch.where(nms_mask, scores, torch.zeros_like(scores))
 
-    @staticmethod
-    def _sample_map(source: Tensor, target_shape: Tensor, *, mode: str) -> Tensor:
-        shape = onnx_ops.shape_as_tensor(target_shape)
-        height = shape[-2]
-        width = shape[-1]
-        y = torch.arange(height, device=target_shape.device, dtype=target_shape.dtype)
-        x = torch.arange(width, device=target_shape.device, dtype=target_shape.dtype)
-        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
-        normalizer = torch.stack([width, height]).to(dtype=target_shape.dtype) - 1.0
-        grid = (2.0 * torch.stack([grid_x, grid_y], dim=-1) / normalizer) - 1.0
-        grid = grid.unsqueeze(0).expand(source.shape[0], -1, -1, -1)
-        return F.grid_sample(source, grid, mode=mode, align_corners=False)
-
     def _topk_keypoints(self, score_map: Tensor) -> tuple[Tensor, Tensor]:
-        batch_size, _, _, width = score_map.shape
-        topk_scores, indices = torch.topk(score_map.reshape(batch_size, -1), k=self.keypoint_count, dim=-1)
+        _, _, _, width = score_map.shape
+        topk_scores, indices = torch.topk(score_map.flatten(start_dim=1), k=self.keypoint_count, dim=-1)
         y = torch.div(indices, width, rounding_mode="floor")
         x = indices - y * width
         return torch.stack([x, y], dim=-1).to(dtype=score_map.dtype), topk_scores
 
     @staticmethod
     def _sample_descriptors(descriptors: Tensor, keypoints: Tensor, score_map: Tensor) -> Tensor:
-        shape = onnx_ops.shape_as_tensor(score_map)
-        height = shape[-2].to(dtype=keypoints.dtype)
-        width = shape[-1].to(dtype=keypoints.dtype)
-        normalizer = torch.stack([width - 1.0, height - 1.0]).view(1, 1, 2)
-        grid = ((2.0 * keypoints) / normalizer - 1.0).unsqueeze(-2)
-        sampled = F.grid_sample(descriptors, grid, mode="bicubic", align_corners=False)
-        return sampled.permute(0, 2, 3, 1).squeeze(-2)
+        _, descriptor_dimension, descriptor_height, descriptor_width = descriptors.shape
+        _, _, image_height, image_width = score_map.shape
+
+        scale = keypoints.new_tensor(
+            [
+                (descriptor_width - 1.0) / (image_width - 1.0),
+                (descriptor_height - 1.0) / (image_height - 1.0),
+            ]
+        )
+        descriptor_points = keypoints * scale
+        x = descriptor_points[..., 0]
+        y = descriptor_points[..., 1]
+        x0_unclamped = torch.floor(x)
+        y0_unclamped = torch.floor(y)
+        x_weight = x - x0_unclamped
+        y_weight = y - y0_unclamped
+
+        x0 = x0_unclamped.to(dtype=torch.int64).clamp(0, descriptor_width - 1)
+        y0 = y0_unclamped.to(dtype=torch.int64).clamp(0, descriptor_height - 1)
+        x1 = (x0 + 1).clamp(0, descriptor_width - 1)
+        y1 = (y0 + 1).clamp(0, descriptor_height - 1)
+
+        descriptors = descriptors.flatten(2).transpose(1, 2)
+
+        def gather(x_index: Tensor, y_index: Tensor) -> Tensor:
+            index = y_index * descriptor_width + x_index
+            index = index.unsqueeze(-1).repeat(1, 1, descriptor_dimension)
+            return torch.gather(descriptors, 1, index)
+
+        top_left = gather(x0, y0)
+        top_right = gather(x1, y0)
+        bottom_left = gather(x0, y1)
+        bottom_right = gather(x1, y1)
+        x_weight = x_weight.unsqueeze(-1)
+        y_weight = y_weight.unsqueeze(-1)
+
+        return (
+            top_left * (1.0 - x_weight) * (1.0 - y_weight)
+            + top_right * x_weight * (1.0 - y_weight)
+            + bottom_left * (1.0 - x_weight) * y_weight
+            + bottom_right * x_weight * y_weight
+        )
 
     @staticmethod
     def _normalize_keypoints(keypoints: Tensor, score_map: Tensor) -> Tensor:

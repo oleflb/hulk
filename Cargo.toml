@@ -241,6 +241,8 @@ json5 = "0.4.1"
 kick = { path = "crates/nodes/kick" }
 kinematics = { path = "crates/kinematics" }
 kinematics_provider = { path = "crates/nodes/kinematics_provider" }
+kornia-3d = { git = "https://github.com/oleflb/kornia-rs", rev = "7659356f10fbafcf75bd82bd7f41fe786b4ec34e" }
+kornia-algebra = { git = "https://github.com/oleflb/kornia-rs", rev = "7659356f10fbafcf75bd82bd7f41fe786b4ec34e" }
 lazy_static = "1.5.0"
 led_handler = { path = "crates/nodes/led_handler" }
 levenberg-marquardt = "0.15.0"

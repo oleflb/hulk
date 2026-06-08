@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{marker::PhantomData, path::Path};
 
 use color_eyre::{
     Result,
@@ -8,30 +8,52 @@ use color_eyre::{
 use ort::{
     execution_providers::TensorRTExecutionProvider,
     inputs,
-    session::{Session, SessionOutputs, builder::GraphOptimizationLevel},
+    session::{
+        HasSelectedOutputs, RunOptions, Session, SessionOutputs, builder::GraphOptimizationLevel,
+        run_options::OutputSelector,
+    },
     value::TensorRef,
 };
 use ros2::sensor_msgs::image::Image;
 use types::stereo_image_pair::StereoImagePair;
 
 pub const KEYPOINTS: usize = 512;
+const DESCRIPTOR_DIMENSION: usize = 64;
 
 pub struct FeatureExtractor {
     session: Session,
+    run_options: RunOptions<HasSelectedOutputs>,
 }
 
 pub struct FeatureOutput<'a> {
     outputs: SessionOutputs<'a>,
 }
 
-pub struct FrameFeatures<'a> {
-    keypoints: &'a [f32],
-    valid: &'a [bool],
+pub struct PreviousFeatureState {
+    keypoints: Vec<f32>,
+    descriptors: Vec<f32>,
+    valid: Vec<bool>,
 }
 
-pub struct Matches<'a> {
+pub struct PreviousLeft;
+pub struct CurrentLeft;
+pub struct CurrentRight;
+
+pub struct FrameFeatures<'a, Frame> {
+    keypoints: &'a [f32],
+    valid: &'a [bool],
+    _frame: PhantomData<Frame>,
+}
+
+pub struct FrameKeypoints<'a, Frame> {
+    keypoints: &'a [f32],
+    _frame: PhantomData<Frame>,
+}
+
+pub struct Matches<'a, From, To> {
     matches: &'a [i32],
     scores: &'a [f32],
+    _frames: PhantomData<(From, To)>,
 }
 
 impl FeatureExtractor {
@@ -50,57 +72,146 @@ impl FeatureExtractor {
             .with_intra_threads(2)?
             .commit_from_file(path)?;
 
-        Ok(Self { session })
+        let run_options = RunOptions::new()?.with_outputs(
+            OutputSelector::no_default()
+                .with("current_left_keypoints")
+                .with("current_left_descriptors")
+                .with("current_left_valid")
+                .with("current_right_keypoints")
+                .with("stereo_matches")
+                .with("stereo_scores")
+                .with("temporal_matches")
+                .with("temporal_scores"),
+        );
+
+        Ok(Self {
+            session,
+            run_options,
+        })
     }
 
     pub fn extract<'a>(
         &'a mut self,
-        previous: &StereoImagePair,
         current: &StereoImagePair,
+        previous: &PreviousFeatureState,
     ) -> Result<FeatureOutput<'a>> {
-        check_stereo_pair_support(previous)?;
         check_stereo_pair_support(current)?;
-        ensure_same_shape(
-            &previous.left,
-            &current.left,
-            "previous left",
-            "current left",
-        )?;
 
-        let previous_left = image_tensor(&previous.left)?;
-        let previous_right = image_tensor(&previous.right)?;
         let current_left = image_tensor(&current.left)?;
         let current_right = image_tensor(&current.right)?;
+        let previous_left_keypoints = previous.keypoints_tensor()?;
+        let previous_left_descriptors = previous.descriptors_tensor()?;
+        let previous_left_valid = previous.valid_tensor()?;
 
-        let outputs = self.session.run(inputs![
-            "previous_left" => previous_left,
-            "previous_right" => previous_right,
-            "current_left" => current_left,
-            "current_right" => current_right,
-        ])?;
+        let outputs = self.session.run_with_options(
+            inputs![
+                "current_left" => current_left,
+                "current_right" => current_right,
+                "previous_left_keypoints" => previous_left_keypoints,
+                "previous_left_descriptors" => previous_left_descriptors,
+                "previous_left_valid" => previous_left_valid,
+            ],
+            &self.run_options,
+        )?;
 
         Ok(FeatureOutput { outputs })
     }
 }
 
+impl PreviousFeatureState {
+    pub fn new() -> Self {
+        Self {
+            keypoints: vec![0.0; KEYPOINTS * 2],
+            descriptors: vec![0.0; KEYPOINTS * DESCRIPTOR_DIMENSION],
+            valid: vec![false; KEYPOINTS],
+        }
+    }
+
+    fn replace(&mut self, keypoints: &[f32], descriptors: &[f32], valid: &[bool]) {
+        self.keypoints.copy_from_slice(keypoints);
+        self.descriptors.copy_from_slice(descriptors);
+        self.valid.copy_from_slice(valid);
+    }
+
+    fn keypoints_tensor(&self) -> Result<TensorRef<'_, f32>> {
+        TensorRef::from_array_view(([KEYPOINTS, 2], self.keypoints.as_slice())).map_err(Into::into)
+    }
+
+    fn descriptors_tensor(&self) -> Result<TensorRef<'_, f32>> {
+        TensorRef::from_array_view((
+            [KEYPOINTS, DESCRIPTOR_DIMENSION],
+            self.descriptors.as_slice(),
+        ))
+        .map_err(Into::into)
+    }
+
+    fn valid_tensor(&self) -> Result<TensorRef<'_, bool>> {
+        TensorRef::from_array_view(([KEYPOINTS], self.valid.as_slice())).map_err(Into::into)
+    }
+}
+
 impl<'a> FeatureOutput<'a> {
-    pub fn current_left(&self) -> Result<FrameFeatures<'_>> {
+    pub fn current_left(&self) -> Result<FrameFeatures<'_, CurrentLeft>> {
         self.frame("current_left_keypoints", "current_left_valid")
     }
 
-    pub fn current_right(&self) -> Result<FrameFeatures<'_>> {
-        self.frame("current_right_keypoints", "current_right_valid")
+    pub fn current_right(&self) -> Result<FrameKeypoints<'_, CurrentRight>> {
+        self.keypoints("current_right_keypoints")
     }
 
-    pub fn stereo_matches(&self) -> Result<Matches<'_>> {
+    pub fn stereo_matches(&self) -> Result<Matches<'_, CurrentLeft, CurrentRight>> {
         self.matches("stereo_matches", "stereo_scores")
     }
 
-    pub fn temporal_matches(&self) -> Result<Matches<'_>> {
+    pub fn temporal_matches(&self) -> Result<Matches<'_, PreviousLeft, CurrentLeft>> {
         self.matches("temporal_matches", "temporal_scores")
     }
 
-    fn frame(&self, keypoints_name: &str, valid_name: &str) -> Result<FrameFeatures<'_>> {
+    pub fn copy_current_left_to(&self, state: &mut PreviousFeatureState) -> Result<()> {
+        let keypoints = self.tensor_f32("current_left_keypoints")?;
+        let descriptors = self.tensor_f32("current_left_descriptors")?;
+        let valid = self.tensor_bool("current_left_valid")?;
+
+        ensure!(
+            keypoints.len() == KEYPOINTS * 2,
+            "unexpected current_left_keypoints length: {}",
+            keypoints.len()
+        );
+        ensure!(
+            descriptors.len() == KEYPOINTS * DESCRIPTOR_DIMENSION,
+            "unexpected current_left_descriptors length: {}",
+            descriptors.len()
+        );
+        ensure!(
+            valid.len() == KEYPOINTS,
+            "unexpected current_left_valid length: {}",
+            valid.len()
+        );
+
+        state.replace(keypoints, descriptors, valid);
+        Ok(())
+    }
+
+    fn keypoints<Frame>(&self, keypoints_name: &str) -> Result<FrameKeypoints<'_, Frame>> {
+        let keypoints = self.tensor_f32(keypoints_name)?;
+
+        ensure!(
+            keypoints.len() == KEYPOINTS * 2,
+            "unexpected {keypoints_name} length: {}",
+            keypoints.len()
+        );
+
+        Ok(FrameKeypoints {
+            keypoints,
+            _frame: PhantomData,
+        })
+    }
+
+    fn frame<Frame>(
+        &self,
+        keypoints_name: &str,
+        valid_name: &str,
+    ) -> Result<FrameFeatures<'_, Frame>> {
         let keypoints = self.tensor_f32(keypoints_name)?;
         let valid = self.tensor_bool(valid_name)?;
 
@@ -115,10 +226,18 @@ impl<'a> FeatureOutput<'a> {
             valid.len()
         );
 
-        Ok(FrameFeatures { keypoints, valid })
+        Ok(FrameFeatures {
+            keypoints,
+            valid,
+            _frame: PhantomData,
+        })
     }
 
-    fn matches(&self, matches_name: &str, scores_name: &str) -> Result<Matches<'_>> {
+    fn matches<From, To>(
+        &self,
+        matches_name: &str,
+        scores_name: &str,
+    ) -> Result<Matches<'_, From, To>> {
         let matches = self.tensor_i32(matches_name)?;
         let scores = self.tensor_f32(scores_name)?;
 
@@ -133,7 +252,11 @@ impl<'a> FeatureOutput<'a> {
             scores.len()
         );
 
-        Ok(Matches { matches, scores })
+        Ok(Matches {
+            matches,
+            scores,
+            _frames: PhantomData,
+        })
     }
 
     fn tensor_f32(&self, name: &str) -> Result<&[f32]> {
@@ -164,13 +287,9 @@ impl<'a> FeatureOutput<'a> {
     }
 }
 
-impl FrameFeatures<'_> {
+impl<Frame> FrameFeatures<'_, Frame> {
     pub fn keypoint(&self, index: usize) -> Option<[f32; 2]> {
-        let offset = index.checked_mul(2)?;
-        Some([
-            *self.keypoints.get(offset)?,
-            *self.keypoints.get(offset + 1)?,
-        ])
+        keypoint(self.keypoints, index)
     }
 
     pub fn is_valid(&self, index: usize) -> bool {
@@ -178,7 +297,18 @@ impl FrameFeatures<'_> {
     }
 }
 
-impl Matches<'_> {
+impl<Frame> FrameKeypoints<'_, Frame> {
+    pub fn keypoint(&self, index: usize) -> Option<[f32; 2]> {
+        keypoint(self.keypoints, index)
+    }
+}
+
+fn keypoint(keypoints: &[f32], index: usize) -> Option<[f32; 2]> {
+    let offset = index.checked_mul(2)?;
+    Some([*keypoints.get(offset)?, *keypoints.get(offset + 1)?])
+}
+
+impl<From, To> Matches<'_, From, To> {
     pub fn left_to_right(&self) -> impl Iterator<Item = (usize, usize, f32)> + '_ {
         self.matches
             .iter()

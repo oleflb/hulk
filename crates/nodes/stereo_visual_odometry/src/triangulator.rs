@@ -3,9 +3,10 @@ use color_eyre::{
     eyre::{bail, ensure},
 };
 use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
+use projection::intrinsic::Intrinsic;
 use ros2::sensor_msgs::camera_info::CameraInfo;
 
-use crate::feature_extractor::{FrameFeatures, Matches};
+use crate::feature_extractor::{CurrentLeft, CurrentRight, FrameFeatures, FrameKeypoints, Matches};
 
 const CAMERA_EPSILON: f64 = 1e-9;
 const MAX_VERTICAL_DISPARITY_PX: f32 = 3.0;
@@ -35,10 +36,11 @@ impl StereoTriangulator {
         let baseline = projection_x(left) - projection_x(right);
         ensure!(baseline.abs() > CAMERA_EPSILON, "stereo baseline is zero");
 
-        let fx = left.p[0] as f32;
-        let fy = left.p[5] as f32;
-        let cx = left.p[2] as f32;
-        let cy = left.p[6] as f32;
+        let intrinsics = Intrinsic::from(left);
+        let fx = intrinsics.focals.x;
+        let fy = intrinsics.focals.y;
+        let cx = intrinsics.optical_center.x();
+        let cy = intrinsics.optical_center.y();
         let baseline = baseline.abs() as f32;
         ensure!(
             fx.is_finite()
@@ -67,9 +69,9 @@ impl StereoTriangulator {
 
     pub fn triangulate_into(
         &self,
-        left: &FrameFeatures<'_>,
-        right: &FrameFeatures<'_>,
-        matches: &Matches,
+        left: &FrameFeatures<'_, CurrentLeft>,
+        right: &FrameKeypoints<'_, CurrentRight>,
+        matches: &Matches<'_, CurrentLeft, CurrentRight>,
         output: &mut Vec<StereoPoint>,
     ) {
         output.clear();
@@ -81,7 +83,7 @@ impl StereoTriangulator {
             let Some(right_keypoint) = right.keypoint(right_index) else {
                 continue;
             };
-            if !left.is_valid(left_index) || !right.is_valid(right_index) {
+            if !left.is_valid(left_index) {
                 continue;
             }
 
