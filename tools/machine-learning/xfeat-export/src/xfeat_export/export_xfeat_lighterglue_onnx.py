@@ -221,8 +221,8 @@ def run_validation_inference(
     default=None,
     help="Path to the XFeat LighterGlue .pt weights. Defaults to the accelerated-features package weights.",
 )
-@click.option("--height", default=1088, show_default=True, help="Full-resolution dummy image height.")
-@click.option("--width", default=1280, show_default=True, help="Full-resolution dummy image width.")
+@click.option("--height", default=488, show_default=True, help="Full-resolution dummy image height.")
+@click.option("--width", default=544, show_default=True, help="Full-resolution dummy image width.")
 @click.option("--keypoints", "keypoint_count", default=512, show_default=True, help="Fixed keypoint count.")
 @click.option("--threshold", "detection_threshold", default=0.05, show_default=True, help="NMS detection threshold.")
 @click.option("--min-confidence", default=0.1, show_default=True, help="Minimum match confidence.")

@@ -37,9 +37,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         node.bind_parameter_as::<StereoVisualOdometryParameters>("stereo_visual_odometry")?;
     let mut parameters_receiver = node_parameters.subscribe();
 
-    let stereo_camera_info_cache = node
-        .create_cache::<StereoCameraInfo>("inputs/stereo_camera_info", 1)?
-        .with_qos(QosProfile {
+    let stereo_camera_info_sub = node
+        .subscriber::<StereoCameraInfo>("inputs/stereo_camera_info")?
+        .qos(QosProfile {
             durability: QosDurability::TransientLocal,
             ..Default::default()
         })
@@ -56,58 +56,41 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let odometry_pub = node
-        .publisher::<na::Isometry3<f32>>(
+        .publisher::<Option<na::Isometry3<f32>>>(
             "visual_odometry/previous_left_camera_to_current_left_camera",
         )?
         .build()
         .await?;
 
-    let mut pipeline = None;
+    let stereo_camera_info = stereo_camera_info_sub.recv().await?;
+    let parameters = node_parameters.snapshot();
+    let mut pipeline = VisualOdometryPipeline::new(
+        parameters
+            .typed()
+            .neural_networks_folder
+            .join(&parameters.typed().model_name),
+        stereo_camera_info,
+    )?;
 
     loop {
-        while !parameters_receiver.borrow().typed().enable {
-            parameters_receiver.changed().await?;
-        }
+        parameters_receiver
+            .wait_for(|parameters| parameters.typed().enable)
+            .await?;
 
         let stereo_image_pair = stereo_image_pair_sub.recv().await?.inner;
-        let stereo_camera_info = stereo_camera_info_cache.get_latest();
-        let parameters_snapshot = node_parameters.snapshot();
-        let parameters = parameters_snapshot.typed();
-        if !parameters.enable {
-            continue;
-        }
 
-        let active_pipeline = match pipeline.take() {
-            Some(pipeline) => pipeline,
-            None => VisualOdometryPipeline::new(
-                parameters
-                    .neural_networks_folder
-                    .join(&parameters.model_name),
-            )?,
-        };
+        let start_time = Instant::now();
+        let odometry = pipeline.process(stereo_image_pair)?;
+        let duration = start_time.elapsed();
 
-        let (next_pipeline, odometry, duration) = tokio::task::spawn_blocking(move || {
-            let start_time = Instant::now();
-            let mut pipeline = active_pipeline;
-            let odometry = pipeline.process(stereo_image_pair, stereo_camera_info.as_deref())?;
-            Result::<_>::Ok((pipeline, odometry, start_time.elapsed()))
-        })
-        .await??;
-        pipeline = Some(next_pipeline);
-        if !node_parameters.snapshot().typed().enable {
-            continue;
-        }
-
-        if let Some(odometry) = odometry {
-            odometry_pub.publish(&odometry).await?;
-        }
+        odometry_pub.publish(&odometry).await?;
         feature_duration_pub.publish(&duration).await?;
     }
 }
 
 struct VisualOdometryPipeline {
     feature_extractor: FeatureExtractor,
-    triangulator: Option<StereoTriangulator>,
+    triangulator: StereoTriangulator,
     previous_features: PreviousFeatureState,
     previous_frame: Option<PreviousFrame>,
     current_points: Vec<crate::triangulator::StereoPoint>,
@@ -115,10 +98,13 @@ struct VisualOdometryPipeline {
 }
 
 impl VisualOdometryPipeline {
-    fn new(model_path: impl AsRef<Path>) -> Result<Self> {
+    fn new(model_path: impl AsRef<Path>, stereo_camera_info: StereoCameraInfo) -> Result<Self> {
         Ok(Self {
             feature_extractor: FeatureExtractor::new(model_path)?,
-            triangulator: None,
+            triangulator: StereoTriangulator::new(
+                &stereo_camera_info.left,
+                &stereo_camera_info.right,
+            )?,
             previous_features: PreviousFeatureState::new(),
             previous_frame: None,
             current_points: Vec::with_capacity(KEYPOINTS),
@@ -129,21 +115,7 @@ impl VisualOdometryPipeline {
     fn process(
         &mut self,
         stereo_image_pair: StereoImagePair,
-        stereo_camera_info: Option<&StereoCameraInfo>,
     ) -> Result<Option<na::Isometry3<f32>>> {
-        if self.triangulator.is_none() {
-            let Some(stereo_camera_info) = stereo_camera_info else {
-                return Ok(None);
-            };
-            self.triangulator = Some(StereoTriangulator::new(
-                &stereo_camera_info.left,
-                &stereo_camera_info.right,
-            )?);
-        }
-        let Some(triangulator) = self.triangulator.as_ref() else {
-            return Ok(None);
-        };
-
         let odometry = {
             let features = self
                 .feature_extractor
@@ -152,20 +124,28 @@ impl VisualOdometryPipeline {
             let current_right = features.current_right()?;
             let stereo_matches = features.stereo_matches()?;
 
-            triangulator.triangulate_into(
-                &current_left,
-                &current_right,
-                &stereo_matches,
+            println!("{} stereo matches", stereo_matches.left_to_right().count());
+
+            self.triangulator.triangulate_into(
+                current_left,
+                current_right,
+                stereo_matches,
                 &mut self.current_points,
             );
 
+            println!("{} triangulations", self.current_points.len());
+
             if let Some(previous_frame) = self.previous_frame.as_ref() {
                 let temporal_matches = features.temporal_matches()?;
+                println!(
+                    "{} temporal matches",
+                    temporal_matches.left_to_right().count()
+                );
                 let odometry = estimate_previous_to_current(
                     previous_frame,
                     &current_left,
                     &temporal_matches,
-                    triangulator,
+                    &self.triangulator,
                     &mut self.odometry_scratch,
                 );
                 features.copy_current_left_to(&mut self.previous_features)?;

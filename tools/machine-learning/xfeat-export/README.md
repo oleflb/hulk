@@ -3,14 +3,14 @@
 Exports XFeat and LighterGlue to fixed-contract ONNX models for later TensorRT conversion.
 
 ```bash
-uv run export-xfeat-onnx models/xfeat.onnx --height 1088 --width 1280 --keypoints 512
-uv run export-xfeat-onnx models/xfeat-b2.onnx --height 1088 --width 1280 --keypoints 512 --batch-size 2
+uv run export-xfeat-onnx models/xfeat.onnx --height 488 --width 544 --keypoints 512
+uv run export-xfeat-onnx models/xfeat-b2.onnx --height 488 --width 544 --keypoints 512 --batch-size 2
 uv run export-lighterglue-onnx models/lighterglue.onnx --keypoints 512
-uv run export-xfeat-lighterglue-onnx models/xfeat-lighterglue.onnx --height 1088 --width 1280 --keypoints 512
-uv run export-xfeat-lighterglue-onnx ../../../etc/neural_networks/xfeat-lighterglue.onnx --height 1088 --width 1280 --keypoints 512
+uv run export-xfeat-lighterglue-onnx models/xfeat-lighterglue.onnx --height 488 --width 544 --keypoints 512
+uv run export-xfeat-lighterglue-onnx ../../../etc/neural_networks/xfeat-lighterglue.onnx --height 488 --width 544 --keypoints 512
 ```
 
-`export-xfeat-onnx` takes NV12 input as `uint8` shaped `(height / 2, width / 2, 6)` and embeds the GPU NV12-to-RGB conversion layer from `../multi-task-yolo/src/utils/nv12_to_rgb.py` into the exported graph.
+`export-xfeat-onnx` takes NV12 input as `uint8` shaped `(height / 2, width / 2, 6)`, for example `(244, 272, 6)` for a `544 x 488` image, and embeds the GPU NV12-to-RGB conversion layer from `../multi-task-yolo/src/utils/nv12_to_rgb.py` into the exported graph.
 With `--batch-size`, the XFeat input is `uint8` shaped `(batch_size, height / 2, width / 2, 6)`.
 It returns normalized keypoints, descriptors, scores, and valid masks. The keypoints use the LighterGlue normalization `(keypoint - [width, height] / 2) / (max(width, height) / 2)`.
 `export-lighterglue-onnx` expects those normalized keypoints directly, so the exported LighterGlue model does not take image-size inputs.

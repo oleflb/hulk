@@ -12,6 +12,7 @@ use ort::{
         HasSelectedOutputs, RunOptions, Session, SessionOutputs, builder::GraphOptimizationLevel,
         run_options::OutputSelector,
     },
+    tensor::PrimitiveTensorElementType,
     value::TensorRef,
 };
 use ros2::sensor_msgs::image::Image;
@@ -35,21 +36,29 @@ pub struct PreviousFeatureState {
     valid: Vec<bool>,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct PreviousLeft;
+
+#[derive(Clone, Copy, Debug)]
 pub struct CurrentLeft;
+
+#[derive(Clone, Copy, Debug)]
 pub struct CurrentRight;
 
+#[derive(Clone, Copy, Debug)]
 pub struct FrameFeatures<'a, Frame> {
     keypoints: &'a [f32],
     valid: &'a [bool],
     _frame: PhantomData<Frame>,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct FrameKeypoints<'a, Frame> {
     keypoints: &'a [f32],
     _frame: PhantomData<Frame>,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct Matches<'a, From, To> {
     matches: &'a [i32],
     scores: &'a [f32],
@@ -168,9 +177,9 @@ impl<'a> FeatureOutput<'a> {
     }
 
     pub fn copy_current_left_to(&self, state: &mut PreviousFeatureState) -> Result<()> {
-        let keypoints = self.tensor_f32("current_left_keypoints")?;
-        let descriptors = self.tensor_f32("current_left_descriptors")?;
-        let valid = self.tensor_bool("current_left_valid")?;
+        let keypoints = self.tensor::<f32>("current_left_keypoints")?;
+        let descriptors = self.tensor::<f32>("current_left_descriptors")?;
+        let valid = self.tensor::<bool>("current_left_valid")?;
 
         ensure!(
             keypoints.len() == KEYPOINTS * 2,
@@ -193,7 +202,7 @@ impl<'a> FeatureOutput<'a> {
     }
 
     fn keypoints<Frame>(&self, keypoints_name: &str) -> Result<FrameKeypoints<'_, Frame>> {
-        let keypoints = self.tensor_f32(keypoints_name)?;
+        let keypoints = self.tensor::<f32>(keypoints_name)?;
 
         ensure!(
             keypoints.len() == KEYPOINTS * 2,
@@ -212,8 +221,8 @@ impl<'a> FeatureOutput<'a> {
         keypoints_name: &str,
         valid_name: &str,
     ) -> Result<FrameFeatures<'_, Frame>> {
-        let keypoints = self.tensor_f32(keypoints_name)?;
-        let valid = self.tensor_bool(valid_name)?;
+        let keypoints = self.tensor::<f32>(keypoints_name)?;
+        let valid = self.tensor::<bool>(valid_name)?;
 
         ensure!(
             keypoints.len() == KEYPOINTS * 2,
@@ -238,8 +247,8 @@ impl<'a> FeatureOutput<'a> {
         matches_name: &str,
         scores_name: &str,
     ) -> Result<Matches<'_, From, To>> {
-        let matches = self.tensor_i32(matches_name)?;
-        let scores = self.tensor_f32(scores_name)?;
+        let matches = self.tensor::<i32>(matches_name)?;
+        let scores = self.tensor::<f32>(scores_name)?;
 
         ensure!(
             matches.len() == KEYPOINTS,
@@ -259,30 +268,12 @@ impl<'a> FeatureOutput<'a> {
         })
     }
 
-    fn tensor_f32(&self, name: &str) -> Result<&[f32]> {
+    fn tensor<T: PrimitiveTensorElementType>(&self, name: &str) -> Result<&[T]> {
         let output = self
             .outputs
             .get(name)
             .wrap_err_with(|| format!("missing model output '{name}'"))?;
-        let (_, data) = output.try_extract_tensor::<f32>()?;
-        Ok(data)
-    }
-
-    fn tensor_i32(&self, name: &str) -> Result<&[i32]> {
-        let output = self
-            .outputs
-            .get(name)
-            .wrap_err_with(|| format!("missing model output '{name}'"))?;
-        let (_, data) = output.try_extract_tensor::<i32>()?;
-        Ok(data)
-    }
-
-    fn tensor_bool(&self, name: &str) -> Result<&[bool]> {
-        let output = self
-            .outputs
-            .get(name)
-            .wrap_err_with(|| format!("missing model output '{name}'"))?;
-        let (_, data) = output.try_extract_tensor::<bool>()?;
+        let (_, data) = output.try_extract_tensor::<T>()?;
         Ok(data)
     }
 }
@@ -343,9 +334,9 @@ fn check_image_support(image: &Image) -> Result<()> {
     let height = image.height as usize;
     let width = image.width as usize;
 
-    if !(width.is_multiple_of(32) && height.is_multiple_of(32)) {
+    if !(width.is_multiple_of(8) && height.is_multiple_of(8)) {
         bail!(
-            "image dimensions must be multiples of 32: {}x{}",
+            "image dimensions must be multiples of 8: {}x{}",
             width,
             height
         );

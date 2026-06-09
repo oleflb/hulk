@@ -171,8 +171,8 @@ def validate_image_size(height: int, width: int) -> None:
         raise click.BadParameter("--height and --width must be > 0")
     if height % 2 != 0 or width % 2 != 0:
         raise click.BadParameter("--height and --width must be even for NV12")
-    if height % 32 != 0 or width % 32 != 0:
-        raise click.BadParameter("--height and --width must be divisible by 32 for XFeat")
+    if height % 8 != 0 or width % 8 != 0:
+        raise click.BadParameter("--height and --width must be divisible by 8 for XFeat")
 
 
 def dynamic_axes(batch_size: int | None) -> dict[str, dict[int, str]]:
@@ -190,8 +190,8 @@ def dynamic_axes(batch_size: int | None) -> dict[str, dict[int, str]]:
     default=None,
     help="Path to the XFeat .pt weights. Defaults to the accelerated-features package weights.",
 )
-@click.option("--height", default=1088, show_default=True, help="Full-resolution dummy image height.")
-@click.option("--width", default=1280, show_default=True, help="Full-resolution dummy image width.")
+@click.option("--height", default=488, show_default=True, help="Full-resolution dummy image height.")
+@click.option("--width", default=544, show_default=True, help="Full-resolution dummy image width.")
 @click.option("--batch-size", default=None, type=int, help="Static batch size. If omitted, export the legacy unbatched input.")
 @click.option("--keypoints", "keypoint_count", default=512, show_default=True, help="Fixed keypoint count.")
 @click.option("--threshold", "detection_threshold", default=0.05, show_default=True, help="NMS detection threshold.")

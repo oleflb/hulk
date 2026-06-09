@@ -69,9 +69,9 @@ impl StereoTriangulator {
 
     pub fn triangulate_into(
         &self,
-        left: &FrameFeatures<'_, CurrentLeft>,
-        right: &FrameKeypoints<'_, CurrentRight>,
-        matches: &Matches<'_, CurrentLeft, CurrentRight>,
+        left: FrameFeatures<'_, CurrentLeft>,
+        right: FrameKeypoints<'_, CurrentRight>,
+        matches: Matches<'_, CurrentLeft, CurrentRight>,
         output: &mut Vec<StereoPoint>,
     ) {
         output.clear();
@@ -118,6 +118,7 @@ impl StereoTriangulator {
             || disparity <= 0.0
             || (left.y - right.y).abs() > MAX_VERTICAL_DISPARITY_PX
         {
+            println!("{left:?} {right:?}");
             return None;
         }
 
