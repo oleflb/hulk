@@ -13,7 +13,7 @@ Each cycler starts by waiting for the hardware interface to deliver it's respect
 
 Stereo visual odometry runs as the ROS-Z `stereo_visual_odometry` node. It is disabled by default through `stereo_visual_odometry.enable` and lazily initializes the TensorRT-backed XFeat/LighterGlue model when enabled. The model path is configured with `stereo_visual_odometry.neural_networks_folder` and `stereo_visual_odometry.model_name`, defaulting to `etc/neural_networks/xfeat-lighterglue.onnx`.
 
-The odometry output topic is `visual_odometry/previous_left_camera_to_current_left_camera`. This replaces the earlier `visual_odometry/previous_head_to_current_head` name because the node publishes the camera-frame transform and does not apply head-to-camera extrinsics.
+The odometry state output topic is `visual_odometry/current_left_camera_to_visual_odometer`. The frame-to-frame delta is also published on `visual_odometry/previous_left_camera_to_current_left_camera` for debugging. Both transforms are in the left-camera frame and do not apply head-to-camera extrinsics.
 
 !!! note
 

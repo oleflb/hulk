@@ -9956,6 +9956,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "robot_viewer"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "clap",
+ "color-eyre",
+ "coordinate_systems",
+ "eframe",
+ "egui_bevy",
+ "image",
+ "kinematics",
+ "linear_algebra",
+ "nalgebra 0.34.2",
+ "projection",
+ "ros-z",
+ "ros2",
+ "tokio",
+ "tracing-subscriber",
+ "types",
+]
+
+[[package]]
 name = "ron"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

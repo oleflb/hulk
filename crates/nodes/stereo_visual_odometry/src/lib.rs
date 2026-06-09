@@ -19,6 +19,7 @@ use ros_z::qos::QosDurability;
 use types::{
     parameters::StereoVisualOdometryParameters, stereo_camera_info::StereoCameraInfo,
     stereo_image_pair::StereoImagePair, time_wrapper::TimeWrapper,
+    visual_odometry::TriangulatedFeature,
 };
 
 use crate::{
@@ -61,6 +62,14 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         )?
         .build()
         .await?;
+    let odometry_state_pub = node
+        .publisher::<na::Isometry3<f32>>("visual_odometry/current_left_camera_to_visual_odometer")?
+        .build()
+        .await?;
+    let triangulated_features_pub = node
+        .publisher::<Vec<TriangulatedFeature>>("visual_odometry/triangulated_features")?
+        .build()
+        .await?;
 
     let stereo_camera_info = stereo_camera_info_sub.recv().await?;
     let parameters = node_parameters.snapshot();
@@ -84,6 +93,12 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let duration = start_time.elapsed();
 
         odometry_pub.publish(&odometry).await?;
+        odometry_state_pub
+            .publish(&pipeline.current_left_camera_to_visual_odometer())
+            .await?;
+        triangulated_features_pub
+            .publish(&pipeline.triangulated_features())
+            .await?;
         feature_duration_pub.publish(&duration).await?;
     }
 }
@@ -94,6 +109,7 @@ struct VisualOdometryPipeline {
     previous_features: PreviousFeatureState,
     previous_frame: Option<PreviousFrame>,
     current_points: Vec<crate::triangulator::StereoPoint>,
+    current_left_camera_to_visual_odometer: na::Isometry3<f32>,
     odometry_scratch: OdometryScratch,
 }
 
@@ -108,6 +124,7 @@ impl VisualOdometryPipeline {
             previous_features: PreviousFeatureState::new(),
             previous_frame: None,
             current_points: Vec::with_capacity(KEYPOINTS),
+            current_left_camera_to_visual_odometer: na::Isometry3::identity(),
             odometry_scratch: OdometryScratch::new(),
         })
     }
@@ -162,6 +179,25 @@ impl VisualOdometryPipeline {
             self.previous_frame = Some(PreviousFrame::from_stereo_points(&self.current_points));
         }
 
+        if let Some(previous_to_current) = &odometry {
+            self.current_left_camera_to_visual_odometer *= previous_to_current.inverse();
+        }
+
         Ok(odometry)
+    }
+
+    fn current_left_camera_to_visual_odometer(&self) -> na::Isometry3<f32> {
+        self.current_left_camera_to_visual_odometer
+    }
+
+    fn triangulated_features(&self) -> Vec<TriangulatedFeature> {
+        self.current_points
+            .iter()
+            .map(|point| TriangulatedFeature {
+                x: point.position.x,
+                y: point.position.y,
+                z: point.position.z,
+            })
+            .collect()
     }
 }

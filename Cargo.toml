@@ -126,6 +126,7 @@ members = [
   "tools/twix",
   "tools/vista",
   "tools/widget_gallery",
+  "tools/robot_viewer",
 ]
 resolver = "2"
 # services are built independently by yocto
