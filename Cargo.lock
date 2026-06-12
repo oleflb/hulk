@@ -11292,6 +11292,7 @@ dependencies = [
  "projection",
  "ros-z",
  "ros2",
+ "serde",
  "tokio",
  "tracing",
  "types",
