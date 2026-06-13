@@ -32,6 +32,7 @@ members = [
   "crates/hungarian_algorithm",
   "crates/hydra",
   "crates/kinematics",
+  "crates/localization-factrs",
   "crates/linear_algebra",
   "crates/microphones",
   "crates/motion",
@@ -60,6 +61,7 @@ members = [
   "crates/nodes/led_handler",
   "crates/nodes/line_detection",
   "crates/nodes/localization",
+   "crates/nodes/localization-3d",
   "crates/nodes/look_around",
   "crates/nodes/look_at",
   "crates/nodes/low_command_publisher",
@@ -122,6 +124,7 @@ members = [
   "tools/mujoco-simulator/mujoco-rust-server",
   "tools/parameter_tester",
   "tools/pepsi",
+  "tools/robot_viewer",
   "tools/tensorrt-compile",
   "tools/twix",
   "tools/vista",
@@ -250,6 +253,8 @@ libc = "0.2.169"
 line_detection = { path = "crates/nodes/line_detection" }
 linear_algebra = { path = "crates/linear_algebra" }
 localization = { path = "crates/nodes/localization" }
+localization-3d = { path = "crates/nodes/localization-3d" }
+localization-factrs = { path = "crates/localization-factrs" }
 log = "0.4.25"
 look_around = { path = "crates/nodes/look_around" }
 look_at = { path = "crates/nodes/look_at" }
