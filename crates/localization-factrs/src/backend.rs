@@ -13,7 +13,7 @@ use factrs::{
     variables::SE23,
 };
 use itertools::Itertools;
-use nalgebra::Matrix2;
+use nalgebra::{Matrix2, SMatrix};
 use thiserror::Error;
 
 use crate::{
@@ -28,6 +28,7 @@ use crate::{
     splines::SE23Spline,
     symbols::{CameraIntrinsics, State},
     tau,
+    visual_odometry_factors::{Measurement as VisualOdometryMeasurement, VisualOdometryFactor},
 };
 
 use tokio::sync::{
@@ -65,6 +66,7 @@ pub struct BackendConfiguration {
     pub gyroscope_process_noise: Matrix3<f64>,
     pub accelerometer_process_noise: Matrix3<f64>,
     pub visual_feature_noise: Matrix2<f64>,
+    pub visual_odometry_noise: SMatrix<f64, 6, 6>,
     pub gravity: Vector3<f64>,
 }
 
@@ -76,6 +78,8 @@ pub enum VinsBackendError {
     FailedToIngestImu,
     #[error("failed to ingest visual measurements")]
     FailedToIngestVisual,
+    #[error("failed to ingest visual odometry measurements")]
+    FailedToIngestVisualOdometry,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +358,77 @@ impl VinsBackend {
         Ok(())
     }
 
+    fn ingest_visual_odometry(
+        &mut self,
+        visual_odometry: Vec<VisualOdometryMeasurement>,
+    ) -> Result<(), VinsBackendError> {
+        let Some(last) = visual_odometry.last() else {
+            return Ok(());
+        };
+        self.last_knot_time = Some(
+            self.last_knot_time
+                .map_or(last.timestamp, |t| t.max(last.timestamp)),
+        );
+
+        let mut interval_groups = Vec::new();
+        for (key, chunk) in visual_odometry
+            .into_iter()
+            .chunk_by(|measurement| {
+                self.interval_assigner
+                    .current_interval_start_time(measurement.timestamp)
+            })
+            .into_iter()
+        {
+            let Some(interval_start_time) = key else {
+                return Err(VinsBackendError::FailedToIngestVisualOdometry);
+            };
+
+            let measurements = chunk.collect::<Vec<_>>();
+
+            let Some(interval_start_index) =
+                self.interval_assigner.assign_interval(interval_start_time)
+            else {
+                return Err(VinsBackendError::FailedToIngestVisualOdometry);
+            };
+
+            interval_groups.push((interval_start_index, interval_start_time, measurements));
+        }
+
+        for (interval_start_index, interval_start_time, measurements) in interval_groups {
+            self.init_intervals_through(interval_start_index);
+            if !self.interval_states_available(interval_start_index) {
+                log::debug!(
+                    "skipping visual odometry measurements for marginalized interval {interval_start_index}"
+                );
+                continue;
+            }
+
+            let keys = (State(interval_start_index), State(interval_start_index + 1));
+            let graph = self.optimizer.graph_mut();
+            if let Some(factor) = graph
+                .factors_for_residual_mut::<VisualOdometryFactor, _>(keys)
+                .next()
+            {
+                factor
+                    .residual_as_mut::<VisualOdometryFactor>()
+                    .expect("factor query must return matching residual")
+                    .extend_measurements(measurements);
+            } else {
+                let residual = VisualOdometryFactor::new(
+                    measurements,
+                    self.config.visual_odometry_noise,
+                    interval_start_time,
+                    interval_start_time + self.config.knot_spacing,
+                );
+                let factor = FactorBuilder::new(residual, keys).build();
+
+                graph.add_factor(factor);
+            }
+        }
+
+        Ok(())
+    }
+
     fn init_intervals_through(&mut self, interval_start_index: u32) {
         let first_missing_interval = self
             .highest_initialized_interval
@@ -391,6 +466,9 @@ impl VinsBackend {
             match self.measurement_receiver.try_recv() {
                 Ok(SensorMeasurement::Imu(imu)) => new_measurements.push_imu(imu),
                 Ok(SensorMeasurement::Visual(visual)) => new_measurements.push_visual(visual),
+                Ok(SensorMeasurement::VisualOdometry(visual_odometry)) => {
+                    new_measurements.push_visual_odometry(visual_odometry)
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     return Err(VinsBackendError::FrontendDisconnected);
@@ -400,6 +478,7 @@ impl VinsBackend {
 
         self.ingest_imu(new_measurements.imu)?;
         self.ingest_visual(new_measurements.visual)?;
+        self.ingest_visual_odometry(new_measurements.visual_odometry)?;
 
         Ok(())
     }
@@ -587,7 +666,7 @@ impl InitStateExt for Values {
 mod tests {
     use super::*;
     use booster::ImuState;
-    use factrs::core::SO3;
+    use factrs::core::{SE3, SO3};
     use factrs::traits::Variable;
     use linear_algebra::IntoFramed;
 
@@ -601,6 +680,7 @@ mod tests {
             gyroscope_process_noise: Matrix3::identity() * 0.01,
             accelerometer_process_noise: Matrix3::identity() * 0.01,
             visual_feature_noise: Matrix2::identity() * 5.0,
+            visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             gravity: Vector3::new(0.0, 0.0, 9.81),
         }
     }
@@ -622,6 +702,14 @@ mod tests {
                 angular_velocity: Vector3::zeros().framed(),
                 linear_acceleration: Vector3::new(0.0, 0.0, 9.81).framed(),
             },
+        })
+    }
+
+    fn visual_odometry(time: SystemTime, x: f64) -> SensorMeasurement {
+        SensorMeasurement::VisualOdometry(VisualOdometryMeasurement {
+            robot_to_left_camera: SE3::identity(),
+            odometer: SE3::from_rot_trans(SO3::identity(), Vector3::new(x, 0.0, 0.0)),
+            timestamp: time,
         })
     }
 
@@ -696,6 +784,39 @@ mod tests {
         assert_eq!(
             result.camera_intrinsics.optical_center(),
             nalgebra::vector![250.0, 240.0]
+        );
+    }
+
+    #[test]
+    fn visual_odometry_measurements_create_interval_factor() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        measurement_sender
+            .send(visual_odometry(start, 0.0))
+            .expect("first visual odometry should send");
+        measurement_sender
+            .send(visual_odometry(start + Duration::from_millis(100), 0.1))
+            .expect("second visual odometry should send");
+
+        let _ = backend.solve_once().expect("solve should succeed");
+
+        assert!(backend.values().get_raw(State(0)).is_some());
+        assert!(backend.values().get_raw(State(1)).is_some());
+        assert_eq!(
+            backend
+                .optimizer
+                .graph_mut()
+                .factors_for_residual::<VisualOdometryFactor, _>((State(0), State(1)))
+                .count(),
+            1
         );
     }
 

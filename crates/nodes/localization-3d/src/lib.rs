@@ -11,7 +11,7 @@ use localization_factrs::{
     BackendConfiguration, CameraIntrinsics, InitialState, LandmarkAssociationCosts, VinsFrontend,
     VinsFrontendError, VisualClassMeasurement, initialize,
 };
-use nalgebra::{Matrix2, Matrix3, Point3, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{
     cache::Cache,
@@ -38,6 +38,7 @@ pub fn backend_configuration() -> BackendConfiguration {
         gyroscope_process_noise: Matrix3::identity() * 0.01,
         accelerometer_process_noise: Matrix3::identity() * 0.01,
         visual_feature_noise: Matrix2::identity() * 5.0,
+        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
         gravity: Vector3::new(0.0, 0.0, 9.81),
     }
 }
@@ -62,6 +63,13 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 
     let object_subscriber = node
         .subscriber::<Vec<Object<RobocupObjectLabel>>>("detected_objects")?
+        .build()
+        .await?;
+
+    let visual_odometry_subscriber = node
+        .subscriber::<nalgebra::Isometry3<f32>>(
+            "visual_odometry/current_left_camera_to_visual_odometer",
+        )?
         .build()
         .await?;
 
@@ -113,6 +121,15 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 //     .last_optimization_result()
                 //     .map(|result| result.transform.cast::<f32>().framed_transform());
                 // localization_publisher.publish(&transform).await?;
+            }
+            visual_odometry = visual_odometry_subscriber.recv_with_metadata() => {
+                let visual_odometry = visual_odometry?;
+                let Some(camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.source_time) else {
+                    continue;
+                };
+
+                ingest_visual_odometry(&mut frontend, visual_odometry.source_time, visual_odometry.message, &camera_matrix.inner)
+                    .wrap_err("failed to ingest visual odometry measurement into frontend")?;
             }
             result = &mut backend_handle => {
                 result.wrap_err("failed to join")?.wrap_err("solver failed")?;
@@ -238,7 +255,7 @@ pub fn ingest_visual_features(
     camera_matrix: &CameraMatrix,
     field_dimensions: Arc<FieldDimensions>,
 ) -> Result<(), VinsFrontendError> {
-    let robot_to_camera = camera_matrix.head_to_camera * camera_matrix.robot_to_head;
+    let robot_to_camera = robot_to_left_camera(camera_matrix);
     let mut classes = Vec::new();
 
     if let Some(class) = visual_class_measurement(
@@ -260,7 +277,22 @@ pub fn ingest_visual_features(
         classes.push(class);
     }
 
-    frontend.ingest_visual_classes(time.to_wallclock(), classes, robot_to_camera.inner)
+    frontend.ingest_visual_classes(time.to_wallclock(), classes, robot_to_camera)
+}
+
+pub fn ingest_visual_odometry(
+    frontend: &mut VinsFrontend,
+    time: Time,
+    odometer: nalgebra::Isometry3<f32>,
+    camera_matrix: &CameraMatrix,
+) -> Result<(), VinsFrontendError> {
+    let robot_to_left_camera = robot_to_left_camera(camera_matrix);
+
+    frontend.ingest_visual_odometry(time.to_wallclock(), robot_to_left_camera, odometer)
+}
+
+fn robot_to_left_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
+    (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
 }
 
 fn visual_class_measurement(
@@ -338,6 +370,7 @@ fn field_candidate(point: Point2<Field>) -> Point3<f64> {
 
 #[cfg(test)]
 mod tests {
+    use coordinate_systems::{Camera, Head};
     use geometry::rectangle::Rectangle;
     use types::bounding_box::BoundingBox;
 
@@ -460,5 +493,24 @@ mod tests {
                 .angle_to(&robot_to_field.rotation)
                 < 1.0e-6
         );
+    }
+
+    #[test]
+    fn visual_odometry_extrinsic_uses_head_and_camera_transforms() {
+        let robot_to_head: Isometry3<Robot, Head> =
+            nalgebra::Isometry3::translation(1.0, 2.0, 3.0).framed_transform();
+        let head_to_camera: Isometry3<Head, Camera> =
+            nalgebra::Isometry3::translation(0.5, 0.0, -0.25).framed_transform();
+        let camera_matrix = CameraMatrix {
+            robot_to_head,
+            head_to_camera,
+            ..Default::default()
+        };
+
+        let robot_to_camera = robot_to_left_camera(&camera_matrix);
+        let expected = (head_to_camera * robot_to_head).inner;
+
+        assert!((robot_to_camera.translation.vector - expected.translation.vector).norm() < 1.0e-6);
+        assert!(robot_to_camera.rotation.angle_to(&expected.rotation) < 1.0e-6);
     }
 }

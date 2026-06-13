@@ -9,7 +9,7 @@ use factrs::{
 use linear_algebra::IntoFramed;
 use localization_factrs::{BackendConfiguration, InitialState, SE23Spline, initialize, tau};
 use log::LevelFilter;
-use nalgebra::{Matrix2, Matrix3, Vector3, vector};
+use nalgebra::{Matrix2, Matrix3, SMatrix, Vector3, vector};
 
 #[test]
 fn imu_on_spline() {
@@ -26,6 +26,7 @@ fn imu_on_spline() {
             gyroscope_process_noise: Matrix3::identity() * 0.01,
             accelerometer_process_noise: Matrix3::identity() * 0.1,
             visual_feature_noise: Matrix2::identity() * 5.0,
+            visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             gravity: Vector3::new(0., 0., 9.81),
         },
         InitialState::default(),

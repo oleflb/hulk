@@ -1,8 +1,12 @@
-use crate::measurements::{ImuMeasurement, VisualMeasurement};
+use crate::{
+    measurements::{ImuMeasurement, VisualMeasurement},
+    visual_odometry_factors::Measurement as VisualOdometryMeasurement,
+};
 
 pub struct IntervalMeasurements {
     pub imu: Vec<ImuMeasurement>,
     pub visual: Vec<Vec<VisualMeasurement>>,
+    pub visual_odometry: Vec<VisualOdometryMeasurement>,
 }
 
 impl IntervalMeasurements {
@@ -10,6 +14,7 @@ impl IntervalMeasurements {
         Self {
             imu: Vec::new(),
             visual: Vec::new(),
+            visual_odometry: Vec::new(),
         }
     }
 
@@ -23,6 +28,12 @@ impl IntervalMeasurements {
                 .first()
                 .expect("visual frames must contain at least one measurement")
                 .time
+        });
+    }
+
+    pub fn push_visual_odometry(&mut self, visual_odometry: VisualOdometryMeasurement) {
+        insert_sorted(&mut self.visual_odometry, visual_odometry, |measurement| {
+            measurement.timestamp
         });
     }
 }

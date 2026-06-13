@@ -20,6 +20,7 @@ use crate::measurements::{
     ImuMeasurement, LandmarkAssociationCosts, SensorMeasurement, VisualClassMeasurement,
     VisualMeasurement,
 };
+use crate::visual_odometry_factors::Measurement as VisualOdometryMeasurement;
 use imu_propagator::ImuPropagator;
 
 pub struct VinsFrontend {
@@ -176,6 +177,24 @@ impl VinsFrontend {
 
         self.measurement_sender
             .send(SensorMeasurement::Visual(measurements))
+            .map_err(|_| VinsFrontendError::BackendDisconnected)
+    }
+
+    /// Adds an accumulated visual odometry pose to the optimization pipeline.
+    pub fn ingest_visual_odometry(
+        &mut self,
+        time: SystemTime,
+        robot_to_left_camera: nalgebra::Isometry3<f32>,
+        odometer: nalgebra::Isometry3<f32>,
+    ) -> Result<(), VinsFrontendError> {
+        let measurement = VisualOdometryMeasurement {
+            robot_to_left_camera: isometry3_to_se3(robot_to_left_camera),
+            odometer: isometry3_to_se3(odometer),
+            timestamp: time,
+        };
+
+        self.measurement_sender
+            .send(SensorMeasurement::VisualOdometry(measurement))
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 }

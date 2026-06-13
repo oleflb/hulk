@@ -4,10 +4,13 @@ use booster::ImuState;
 use factrs::core::SE3;
 use nalgebra::{Point2, Point3};
 
+use crate::visual_odometry_factors::Measurement as VisualOdometryMeasurement;
+
 #[derive(Debug, Clone)]
 pub enum SensorMeasurement {
     Imu(ImuMeasurement),
     Visual(Vec<VisualMeasurement>),
+    VisualOdometry(VisualOdometryMeasurement),
 }
 
 impl SensorMeasurement {
@@ -20,6 +23,7 @@ impl SensorMeasurement {
                     .expect("visual frames must contain at least one measurement")
                     .time
             }
+            SensorMeasurement::VisualOdometry(visual_odometry) => visual_odometry.timestamp,
         }
     }
 }

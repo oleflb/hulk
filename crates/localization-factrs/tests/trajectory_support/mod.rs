@@ -12,7 +12,7 @@ use linear_algebra::IntoFramed;
 use localization_factrs::{
     BackendConfiguration, CameraIntrinsics, InitialState, LandmarkAssociationCosts, initialize,
 };
-use nalgebra::{Matrix2, Matrix3, Point2, Point3, Vector3, vector};
+use nalgebra::{Matrix2, Matrix3, Point2, Point3, SMatrix, Vector3, vector};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
@@ -187,6 +187,7 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             gyroscope_process_noise: Matrix3::identity() * 0.01,
             accelerometer_process_noise: Matrix3::identity() * 0.01,
             visual_feature_noise: Matrix2::identity() * solver_variance(config.detection_noise_std),
+            visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             gravity: vector![0.0, 0.0, 9.81],
         },
         initial_state,
