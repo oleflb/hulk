@@ -5889,6 +5889,7 @@ dependencies = [
  "line_detection",
  "localization",
  "localization-3d",
+ "localization_recorder",
  "look_around",
  "look_at",
  "low_command_publisher",
@@ -7001,6 +7002,28 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "types",
+]
+
+[[package]]
+name = "localization_recorder"
+version = "0.1.0"
+dependencies = [
+ "booster",
+ "color-eyre",
+ "coordinate_systems",
+ "kinematics",
+ "linear_algebra",
+ "localization-3d",
+ "mcap",
+ "nalgebra 0.34.2",
+ "projection",
+ "ros-z",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "types",
 ]
 
