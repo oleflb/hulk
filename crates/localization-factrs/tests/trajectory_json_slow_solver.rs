@@ -15,6 +15,7 @@ const TEST_CONFIG: TrajectoryTestConfig = TrajectoryTestConfig {
     output_path: "/tmp/graph_trajectory_slow_solver.json",
     gyro_noise_std: 0.1,
     accel_noise_std: 0.1,
+    roll_pitch_yaw_noise_std: 0.01,
     detection_noise_std: 1.0,
     noise_seed: 0,
     max_position_rmse_meters: 0.12,
