@@ -33,6 +33,7 @@ pub struct TrajectoryTestConfig {
     pub output_path: &'static str,
     pub gyro_noise_std: f64,
     pub accel_noise_std: f64,
+    pub roll_pitch_yaw_noise_std: f64,
     pub detection_noise_std: f64,
     pub noise_seed: u64,
     pub max_position_rmse_meters: f64,
@@ -159,6 +160,7 @@ struct SensorNoise {
     rng: ChaCha8Rng,
     gyro_std: f64,
     accel_std: f64,
+    roll_pitch_yaw_std: f64,
     detection_std: f64,
 }
 
@@ -182,10 +184,10 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             knot_spacing: KNOT_SPACING,
             max_optimization_window: MAX_OPTIMIZATION_WINDOW,
             optimizer_max_iterations: config.optimizer_max_iterations,
-            gyroscope_noise: Matrix3::identity() * solver_variance(config.gyro_noise_std),
-            accelerometer_noise: Matrix3::identity() * solver_variance(config.accel_noise_std),
             gyroscope_process_noise: Matrix3::identity() * 0.01,
             accelerometer_process_noise: Matrix3::identity() * 0.01,
+            roll_pitch_yaw_noise: Matrix3::identity()
+                * solver_variance(config.roll_pitch_yaw_noise_std),
             visual_feature_noise: Matrix2::identity() * solver_variance(config.detection_noise_std),
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_softness: 1.0e-3,
@@ -210,6 +212,10 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
         let solve_start = Instant::now();
 
         if config.measurement_selection.use_imu() {
+            let roll_pitch_yaw = sensor_noise
+                .noisy_roll_pitch_yaw(simulator_state_to_roll_pitch_yaw(&frame.ground_truth_pose))
+                .cast::<f32>()
+                .framed();
             let angular_velocity = sensor_noise
                 .noisy_gyroscope(frame.imu.angular_velocity)
                 .cast::<f32>()
@@ -221,7 +227,7 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             frontend.ingest_imu(
                 time,
                 ImuState {
-                    roll_pitch_yaw: vector![0.0, 0.0, 0.0].framed(),
+                    roll_pitch_yaw,
                     angular_velocity,
                     linear_acceleration,
                 },
@@ -450,6 +456,7 @@ impl SensorNoise {
             rng: ChaCha8Rng::seed_from_u64(config.noise_seed),
             gyro_std: config.gyro_noise_std,
             accel_std: config.accel_noise_std,
+            roll_pitch_yaw_std: config.roll_pitch_yaw_noise_std,
             detection_std: config.detection_noise_std,
         }
     }
@@ -462,6 +469,11 @@ impl SensorNoise {
     fn noisy_acceleration(&mut self, value: [f64; 3]) -> Vector3<f64> {
         let std = self.accel_std;
         self.noisy_imu_vector(value, std)
+    }
+
+    fn noisy_roll_pitch_yaw(&mut self, value: Vector3<f64>) -> Vector3<f64> {
+        let std = self.roll_pitch_yaw_std;
+        value.map(|component| component + self.sample(std))
     }
 
     fn noisy_imu_vector(&mut self, value: [f64; 3], std: f64) -> Vector3<f64> {
@@ -520,6 +532,14 @@ fn simulator_state_to_se23(state: &SimulatorState) -> SE23<f64> {
     let translation = Vector3::from(state.position);
 
     SE23::from_rot_vel_trans(rotation, velocity, translation)
+}
+
+fn simulator_state_to_roll_pitch_yaw(state: &SimulatorState) -> Vector3<f64> {
+    let [w, x, y, z] = state.quaternion_wxyz;
+    let rotation = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(w, x, y, z));
+    let (roll, pitch, yaw) = rotation.euler_angles();
+
+    vector![roll, pitch, yaw]
 }
 
 fn robot_to_camera() -> nalgebra::Isometry3<f32> {
