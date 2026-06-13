@@ -38,9 +38,8 @@ const EXPECTED_DETECTED_OBJECT_FRAME_COUNT: usize = 710;
 const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 508;
 const EXPECTED_GOALPOST_DETECTION_COUNT: usize = 723;
 const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 186;
-const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 5086;
+const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 171;
 const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 171;
-const EXPECTED_PROPAGATED_SOLVE_SAMPLE_COUNT: usize = 171;
 const EXPECTED_LANDMARK_COUNT: usize = 4;
 
 #[derive(Debug, Deserialize)]
@@ -55,7 +54,6 @@ struct RecordingEnvelope {
 struct TrajectoryOutput {
     optimized: Vec<PoseSample>,
     raw_backend_solves: Vec<PoseSample>,
-    propagated_solves: Vec<PoseSample>,
     landmarks: Vec<LandmarkSample>,
 }
 
@@ -77,7 +75,6 @@ struct LandmarkSample {
 struct ReplayTrajectories {
     optimized: Vec<PoseSample>,
     raw_backend_solves: Vec<PoseSample>,
-    propagated_solves: Vec<PoseSample>,
 }
 
 #[test]
@@ -176,7 +173,6 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                 let imu: ImuState = serde_json::from_value(envelope.message)?;
                 frontend.ingest_imu(source_time.to_wallclock(), imu)?;
                 has_pending_measurements = true;
-                push_pose_sample(&mut trajectories.optimized, &mut frontend, start_time);
             }
             _ => {}
         }
@@ -196,7 +192,6 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     let output = TrajectoryOutput {
         optimized: trajectories.optimized,
         raw_backend_solves: trajectories.raw_backend_solves,
-        propagated_solves: trajectories.propagated_solves,
         landmarks: goalpost_landmarks(&field_dimensions),
     };
 
@@ -214,14 +209,9 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
         output.raw_backend_solves.len(),
         EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT
     );
-    assert_eq!(
-        output.propagated_solves.len(),
-        EXPECTED_PROPAGATED_SOLVE_SAMPLE_COUNT
-    );
     assert_eq!(output.landmarks.len(), EXPECTED_LANDMARK_COUNT);
     assert_trajectory_is_finite_and_ordered("optimized", &output.optimized);
     assert_trajectory_is_finite_and_ordered("raw backend solves", &output.raw_backend_solves);
-    assert_trajectory_is_finite_and_ordered("propagated solve states", &output.propagated_solves);
 
     println!("replayed {imu_count} IMU samples");
     println!("replayed {object_frame_count} detected object frames");
@@ -229,9 +219,9 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     println!("ingested {goalpost_detection_count} goalpost detections");
     println!("ran {solver_solution_count} backend solver iterations");
     println!(
-        "exported {} raw backend solve states and {} propagated solve states",
+        "exported {} raw backend solve states and {} optimization states",
         output.raw_backend_solves.len(),
-        output.propagated_solves.len()
+        output.optimized.len()
     );
     println!(
         "assumed solve time {:.3} ms, solving every {solve_every_nth_round} IMU-equivalent rounds",
@@ -322,7 +312,6 @@ fn solve_and_record(
         return Ok(backend_result.as_ref().map(|result| result.time));
     };
     push_result_sample(&mut trajectories.optimized, &result, start_time);
-    push_result_sample(&mut trajectories.propagated_solves, &result, start_time);
 
     Ok(backend_result.as_ref().map(|result| result.time))
 }
@@ -378,17 +367,6 @@ fn nearest_camera_matrix(
         .iter()
         .min_by_key(|(candidate_time, _)| candidate_time.as_nanos().abs_diff(time.as_nanos()))
         .map(|(_, camera_matrix)| camera_matrix)
-}
-
-fn push_pose_sample(
-    trajectory: &mut Vec<PoseSample>,
-    frontend: &mut localization_factrs::VinsFrontend,
-    start_time: SystemTime,
-) {
-    let Some(result) = frontend.last_optimization_result() else {
-        return;
-    };
-    push_result_sample(trajectory, &result, start_time);
 }
 
 fn push_result_sample(
