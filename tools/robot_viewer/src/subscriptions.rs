@@ -96,7 +96,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         .build()
         .await?;
     let camera = node
-        .subscriber::<RosImage>(CAMERA_IMAGE_TOPIC)?
+        .subscriber::<TimeWrapper<RosImage>>(CAMERA_IMAGE_TOPIC)?
         .build()
         .await?;
     let objects = node
@@ -187,7 +187,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                 }),
             },
             message = camera.recv() => match message {
-                Ok(image) => match decode_camera_frame(image) {
+                Ok(image) => match decode_camera_frame(image.inner) {
                     Ok(frame) => update_state(&state, &egui_context, |state| {
                         state.camera_sequence += 1;
                         state.camera_frame = Some(CameraFrame {
