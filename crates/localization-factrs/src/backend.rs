@@ -223,9 +223,7 @@ impl VinsBackend {
         };
         self.update_last_knot_time(last.time);
 
-        let interval_groups = self
-            .interval_groups(imus, |imu| imu.time)
-            .ok_or(VinsBackendError::FailedToIngestImu)?;
+        let interval_groups = self.interval_groups(imus, |imu| imu.time);
 
         for group in interval_groups {
             if !self.prepare_interval_for_measurements(group.start_index, "IMU") {
@@ -276,9 +274,7 @@ impl VinsBackend {
         let last_time = visual_frame_time(last);
         self.update_last_knot_time(last_time);
 
-        let interval_groups = self
-            .interval_groups(visuals, |visual| visual_frame_time(visual))
-            .ok_or(VinsBackendError::FailedToIngestVisual)?;
+        let interval_groups = self.interval_groups(visuals, |visual| visual_frame_time(visual));
 
         for group in interval_groups {
             if !self.prepare_interval_for_measurements(group.start_index, "visual") {
@@ -340,9 +336,8 @@ impl VinsBackend {
         }
         self.update_last_knot_time(last_timestamp);
 
-        let interval_groups = self
-            .interval_groups(deltas, |measurement| measurement.interval_start_time)
-            .ok_or(VinsBackendError::FailedToIngestVisualOdometry)?;
+        let interval_groups =
+            self.interval_groups(deltas, |measurement| measurement.interval_start_time);
 
         for group in interval_groups {
             if !self.prepare_interval_for_measurements(group.start_index, "visual odometry") {
@@ -416,9 +411,7 @@ impl VinsBackend {
         };
         self.update_last_knot_time(last.time);
 
-        let interval_groups = self
-            .interval_groups(foot_heights, |measurement| measurement.time)
-            .ok_or(VinsBackendError::FailedToIngestFootHeights)?;
+        let interval_groups = self.interval_groups(foot_heights, |measurement| measurement.time);
 
         for group in interval_groups {
             if !self.prepare_interval_for_measurements(group.start_index, "foot height") {
@@ -491,7 +484,7 @@ impl VinsBackend {
         &self,
         measurements: Vec<T>,
         time_of: impl Fn(&T) -> SystemTime,
-    ) -> Option<Vec<IntervalGroup<T>>> {
+    ) -> Vec<IntervalGroup<T>> {
         let mut interval_groups = Vec::new();
         for (key, chunk) in measurements
             .into_iter()
@@ -501,8 +494,14 @@ impl VinsBackend {
             })
             .into_iter()
         {
-            let start_time = key?;
-            let start_index = self.interval_assigner.assign_interval(start_time)?;
+            let Some(start_time) = key else {
+                log::debug!("dropping measurements before earliest solver time");
+                continue;
+            };
+            let Some(start_index) = self.interval_assigner.assign_interval(start_time) else {
+                log::debug!("dropping measurements before earliest solver time");
+                continue;
+            };
 
             interval_groups.push(IntervalGroup {
                 start_index,
@@ -512,7 +511,7 @@ impl VinsBackend {
             });
         }
 
-        Some(interval_groups)
+        interval_groups
     }
 
     fn prepare_interval_for_measurements(
@@ -962,6 +961,37 @@ mod tests {
                 .factors_for_residual::<IntervalFootAboveGroundFactor, _>((State(0), State(1)))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn foot_height_measurements_before_solver_start_are_dropped() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let solver_start = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+        measurement_sender
+            .send(stationary_imu(solver_start))
+            .expect("IMU should send");
+        measurement_sender
+            .send(foot_heights(solver_start - Duration::from_millis(100)))
+            .expect("foot heights should send");
+
+        let _ = backend.solve_once().expect("solve should succeed");
+
+        assert_eq!(
+            backend
+                .optimizer
+                .graph_mut()
+                .factors_for_residual::<IntervalFootAboveGroundFactor, _>((State(0), State(1)))
+                .count(),
+            0
         );
     }
 
