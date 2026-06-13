@@ -1,33 +1,68 @@
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, pin::Pin, sync::Arc, time::Duration};
 
 use booster::ImuState;
 use color_eyre::{
     Result,
     eyre::{Context as _, bail},
 };
-use coordinate_systems::{Field, Pixel, Robot};
+use coordinate_systems::{Camera, Field, Pixel, Robot};
+use global_localizer::{GlobalLocalizationInput, GlobalLocalizationResult, GlobalLocalizer};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, Point2, point};
 use localization_factrs::{
-    BackendConfiguration, CameraIntrinsics, InitialState, LandmarkAssociationCosts, VinsFrontend,
-    VinsFrontendError, VisualClassMeasurement, initialize,
+    BackendConfiguration, CameraIntrinsics, InitialState, VinsFrontend, VinsFrontendError,
+    VisualReprojectionAssociation, initialize,
 };
-use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, SVector, Vector3};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{
+    Message,
     cache::Cache,
     context::Context,
-    qos::{QosDurability, QosProfile},
+    parameter::NodeParametersExt,
+    qos::{QosDurability, QosHistory, QosProfile},
     time::Time,
 };
-use tokio::select;
+use serde::{Deserialize, Serialize};
+use tokio::{select, task::JoinHandle};
 use types::{
-    field_dimensions::{FieldDimensions, Half, Side},
+    field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
     time_wrapper::TimeWrapper,
+    visual_odometry::VisualOdometryDelta as VisualOdometryDeltaMessage,
 };
-const GOALPOST_UNMATCHED_LANDMARK_COST: f64 = 0.0;
-const GOALPOST_UNMATCHED_DETECTION_COST: f64 = 25.0;
+
+mod global_localizer;
+
+/// Global field-feature localizer thresholds.
+pub use global_localizer::GlobalLocalizerConfig as GlobalLocalizerParameters;
+
+/// Runtime parameters for the 3D localization node.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Message)]
+#[serde(deny_unknown_fields)]
+pub struct Localization3dParameters {
+    /// Parameters for fixed-field-feature global localization from object detections.
+    pub global_localizer: GlobalLocalizerParameters,
+}
+
+impl Localization3dParameters {
+    fn validate(&self) -> std::result::Result<(), String> {
+        self.global_localizer.validate()
+    }
+}
+
+pub struct GlobalVisualLocalization {
+    /// Debug payload for the best visual global localization result, if any.
+    pub debug: Option<GlobalLocalizationDebug>,
+    /// Fixed associations that are safe to ingest into the backend graph.
+    pub unique_associations: Option<Vec<VisualReprojectionAssociation>>,
+}
+
+struct GlobalLocalizationTaskOutput {
+    source_time: Time,
+    robot_to_camera: nalgebra::Isometry3<f32>,
+    localization: GlobalVisualLocalization,
+}
 
 pub fn backend_configuration() -> BackendConfiguration {
     BackendConfiguration {
@@ -38,7 +73,9 @@ pub fn backend_configuration() -> BackendConfiguration {
         roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
         accelerometer_process_noise: Matrix3::identity() * 0.01,
         visual_feature_noise: Matrix2::identity() * 5.0,
-        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
+        visual_odometry_noise: SMatrix::<f64, 6, 6>::from_diagonal(&SVector::<f64, 6>::new(
+            2.5e-3, 2.5e-3, 5.0e-6, 5e-5, 5e-5, 9e-2,
+        )),
         foot_ground_softness: 1.0e-3,
         foot_ground_sigma: 0.01,
         gravity: Vector3::new(0.0, 0.0, 9.81),
@@ -51,6 +88,8 @@ pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> +
 
 pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("localization3d").build().await?;
+    let parameters = node.bind_parameter_as::<Localization3dParameters>("localization3d")?;
+    parameters.add_validation_hook(Localization3dParameters::validate)?;
 
     let imu_subscriber = node
         .subscriber::<ImuState>("inputs/imu_state")?
@@ -65,12 +104,16 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 
     let object_subscriber = node
         .subscriber::<Vec<Object<RobocupObjectLabel>>>("detected_objects")?
+        .qos(QosProfile {
+            history: QosHistory::KeepLast(NonZeroUsize::MIN),
+            ..Default::default()
+        })
         .build()
         .await?;
 
     let visual_odometry_subscriber = node
-        .subscriber::<nalgebra::Isometry3<f32>>(
-            "visual_odometry/current_left_camera_to_visual_odometer",
+        .subscriber::<VisualOdometryDeltaMessage>(
+            "visual_odometry/current_left_camera_to_previous_left_camera",
         )?
         .build()
         .await?;
@@ -97,17 +140,31 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .publisher::<Intrinsic>("debug/calibrated_intrinsics")?
         .build()
         .await?;
+    let global_localization_publisher = node
+        .publisher::<Option<GlobalLocalizationDebug>>("debug/global_localization")?
+        .build()
+        .await?;
 
     let initial_state = wait_for_initial_state(&camera_matrix_cache).await;
     let (mut frontend, backend) = initialize(backend_configuration(), initial_state);
     let mut backend_handle = std::pin::pin!(tokio::task::spawn_blocking(|| backend.run_loop()));
+    let mut global_localization_task: Option<JoinHandle<GlobalLocalizationTaskOutput>> = None;
 
     loop {
         select! {
             // TODO(oleflb): Use the correct image timestamp, not the source time
-            objects = object_subscriber.recv_with_metadata() => {
+            objects = object_subscriber.recv_with_metadata(), if global_localization_task.is_none() => {
                 let objects = objects?;
                 let visual_features = find_detected_visual_features(objects.message);
+                let parameters = parameters.snapshot().typed().clone();
+                if visual_features.supported_feature_count()
+                    < parameters.global_localizer.min_inliers.max(2)
+                {
+                    let debug: Option<GlobalLocalizationDebug> = None;
+                    global_localization_publisher.publish(&debug).await?;
+                    continue;
+                }
+
                 let Some(camera_matrix) = camera_matrix_cache.get_nearest(objects.source_time) else {
                     continue;
                 };
@@ -115,8 +172,49 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     continue;
                 };
 
-                ingest_visual_features(&mut frontend, objects.source_time, visual_features, &camera_matrix.inner, field_dimensions)
-                    .wrap_err("ingest of visual features failed")?;
+                let source_time = objects.source_time;
+                let camera_matrix = camera_matrix.inner.clone();
+                let field_dimensions = *field_dimensions.as_ref();
+                let pose_hint = pose_hint_from_frontend(&frontend);
+                global_localization_task = Some(tokio::task::spawn_blocking(move || {
+                    let robot_to_camera = robot_to_left_camera(&camera_matrix);
+                    let localization = localize_global_visual_features(
+                        &visual_features,
+                        &camera_matrix,
+                        &field_dimensions,
+                        pose_hint,
+                        &parameters.global_localizer,
+                    );
+
+                    GlobalLocalizationTaskOutput {
+                        source_time,
+                        robot_to_camera,
+                        localization,
+                    }
+                }));
+            }
+            global_localization = async {
+                global_localization_task
+                    .as_mut()
+                    .expect("task exists because select branch is gated")
+                    .await
+            }, if global_localization_task.is_some() => {
+                let output = global_localization.wrap_err("global localization task failed")?;
+                global_localization_task = None;
+
+                global_localization_publisher
+                    .publish(&output.localization.debug)
+                    .await?;
+
+                if let Some(associations) = output.localization.unique_associations {
+                    frontend
+                        .ingest_visual_reprojection_associations(
+                            output.source_time.to_wallclock(),
+                            associations,
+                            output.robot_to_camera,
+                        )
+                        .wrap_err("ingest of globally associated visual features failed")?;
+                }
             }
             // TODO(oleflb): Use the correct sensor timestamp, not the source time
             imu = imu_subscriber.recv_with_metadata() => {
@@ -129,13 +227,16 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 //     .map(|result| result.transform.cast::<f32>().framed_transform());
                 // localization_publisher.publish(&transform).await?;
             }
-            visual_odometry = visual_odometry_subscriber.recv_with_metadata() => {
+            visual_odometry = visual_odometry_subscriber.recv() => {
                 let visual_odometry = visual_odometry?;
-                let Some(camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.source_time) else {
+                let Some(previous_camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.previous_time) else {
+                    continue;
+                };
+                let Some(current_camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.current_time) else {
                     continue;
                 };
 
-                ingest_visual_odometry(&mut frontend, visual_odometry.source_time, visual_odometry.message, &camera_matrix.inner)
+                ingest_visual_odometry(&mut frontend, visual_odometry, &previous_camera_matrix.inner, &current_camera_matrix.inner)
                     .wrap_err("failed to ingest visual odometry measurement into frontend")?;
             }
             robot_kinematics = robot_kinematics_subscriber.recv() => {
@@ -153,7 +254,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 let transform = result
                     .as_ref()
                     .map(|result| localization_transform_from_backend_pose(&result.transform));
+
                 localization_publisher.publish(&transform).await?;
+
                 if let Some(result) = result {
                     calibrated_intrinsics_publisher
                         .publish(&intrinsic_from_camera_intrinsics(&result.camera_intrinsics))
@@ -168,6 +271,58 @@ fn localization_transform_from_backend_pose(
     robot_to_field: &nalgebra::Isometry3<f64>,
 ) -> Isometry3<Field, Robot> {
     robot_to_field.inverse().cast::<f32>().framed_transform()
+}
+
+fn pose_hint_from_frontend(frontend: &VinsFrontend) -> Option<Isometry3<Robot, Field>> {
+    frontend
+        .peek_last_optimization_result()
+        .map(|result| result.transform.cast::<f32>().framed_transform())
+}
+
+/// Runs global localization and returns debug data plus Unique-only backend associations.
+pub fn localize_global_visual_features(
+    visual_features: &DetectedVisualFeatures,
+    camera_matrix: &CameraMatrix,
+    field_dimensions: &FieldDimensions,
+    pose_hint: Option<Isometry3<Robot, Field>>,
+    parameters: &GlobalLocalizerParameters,
+) -> GlobalVisualLocalization {
+    let localizer = GlobalLocalizer::new(*parameters);
+    let result = localizer.localize(GlobalLocalizationInput {
+        visual_features,
+        field_dimensions,
+        ground_to_robot: camera_matrix.ground_to_robot,
+        robot_to_camera: robot_to_camera(camera_matrix),
+        camera_intrinsic: camera_matrix.intrinsics,
+        pose_hint,
+    });
+
+    GlobalVisualLocalization {
+        debug: result.as_ref().map(global_localization_debug_from_result),
+        unique_associations: result.as_ref().and_then(|result| {
+            result
+                .unique_reprojection_associations()
+                .map(Iterator::collect)
+        }),
+    }
+}
+
+fn global_localization_debug_from_result(
+    result: &GlobalLocalizationResult,
+) -> GlobalLocalizationDebug {
+    let status = if result.is_unique() {
+        GlobalLocalizationDebugStatus::Unique
+    } else {
+        GlobalLocalizationDebugStatus::Ambiguous
+    };
+    let associations = result.associations();
+    GlobalLocalizationDebug {
+        robot_to_field: associations.robot_to_field,
+        status,
+        inliers: associations.score.inliers,
+        reprojection_rmse: associations.score.reprojection_rmse,
+        total_cost: associations.score.total_cost,
+    }
 }
 
 async fn wait_for_initial_state(
@@ -227,6 +382,37 @@ pub struct DetectedVisualFeatures {
     pub goalposts: Vec<Point2<Pixel>>,
     pub l_spots: Vec<Point2<Pixel>>,
     pub t_spots: Vec<Point2<Pixel>>,
+    pub penalty_spots: Vec<Point2<Pixel>>,
+}
+
+impl DetectedVisualFeatures {
+    pub fn supported_feature_count(&self) -> usize {
+        self.goalposts.len() + self.l_spots.len() + self.t_spots.len() + self.penalty_spots.len()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+/// Published debug data for a successful global localization hypothesis.
+pub struct GlobalLocalizationDebug {
+    /// Best robot pose in the field frame for this visual result.
+    pub robot_to_field: Isometry3<Robot, Field>,
+    /// Whether the best result was visually unique or ambiguous.
+    pub status: GlobalLocalizationDebugStatus,
+    /// Number of fixed feature associations accepted by the reprojection gate.
+    pub inliers: usize,
+    /// Root-mean-square reprojection error in pixels.
+    pub reprojection_rmse: f32,
+    /// Sum of squared reprojection errors in pixels squared.
+    pub total_cost: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Message)]
+/// Classification of a successful global localization result.
+pub enum GlobalLocalizationDebugStatus {
+    /// A plausible alternative association or field symmetry remains.
+    Ambiguous,
+    /// No plausible alternative survived the deterministic search.
+    Unique,
 }
 
 pub fn find_detected_visual_features(
@@ -241,6 +427,9 @@ pub fn find_detected_visual_features(
                 }
                 RobocupObjectLabel::LSpot => features.l_spots.push(pixel_center(object)),
                 RobocupObjectLabel::TSpot => features.t_spots.push(pixel_center(object)),
+                RobocupObjectLabel::PenaltySpot => {
+                    features.penalty_spots.push(pixel_center(object))
+                }
                 _ => {}
             }
             features
@@ -260,47 +449,19 @@ fn pixel_center(object: Object<RobocupObjectLabel>) -> Point2<Pixel> {
     ]
 }
 
-pub fn ingest_visual_features(
-    frontend: &mut VinsFrontend,
-    time: Time,
-    visual_features: DetectedVisualFeatures,
-    camera_matrix: &CameraMatrix,
-    field_dimensions: Arc<FieldDimensions>,
-) -> Result<(), VinsFrontendError> {
-    let robot_to_camera = robot_to_left_camera(camera_matrix);
-    let mut classes = Vec::new();
-
-    if let Some(class) = visual_class_measurement(
-        visual_features.goalposts,
-        goalpost_candidate_positions(&field_dimensions),
-    ) {
-        classes.push(class);
-    }
-    if let Some(class) = visual_class_measurement(
-        visual_features.l_spots,
-        l_spot_candidate_positions(&field_dimensions),
-    ) {
-        classes.push(class);
-    }
-    if let Some(class) = visual_class_measurement(
-        visual_features.t_spots,
-        t_spot_candidate_positions(&field_dimensions),
-    ) {
-        classes.push(class);
-    }
-
-    frontend.ingest_visual_classes(time.to_wallclock(), classes, robot_to_camera)
-}
-
 pub fn ingest_visual_odometry(
     frontend: &mut VinsFrontend,
-    time: Time,
-    odometer: nalgebra::Isometry3<f32>,
-    camera_matrix: &CameraMatrix,
+    delta: VisualOdometryDeltaMessage,
+    previous_camera_matrix: &CameraMatrix,
+    current_camera_matrix: &CameraMatrix,
 ) -> Result<(), VinsFrontendError> {
-    let robot_to_left_camera = robot_to_left_camera(camera_matrix);
-
-    frontend.ingest_visual_odometry(time.to_wallclock(), robot_to_left_camera, odometer)
+    frontend.ingest_visual_odometry_delta(
+        delta.previous_time.to_wallclock(),
+        delta.current_time.to_wallclock(),
+        robot_to_left_camera(previous_camera_matrix),
+        robot_to_left_camera(current_camera_matrix),
+        delta.current_left_camera_to_previous_left_camera,
+    )
 }
 
 pub fn ingest_foot_heights(
@@ -334,80 +495,11 @@ fn foot_height_points(robot_kinematics: &RobotKinematics) -> (Point3<f64>, Point
 }
 
 fn robot_to_left_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
-    (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
+    robot_to_camera(camera_matrix).inner
 }
 
-fn visual_class_measurement(
-    detections: Vec<Point2<Pixel>>,
-    candidates: Vec<Point3<f64>>,
-) -> Option<VisualClassMeasurement> {
-    if detections.is_empty() {
-        return None;
-    }
-
-    Some(VisualClassMeasurement {
-        detections: detections
-            .into_iter()
-            .map(|detection| detection.inner.cast())
-            .collect(),
-        candidates,
-        association_costs: Some(LandmarkAssociationCosts {
-            unmatched_landmark: GOALPOST_UNMATCHED_LANDMARK_COST,
-            unmatched_detection: GOALPOST_UNMATCHED_DETECTION_COST,
-        }),
-    })
-}
-
-fn goalpost_candidate_positions(field_dimensions: &FieldDimensions) -> Vec<Point3<f64>> {
-    [Half::Opponent, Half::Own]
-        .into_iter()
-        .flat_map(|half| {
-            [Side::Left, Side::Right]
-                .into_iter()
-                .map(move |side| field_candidate(field_dimensions.goal_post(half, side)))
-        })
-        .collect()
-}
-
-fn l_spot_candidate_positions(field_dimensions: &FieldDimensions) -> Vec<Point3<f64>> {
-    [Half::Opponent, Half::Own]
-        .into_iter()
-        .flat_map(|half| {
-            [Side::Left, Side::Right].into_iter().flat_map(move |side| {
-                [
-                    field_dimensions.corner(half, side),
-                    field_dimensions.goal_box_corner(half, side),
-                    field_dimensions.penalty_box_corner(half, side),
-                ]
-                .into_iter()
-                .map(field_candidate)
-            })
-        })
-        .collect()
-}
-
-fn t_spot_candidate_positions(field_dimensions: &FieldDimensions) -> Vec<Point3<f64>> {
-    let sideline_t_crossings = [Side::Left, Side::Right]
-        .into_iter()
-        .map(|side| field_candidate(field_dimensions.t_crossing(side)));
-    let box_goal_line_intersections = [Half::Opponent, Half::Own].into_iter().flat_map(|half| {
-        [Side::Left, Side::Right].into_iter().flat_map(move |side| {
-            [
-                field_dimensions.goal_box_goal_line_intersection(half, side),
-                field_dimensions.penalty_box_goal_line_intersection(half, side),
-            ]
-            .into_iter()
-            .map(field_candidate)
-        })
-    });
-
-    sideline_t_crossings
-        .chain(box_goal_line_intersections)
-        .collect()
-}
-
-fn field_candidate(point: Point2<Field>) -> Point3<f64> {
-    point.extend(0.0).inner.cast()
+fn robot_to_camera(camera_matrix: &CameraMatrix) -> Isometry3<Robot, Camera> {
+    camera_matrix.head_to_camera * camera_matrix.robot_to_head
 }
 
 #[cfg(test)]
@@ -460,12 +552,23 @@ mod tests {
                     confidence: 1.0,
                 },
             },
+            Object {
+                label: RobocupObjectLabel::PenaltySpot,
+                bounding_box: BoundingBox {
+                    area: Rectangle {
+                        min: point![70.0, 90.0],
+                        max: point![90.0, 110.0],
+                    },
+                    confidence: 1.0,
+                },
+            },
         ];
 
         let features = find_detected_visual_features(detections);
 
         assert_eq!(features.l_spots, vec![point![20.0, 35.0]]);
         assert_eq!(features.t_spots, vec![point![50.0, 70.0]]);
+        assert_eq!(features.penalty_spots, vec![point![80.0, 100.0]]);
     }
 
     #[test]

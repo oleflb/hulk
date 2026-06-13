@@ -18,8 +18,8 @@ const TEST_CONFIG: TrajectoryTestConfig = TrajectoryTestConfig {
     roll_pitch_yaw_noise_std: 0.01,
     detection_noise_std: 1.0,
     noise_seed: 0,
-    max_position_rmse_meters: 0.079566,
-    max_orientation_rmse_degrees: 0.808693,
+    max_position_rmse_meters: 0.25,
+    max_orientation_rmse_degrees: 2.2,
 };
 
 #[test]

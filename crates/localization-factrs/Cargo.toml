@@ -8,6 +8,7 @@ homepage.workspace = true
 [dependencies]
 booster.workspace = true
 context_attribute.workspace = true
+coordinate_systems.workspace = true
 factrs = { git = "https://github.com/oleflb/fact-rs", rev = "4b5802bfb386d0b594464197d079d28f96bef9c7" }
 faer = "0.23.0"
 faer-ext = { version = "0.7.1", features = ["nalgebra"] }

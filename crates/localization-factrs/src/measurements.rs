@@ -1,17 +1,20 @@
 use std::time::SystemTime;
 
 use booster::ImuState;
+use coordinate_systems::{Field, Pixel};
 use factrs::core::SE3;
+use linear_algebra::{Point2 as FramedPoint2, Point3 as FramedPoint3};
 use nalgebra::{Point2, Point3};
 
-use crate::foot_above_ground_factor::FootHeightMeasurement;
-use crate::visual_odometry_factors::VisualOdometrySample;
+use crate::factors::{
+    foot_above_ground::FootHeightMeasurement, visual_odometry::VisualOdometryMeasurement,
+};
 
 #[derive(Debug, Clone)]
 pub enum SensorMeasurement {
     Imu(ImuMeasurement),
-    Visual(Vec<VisualMeasurement>),
-    VisualOdometry(VisualOdometrySample),
+    Visual(Vec<VisualReprojectionMeasurement>),
+    VisualOdometry(VisualOdometryMeasurement),
     FootHeights(FootHeightMeasurement),
 }
 
@@ -25,7 +28,7 @@ impl SensorMeasurement {
                     .expect("visual frames must contain at least one measurement")
                     .time
             }
-            SensorMeasurement::VisualOdometry(visual_odometry) => visual_odometry.timestamp,
+            SensorMeasurement::VisualOdometry(visual_odometry) => visual_odometry.current_time,
             SensorMeasurement::FootHeights(foot_heights) => foot_heights.time,
         }
     }
@@ -37,32 +40,23 @@ pub struct ImuMeasurement {
     pub state: ImuState,
 }
 
+/// A fixed visual feature association in domain frames.
+#[derive(Debug, Clone, Copy)]
+pub struct VisualReprojectionAssociation {
+    /// Detected feature location in pixel coordinates.
+    pub detection: FramedPoint2<Pixel>,
+    /// Associated field feature in field coordinates.
+    pub field_point: FramedPoint3<Field>,
+}
+
 #[derive(Debug, Clone)]
-pub struct VisualMeasurement {
+pub struct VisualReprojectionMeasurement {
     /// Time of the detection
     pub time: SystemTime,
-    /// The detected features in image space
-    pub detections: Vec<Point2<f64>>,
-    /// Candidate 3d global correspondences
-    pub candidates: Vec<Point3<f64>>,
+    /// The detected feature in image space.
+    pub detection: Point2<f64>,
+    /// The associated 3d field point.
+    pub field_point: Point3<f64>,
     /// Transformation from the robot frame to the camera frame
     pub robot_to_camera: SE3<f64>,
-    /// Optional per-frame association costs overriding the landmark factor default.
-    pub association_costs: Option<LandmarkAssociationCosts>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VisualClassMeasurement {
-    /// The detected features in image space for one semantic class.
-    pub detections: Vec<Point2<f64>>,
-    /// Candidate 3d global correspondences for the same semantic class.
-    pub candidates: Vec<Point3<f64>>,
-    /// Optional per-class association costs overriding the landmark factor default.
-    pub association_costs: Option<LandmarkAssociationCosts>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LandmarkAssociationCosts {
-    pub unmatched_landmark: f64,
-    pub unmatched_detection: f64,
 }

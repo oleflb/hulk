@@ -12,7 +12,7 @@ use linear_algebra::Isometry3;
 use projection::camera_matrix::CameraMatrix;
 use types::field_dimensions::FieldDimensions;
 
-use crate::state::{CameraFrame, ViewerState};
+use crate::state::{CameraFrame, PoseSource, ViewerState};
 
 const K1_ASSET_DIRECTORY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -42,15 +42,17 @@ pub(crate) fn configure(app: &mut App) {
 
 #[derive(Clone, Default, Resource)]
 pub(crate) struct ViewerData {
+    pose_source: PoseSource,
     field_dimensions: Option<FieldDimensions>,
     localization: Option<Isometry3<Field, Robot>>,
+    visual_odometer: Option<nalgebra::Isometry3<f32>>,
     robot_kinematics: Option<RobotKinematics>,
     camera_matrix: Option<CameraMatrix>,
     camera_frame: Option<CameraFrame>,
 }
 
 impl ViewerData {
-    pub(crate) fn from_state(state: &ViewerState) -> Self {
+    pub(crate) fn from_state(state: &ViewerState, pose_source: PoseSource) -> Self {
         let camera_matrix = state.camera_matrix.clone().map(|mut camera_matrix| {
             if let Some(intrinsics) = state.calibrated_intrinsics {
                 camera_matrix.intrinsics = intrinsics;
@@ -59,8 +61,10 @@ impl ViewerData {
         });
 
         Self {
+            pose_source,
             field_dimensions: state.field_dimensions,
             localization: state.localization,
+            visual_odometer: state.visual_odometer,
             robot_kinematics: state.robot_kinematics.clone(),
             camera_matrix,
             camera_frame: state.camera_frame.clone(),
@@ -501,7 +505,7 @@ fn update_camera_viewport(
         return;
     };
 
-    let transform = camera_to_field_transform(&data, camera_matrix);
+    let transform = camera_to_display_transform(&data, camera_matrix);
     *frustum.1 = transform;
     *image_plane.1 = transform;
     *frustum.2 = Visibility::Visible;
@@ -537,11 +541,7 @@ fn update_robot_links(
     data: Res<ViewerData>,
     mut links: Query<(&RobotLink, &mut Transform), Without<FieldPlane>>,
 ) {
-    let robot_to_field = data
-        .localization
-        .as_ref()
-        .map(|field_to_robot| field_to_robot.inverse().inner)
-        .unwrap_or_else(nalgebra::Isometry3::identity);
+    let robot_to_display = robot_to_display(&data);
 
     for (link, mut transform) in &mut links {
         let link_to_robot = data
@@ -555,21 +555,37 @@ fn update_robot_links(
                     link.fallback_translation[2],
                 )
             });
-        *transform = transform_from_isometry(robot_to_field * link_to_robot);
+        *transform = transform_from_isometry(robot_to_display * link_to_robot);
     }
 }
 
-fn camera_to_field_transform(data: &ViewerData, camera_matrix: &CameraMatrix) -> Transform {
-    let robot_to_field = data
-        .localization
-        .as_ref()
-        .map(|field_to_robot| field_to_robot.inverse().inner)
-        .unwrap_or_else(nalgebra::Isometry3::identity);
-    let camera_to_robot = (camera_matrix.head_to_camera * camera_matrix.robot_to_head)
-        .inverse()
-        .inner;
+fn camera_to_display_transform(data: &ViewerData, camera_matrix: &CameraMatrix) -> Transform {
+    let robot_to_display = robot_to_display(data);
+    let camera_to_robot = robot_to_camera(camera_matrix).inverse();
 
-    transform_from_isometry(robot_to_field * camera_to_robot)
+    transform_from_isometry(robot_to_display * camera_to_robot)
+}
+
+fn robot_to_display(data: &ViewerData) -> nalgebra::Isometry3<f32> {
+    match data.pose_source {
+        PoseSource::Localization => data
+            .localization
+            .as_ref()
+            .map(|field_to_robot| field_to_robot.inverse().inner),
+        PoseSource::VisualOdometer => visual_odometer_robot_to_display(data),
+    }
+    .unwrap_or_else(nalgebra::Isometry3::identity)
+}
+
+fn visual_odometer_robot_to_display(data: &ViewerData) -> Option<nalgebra::Isometry3<f32>> {
+    let visual_odometer = data.visual_odometer?;
+    let camera_matrix = data.camera_matrix.as_ref()?;
+
+    Some(visual_odometer * robot_to_camera(camera_matrix))
+}
+
+fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
+    (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
 }
 
 fn camera_frustum_mesh(camera_matrix: &CameraMatrix) -> Mesh {

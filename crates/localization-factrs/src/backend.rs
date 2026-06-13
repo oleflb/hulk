@@ -5,7 +5,7 @@ use std::{
 
 use factrs::{
     containers::FactorBuilder,
-    core::{GaussNewton, Graph, PriorResidual, Values, Vector3},
+    core::{GaussNewton, Graph, PriorResidual, SO3, Values, Vector3},
     linalg::Matrix3,
     noise::GaussianNoise,
     optimizers::{BaseOptParams, OptError, OptStatus},
@@ -17,18 +17,26 @@ use nalgebra::{Matrix2, SMatrix};
 use thiserror::Error;
 
 use crate::{
-    foot_above_ground_factor::{FootHeightMeasurement, IntervalFootAboveGroundFactor},
-    gaussian_process_prior_factor::GaussianProcessPriorFactor,
-    imu_factor::IntervalGaussianProcessImuFactor,
+    factors::{
+        foot_above_ground::{FootHeightMeasurement, IntervalFootAboveGroundFactor},
+        gaussian_process_prior::GaussianProcessPriorFactor,
+        imu::{
+            CurrentSplineOrientationFactor, RelativeYawFactor, RollPitchPriorFactor,
+            interpolate_measurement_orientation,
+        },
+        visual_odometry::{
+            AdjacentVisualOdometryFactor, VisualOdometryDelta, VisualOdometryFactor,
+            VisualOdometryMeasurement,
+        },
+        visual_reprojection::VisualReprojectionFactor,
+    },
     initial_state::InitialState,
     interval_measurement::IntervalMeasurements,
-    landmark_factor::LandmarkFactor,
-    measurements::{ImuMeasurement, SensorMeasurement, VisualMeasurement},
+    measurements::{ImuMeasurement, SensorMeasurement, VisualReprojectionMeasurement},
     schur_marginalization::marginalize,
     splines::SE23Spline,
     symbols::{CameraIntrinsics, State},
     tau,
-    visual_odometry_factors::{VisualOdometryDelta, VisualOdometryFactor, VisualOdometrySample},
 };
 
 use tokio::sync::{
@@ -38,9 +46,6 @@ use tokio::sync::{
 
 const INITIAL_CAMERA_INTRINSICS_PRIOR_SIGMA: f64 = 1.0e-6;
 const INITIAL_POSE_PRIOR_SIGMA: f64 = 1.0e-1;
-// Sparse detections should not force every candidate landmark to be explained.
-const UNMATCHED_LANDMARK_COST: f64 = 0.0;
-const UNMATCHED_DETECTION_COST: f64 = 25.0;
 // Empty intervals are inserted only to keep graph components connected across
 // dropped recording data. They use zero-start-velocity GP priors so stale
 // pre-gap velocity is not treated as measured ballistic motion.
@@ -118,8 +123,14 @@ pub struct VinsBackend {
     highest_initialized_interval: Option<u32>,
     /// Stores the timestamp of the first measurement received by the backend.
     interval_assigner: IntervalAssigner,
-    /// Last absolute visual odometry sample used to form the next relative delta.
-    last_visual_odometry_sample: Option<VisualOdometrySample>,
+    /// Last IMU attitude sample seen by the sorted stream.
+    last_imu_attitude_measurement: Option<ImuMeasurement>,
+    /// Latest IMU attitude sample used by the live in-interval orientation factor.
+    latest_imu_attitude_measurement: Option<ImuMeasurement>,
+    /// Next knot whose interpolated IMU attitude measurement has not been finalized yet.
+    next_imu_attitude_knot_index: u32,
+    /// Latest finalized knot orientation, used to form relative yaw and live yaw residuals.
+    last_imu_knot_orientation: Option<ImuKnotOrientation>,
 }
 
 pub fn initialize_graph(initial_state: &InitialState) -> (Graph, Values) {
@@ -188,7 +199,10 @@ impl VinsBackend {
             values,
             last_knot_time: None,
             highest_initialized_interval: None,
-            last_visual_odometry_sample: None,
+            last_imu_attitude_measurement: None,
+            latest_imu_attitude_measurement: None,
+            next_imu_attitude_knot_index: 0,
+            last_imu_knot_orientation: None,
         }
     }
 
@@ -217,48 +231,204 @@ impl VinsBackend {
 
     /// Ingests a batch of IMU measurements into the graph.
     /// Assumes the measurements are already sorted by time.
-    fn ingest_imu(&mut self, imus: Vec<ImuMeasurement>) -> Result<(), VinsBackendError> {
-        let Some(last) = imus.last() else {
+    fn ingest_imu(&mut self, measurements: Vec<ImuMeasurement>) -> Result<(), VinsBackendError> {
+        let Some(last) = measurements.last() else {
             return Ok(());
         };
-        self.update_last_knot_time(last.time);
+        let first_time = measurements
+            .first()
+            .expect("non-empty IMU measurements must have first sample")
+            .time;
+        let last_time = last.time;
+        let _ = self.interval_assigner.assign_interval(first_time);
+        self.update_last_knot_time(last_time);
 
-        let interval_groups = self.interval_groups(imus, |imu| imu.time);
-
-        for group in interval_groups {
-            if !self.prepare_interval_for_measurements(group.start_index, "IMU") {
-                continue;
-            }
-
-            let keys = (State(group.start_index), State(group.start_index + 1));
-            let graph = self.optimizer.graph_mut();
-            if let Some(factor) = graph
-                .factors_for_residual_mut::<IntervalGaussianProcessImuFactor, _>(keys)
-                .next()
-            {
-                factor
-                    .residual_as_mut::<IntervalGaussianProcessImuFactor>()
-                    .expect("factor query must return matching residual")
-                    .extend_measurements(group.measurements);
-            } else {
-                let residual = IntervalGaussianProcessImuFactor::new(
-                    group.measurements,
-                    self.config.roll_pitch_yaw_noise,
-                    group.start_time,
-                    group.end_time,
-                );
-                let factor = FactorBuilder::new(residual, keys).build();
-
-                graph.add_factor(factor);
-            }
-        }
+        let Some(last_interval_index) = self.interval_assigner.assign_interval(last_time) else {
+            return Ok(());
+        };
+        self.init_intervals_through(last_interval_index);
+        self.process_imu_attitude_measurements(measurements);
 
         Ok(())
     }
 
+    fn process_imu_attitude_measurements(&mut self, measurements: Vec<ImuMeasurement>) {
+        let mut previous = self.last_imu_attitude_measurement.clone();
+
+        for measurement in measurements {
+            if let Some(previous) = previous.as_ref() {
+                debug_assert!(
+                    previous.time <= measurement.time,
+                    "IMU measurements must be globally sorted by time"
+                );
+                self.add_imu_attitude_factors_between(previous, &measurement);
+            } else {
+                self.add_exact_imu_attitude_knot(&measurement);
+            }
+
+            self.latest_imu_attitude_measurement = Some(measurement.clone());
+            previous = Some(measurement);
+        }
+
+        self.last_imu_attitude_measurement = previous;
+    }
+
+    fn add_exact_imu_attitude_knot(&mut self, measurement: &ImuMeasurement) {
+        while let Some(knot_time) = self
+            .interval_assigner
+            .interval_start_time(self.next_imu_attitude_knot_index)
+        {
+            if knot_time > measurement.time {
+                return;
+            }
+
+            if knot_time == measurement.time {
+                self.add_imu_knot_orientation(
+                    self.next_imu_attitude_knot_index,
+                    interpolate_measurement_orientation(measurement, measurement, knot_time),
+                );
+            }
+            self.next_imu_attitude_knot_index += 1;
+        }
+    }
+
+    fn add_imu_attitude_factors_between(
+        &mut self,
+        previous: &ImuMeasurement,
+        current: &ImuMeasurement,
+    ) {
+        while let Some(knot_time) = self
+            .interval_assigner
+            .interval_start_time(self.next_imu_attitude_knot_index)
+        {
+            if knot_time < previous.time {
+                self.next_imu_attitude_knot_index += 1;
+                continue;
+            }
+            if knot_time > current.time {
+                return;
+            }
+
+            let measured_orientation =
+                interpolate_measurement_orientation(previous, current, knot_time);
+            self.add_imu_knot_orientation(self.next_imu_attitude_knot_index, measured_orientation);
+            self.next_imu_attitude_knot_index += 1;
+        }
+    }
+
+    fn add_imu_knot_orientation(&mut self, knot_index: u32, measured_orientation: SO3) {
+        self.add_roll_pitch_prior_if_available(State(knot_index), measured_orientation.clone());
+
+        if let Some(previous) = self.last_imu_knot_orientation.as_ref()
+            && previous.index + 1 == knot_index
+            && self.interval_states_available(previous.index)
+        {
+            self.add_relative_yaw_factor_if_available(
+                previous.index,
+                previous.orientation.clone(),
+                measured_orientation.clone(),
+            );
+        }
+
+        self.last_imu_knot_orientation = Some(ImuKnotOrientation {
+            index: knot_index,
+            orientation: measured_orientation,
+        });
+    }
+
+    fn add_roll_pitch_prior_if_available(&mut self, state: State, measured_orientation: SO3) {
+        if self.values.get(state).is_none() {
+            return;
+        }
+        let graph = self.optimizer.graph_mut();
+        if graph
+            .factors_for_residual_mut::<RollPitchPriorFactor, _>(state)
+            .next()
+            .is_some()
+        {
+            return;
+        }
+
+        let residual =
+            RollPitchPriorFactor::new(measured_orientation, self.config.roll_pitch_yaw_noise);
+        let factor = FactorBuilder::new(residual, state).build();
+        graph.add_factor(factor);
+    }
+
+    fn add_relative_yaw_factor_if_available(
+        &mut self,
+        interval_index: u32,
+        measured_start_orientation: SO3,
+        measured_end_orientation: SO3,
+    ) {
+        let keys = (State(interval_index), State(interval_index + 1));
+        let graph = self.optimizer.graph_mut();
+        if graph
+            .factors_for_residual_mut::<RelativeYawFactor, _>(keys)
+            .next()
+            .is_some()
+        {
+            return;
+        }
+
+        let residual = RelativeYawFactor::new(
+            measured_start_orientation,
+            measured_end_orientation,
+            self.config.roll_pitch_yaw_noise,
+        );
+        let factor = FactorBuilder::new(residual, keys).build();
+        graph.add_factor(factor);
+    }
+
+    fn add_current_spline_orientation_factor(&mut self) {
+        let Some(current_measurement) = self.latest_imu_attitude_measurement.clone() else {
+            return;
+        };
+        let Some(start_time) = self
+            .interval_assigner
+            .current_interval_start_time(current_measurement.time)
+        else {
+            return;
+        };
+        let Some(interval_index) = self.interval_assigner.assign_interval(start_time) else {
+            return;
+        };
+        if !self.interval_states_available(interval_index) {
+            return;
+        }
+
+        let Some(start_orientation) = self.last_imu_knot_orientation.as_ref() else {
+            return;
+        };
+        if start_orientation.index != interval_index {
+            return;
+        }
+
+        let end_time = start_time + self.config.knot_spacing;
+        let residual = CurrentSplineOrientationFactor::new(
+            start_orientation.orientation.clone(),
+            &current_measurement,
+            self.config.roll_pitch_yaw_noise,
+            start_time,
+            end_time,
+        );
+        let factor =
+            FactorBuilder::new(residual, (State(interval_index), State(interval_index + 1)))
+                .build();
+        self.optimizer.graph_mut().add_factor(factor);
+    }
+
+    fn remove_current_spline_orientation_factor(&mut self) {
+        self.optimizer.graph_mut().remove_factors(|factor| {
+            factor
+                .residual_as::<CurrentSplineOrientationFactor>()
+                .is_some()
+        });
+    }
+
     fn ingest_visual(
         &mut self,
-        mut visuals: Vec<Vec<VisualMeasurement>>,
+        mut visuals: Vec<Vec<VisualReprojectionMeasurement>>,
     ) -> Result<(), VinsBackendError> {
         visuals.retain(|visual| !visual.is_empty());
         if visuals.is_empty() {
@@ -286,21 +456,20 @@ impl VinsBackend {
             );
             let graph = self.optimizer.graph_mut();
             if let Some(factor) = graph
-                .factors_for_residual_mut::<LandmarkFactor, _>(keys)
+                .factors_for_residual_mut::<VisualReprojectionFactor, _>(keys)
                 .next()
             {
                 factor
-                    .residual_as_mut::<LandmarkFactor>()
+                    .residual_as_mut::<VisualReprojectionFactor>()
                     .expect("factor query must return matching residual")
                     .extend_frames(group.measurements);
             } else {
-                let residual = LandmarkFactor::new(
+                let residual = VisualReprojectionFactor::new(
                     group.start_time,
                     group.end_time,
                     group.measurements,
                     self.config.visual_feature_noise,
-                )
-                .with_unmatched_costs(UNMATCHED_LANDMARK_COST, UNMATCHED_DETECTION_COST);
+                );
                 let factor = FactorBuilder::new(residual, keys).build();
 
                 graph.add_factor(factor);
@@ -312,33 +481,43 @@ impl VinsBackend {
 
     fn ingest_visual_odometry(
         &mut self,
-        visual_odometry: Vec<VisualOdometrySample>,
+        visual_odometry: Vec<VisualOdometryMeasurement>,
     ) -> Result<(), VinsBackendError> {
         let Some(last) = visual_odometry.last() else {
             return Ok(());
         };
-        let last_timestamp = last.timestamp;
+        let last_timestamp = last.current_time;
 
-        let mut deltas = Vec::new();
-        for sample in visual_odometry {
-            if let Some(previous) = self.last_visual_odometry_sample.as_ref()
-                && let Some(delta) = self.visual_odometry_delta(previous, &sample)
-            {
-                deltas.push(delta);
+        let mut same_interval_deltas = Vec::new();
+        let mut adjacent_interval_deltas = Vec::new();
+        for measurement in visual_odometry {
+            match self.visual_odometry_delta(&measurement) {
+                Some(TimedVisualOdometryDelta::SameInterval(delta)) => {
+                    same_interval_deltas.push(delta);
+                }
+                Some(TimedVisualOdometryDelta::AdjacentInterval(delta)) => {
+                    adjacent_interval_deltas.push(delta);
+                }
+                None => {}
             }
-            self.last_visual_odometry_sample = Some(sample);
         }
 
-        if deltas.is_empty() {
+        if same_interval_deltas.is_empty() && adjacent_interval_deltas.is_empty() {
             return Ok(());
         }
         self.update_last_knot_time(last_timestamp);
+        self.add_visual_odometry_factors(same_interval_deltas);
+        self.add_adjacent_visual_odometry_factors(adjacent_interval_deltas);
 
+        Ok(())
+    }
+
+    fn add_visual_odometry_factors(&mut self, deltas: Vec<IntervalVisualOdometryDelta>) {
         let interval_groups =
             self.interval_groups(deltas, |measurement| measurement.interval_start_time);
 
         for group in interval_groups {
-            if !self.prepare_interval_for_measurements(group.start_index, "visual odometry") {
+            if !self.prepare_visual_odometry_states(group.start_index, group.start_index) {
                 continue;
             }
 
@@ -369,35 +548,122 @@ impl VinsBackend {
                 graph.add_factor(factor);
             }
         }
+    }
 
-        Ok(())
+    fn add_adjacent_visual_odometry_factors(&mut self, deltas: Vec<IntervalVisualOdometryDelta>) {
+        let interval_groups =
+            self.interval_groups(deltas, |measurement| measurement.interval_start_time);
+
+        for group in interval_groups {
+            let end_index = group.start_index + 1;
+            if !self.prepare_visual_odometry_states(group.start_index, end_index) {
+                continue;
+            }
+
+            let measurements = group
+                .measurements
+                .into_iter()
+                .map(|measurement| measurement.delta)
+                .collect::<Vec<_>>();
+
+            let keys = (
+                State(group.start_index),
+                State(group.start_index + 1),
+                State(group.start_index + 2),
+            );
+            let graph = self.optimizer.graph_mut();
+            if let Some(factor) = graph
+                .factors_for_residual_mut::<AdjacentVisualOdometryFactor, _>(keys)
+                .next()
+            {
+                factor
+                    .residual_as_mut::<AdjacentVisualOdometryFactor>()
+                    .expect("factor query must return matching residual")
+                    .extend_measurements(measurements);
+            } else {
+                let residual = AdjacentVisualOdometryFactor::new(
+                    measurements,
+                    self.config.visual_odometry_noise,
+                    self.config.knot_spacing.as_secs_f64(),
+                );
+                let factor = FactorBuilder::new(residual, keys).build();
+
+                graph.add_factor(factor);
+            }
+        }
+    }
+
+    fn prepare_visual_odometry_states(&mut self, start_index: u32, end_index: u32) -> bool {
+        self.init_intervals_through(end_index);
+        if (start_index..=(end_index + 1)).all(|index| self.values.get(State(index)).is_some()) {
+            return true;
+        }
+
+        log::debug!(
+            "skipping visual odometry measurements for marginalized states {start_index}..{}",
+            end_index + 1
+        );
+        false
     }
 
     fn visual_odometry_delta(
         &self,
-        previous: &VisualOdometrySample,
-        current: &VisualOdometrySample,
+        measurement: &VisualOdometryMeasurement,
     ) -> Option<TimedVisualOdometryDelta> {
-        let interval_start_time = self
-            .interval_assigner
-            .current_interval_start_time(previous.timestamp)?;
-        if self
-            .interval_assigner
-            .current_interval_start_time(current.timestamp)?
-            != interval_start_time
-        {
+        if measurement.current_time <= measurement.previous_time {
+            log::debug!("dropping non-forward visual odometry measurement");
             return None;
         }
 
-        Some(TimedVisualOdometryDelta {
-            interval_start_time,
-            delta: VisualOdometryDelta::from_samples(
-                previous,
-                current,
-                interval_start_time,
-                interval_start_time + self.config.knot_spacing,
-            ),
-        })
+        let previous_interval_start_time = self
+            .interval_assigner
+            .current_interval_start_time(measurement.previous_time)?;
+        let previous_interval_index = self
+            .interval_assigner
+            .assign_interval(previous_interval_start_time)?;
+        let current_interval_start_time = self
+            .interval_assigner
+            .current_interval_start_time(measurement.current_time)?;
+        let current_interval_index = self
+            .interval_assigner
+            .assign_interval(current_interval_start_time)?;
+
+        match current_interval_index.checked_sub(previous_interval_index)? {
+            0 => Some(TimedVisualOdometryDelta::SameInterval(
+                IntervalVisualOdometryDelta {
+                    interval_start_time: previous_interval_start_time,
+                    delta: VisualOdometryDelta::from_measurement(
+                        measurement,
+                        previous_interval_start_time,
+                        previous_interval_start_time + self.config.knot_spacing,
+                    ),
+                },
+            )),
+            1 => Some(TimedVisualOdometryDelta::AdjacentInterval(
+                IntervalVisualOdometryDelta {
+                    interval_start_time: previous_interval_start_time,
+                    delta: VisualOdometryDelta::new(
+                        tau(
+                            previous_interval_start_time,
+                            previous_interval_start_time + self.config.knot_spacing,
+                            measurement.previous_time,
+                        ),
+                        tau(
+                            current_interval_start_time,
+                            current_interval_start_time + self.config.knot_spacing,
+                            measurement.current_time,
+                        ),
+                        measurement.robot_delta.clone(),
+                    ),
+                },
+            )),
+            skipped_intervals => {
+                log::debug!(
+                    "dropping visual odometry measurement spanning {skipped_intervals} intervals"
+                );
+                None
+            }
+        }
     }
 
     fn ingest_foot_heights(
@@ -559,6 +825,8 @@ impl VinsBackend {
         let time = self.last_knot_time?;
         log::info!("solving graph with {} values", self.values.len());
 
+        self.remove_current_spline_orientation_factor();
+
         // do Schur marginalization
         let cutoff_time = time - self.config.max_optimization_window;
         if let Some(smallest_interval_index_in_window) =
@@ -570,6 +838,8 @@ impl VinsBackend {
                 State(smallest_interval_index_in_window),
             );
         }
+
+        self.add_current_spline_orientation_factor();
 
         match self.optimizer.optimize(&mut self.values) {
             Ok(OptStatus::Converged) => {}
@@ -583,6 +853,7 @@ impl VinsBackend {
                 log::warn!("optimizer failed: invalid system");
             }
         };
+        self.remove_current_spline_orientation_factor();
 
         let interval_start_time = self.interval_assigner.current_interval_start_time(time)?;
         let interval_start_index = self
@@ -603,7 +874,7 @@ impl VinsBackend {
     }
 }
 
-fn visual_frame_time(visual: &[VisualMeasurement]) -> SystemTime {
+fn visual_frame_time(visual: &[VisualReprojectionMeasurement]) -> SystemTime {
     visual
         .first()
         .expect("visual frames must contain at least one measurement")
@@ -617,7 +888,18 @@ struct IntervalGroup<T> {
     measurements: Vec<T>,
 }
 
-struct TimedVisualOdometryDelta {
+#[derive(Debug, Clone)]
+struct ImuKnotOrientation {
+    index: u32,
+    orientation: SO3,
+}
+
+enum TimedVisualOdometryDelta {
+    SameInterval(IntervalVisualOdometryDelta),
+    AdjacentInterval(IntervalVisualOdometryDelta),
+}
+
+struct IntervalVisualOdometryDelta {
     interval_start_time: SystemTime,
     delta: VisualOdometryDelta,
 }
@@ -778,12 +1060,37 @@ mod tests {
         })
     }
 
-    fn visual_odometry(time: SystemTime, x: f64) -> SensorMeasurement {
-        SensorMeasurement::VisualOdometry(VisualOdometrySample {
-            robot_to_left_camera: SE3::identity(),
-            odometer: SE3::from_rot_trans(SO3::identity(), Vector3::new(x, 0.0, 0.0)),
-            timestamp: time,
+    fn visual_odometry(
+        previous_time: SystemTime,
+        current_time: SystemTime,
+        x: f64,
+    ) -> SensorMeasurement {
+        SensorMeasurement::VisualOdometry(VisualOdometryMeasurement {
+            previous_time,
+            current_time,
+            robot_delta: SE3::from_rot_trans(SO3::identity(), Vector3::new(x, 0.0, 0.0)),
         })
+    }
+
+    fn visual_reprojection(time: SystemTime) -> SensorMeasurement {
+        SensorMeasurement::Visual(vec![VisualReprojectionMeasurement {
+            time,
+            detection: nalgebra::point![0.0, 0.0],
+            field_point: nalgebra::point![0.0, 0.0, 2.0],
+            robot_to_camera: SE3::identity(),
+        }])
+    }
+
+    fn visual_reprojection_factor_count(backend: &mut VinsBackend, state: State) -> usize {
+        backend
+            .optimizer
+            .graph_mut()
+            .factors_for_residual::<VisualReprojectionFactor, _>((
+                state,
+                State(state.0 + 1),
+                CameraIntrinsics(0),
+            ))
+            .count()
     }
 
     fn visual_odometry_factor_count(backend: &mut VinsBackend, state: State) -> usize {
@@ -791,6 +1098,18 @@ mod tests {
             .optimizer
             .graph_mut()
             .factors_for_residual::<VisualOdometryFactor, _>((state, State(state.0 + 1)))
+            .count()
+    }
+
+    fn adjacent_visual_odometry_factor_count(backend: &mut VinsBackend, state: State) -> usize {
+        backend
+            .optimizer
+            .graph_mut()
+            .factors_for_residual::<AdjacentVisualOdometryFactor, _>((
+                state,
+                State(state.0 + 1),
+                State(state.0 + 2),
+            ))
             .count()
     }
 
@@ -877,6 +1196,29 @@ mod tests {
     }
 
     #[test]
+    fn visual_reprojection_measurements_create_interval_factor() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        measurement_sender
+            .send(visual_reprojection(start))
+            .expect("visual reprojection should send");
+
+        let _ = backend.solve_once().expect("solve should succeed");
+
+        assert!(backend.values().get_raw(State(0)).is_some());
+        assert!(backend.values().get_raw(State(1)).is_some());
+        assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 1);
+    }
+
+    #[test]
     fn visual_odometry_measurements_create_interval_factor() {
         let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
@@ -889,11 +1231,12 @@ mod tests {
         let start = SystemTime::UNIX_EPOCH;
 
         measurement_sender
-            .send(visual_odometry(start, 0.0))
-            .expect("first visual odometry should send");
-        measurement_sender
-            .send(visual_odometry(start + Duration::from_millis(100), 0.1))
-            .expect("second visual odometry should send");
+            .send(visual_odometry(
+                start,
+                start + Duration::from_millis(100),
+                0.1,
+            ))
+            .expect("visual odometry should send");
 
         let _ = backend.solve_once().expect("solve should succeed");
 
@@ -903,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn single_visual_odometry_measurement_does_not_create_empty_factor() {
+    fn visual_odometry_measurements_create_adjacent_interval_factor() {
         let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
         let mut backend = VinsBackend::new(
@@ -915,7 +1258,39 @@ mod tests {
         let start = SystemTime::UNIX_EPOCH;
 
         measurement_sender
-            .send(visual_odometry(start, 0.0))
+            .send(stationary_imu(start))
+            .expect("IMU should send");
+        measurement_sender
+            .send(visual_odometry(
+                start + Duration::from_millis(100),
+                start + Duration::from_millis(300),
+                0.1,
+            ))
+            .expect("visual odometry should send");
+
+        let _ = backend.solve_once().expect("solve should succeed");
+
+        assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 0);
+        assert_eq!(
+            adjacent_visual_odometry_factor_count(&mut backend, State(0)),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_visual_odometry_measurement_does_not_create_empty_factor() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        measurement_sender
+            .send(visual_odometry(start, start, 0.0))
             .expect("visual odometry should send");
 
         let _ = backend.solve_once().expect("solve should succeed");
@@ -923,7 +1298,11 @@ mod tests {
         assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 0);
 
         measurement_sender
-            .send(visual_odometry(start + Duration::from_millis(100), 0.1))
+            .send(visual_odometry(
+                start,
+                start + Duration::from_millis(100),
+                0.1,
+            ))
             .expect("visual odometry should send");
 
         let _ = backend.solve_once().expect("solve should succeed");

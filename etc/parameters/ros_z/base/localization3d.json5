@@ -1,0 +1,7 @@
+{
+  global_localizer: {
+    min_inliers: 5,
+    reprojection_gate: 12.0,
+    ambiguity_rmse_margin: 3.0,
+  },
+}

@@ -7,9 +7,11 @@ use std::{
 };
 
 use booster::ImuState;
+use linear_algebra::IntoTransform;
 use localization_3d::{
-    backend_configuration, find_detected_visual_features, ingest_visual_features,
-    initial_state_from_camera_matrix,
+    GlobalLocalizerParameters, Localization3dParameters, backend_configuration,
+    find_detected_visual_features, initial_state_from_camera_matrix,
+    localize_global_visual_features,
 };
 use localization_factrs::{
     OptimizationResult, backend::OptimizationResult as BackendResult, initialize,
@@ -35,11 +37,15 @@ const EXPECTED_IMU_SAMPLE_COUNT: usize = 5981;
 const EXPECTED_CAMERA_MATRIX_COUNT: usize = 4923;
 const EXPECTED_FIELD_DIMENSIONS_COUNT: usize = 6;
 const EXPECTED_DETECTED_OBJECT_FRAME_COUNT: usize = 710;
-const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 508;
+// This recording only has ambiguous goalpost-only global localizations, so the
+// deployed Unique-only backend path must not ingest visual feature frames.
+const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 0;
+const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 0;
+const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 3;
 const EXPECTED_GOALPOST_DETECTION_COUNT: usize = 723;
-const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 186;
-const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 171;
-const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 171;
+const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 184;
+const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 169;
+const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 169;
 const EXPECTED_LANDMARK_COUNT: usize = 4;
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +96,11 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     let solve_every_nth_round = solve_every_nth_round();
     let solve_cadence = solve_cadence_duration(solve_every_nth_round);
     let (mut frontend, mut backend) = initialize(backend_configuration(), initial_state);
+    let parameters = Localization3dParameters::default();
+    let relaxed_debug_global_localizer = GlobalLocalizerParameters {
+        min_inliers: 4,
+        ..Default::default()
+    };
     let mut camera_matrices = Vec::new();
     let mut field_dimensions = None;
     let mut trajectories = ReplayTrajectories::default();
@@ -98,6 +109,8 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     let mut field_dimensions_count = 0;
     let mut object_frame_count = 0;
     let mut visual_frame_count = 0;
+    let mut global_localization_debug_frame_count = 0;
+    let mut relaxed_global_localization_debug_frame_count = 0;
     let mut goalpost_detection_count = 0;
     let mut solver_solution_count = 0;
     let mut has_pending_measurements = false;
@@ -145,6 +158,7 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                 if visual_features.goalposts.is_empty()
                     && visual_features.l_spots.is_empty()
                     && visual_features.t_spots.is_empty()
+                    && visual_features.penalty_spots.is_empty()
                 {
                     continue;
                 }
@@ -158,15 +172,38 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                 };
 
                 goalpost_detection_count += visual_features.goalposts.len();
-                ingest_visual_features(
-                    &mut frontend,
-                    source_time,
-                    visual_features,
+                let pose_hint = frontend
+                    .peek_last_optimization_result()
+                    .map(|result| result.transform.cast::<f32>().framed_transform());
+                let localization = localize_global_visual_features(
+                    &visual_features,
                     camera_matrix,
-                    field_dimensions,
-                )?;
-                visual_frame_count += 1;
-                has_pending_measurements = true;
+                    field_dimensions.as_ref(),
+                    pose_hint,
+                    &parameters.global_localizer,
+                );
+                let relaxed_debug_localization = localize_global_visual_features(
+                    &visual_features,
+                    camera_matrix,
+                    field_dimensions.as_ref(),
+                    pose_hint,
+                    &relaxed_debug_global_localizer,
+                );
+                if localization.debug.is_some() {
+                    global_localization_debug_frame_count += 1;
+                }
+                if relaxed_debug_localization.debug.is_some() {
+                    relaxed_global_localization_debug_frame_count += 1;
+                }
+                if let Some(associations) = localization.unique_associations {
+                    frontend.ingest_visual_reprojection_associations(
+                        source_time.to_wallclock(),
+                        associations,
+                        (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner,
+                    )?;
+                    visual_frame_count += 1;
+                    has_pending_measurements = true;
+                }
             }
             "inputs/imu_state" => {
                 imu_count += 1;
@@ -202,6 +239,14 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     assert_eq!(field_dimensions_count, EXPECTED_FIELD_DIMENSIONS_COUNT);
     assert_eq!(object_frame_count, EXPECTED_DETECTED_OBJECT_FRAME_COUNT);
     assert_eq!(visual_frame_count, EXPECTED_VISUAL_FEATURE_FRAME_COUNT);
+    assert_eq!(
+        global_localization_debug_frame_count,
+        EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT
+    );
+    assert_eq!(
+        relaxed_global_localization_debug_frame_count,
+        EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT
+    );
     assert_eq!(goalpost_detection_count, EXPECTED_GOALPOST_DETECTION_COUNT);
     assert_eq!(solver_solution_count, EXPECTED_SOLVER_SOLUTION_COUNT);
     assert_eq!(output.optimized.len(), EXPECTED_OPTIMIZED_SAMPLE_COUNT);
@@ -216,6 +261,12 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     println!("replayed {imu_count} IMU samples");
     println!("replayed {object_frame_count} detected object frames");
     println!("ingested {visual_frame_count} visual feature frames");
+    println!(
+        "computed {global_localization_debug_frame_count} deployed global localization debug frames"
+    );
+    println!(
+        "computed {relaxed_global_localization_debug_frame_count} relaxed global localization debug frames"
+    );
     println!("ingested {goalpost_detection_count} goalpost detections");
     println!("ran {solver_solution_count} backend solver iterations");
     println!(

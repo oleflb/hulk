@@ -2,27 +2,22 @@ pub use backend::{BackendConfiguration, VinsBackend, VinsBackendError};
 pub use camera_intrinsics::CameraIntrinsics;
 pub use frontend::{OptimizationResult, VinsFrontend, VinsFrontendError};
 pub use initial_state::InitialState;
-pub use measurements::{LandmarkAssociationCosts, VisualClassMeasurement};
+pub use measurements::VisualReprojectionAssociation;
 pub use splines::{SE23Kinematics, SE23Spline};
 pub use symbols::State;
 pub use utils::{interval_dt, tau};
 
 pub mod backend;
 mod camera_intrinsics;
-mod foot_above_ground_factor;
+mod factors;
 mod frontend;
-pub mod gaussian_process_prior_factor;
-mod imu_factor;
 mod initial_state;
 mod interval_measurement;
-mod landmark_factor;
 mod measurements;
-mod prior_factor;
 mod schur_marginalization;
 mod splines;
 mod symbols;
 mod utils;
-pub mod visual_odometry_factors;
 
 pub fn initialize(
     config: BackendConfiguration,

@@ -3,7 +3,7 @@ use std::{
     ops::Mul,
 };
 
-use crate::{prior_factor::SchurPriorResidual, symbols::State};
+use crate::{factors::prior::SchurPriorResidual, symbols::State};
 use factrs::{
     containers::{FactorBuilder, Key, ValuesOrder},
     core::{GaussNewton, Graph, Values},

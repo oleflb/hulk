@@ -15,7 +15,10 @@ use types::object_detection::{Object, RobocupObjectLabel};
 use crate::{
     cli::Arguments,
     scene::{self, ViewerData},
-    state::{CameraFrame, ConnectionStatus, SharedState, StreamState, StreamStatus, ViewerState},
+    state::{
+        CameraFrame, ConnectionStatus, PoseSource, SharedState, StreamState, StreamStatus,
+        ViewerState,
+    },
     subscriptions,
 };
 
@@ -24,6 +27,7 @@ pub(crate) struct RobotViewerApp {
     state: SharedState,
     namespace: String,
     router: String,
+    pose_source: PoseSource,
     camera_texture: Option<TextureHandle>,
     camera_texture_sequence: u64,
     _runtime: Arc<Runtime>,
@@ -63,6 +67,7 @@ impl RobotViewerApp {
             state,
             namespace,
             router,
+            pose_source: PoseSource::default(),
             camera_texture: None,
             camera_texture_sequence: 0,
             _runtime: runtime,
@@ -78,14 +83,13 @@ impl App for RobotViewerApp {
             .expect("viewer state lock should not be poisoned")
             .clone();
 
-        self.widget
-            .bevy_app
-            .world_mut()
-            .insert_resource(ViewerData::from_state(&snapshot));
-
         self.update_camera_texture(context, snapshot.camera_frame.as_ref());
         self.header(context, &snapshot);
         self.camera_panel(context, &snapshot);
+        self.widget
+            .bevy_app
+            .world_mut()
+            .insert_resource(ViewerData::from_state(&snapshot, self.pose_source));
         self.viewport(context);
     }
 }
@@ -112,7 +116,7 @@ impl RobotViewerApp {
         self.camera_texture_sequence = frame.sequence;
     }
 
-    fn header(&self, context: &Context, state: &ViewerState) {
+    fn header(&mut self, context: &Context, state: &ViewerState) {
         TopBottomPanel::top("header")
             .min_height(86.0)
             .show(context, |ui| {
@@ -133,6 +137,7 @@ impl RobotViewerApp {
                     ui.horizontal_wrapped(|ui| {
                         stream_status(ui, "field", &state.field_status);
                         stream_status(ui, "localization", &state.localization_status);
+                        stream_status(ui, "visual odometer", &state.visual_odometer_status);
                         stream_status(ui, "kinematics", &state.robot_kinematics_status);
                         stream_status(ui, "camera matrix", &state.camera_matrix_status);
                         stream_status(
@@ -142,6 +147,17 @@ impl RobotViewerApp {
                         );
                         stream_status(ui, "camera", &state.camera_status);
                         stream_status(ui, "objects", &state.objects_status);
+                        ui.separator();
+                        ui.label(format!("pose: {}", pose_source_label(self.pose_source)));
+                        if ui
+                            .button(pose_source_button_label(self.pose_source))
+                            .clicked()
+                        {
+                            self.pose_source = match self.pose_source {
+                                PoseSource::Localization => PoseSource::VisualOdometer,
+                                PoseSource::VisualOdometer => PoseSource::Localization,
+                            };
+                        }
                     });
                 });
             });
@@ -221,6 +237,20 @@ impl RobotViewerApp {
                     self.widget.ui(ui);
                 });
             });
+    }
+}
+
+fn pose_source_label(pose_source: PoseSource) -> &'static str {
+    match pose_source {
+        PoseSource::Localization => "localization",
+        PoseSource::VisualOdometer => "visual odometer",
+    }
+}
+
+fn pose_source_button_label(pose_source: PoseSource) -> &'static str {
+    match pose_source {
+        PoseSource::Localization => "use visual odometer pose",
+        PoseSource::VisualOdometer => "use localization pose",
     }
 }
 
