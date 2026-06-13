@@ -6,18 +6,18 @@ use factrs::{
     traits::Variable,
     variables::{MatrixLieGroup, SE23},
 };
-use nalgebra::{Point2, Point3};
+use nalgebra::Point3;
 use thiserror::Error;
 use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::backend::OptimizationResult as BackendOptimizationResult;
 use crate::camera_intrinsics::CameraIntrinsics;
-use crate::foot_above_ground_factor::FootHeightMeasurement;
-use crate::measurements::{
-    ImuMeasurement, LandmarkAssociationCosts, SensorMeasurement, VisualClassMeasurement,
-    VisualMeasurement,
+use crate::factors::{
+    foot_above_ground::FootHeightMeasurement, visual_odometry::VisualOdometryMeasurement,
 };
-use crate::visual_odometry_factors::VisualOdometrySample;
+use crate::measurements::{
+    ImuMeasurement, SensorMeasurement, VisualReprojectionAssociation, VisualReprojectionMeasurement,
+};
 
 pub struct VinsFrontend {
     measurement_sender: UnboundedSender<SensorMeasurement>,
@@ -50,8 +50,15 @@ impl VinsFrontend {
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 
+    /// Returns the latest backend result and marks it observed for `wait_for_optimization_result`.
     pub fn last_optimization_result(&mut self) -> Option<OptimizationResult> {
         let backend_result = self.result_receiver.borrow_and_update().clone()?;
+        Some(optimization_result_from_backend_result(backend_result))
+    }
+
+    /// Returns the latest backend result without marking it observed.
+    pub fn peek_last_optimization_result(&self) -> Option<OptimizationResult> {
+        let backend_result = self.result_receiver.borrow().clone()?;
         Some(optimization_result_from_backend_result(backend_result))
     }
 
@@ -67,60 +74,21 @@ impl VinsFrontend {
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 
-    /// Adds a visual measurement to the optimization pipeline.
-    pub fn ingest_visual(
+    /// Adds globally-associated visual features to the optimization pipeline.
+    pub fn ingest_visual_reprojection_associations(
         &mut self,
         time: SystemTime,
-        detections: Vec<Point2<f64>>,
-        candidates: Vec<Point3<f64>>,
-        robot_to_camera: nalgebra::Isometry3<f32>,
-    ) -> Result<(), VinsFrontendError> {
-        self.ingest_visual_with_association_costs(
-            time,
-            detections,
-            candidates,
-            robot_to_camera,
-            None,
-        )
-    }
-
-    /// Adds a visual measurement with per-frame association costs.
-    pub fn ingest_visual_with_association_costs(
-        &mut self,
-        time: SystemTime,
-        detections: Vec<Point2<f64>>,
-        candidates: Vec<Point3<f64>>,
-        robot_to_camera: nalgebra::Isometry3<f32>,
-        association_costs: Option<LandmarkAssociationCosts>,
-    ) -> Result<(), VinsFrontendError> {
-        self.ingest_visual_classes(
-            time,
-            vec![VisualClassMeasurement {
-                detections,
-                candidates,
-                association_costs,
-            }],
-            robot_to_camera,
-        )
-    }
-
-    /// Adds visual measurements for multiple semantic classes in one image frame.
-    pub fn ingest_visual_classes(
-        &mut self,
-        time: SystemTime,
-        classes: Vec<VisualClassMeasurement>,
+        associations: impl IntoIterator<Item = VisualReprojectionAssociation>,
         robot_to_camera: nalgebra::Isometry3<f32>,
     ) -> Result<(), VinsFrontendError> {
         let robot_to_camera = isometry3_to_se3(robot_to_camera);
-        let measurements = classes
+        let measurements = associations
             .into_iter()
-            .filter(|class| !class.detections.is_empty() && !class.candidates.is_empty())
-            .map(|class| VisualMeasurement {
+            .map(|association| VisualReprojectionMeasurement {
                 time,
-                detections: class.detections,
-                candidates: class.candidates,
+                detection: association.detection.inner.cast(),
+                field_point: association.field_point.inner.cast(),
                 robot_to_camera: robot_to_camera.clone(),
-                association_costs: class.association_costs,
             })
             .collect::<Vec<_>>();
 
@@ -133,17 +101,22 @@ impl VinsFrontend {
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 
-    /// Adds an accumulated visual odometry pose to the optimization pipeline.
-    pub fn ingest_visual_odometry(
+    /// Adds a frame-to-frame visual odometry delta to the optimization pipeline.
+    pub fn ingest_visual_odometry_delta(
         &mut self,
-        time: SystemTime,
-        robot_to_left_camera: nalgebra::Isometry3<f32>,
-        odometer: nalgebra::Isometry3<f32>,
+        previous_time: SystemTime,
+        current_time: SystemTime,
+        previous_robot_to_left_camera: nalgebra::Isometry3<f32>,
+        current_robot_to_left_camera: nalgebra::Isometry3<f32>,
+        current_left_camera_to_previous_left_camera: nalgebra::Isometry3<f32>,
     ) -> Result<(), VinsFrontendError> {
-        let measurement = VisualOdometrySample {
-            robot_to_left_camera: isometry3_to_se3(robot_to_left_camera),
-            odometer: isometry3_to_se3(odometer),
-            timestamp: time,
+        let current_robot_to_previous_robot = previous_robot_to_left_camera.inverse()
+            * current_left_camera_to_previous_left_camera
+            * current_robot_to_left_camera;
+        let measurement = VisualOdometryMeasurement {
+            previous_time,
+            current_time,
+            robot_delta: isometry3_to_se3(current_robot_to_previous_robot),
         };
 
         self.measurement_sender
@@ -220,4 +193,47 @@ pub(crate) fn se23_to_isometry3_and_velocity(
     );
 
     (isometry, local_velocity)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use crate::measurements::SensorMeasurement;
+
+    use super::*;
+
+    fn translation(x: f32, y: f32, z: f32) -> nalgebra::Isometry3<f32> {
+        nalgebra::Isometry3::translation(x, y, z)
+    }
+
+    #[test]
+    fn visual_odometry_delta_uses_endpoint_camera_extrinsics() {
+        let (measurement_sender, mut measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_result_sender, result_receiver) = tokio::sync::watch::channel(None);
+        let mut frontend = VinsFrontend::new(measurement_sender, result_receiver);
+        let previous_time = SystemTime::UNIX_EPOCH;
+        let current_time = previous_time + Duration::from_millis(33);
+
+        frontend
+            .ingest_visual_odometry_delta(
+                previous_time,
+                current_time,
+                translation(1.0, 0.0, 0.0),
+                translation(2.0, 0.0, 0.0),
+                translation(0.5, 0.0, 0.0),
+            )
+            .expect("visual odometry should ingest");
+
+        let SensorMeasurement::VisualOdometry(measurement) = measurement_receiver
+            .try_recv()
+            .expect("measurement should be queued")
+        else {
+            panic!("expected visual odometry measurement");
+        };
+
+        assert_eq!(measurement.previous_time, previous_time);
+        assert_eq!(measurement.current_time, current_time);
+        assert!((measurement.robot_delta.xyz().x - 1.5).abs() < 1.0e-9);
+    }
 }

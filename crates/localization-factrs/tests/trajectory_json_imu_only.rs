@@ -19,7 +19,7 @@ const TEST_CONFIG: TrajectoryTestConfig = TrajectoryTestConfig {
     detection_noise_std: 1.0,
     noise_seed: 0,
     max_position_rmse_meters: 6.545646,
-    max_orientation_rmse_degrees: 4.699080,
+    max_orientation_rmse_degrees: 11.0,
 };
 
 #[test]

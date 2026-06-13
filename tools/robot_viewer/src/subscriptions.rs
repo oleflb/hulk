@@ -29,6 +29,7 @@ pub(crate) const CAMERA_IMAGE_TOPIC: &str = "inputs/left_image";
 
 const FIELD_DIMENSIONS_TOPIC: &str = "field_dimensions";
 const LOCALIZATION_TOPIC: &str = "localization";
+const VISUAL_ODOMETER_TOPIC: &str = "visual_odometry/current_left_camera_to_visual_odometer";
 const ROBOT_KINEMATICS_TOPIC: &str = "robot_kinematics";
 const CAMERA_MATRIX_TOPIC: &str = "camera_matrix";
 const CALIBRATED_INTRINSICS_TOPIC: &str = "debug/calibrated_intrinsics";
@@ -83,6 +84,10 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         .subscriber::<Option<Isometry3<Field, Robot>>>(LOCALIZATION_TOPIC)?
         .build()
         .await?;
+    let visual_odometer = node
+        .subscriber::<nalgebra::Isometry3<f32>>(VISUAL_ODOMETER_TOPIC)?
+        .build()
+        .await?;
     let robot_kinematics = node
         .subscriber::<TimeWrapper<RobotKinematics>>(ROBOT_KINEMATICS_TOPIC)?
         .build()
@@ -112,6 +117,10 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
             localization.publisher_count(),
         );
         update_publisher_count(
+            &mut state.visual_odometer_status,
+            visual_odometer.publisher_count(),
+        );
+        update_publisher_count(
             &mut state.robot_kinematics_status,
             robot_kinematics.publisher_count(),
         );
@@ -134,6 +143,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                 update_state(&state, &egui_context, |state| {
                     update_publisher_count(&mut state.field_status, field_dimensions.publisher_count());
                     update_publisher_count(&mut state.localization_status, localization.publisher_count());
+                    update_publisher_count(&mut state.visual_odometer_status, visual_odometer.publisher_count());
                     update_publisher_count(&mut state.robot_kinematics_status, robot_kinematics.publisher_count());
                     update_publisher_count(&mut state.camera_matrix_status, camera_matrix.publisher_count());
                     update_publisher_count(&mut state.calibrated_intrinsics_status, calibrated_intrinsics.publisher_count());
@@ -157,6 +167,15 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                 }),
                 Err(error) => update_state(&state, &egui_context, |state| {
                     state.localization_status.mark_error(localization.publisher_count(), format!("{error:#}"));
+                }),
+            },
+            message = visual_odometer.recv() => match message {
+                Ok(message) => update_state(&state, &egui_context, |state| {
+                    state.visual_odometer = Some(message);
+                    state.visual_odometer_status.mark_live(visual_odometer.publisher_count());
+                }),
+                Err(error) => update_state(&state, &egui_context, |state| {
+                    state.visual_odometer_status.mark_error(visual_odometer.publisher_count(), format!("{error:#}"));
                 }),
             },
             message = robot_kinematics.recv() => match message {

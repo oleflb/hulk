@@ -6962,6 +6962,7 @@ dependencies = [
  "coordinate_systems",
  "geometry",
  "hsl_network_messages",
+ "itertools 0.14.0",
  "kinematics",
  "linear_algebra",
  "localization-factrs",
@@ -6980,6 +6981,7 @@ version = "0.1.0"
 dependencies = [
  "booster",
  "context_attribute",
+ "coordinate_systems",
  "env_logger",
  "factrs",
  "faer 0.23.2",

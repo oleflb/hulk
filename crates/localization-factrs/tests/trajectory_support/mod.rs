@@ -6,11 +6,12 @@ use std::{
 };
 
 use booster::ImuState;
+use coordinate_systems::{Field, Pixel};
 use factrs::{core::SO3, variables::SE23};
 use indicatif::ProgressIterator;
-use linear_algebra::IntoFramed;
+use linear_algebra::{IntoFramed, Point2 as FramedPoint2, Point3 as FramedPoint3};
 use localization_factrs::{
-    BackendConfiguration, CameraIntrinsics, InitialState, LandmarkAssociationCosts, initialize,
+    BackendConfiguration, CameraIntrinsics, InitialState, VisualReprojectionAssociation, initialize,
 };
 use nalgebra::{Matrix2, Matrix3, Point2, Point3, SMatrix, Vector3, vector};
 use rand::{Rng, SeedableRng};
@@ -21,7 +22,6 @@ use serde::{Deserialize, Serialize};
 const KNOT_SPACING: Duration = Duration::from_millis(200);
 const MAX_OPTIMIZATION_WINDOW: Duration = Duration::from_secs(5);
 const MIN_SOLVER_STD: f64 = 1.0e-6;
-const DENSE_UNMATCHED_COST: f64 = 1.0e3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TrajectoryTestConfig {
@@ -166,7 +166,6 @@ struct SensorNoise {
 
 struct VisualOutlierInjector {
     rng: ChaCha8Rng,
-    false_detection_probability: f64,
     real_detection_dropout_probability: f64,
     injected_false_detections: usize,
     dropped_real_detections: usize,
@@ -248,21 +247,19 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
 
                 detections.push(sensor_noise.noisy_detection(*detection));
             }
+            let associations = associate_visual_detections(
+                &detections,
+                visual_features,
+                &frame.ground_truth_pose,
+                &landmarks,
+                robot_to_camera,
+            );
 
-            if let Some(visual_outliers) = visual_outliers.as_mut() {
-                visual_outliers.maybe_push_outlier(&mut detections, visual_features);
-            }
-
-            if !detections.is_empty() {
-                frontend.ingest_visual_with_association_costs(
+            if !associations.is_empty() {
+                frontend.ingest_visual_reprojection_associations(
                     time,
-                    detections,
-                    landmarks.clone(),
+                    associations,
                     robot_to_camera,
-                    Some(LandmarkAssociationCosts {
-                        unmatched_landmark: DENSE_UNMATCHED_COST,
-                        unmatched_detection: DENSE_UNMATCHED_COST,
-                    }),
                 )?;
             }
         }
@@ -384,7 +381,6 @@ impl VisualOutlierInjector {
 
         Self {
             rng: ChaCha8Rng::seed_from_u64(config.seed),
-            false_detection_probability: config.false_detection_probability,
             real_detection_dropout_probability: config.real_detection_dropout_probability,
             injected_false_detections: 0,
             dropped_real_detections: 0,
@@ -400,54 +396,6 @@ impl VisualOutlierInjector {
         }
         drop
     }
-
-    fn maybe_push_outlier(
-        &mut self,
-        detections: &mut Vec<Point2<f64>>,
-        visual_features: &SimulatorDetectedFeatures,
-    ) {
-        if !self.rng.random_bool(self.false_detection_probability) {
-            return;
-        }
-
-        detections.push(misdetected_visual_feature(visual_features));
-        self.injected_false_detections += 1;
-    }
-}
-
-fn misdetected_visual_feature(visual_features: &SimulatorDetectedFeatures) -> Point2<f64> {
-    let intrinsics = &visual_features.intrinsics;
-    let image_width = intrinsics.center_x * 2.0;
-    let image_height = intrinsics.center_y * 2.0;
-
-    // Pick the image-region sample farthest from real detections so the added
-    // feature behaves like an unrelated environmental corner, not extra noise.
-    let candidates = [
-        Point2::new(image_width * 0.1, image_height * 0.1),
-        Point2::new(image_width * 0.9, image_height * 0.1),
-        Point2::new(image_width * 0.9, image_height * 0.9),
-        Point2::new(image_width * 0.1, image_height * 0.9),
-        Point2::new(intrinsics.center_x, intrinsics.center_y),
-    ];
-
-    candidates
-        .into_iter()
-        .max_by(|left, right| {
-            minimum_detection_distance(*left, visual_features)
-                .total_cmp(&minimum_detection_distance(*right, visual_features))
-        })
-        .expect("misdetection candidates must not be empty")
-}
-
-fn minimum_detection_distance(
-    detection: Point2<f64>,
-    visual_features: &SimulatorDetectedFeatures,
-) -> f64 {
-    visual_features
-        .detections
-        .iter()
-        .map(|reference| (detection - Point2::from(*reference)).norm())
-        .fold(f64::INFINITY, f64::min)
 }
 
 impl SensorNoise {
@@ -540,6 +488,86 @@ fn simulator_state_to_roll_pitch_yaw(state: &SimulatorState) -> Vector3<f64> {
     let (roll, pitch, yaw) = rotation.euler_angles();
 
     vector![roll, pitch, yaw]
+}
+
+fn simulator_state_to_isometry3(state: &SimulatorState) -> nalgebra::Isometry3<f64> {
+    let [w, x, y, z] = state.quaternion_wxyz;
+    nalgebra::Isometry3::from_parts(
+        nalgebra::Translation3::from(Vector3::from(state.position)),
+        nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(w, x, y, z)),
+    )
+}
+
+fn associate_visual_detections(
+    detections: &[Point2<f64>],
+    visual_features: &SimulatorDetectedFeatures,
+    robot_to_field: &SimulatorState,
+    landmarks: &[Point3<f64>],
+    robot_to_camera: nalgebra::Isometry3<f32>,
+) -> Vec<VisualReprojectionAssociation> {
+    let projected = project_landmarks(
+        landmarks,
+        &visual_features.intrinsics,
+        simulator_state_to_isometry3(robot_to_field),
+        robot_to_camera.cast(),
+    );
+    let mut pairs = detections
+        .iter()
+        .enumerate()
+        .flat_map(|(detection_index, detection)| {
+            projected.iter().map(move |(landmark_index, projection)| {
+                (
+                    detection_index,
+                    *landmark_index,
+                    (*detection - *projection).norm_squared(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.2.total_cmp(&b.2));
+
+    let mut used_detections = vec![false; detections.len()];
+    let mut used_landmarks = vec![false; landmarks.len()];
+    let mut associations = Vec::new();
+    for (detection, landmark, _) in pairs {
+        if used_detections[detection] || used_landmarks[landmark] {
+            continue;
+        }
+        used_detections[detection] = true;
+        used_landmarks[landmark] = true;
+        let landmark = landmarks[landmark];
+        associations.push(VisualReprojectionAssociation {
+            detection: FramedPoint2::<Pixel>::wrap(detections[detection].cast()),
+            field_point: FramedPoint3::<Field>::wrap(landmark.cast()),
+        });
+    }
+
+    associations
+}
+
+fn project_landmarks(
+    landmarks: &[Point3<f64>],
+    intrinsics: &SimulatorCameraIntrinsics,
+    robot_to_field: nalgebra::Isometry3<f64>,
+    robot_to_camera: nalgebra::Isometry3<f64>,
+) -> Vec<(usize, Point2<f64>)> {
+    let field_to_camera = robot_to_camera * robot_to_field.inverse();
+    landmarks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, landmark)| {
+            let point = field_to_camera * *landmark;
+            (point.z > 0.0).then(|| {
+                (
+                    index,
+                    Point2::new(
+                        intrinsics.focal_x * point.x / point.z + intrinsics.center_x,
+                        intrinsics.focal_y * point.y / point.z + intrinsics.center_y,
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 fn robot_to_camera() -> nalgebra::Isometry3<f32> {

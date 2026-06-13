@@ -16,6 +16,7 @@ pub(crate) struct ViewerState {
     pub(crate) connection: ConnectionStatus,
     pub(crate) field_dimensions: Option<FieldDimensions>,
     pub(crate) localization: Option<Isometry3<Field, Robot>>,
+    pub(crate) visual_odometer: Option<nalgebra::Isometry3<f32>>,
     pub(crate) robot_kinematics: Option<RobotKinematics>,
     pub(crate) camera_matrix: Option<CameraMatrix>,
     pub(crate) calibrated_intrinsics: Option<Intrinsic>,
@@ -24,11 +25,19 @@ pub(crate) struct ViewerState {
     pub(crate) detected_objects: Vec<Object<RobocupObjectLabel>>,
     pub(crate) field_status: StreamStatus,
     pub(crate) localization_status: StreamStatus,
+    pub(crate) visual_odometer_status: StreamStatus,
     pub(crate) robot_kinematics_status: StreamStatus,
     pub(crate) camera_matrix_status: StreamStatus,
     pub(crate) calibrated_intrinsics_status: StreamStatus,
     pub(crate) camera_status: StreamStatus,
     pub(crate) objects_status: StreamStatus,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum PoseSource {
+    #[default]
+    Localization,
+    VisualOdometer,
 }
 
 #[derive(Clone, Default)]

@@ -24,7 +24,7 @@ use ros_z::prelude::*;
 use ros_z::qos::QosDurability;
 use types::{
     stereo_camera_info::StereoCameraInfo, stereo_image_pair::StereoImagePair,
-    time_wrapper::TimeWrapper,
+    time_wrapper::TimeWrapper, visual_odometry::VisualOdometryDelta,
 };
 
 use crate::parameters::StereoVisualOdometryParameters;
@@ -66,6 +66,13 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
 
+    let delta_odometry_pub = node
+        .publisher::<VisualOdometryDelta>(
+            "visual_odometry/current_left_camera_to_previous_left_camera",
+        )?
+        .build()
+        .await?;
+
     let odometer_pub = node
         .publisher::<na::Isometry3<f32>>("visual_odometry/current_left_camera_to_visual_odometer")?
         .build()
@@ -81,13 +88,16 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     let parameters = node_parameters.snapshot();
     let mut pipeline =
         VisualOdometryPipeline::new(&parameters.typed().neural_network, stereo_camera_info)?;
+    let mut previous_image_time: Option<ros_z::time::Time> = None;
 
     loop {
         parameters_receiver
             .wait_for(|parameters| parameters.typed().enable)
             .await?;
 
-        let stereo_image_pair = stereo_image_pair_sub.recv().await?.inner;
+        let stereo_image_pair = stereo_image_pair_sub.recv().await?;
+        let current_image_time = stereo_image_pair.time;
+        let stereo_image_pair = stereo_image_pair.inner;
         let parameters = node_parameters.snapshot();
         let parameters = parameters.typed();
 
@@ -97,6 +107,19 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let duration = start_time.elapsed();
 
         odometry_pub.publish(&odometry).await?;
+        if let (Some(previous_time), Some(previous_left_camera_to_current_left_camera)) =
+            (previous_image_time, odometry.as_ref())
+        {
+            delta_odometry_pub
+                .publish(&VisualOdometryDelta {
+                    previous_time,
+                    current_time: current_image_time,
+                    current_left_camera_to_previous_left_camera:
+                        previous_left_camera_to_current_left_camera.inverse(),
+                })
+                .await?;
+        }
+        previous_image_time = Some(current_image_time);
         odometer_pub
             .publish(&pipeline.current_left_camera_to_visual_odometer())
             .await?;
