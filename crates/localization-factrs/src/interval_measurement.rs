@@ -1,12 +1,14 @@
 use crate::{
+    foot_above_ground_factor::FootHeightMeasurement,
     measurements::{ImuMeasurement, VisualMeasurement},
-    visual_odometry_factors::Measurement as VisualOdometryMeasurement,
+    visual_odometry_factors::VisualOdometrySample,
 };
 
 pub struct IntervalMeasurements {
     pub imu: Vec<ImuMeasurement>,
     pub visual: Vec<Vec<VisualMeasurement>>,
-    pub visual_odometry: Vec<VisualOdometryMeasurement>,
+    pub visual_odometry: Vec<VisualOdometrySample>,
+    pub foot_heights: Vec<FootHeightMeasurement>,
 }
 
 impl IntervalMeasurements {
@@ -15,6 +17,7 @@ impl IntervalMeasurements {
             imu: Vec::new(),
             visual: Vec::new(),
             visual_odometry: Vec::new(),
+            foot_heights: Vec::new(),
         }
     }
 
@@ -31,9 +34,15 @@ impl IntervalMeasurements {
         });
     }
 
-    pub fn push_visual_odometry(&mut self, visual_odometry: VisualOdometryMeasurement) {
+    pub fn push_visual_odometry(&mut self, visual_odometry: VisualOdometrySample) {
         insert_sorted(&mut self.visual_odometry, visual_odometry, |measurement| {
             measurement.timestamp
+        });
+    }
+
+    pub fn push_foot_heights(&mut self, foot_heights: FootHeightMeasurement) {
+        insert_sorted(&mut self.foot_heights, foot_heights, |measurement| {
+            measurement.time
         });
     }
 }

@@ -4,13 +4,15 @@ use booster::ImuState;
 use factrs::core::SE3;
 use nalgebra::{Point2, Point3};
 
-use crate::visual_odometry_factors::Measurement as VisualOdometryMeasurement;
+use crate::foot_above_ground_factor::FootHeightMeasurement;
+use crate::visual_odometry_factors::VisualOdometrySample;
 
 #[derive(Debug, Clone)]
 pub enum SensorMeasurement {
     Imu(ImuMeasurement),
     Visual(Vec<VisualMeasurement>),
-    VisualOdometry(VisualOdometryMeasurement),
+    VisualOdometry(VisualOdometrySample),
+    FootHeights(FootHeightMeasurement),
 }
 
 impl SensorMeasurement {
@@ -24,6 +26,7 @@ impl SensorMeasurement {
                     .time
             }
             SensorMeasurement::VisualOdometry(visual_odometry) => visual_odometry.timestamp,
+            SensorMeasurement::FootHeights(foot_heights) => foot_heights.time,
         }
     }
 }

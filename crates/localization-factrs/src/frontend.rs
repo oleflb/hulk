@@ -12,11 +12,12 @@ use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::backend::OptimizationResult as BackendOptimizationResult;
 use crate::camera_intrinsics::CameraIntrinsics;
+use crate::foot_above_ground_factor::FootHeightMeasurement;
 use crate::measurements::{
     ImuMeasurement, LandmarkAssociationCosts, SensorMeasurement, VisualClassMeasurement,
     VisualMeasurement,
 };
-use crate::visual_odometry_factors::Measurement as VisualOdometryMeasurement;
+use crate::visual_odometry_factors::VisualOdometrySample;
 
 pub struct VinsFrontend {
     measurement_sender: UnboundedSender<SensorMeasurement>,
@@ -139,7 +140,7 @@ impl VinsFrontend {
         robot_to_left_camera: nalgebra::Isometry3<f32>,
         odometer: nalgebra::Isometry3<f32>,
     ) -> Result<(), VinsFrontendError> {
-        let measurement = VisualOdometryMeasurement {
+        let measurement = VisualOdometrySample {
             robot_to_left_camera: isometry3_to_se3(robot_to_left_camera),
             odometer: isometry3_to_se3(odometer),
             timestamp: time,
@@ -147,6 +148,24 @@ impl VinsFrontend {
 
         self.measurement_sender
             .send(SensorMeasurement::VisualOdometry(measurement))
+            .map_err(|_| VinsFrontendError::BackendDisconnected)
+    }
+
+    /// Adds sole positions to keep the estimated feet above the ground plane.
+    pub fn ingest_foot_heights(
+        &mut self,
+        time: SystemTime,
+        left_sole_in_robot: Point3<f64>,
+        right_sole_in_robot: Point3<f64>,
+    ) -> Result<(), VinsFrontendError> {
+        let measurement = FootHeightMeasurement {
+            time,
+            left_sole_in_robot,
+            right_sole_in_robot,
+        };
+
+        self.measurement_sender
+            .send(SensorMeasurement::FootHeights(measurement))
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 }

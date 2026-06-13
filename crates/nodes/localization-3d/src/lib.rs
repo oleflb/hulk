@@ -6,6 +6,7 @@ use color_eyre::{
     eyre::{Context as _, bail},
 };
 use coordinate_systems::{Field, Pixel, Robot};
+use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, Point2, point};
 use localization_factrs::{
     BackendConfiguration, CameraIntrinsics, InitialState, LandmarkAssociationCosts, VinsFrontend,
@@ -39,6 +40,8 @@ pub fn backend_configuration() -> BackendConfiguration {
         accelerometer_process_noise: Matrix3::identity() * 0.01,
         visual_feature_noise: Matrix2::identity() * 5.0,
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
+        foot_ground_softness: 1.0e-3,
+        foot_ground_sigma: 0.01,
         gravity: Vector3::new(0.0, 0.0, 9.81),
     }
 }
@@ -70,6 +73,11 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .subscriber::<nalgebra::Isometry3<f32>>(
             "visual_odometry/current_left_camera_to_visual_odometer",
         )?
+        .build()
+        .await?;
+
+    let robot_kinematics_subscriber = node
+        .subscriber::<TimeWrapper<RobotKinematics>>("robot_kinematics")?
         .build()
         .await?;
 
@@ -130,6 +138,11 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 
                 ingest_visual_odometry(&mut frontend, visual_odometry.source_time, visual_odometry.message, &camera_matrix.inner)
                     .wrap_err("failed to ingest visual odometry measurement into frontend")?;
+            }
+            robot_kinematics = robot_kinematics_subscriber.recv() => {
+                let robot_kinematics = robot_kinematics?;
+                ingest_foot_heights(&mut frontend, robot_kinematics)
+                    .wrap_err("failed to ingest foot height measurement into frontend")?;
             }
             result = &mut backend_handle => {
                 result.wrap_err("failed to join")?.wrap_err("solver failed")?;
@@ -291,6 +304,36 @@ pub fn ingest_visual_odometry(
     frontend.ingest_visual_odometry(time.to_wallclock(), robot_to_left_camera, odometer)
 }
 
+pub fn ingest_foot_heights(
+    frontend: &mut VinsFrontend,
+    robot_kinematics: TimeWrapper<RobotKinematics>,
+) -> Result<(), VinsFrontendError> {
+    let (left_sole_in_robot, right_sole_in_robot) = foot_height_points(&robot_kinematics.inner);
+
+    frontend.ingest_foot_heights(
+        robot_kinematics.time.to_wallclock(),
+        left_sole_in_robot,
+        right_sole_in_robot,
+    )
+}
+
+fn foot_height_points(robot_kinematics: &RobotKinematics) -> (Point3<f64>, Point3<f64>) {
+    (
+        robot_kinematics
+            .left_leg
+            .sole_to_robot
+            .translation()
+            .inner
+            .cast(),
+        robot_kinematics
+            .right_leg
+            .sole_to_robot
+            .translation()
+            .inner
+            .cast(),
+    )
+}
+
 fn robot_to_left_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
     (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
 }
@@ -370,7 +413,7 @@ fn field_candidate(point: Point2<Field>) -> Point3<f64> {
 
 #[cfg(test)]
 mod tests {
-    use coordinate_systems::{Camera, Head};
+    use coordinate_systems::{Camera, Head, LeftSole, RightSole};
     use geometry::rectangle::Rectangle;
     use types::bounding_box::BoundingBox;
 
@@ -512,5 +555,29 @@ mod tests {
 
         assert!((robot_to_camera.translation.vector - expected.translation.vector).norm() < 1.0e-6);
         assert!(robot_to_camera.rotation.angle_to(&expected.rotation) < 1.0e-6);
+    }
+
+    #[test]
+    fn foot_height_points_use_sole_positions_in_robot_frame() {
+        let left_sole_to_robot: Isometry3<LeftSole, Robot> =
+            nalgebra::Isometry3::translation(0.1, 0.2, -0.3).framed_transform();
+        let right_sole_to_robot: Isometry3<RightSole, Robot> =
+            nalgebra::Isometry3::translation(0.4, -0.5, -0.6).framed_transform();
+        let robot_kinematics = RobotKinematics {
+            left_leg: kinematics::robot_kinematics::RobotLeftLegKinematics {
+                sole_to_robot: left_sole_to_robot,
+                ..Default::default()
+            },
+            right_leg: kinematics::robot_kinematics::RobotRightLegKinematics {
+                sole_to_robot: right_sole_to_robot,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (left, right) = foot_height_points(&robot_kinematics);
+
+        assert!((left - nalgebra::Point3::new(0.1, 0.2, -0.3)).norm() < 1.0e-6);
+        assert!((right - nalgebra::Point3::new(0.4, -0.5, -0.6)).norm() < 1.0e-6);
     }
 }

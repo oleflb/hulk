@@ -9,6 +9,7 @@ pub use utils::{interval_dt, tau};
 
 pub mod backend;
 mod camera_intrinsics;
+mod foot_above_ground_factor;
 mod frontend;
 pub mod gaussian_process_prior_factor;
 mod imu_factor;
@@ -16,7 +17,6 @@ mod initial_state;
 mod interval_measurement;
 mod landmark_factor;
 mod measurements;
-mod positive_z_factor;
 mod prior_factor;
 mod schur_marginalization;
 mod splines;
