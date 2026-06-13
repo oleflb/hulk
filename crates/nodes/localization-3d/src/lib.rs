@@ -135,9 +135,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 result.wrap_err("failed to join")?.wrap_err("solver failed")?;
                 bail!("solver stopped unexpectedly")
             }
-            result = frontend.wait_for_backend_optimization_result() => {
+            result = frontend.wait_for_optimization_result() => {
                 result?;
-                let result = frontend.last_backend_optimization_result();
+                let result = frontend.last_optimization_result();
                 let transform = result
                     .as_ref()
                     .map(|result| localization_transform_from_backend_pose(&result.transform));
