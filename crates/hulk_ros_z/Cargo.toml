@@ -36,6 +36,7 @@ led_handler = { workspace = true }
 line_detection = { workspace = true }
 localization = { workspace = true }
 localization-3d = { workspace = true }
+localization_recorder = { workspace = true }
 look_around = { workspace = true }
 look_at = { workspace = true }
 low_command_publisher = { workspace = true }

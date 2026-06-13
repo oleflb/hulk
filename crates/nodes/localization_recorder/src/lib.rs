@@ -13,7 +13,7 @@ use std::{
 use booster::ImuState;
 use color_eyre::{
     Result,
-    eyre::{Context as _, WrapErr, eyre},
+    eyre::{WrapErr, eyre},
 };
 use coordinate_systems::{Field, Robot};
 use kinematics::robot_kinematics::RobotKinematics;
@@ -21,14 +21,10 @@ use linear_algebra::Isometry3;
 use localization_3d::GlobalLocalizationDebug;
 use mcap::{Writer, records::MessageHeader};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
-use ros_z::{
-    Message,
-    attachment::Attachment,
-    prelude::*,
-    time::Time,
-};
+use ros_z::{Message, attachment::Attachment, prelude::*, time::Time};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 use types::{
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
@@ -64,10 +60,7 @@ impl LocalizationRecorderParameters {
         if self.output_path.as_os_str().is_empty() {
             return Err("output_path must not be empty".to_string());
         }
-        if self
-            .max_duration
-            .is_some_and(|duration| duration.is_zero())
-        {
+        if self.max_duration.is_some_and(|duration| duration.is_zero()) {
             return Err("max_duration must be positive when set".to_string());
         }
         Ok(())
@@ -80,7 +73,8 @@ pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> +
 
 async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("localization_recorder").build().await?;
-    let parameters = node.bind_parameter_as::<LocalizationRecorderParameters>("localization_recorder")?;
+    let parameters =
+        node.bind_parameter_as::<LocalizationRecorderParameters>("localization_recorder")?;
     parameters.add_validation_hook(LocalizationRecorderParameters::validate)?;
     let parameters = parameters.snapshot().typed().clone();
 
@@ -93,7 +87,10 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent).wrap_err_with(|| {
-            format!("failed to create recorder output directory {}", parent.display())
+            format!(
+                "failed to create recorder output directory {}",
+                parent.display()
+            )
         })?;
     }
 
@@ -105,10 +102,17 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     })?;
     let writer = McapWriter::new(BufWriter::new(file))?;
     let (sample_sender, sample_receiver) = mpsc::unbounded_channel();
-    let writer_task = tokio::spawn(write_mcap(sample_receiver, writer));
+    let token = CancellationToken::new();
+    let writer_task = tokio::spawn(write_mcap(sample_receiver, writer, token.clone()));
 
     let mut recorders = JoinSet::new();
-    spawn_topic::<ImuState>(&node, &mut recorders, sample_sender.clone(), "inputs/imu_state").await?;
+    spawn_topic::<ImuState>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "inputs/imu_state",
+    )
+    .await?;
     spawn_topic::<VisualOdometryDelta>(
         &node,
         &mut recorders,
@@ -213,6 +217,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         }
     }
 
+    token.cancel();
     drop(recorders);
     let samples_written = writer_task
         .await
@@ -236,7 +241,7 @@ where
     T: Message + Send + Sync + 'static,
 {
     let mut subscriber = node.subscriber::<T>(topic)?.raw().build().await?;
-    let channel = RecordedChannel::for_message::<T>(topic);
+    let channel = Arc::new(RecordedChannel::for_message::<T>(topic));
 
     recorders.spawn(async move {
         loop {
@@ -248,8 +253,9 @@ where
                 .attachment()
                 .ok_or_else(|| eyre!("sample on {topic} has no ros-z attachment"))
                 .and_then(|raw| {
-                    Attachment::try_from(raw)
-                        .map_err(|error| eyre!("failed to decode ros-z attachment on {topic}: {error}"))
+                    Attachment::try_from(raw).map_err(|error| {
+                        eyre!("failed to decode ros-z attachment on {topic}: {error}")
+                    })
                 })?;
             let source_time = attachment.source_time();
             let transport_time = sample
@@ -274,7 +280,9 @@ where
     Ok(())
 }
 
-fn handle_recorder_result(result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>) -> Result<()> {
+fn handle_recorder_result(
+    result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>,
+) -> Result<()> {
     if let Some(result) = result {
         result.wrap_err("localization recorder task panicked")??;
     }
@@ -284,9 +292,10 @@ fn handle_recorder_result(result: Option<std::result::Result<Result<()>, tokio::
 async fn write_mcap(
     mut sample_receiver: mpsc::UnboundedReceiver<RecordedSample>,
     mut writer: McapWriter<BufWriter<File>>,
+    token: CancellationToken,
 ) -> Result<usize> {
     let mut samples_written = 0;
-    while let Some(sample) = sample_receiver.recv().await {
+    while let Some(Some(sample)) = token.run_until_cancelled(sample_receiver.recv()).await {
         writer.write(sample)?;
         samples_written += 1;
     }
@@ -297,34 +306,40 @@ async fn write_mcap(
 #[derive(Clone)]
 struct RecordedChannel {
     topic: &'static str,
+    schema_name: String,
+    schema_data: Vec<u8>,
     metadata: BTreeMap<String, String>,
 }
 
 impl RecordedChannel {
     fn for_message<T: Message>(topic: &'static str) -> Self {
+        let schema_name = T::type_name();
+        let schema_data = serde_json::to_vec(&T::schema()).unwrap_or_default();
         let mut metadata = BTreeMap::new();
-        metadata.insert("ros_z.type_name".to_string(), T::type_name());
+        metadata.insert("ros_z.type_name".to_string(), schema_name.clone());
         metadata.insert(
             "ros_z.schema_hash".to_string(),
             T::schema_hash().to_hash_string(),
         );
-        if let Ok(schema) = serde_json::to_string(&T::schema()) {
-            metadata.insert("ros_z.schema_json".to_string(), schema);
-        }
 
-        Self { topic, metadata }
+        Self {
+            topic,
+            schema_name,
+            schema_data,
+            metadata,
+        }
     }
 }
 
 struct RecordedSample {
-    channel: RecordedChannel,
+    channel: Arc<RecordedChannel>,
     payload: Vec<u8>,
     sequence: u32,
     log_time: u64,
     publish_time: u64,
 }
 
-struct McapWriter<W> {
+struct McapWriter<W: std::io::Write + std::io::Seek> {
     writer: Writer<W>,
     channel_mapping: BTreeMap<&'static str, ChannelId>,
 }
@@ -344,13 +359,19 @@ where
         let channel_id = match self.channel_mapping.get(sample.channel.topic).copied() {
             Some(channel_id) => channel_id,
             None => {
+                let schema_id = self.writer.add_schema(
+                    &sample.channel.schema_name,
+                    "ros-z-schema-json",
+                    &sample.channel.schema_data,
+                )?;
                 let channel_id = self.writer.add_channel(
-                    0,
+                    schema_id,
                     sample.channel.topic,
                     "ros-z-cdr",
                     &sample.channel.metadata,
                 )?;
-                self.channel_mapping.insert(sample.channel.topic, channel_id);
+                self.channel_mapping
+                    .insert(sample.channel.topic, channel_id);
                 channel_id
             }
         };

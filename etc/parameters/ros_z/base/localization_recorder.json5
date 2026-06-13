@@ -1,0 +1,6 @@
+{
+  enable: true,
+  output_path: "/home/booster/localization_recording.mcap",
+  max_duration: { "secs": 120, "nanos": 0 },
+  include_raw_images: true,
+}
