@@ -8,13 +8,10 @@ use factrs::{
 };
 use nalgebra::{SMatrix, SVector};
 
-use crate::{
-    SE23Spline,
-    utils::{interval_dt, tau},
-};
+use crate::{SE23Spline, utils::tau};
 
 #[derive(Debug, Clone)]
-pub struct Measurement {
+pub struct VisualOdometrySample {
     /// Transformation from the robot frame to the left camera frame.
     pub robot_to_left_camera: SE3,
     /// Accumulated visual odometry pose from the current left camera frame to
@@ -25,16 +22,13 @@ pub struct Measurement {
 
 #[derive(Debug, Clone)]
 pub struct VisualOdometryFactor {
-    measurements: Vec<DeltaMeasurement>,
-    last_measurement: Option<Measurement>,
+    measurements: Vec<VisualOdometryDelta>,
     information_root: SMatrix<f64, 6, 6>,
-    start_time: SystemTime,
-    end_time: SystemTime,
     duration: f64,
 }
 
 #[derive(Debug, Clone)]
-struct DeltaMeasurement {
+pub struct VisualOdometryDelta {
     start_tau: f64,
     end_tau: f64,
     robot_delta: SE3,
@@ -56,10 +50,9 @@ impl Residual for VisualOdometryFactor {
 
 impl VisualOdometryFactor {
     pub fn new(
-        measurements: Vec<Measurement>,
+        measurements: Vec<VisualOdometryDelta>,
         visual_odometry_noise: SMatrix<f64, 6, 6>,
-        start_time: SystemTime,
-        end_time: SystemTime,
+        duration: f64,
     ) -> Self {
         let information_root = visual_odometry_noise
             .cholesky()
@@ -68,32 +61,18 @@ impl VisualOdometryFactor {
             .try_inverse()
             .expect("visual odometry covariance Cholesky factor must be invertible");
 
-        let duration = interval_dt::<f64>(start_time, end_time);
-        let last_measurement = measurements.last().cloned();
-        let measurements = delta_measurements(measurements, start_time, end_time);
-
         Self {
             measurements,
-            last_measurement,
             information_root,
-            start_time,
-            end_time,
             duration,
         }
     }
 
-    pub fn extend_measurements(&mut self, measurements: impl IntoIterator<Item = Measurement>) {
-        for measurement in measurements {
-            if let Some(previous) = &self.last_measurement {
-                self.measurements.push(DeltaMeasurement::new(
-                    previous,
-                    &measurement,
-                    self.start_time,
-                    self.end_time,
-                ));
-            }
-            self.last_measurement = Some(measurement);
-        }
+    pub fn extend_measurements(
+        &mut self,
+        measurements: impl IntoIterator<Item = VisualOdometryDelta>,
+    ) {
+        self.measurements.extend(measurements);
     }
 
     fn residuals_on_spline<T: Numeric>(&self, start: SE23<T>, end: SE23<T>) -> VectorX<T> {
@@ -125,10 +104,10 @@ impl VisualOdometryFactor {
     }
 }
 
-impl DeltaMeasurement {
-    fn new(
-        previous: &Measurement,
-        current: &Measurement,
+impl VisualOdometryDelta {
+    pub fn from_samples(
+        previous: &VisualOdometrySample,
+        current: &VisualOdometrySample,
         start_time: SystemTime,
         end_time: SystemTime,
     ) -> Self {
@@ -145,17 +124,6 @@ impl DeltaMeasurement {
             robot_delta,
         }
     }
-}
-
-fn delta_measurements(
-    measurements: Vec<Measurement>,
-    start_time: SystemTime,
-    end_time: SystemTime,
-) -> Vec<DeltaMeasurement> {
-    measurements
-        .windows(2)
-        .map(|pair| DeltaMeasurement::new(&pair[0], &pair[1], start_time, end_time))
-        .collect()
 }
 
 fn se23_pose_to_se3<T: Numeric>(pose: SE23<T>) -> SE3<T> {
@@ -194,23 +162,34 @@ mod tests {
         SE3::from_rot_trans(rotation, vector![x, y, z])
     }
 
-    fn measurement(timestamp: SystemTime, robot_to_left_camera: SE3, odometer: SE3) -> Measurement {
-        Measurement {
+    fn sample(
+        timestamp: SystemTime,
+        robot_to_left_camera: SE3,
+        odometer: SE3,
+    ) -> VisualOdometrySample {
+        VisualOdometrySample {
             robot_to_left_camera,
             odometer,
             timestamp,
         }
     }
 
-    #[test]
-    fn single_measurement_has_empty_residual() {
-        let start_time = SystemTime::UNIX_EPOCH;
-        let factor = VisualOdometryFactor::new(
-            vec![measurement(start_time, SE3::identity(), SE3::identity())],
-            SMatrix::<f64, 6, 6>::identity(),
+    fn delta(
+        previous: VisualOdometrySample,
+        current: VisualOdometrySample,
+        start_time: SystemTime,
+    ) -> VisualOdometryDelta {
+        VisualOdometryDelta::from_samples(
+            &previous,
+            &current,
             start_time,
             start_time + Duration::from_secs(1),
-        );
+        )
+    }
+
+    #[test]
+    fn empty_deltas_have_empty_residual() {
+        let factor = VisualOdometryFactor::new(vec![], SMatrix::<f64, 6, 6>::identity(), 1.0);
 
         let residual = factor.residuals_on_spline(
             state(Vector3::zeros(), Vector3::zeros()),
@@ -224,17 +203,17 @@ mod tests {
     fn residual_is_zero_for_matching_camera_motion() {
         let start_time = SystemTime::UNIX_EPOCH;
         let factor = VisualOdometryFactor::new(
-            vec![
-                measurement(start_time, SE3::identity(), SE3::identity()),
-                measurement(
+            vec![delta(
+                sample(start_time, SE3::identity(), SE3::identity()),
+                sample(
                     start_time + Duration::from_secs(1),
                     SE3::identity(),
                     translation(1.0, 0.0, 0.0),
                 ),
-            ],
+                start_time,
+            )],
             SMatrix::<f64, 6, 6>::identity(),
-            start_time,
-            start_time + Duration::from_secs(1),
+            1.0,
         );
 
         let residual = factor.residuals_on_spline(
@@ -253,17 +232,17 @@ mod tests {
         let start_time = SystemTime::UNIX_EPOCH;
         let robot_to_left_camera = translation(1.0, 0.0, 0.0);
         let factor = VisualOdometryFactor::new(
-            vec![
-                measurement(start_time, robot_to_left_camera.clone(), SE3::identity()),
-                measurement(
+            vec![delta(
+                sample(start_time, robot_to_left_camera.clone(), SE3::identity()),
+                sample(
                     start_time + Duration::from_secs(1),
                     robot_to_left_camera,
                     transform(yaw_90(), 1.0, -1.0, 0.0),
                 ),
-            ],
+                start_time,
+            )],
             SMatrix::<f64, 6, 6>::identity(),
-            start_time,
-            start_time + Duration::from_secs(1),
+            1.0,
         );
 
         let residual = factor.residuals_on_spline(
@@ -281,17 +260,17 @@ mod tests {
     fn residual_is_nonzero_for_mismatching_odometer_motion() {
         let start_time = SystemTime::UNIX_EPOCH;
         let factor = VisualOdometryFactor::new(
-            vec![
-                measurement(start_time, SE3::identity(), SE3::identity()),
-                measurement(
+            vec![delta(
+                sample(start_time, SE3::identity(), SE3::identity()),
+                sample(
                     start_time + Duration::from_secs(1),
                     SE3::identity(),
                     translation(0.5, 0.0, 0.0),
                 ),
-            ],
+                start_time,
+            )],
             SMatrix::<f64, 6, 6>::identity(),
-            start_time,
-            start_time + Duration::from_secs(1),
+            1.0,
         );
 
         let residual = factor.residuals_on_spline(
