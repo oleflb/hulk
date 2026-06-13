@@ -218,39 +218,18 @@ impl VinsBackend {
         let Some(last) = imus.last() else {
             return Ok(());
         };
-        self.last_knot_time = Some(self.last_knot_time.map_or(last.time, |t| t.max(last.time)));
+        self.update_last_knot_time(last.time);
 
-        let mut interval_groups = Vec::new();
-        for (key, chunk) in imus
-            .into_iter()
-            .chunk_by(|imu| self.interval_assigner.current_interval_start_time(imu.time))
-            .into_iter()
-        {
-            let Some(interval_start_time) = key else {
-                return Err(VinsBackendError::FailedToIngestImu);
-            };
+        let interval_groups = self
+            .interval_groups(imus, |imu| imu.time)
+            .ok_or(VinsBackendError::FailedToIngestImu)?;
 
-            let measurements = chunk.collect::<Vec<_>>();
-
-            let Some(interval_start_index) =
-                self.interval_assigner.assign_interval(interval_start_time)
-            else {
-                return Err(VinsBackendError::FailedToIngestImu);
-            };
-
-            interval_groups.push((interval_start_index, interval_start_time, measurements));
-        }
-
-        for (interval_start_index, interval_start_time, measurements) in interval_groups {
-            self.init_intervals_through(interval_start_index);
-            if !self.interval_states_available(interval_start_index) {
-                log::debug!(
-                    "skipping IMU measurements for marginalized interval {interval_start_index}"
-                );
+        for group in interval_groups {
+            if !self.prepare_interval_for_measurements(group.start_index, "IMU") {
                 continue;
             }
 
-            let keys = (State(interval_start_index), State(interval_start_index + 1));
+            let keys = (State(group.start_index), State(group.start_index + 1));
             let graph = self.optimizer.graph_mut();
             if let Some(factor) = graph
                 .factors_for_residual_mut::<IntervalGaussianProcessImuFactor, _>(keys)
@@ -259,15 +238,15 @@ impl VinsBackend {
                 factor
                     .residual_as_mut::<IntervalGaussianProcessImuFactor>()
                     .expect("factor query must return matching residual")
-                    .extend_measurements(measurements);
+                    .extend_measurements(group.measurements);
             } else {
                 let residual = IntervalGaussianProcessImuFactor::new(
-                    measurements,
+                    group.measurements,
                     self.config.gyroscope_noise,
                     self.config.accelerometer_noise,
                     self.config.gravity,
-                    interval_start_time,
-                    interval_start_time + self.config.knot_spacing,
+                    group.start_time,
+                    group.end_time,
                 );
                 let factor = FactorBuilder::new(residual, keys).build();
 
@@ -292,44 +271,20 @@ impl VinsBackend {
         };
 
         let last_time = visual_frame_time(last);
-        self.last_knot_time = Some(self.last_knot_time.map_or(last_time, |t| t.max(last_time)));
+        self.update_last_knot_time(last_time);
 
-        let mut interval_groups = Vec::new();
-        for (key, chunk) in visuals
-            .into_iter()
-            .chunk_by(|visual| {
-                self.interval_assigner
-                    .current_interval_start_time(visual_frame_time(visual))
-            })
-            .into_iter()
-        {
-            let Some(interval_start_time) = key else {
-                return Err(VinsBackendError::FailedToIngestVisual);
-            };
+        let interval_groups = self
+            .interval_groups(visuals, |visual| visual_frame_time(visual))
+            .ok_or(VinsBackendError::FailedToIngestVisual)?;
 
-            let frames = chunk.collect::<Vec<_>>();
-
-            let Some(interval_start_index) =
-                self.interval_assigner.assign_interval(interval_start_time)
-            else {
-                return Err(VinsBackendError::FailedToIngestVisual);
-            };
-
-            interval_groups.push((interval_start_index, interval_start_time, frames));
-        }
-
-        for (interval_start_index, interval_start_time, frames) in interval_groups {
-            self.init_intervals_through(interval_start_index);
-            if !self.interval_states_available(interval_start_index) {
-                log::debug!(
-                    "skipping visual measurements for marginalized interval {interval_start_index}"
-                );
+        for group in interval_groups {
+            if !self.prepare_interval_for_measurements(group.start_index, "visual") {
                 continue;
             }
 
             let keys = (
-                State(interval_start_index),
-                State(interval_start_index + 1),
+                State(group.start_index),
+                State(group.start_index + 1),
                 CameraIntrinsics(0),
             );
             let graph = self.optimizer.graph_mut();
@@ -340,12 +295,12 @@ impl VinsBackend {
                 factor
                     .residual_as_mut::<LandmarkFactor>()
                     .expect("factor query must return matching residual")
-                    .extend_frames(frames);
+                    .extend_frames(group.measurements);
             } else {
                 let residual = LandmarkFactor::new(
-                    interval_start_time,
-                    interval_start_time + self.config.knot_spacing,
-                    frames,
+                    group.start_time,
+                    group.end_time,
+                    group.measurements,
                     self.config.visual_feature_noise,
                 )
                 .with_unmatched_costs(UNMATCHED_LANDMARK_COST, UNMATCHED_DETECTION_COST);
@@ -365,45 +320,18 @@ impl VinsBackend {
         let Some(last) = visual_odometry.last() else {
             return Ok(());
         };
-        self.last_knot_time = Some(
-            self.last_knot_time
-                .map_or(last.timestamp, |t| t.max(last.timestamp)),
-        );
+        self.update_last_knot_time(last.timestamp);
 
-        let mut interval_groups = Vec::new();
-        for (key, chunk) in visual_odometry
-            .into_iter()
-            .chunk_by(|measurement| {
-                self.interval_assigner
-                    .current_interval_start_time(measurement.timestamp)
-            })
-            .into_iter()
-        {
-            let Some(interval_start_time) = key else {
-                return Err(VinsBackendError::FailedToIngestVisualOdometry);
-            };
+        let interval_groups = self
+            .interval_groups(visual_odometry, |measurement| measurement.timestamp)
+            .ok_or(VinsBackendError::FailedToIngestVisualOdometry)?;
 
-            let measurements = chunk.collect::<Vec<_>>();
-
-            let Some(interval_start_index) =
-                self.interval_assigner.assign_interval(interval_start_time)
-            else {
-                return Err(VinsBackendError::FailedToIngestVisualOdometry);
-            };
-
-            interval_groups.push((interval_start_index, interval_start_time, measurements));
-        }
-
-        for (interval_start_index, interval_start_time, measurements) in interval_groups {
-            self.init_intervals_through(interval_start_index);
-            if !self.interval_states_available(interval_start_index) {
-                log::debug!(
-                    "skipping visual odometry measurements for marginalized interval {interval_start_index}"
-                );
+        for group in interval_groups {
+            if !self.prepare_interval_for_measurements(group.start_index, "visual odometry") {
                 continue;
             }
 
-            let keys = (State(interval_start_index), State(interval_start_index + 1));
+            let keys = (State(group.start_index), State(group.start_index + 1));
             let graph = self.optimizer.graph_mut();
             if let Some(factor) = graph
                 .factors_for_residual_mut::<VisualOdometryFactor, _>(keys)
@@ -412,13 +340,13 @@ impl VinsBackend {
                 factor
                     .residual_as_mut::<VisualOdometryFactor>()
                     .expect("factor query must return matching residual")
-                    .extend_measurements(measurements);
+                    .extend_measurements(group.measurements);
             } else {
                 let residual = VisualOdometryFactor::new(
-                    measurements,
+                    group.measurements,
                     self.config.visual_odometry_noise,
-                    interval_start_time,
-                    interval_start_time + self.config.knot_spacing,
+                    group.start_time,
+                    group.end_time,
                 );
                 let factor = FactorBuilder::new(residual, keys).build();
 
@@ -458,6 +386,54 @@ impl VinsBackend {
     fn interval_states_available(&self, interval_start_index: u32) -> bool {
         self.values.get(State(interval_start_index)).is_some()
             && self.values.get(State(interval_start_index + 1)).is_some()
+    }
+
+    fn update_last_knot_time(&mut self, time: SystemTime) {
+        self.last_knot_time = Some(self.last_knot_time.map_or(time, |t| t.max(time)));
+    }
+
+    fn interval_groups<T>(
+        &self,
+        measurements: Vec<T>,
+        time_of: impl Fn(&T) -> SystemTime,
+    ) -> Option<Vec<IntervalGroup<T>>> {
+        let mut interval_groups = Vec::new();
+        for (key, chunk) in measurements
+            .into_iter()
+            .chunk_by(|measurement| {
+                self.interval_assigner
+                    .current_interval_start_time(time_of(measurement))
+            })
+            .into_iter()
+        {
+            let start_time = key?;
+            let start_index = self.interval_assigner.assign_interval(start_time)?;
+
+            interval_groups.push(IntervalGroup {
+                start_index,
+                start_time,
+                end_time: start_time + self.config.knot_spacing,
+                measurements: chunk.collect(),
+            });
+        }
+
+        Some(interval_groups)
+    }
+
+    fn prepare_interval_for_measurements(
+        &mut self,
+        interval_start_index: u32,
+        sensor_name: &str,
+    ) -> bool {
+        self.init_intervals_through(interval_start_index);
+        if self.interval_states_available(interval_start_index) {
+            return true;
+        }
+
+        log::debug!(
+            "skipping {sensor_name} measurements for marginalized interval {interval_start_index}"
+        );
+        false
     }
 
     fn ingest_until_empty(&mut self) -> Result<(), VinsBackendError> {
@@ -536,6 +512,13 @@ fn visual_frame_time(visual: &[VisualMeasurement]) -> SystemTime {
         .first()
         .expect("visual frames must contain at least one measurement")
         .time
+}
+
+struct IntervalGroup<T> {
+    start_index: u32,
+    start_time: SystemTime,
+    end_time: SystemTime,
+    measurements: Vec<T>,
 }
 
 fn reset_state_velocity(values: &mut Values, state: State) {
