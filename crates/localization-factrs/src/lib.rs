@@ -25,6 +25,7 @@ mod schur_marginalization;
 mod splines;
 mod symbols;
 mod utils;
+pub mod visual_odometry_factors;
 
 pub fn initialize(
     config: BackendConfiguration,
