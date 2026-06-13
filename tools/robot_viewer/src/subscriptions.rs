@@ -1,4 +1,7 @@
-use color_eyre::{Result, eyre::eyre};
+use color_eyre::{
+    Result,
+    eyre::{WrapErr as _, eyre},
+};
 use coordinate_systems::{Field, Robot};
 use eframe::egui::Context as EguiContext;
 use image::RgbImage;
@@ -51,12 +54,17 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         state.connection = ConnectionStatus::Connecting;
     });
 
+    let router_display = arguments.router_display();
     let mut builder = ContextBuilder::default().with_namespace(arguments.namespace());
-    if let Some(router) = arguments.router {
-        builder = builder.with_router_endpoint(router)?;
+    if let Some(router) = arguments.router.clone() {
+        builder = builder.with_mode("client").with_connect_endpoints([router]);
     }
 
-    let context = builder.build().await?;
+    let context = builder.build().await.wrap_err_with(|| {
+        format!(
+            "failed to connect to Zenoh router {router_display}; make sure zenohd is running and listening on that address, or use tcp/127.0.0.1:7447 when running on the robot or through an SSH port forward"
+        )
+    })?;
     let node = context
         .create_node("robot_viewer")
         .without_schema_service()
