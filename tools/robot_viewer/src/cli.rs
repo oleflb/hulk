@@ -32,39 +32,12 @@ impl Arguments {
 }
 
 fn normalize_namespace(namespace: &str) -> String {
-    let components = namespace
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .map(sanitize_namespace_component)
-        .collect::<Vec<_>>();
-
-    if components.is_empty() {
+    let namespace = namespace.trim_matches('/');
+    if namespace.is_empty() {
         "/".to_string()
     } else {
-        format!("/{}", components.join("/"))
+        format!("/{namespace}")
     }
-}
-
-fn sanitize_namespace_component(component: &str) -> String {
-    let mut sanitized = String::new();
-
-    for character in component.chars() {
-        if character.is_ascii_alphanumeric() || character == '_' {
-            sanitized.push(character);
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    if sanitized
-        .chars()
-        .next()
-        .is_some_and(|character| character.is_ascii_digit())
-    {
-        sanitized.insert(0, '_');
-    }
-
-    sanitized
 }
 
 #[cfg(test)]
@@ -72,12 +45,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn robot_namespace_replaces_invalid_characters() {
-        assert_eq!(normalize_namespace("robot-01"), "/robot_01");
+    fn robot_namespace_preserves_ros_z_graph_name_characters() {
+        assert_eq!(normalize_namespace("42"), "/42");
+        assert_eq!(normalize_namespace("robot-01"), "/robot-01");
+        assert_eq!(normalize_namespace("robot_01"), "/robot_01");
     }
 
     #[test]
     fn explicit_namespace_is_normalized() {
-        assert_eq!(normalize_namespace("/foo/bar-baz/"), "/foo/bar_baz");
+        assert_eq!(normalize_namespace("/foo/bar-baz/"), "/foo/bar-baz");
+    }
+
+    #[test]
+    fn root_namespace_is_normalized() {
+        assert_eq!(normalize_namespace(""), "/");
+        assert_eq!(normalize_namespace("/"), "/");
     }
 }
