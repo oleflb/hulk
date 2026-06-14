@@ -95,9 +95,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             .wait_for(|parameters| parameters.typed().enable)
             .await?;
 
-        let stereo_image_pair = stereo_image_pair_sub.recv().await?;
-        let current_image_time = stereo_image_pair.time;
-        let stereo_image_pair = stereo_image_pair.inner;
+        let stereo_image_pair = stereo_image_pair_sub.recv_with_metadata().await?;
+        let current_image_time = stereo_image_pair.source_time;
+        let stereo_image_pair = stereo_image_pair.message.inner;
         let parameters = node_parameters.snapshot();
         let parameters = parameters.typed();
 

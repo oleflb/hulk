@@ -18,7 +18,6 @@ const PAIR_DISTANCE_RELATIVE_GATE: f32 = 0.15;
 const MAX_REFINED_HYPOTHESES: usize = 512;
 const MAX_SCORED_HYPOTHESES: usize = 8_192;
 const LOCAL_OPTIMIZATION_PASSES: usize = 2;
-const INLIER_AMBIGUITY_SLACK: usize = 1;
 const SYMMETRY_EPSILON: f32 = 1.0e-4;
 const POSE_HINT_TRANSLATION_TIE_EPSILON_SQUARED: f32 = 1.0e-6;
 const CLASS_COUNT: usize = 4;
@@ -33,26 +32,29 @@ pub(crate) struct GlobalLocalizer {
 pub struct GlobalLocalizerConfig {
     /// Minimum accepted fixed associations for any published result.
     pub min_inliers: usize,
-    /// Maximum per-feature reprojection error in pixels.
+    /// Coarse maximum per-feature reprojection error in pixels for assignment.
+    /// The factor graph performs the final metric optimization after a fixed
+    /// assignment is selected.
     pub reprojection_gate: f32,
-    /// RMSE margin in pixels for treating alternatives as ambiguous.
+    /// Minimum top-1 to top-2 RMSE separation in pixels for distinct assignments.
+    /// Field-symmetric alternatives are part of the same equivalence class.
     pub ambiguity_rmse_margin: f32,
 }
 
 impl Default for GlobalLocalizerConfig {
     fn default() -> Self {
         Self {
-            min_inliers: 5,
-            reprojection_gate: 12.0,
-            ambiguity_rmse_margin: 3.0,
+            min_inliers: 3,
+            reprojection_gate: 100.0,
+            ambiguity_rmse_margin: 0.1,
         }
     }
 }
 
 impl GlobalLocalizerConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.min_inliers < 2 {
-            return Err("global_localizer.min_inliers must be at least 2".to_string());
+        if self.min_inliers < 3 {
+            return Err("global_localizer.min_inliers must be at least 3".to_string());
         }
         if !self.reprojection_gate.is_finite() || self.reprojection_gate <= 0.0 {
             return Err("global_localizer.reprojection_gate must be finite and > 0".to_string());
@@ -78,26 +80,36 @@ pub(crate) struct GlobalLocalizationInput<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum GlobalLocalizationResult {
+    /// A distinct non-symmetric assignment remains plausible.
     Ambiguous(FeatureAssociations),
+    /// The assignment is unique in field coordinates.
     Unique(FeatureAssociations),
+    /// The assignment is unique after quotienting the unavoidable 180 degree
+    /// field symmetry. The selected branch is closest to the pose hint when
+    /// available; otherwise it is the deterministic best-scoring branch.
+    UniqueModuloSymmetry(FeatureAssociations),
 }
 
 impl GlobalLocalizationResult {
     pub fn associations(&self) -> &FeatureAssociations {
         match self {
-            Self::Ambiguous(associations) | Self::Unique(associations) => associations,
+            Self::Ambiguous(associations)
+            | Self::Unique(associations)
+            | Self::UniqueModuloSymmetry(associations) => associations,
         }
     }
 
+    #[cfg(test)]
     pub fn is_unique(&self) -> bool {
-        matches!(self, Self::Unique(_))
+        matches!(self, Self::Unique(_) | Self::UniqueModuloSymmetry(_))
     }
 
     pub fn unique_reprojection_associations(
         &self,
     ) -> Option<impl Iterator<Item = VisualReprojectionAssociation> + '_> {
-        let Self::Unique(associations) = self else {
-            return None;
+        let associations = match self {
+            Self::Unique(associations) | Self::UniqueModuloSymmetry(associations) => associations,
+            Self::Ambiguous(_) => return None,
         };
 
         Some(
@@ -249,7 +261,7 @@ impl Problem {
                 ground,
             })
             .collect_vec();
-        if detections.len() < cfg.min_inliers.max(2) {
+        if detections.len() < cfg.min_inliers.max(3) {
             return None;
         }
 
@@ -810,14 +822,15 @@ fn classify(mut result: SearchResult, problem: &Problem) -> Option<GlobalLocaliz
     let best_ids = association_ids(&selected).collect_vec();
     let best_symmetric_ids = symmetric_association_ids(&selected, &problem.features).collect_vec();
     let mut has_symmetric_alternative = false;
-    let mut has_distinct_alternative = false;
+    let mut best_distinct_score = None;
 
-    for alternative in hypotheses.filter(|h| plausible(best_score, h.score, problem.cfg)) {
+    for alternative in hypotheses.filter(|h| h.score.inliers == best_score.inliers) {
         let alternative_ids = association_ids(&alternative).collect_vec();
         if alternative_ids == best_symmetric_ids {
             has_symmetric_alternative = true;
         } else if alternative_ids != best_ids {
-            has_distinct_alternative = true;
+            best_distinct_score = Some(alternative.score);
+            break;
         }
 
         if let Some(hint) = problem.pose_hint
@@ -827,18 +840,28 @@ fn classify(mut result: SearchResult, problem: &Problem) -> Option<GlobalLocaliz
         }
     }
 
-    let associations = to_public(select_branch(selected, problem), problem);
-    if has_distinct_alternative || has_symmetric_alternative || !exhaustive {
+    let selected = select_branch(selected, problem);
+    let has_symmetry_equivalent = has_nontrivial_symmetric_branch(&selected, &problem.features);
+    let associations = to_public(selected, problem);
+    if !exhaustive
+        || best_distinct_score.is_some_and(|score| !separated(best_score, score, problem.cfg))
+    {
         Some(GlobalLocalizationResult::Ambiguous(associations))
+    } else if has_symmetric_alternative || has_symmetry_equivalent {
+        Some(GlobalLocalizationResult::UniqueModuloSymmetry(associations))
     } else {
         Some(GlobalLocalizationResult::Unique(associations))
     }
 }
 
-fn plausible(best: Score, other: Score, cfg: GlobalLocalizerConfig) -> bool {
-    other.inliers + INLIER_AMBIGUITY_SLACK >= best.inliers
-        && other.rmse() <= best.rmse() + cfg.ambiguity_rmse_margin
-        && other.rmse() <= cfg.reprojection_gate
+fn has_nontrivial_symmetric_branch(h: &Hypothesis, features: &[FieldFeature]) -> bool {
+    h.associations
+        .iter()
+        .any(|a| features[a.feature].symmetric_id != a.feature)
+}
+
+fn separated(best: Score, second: Score, cfg: GlobalLocalizerConfig) -> bool {
+    second.rmse() > best.rmse() + cfg.ambiguity_rmse_margin
 }
 
 fn association_ids(h: &Hypothesis) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -1133,11 +1156,15 @@ mod tests {
 
         let ambiguous = GlobalLocalizationResult::Ambiguous(empty_associations());
         let unique = GlobalLocalizationResult::Unique(empty_associations());
+        let unique_modulo_symmetry =
+            GlobalLocalizationResult::UniqueModuloSymmetry(empty_associations());
 
         assert!(!ambiguous.is_unique());
         assert!(unique.is_unique());
+        assert!(unique_modulo_symmetry.is_unique());
         assert_eq!(ambiguous.associations().features.len(), 0);
         assert_eq!(unique.associations().features.len(), 0);
+        assert_eq!(unique_modulo_symmetry.associations().features.len(), 0);
     }
 
     #[test]
@@ -1201,6 +1228,10 @@ mod tests {
             .expect("synthetic detections should localize");
 
         let associations = result.associations();
+        assert!(matches!(
+            &result,
+            GlobalLocalizationResult::Unique(_) | GlobalLocalizationResult::UniqueModuloSymmetry(_)
+        ));
         assert_eq!(associations.score.inliers, 6);
         assert!(associations.score.reprojection_rmse < 1.0e-3);
         assert_eq!(associations.features.len(), 6);
@@ -1221,7 +1252,42 @@ mod tests {
     }
 
     #[test]
-    fn goalpost_only_localization_is_ambiguous() {
+    fn three_features_with_penalty_spot_are_unique_modulo_symmetry() {
+        let field = FieldDimensions::SPL_2025;
+        let ground_to_field = ground_to_field();
+        let expected = robot_to_field_from_ground_to_field(ground_to_field, Isometry3::identity());
+        let camera_intrinsic = camera_intrinsic();
+        let visual_features = DetectedVisualFeatures {
+            l_spots: project_points(ground_to_field, [l_spot_candidates(&field)[0]]),
+            t_spots: project_points(ground_to_field, [t_spot_candidates(&field)[1]]),
+            penalty_spots: project_points(ground_to_field, [penalty_spot_candidates(&field)[0]]),
+            ..Default::default()
+        };
+        let localizer = GlobalLocalizer::new(GlobalLocalizerConfig {
+            ambiguity_rmse_margin: 1.0e-3,
+            ..Default::default()
+        });
+
+        let result = localizer
+            .localize(GlobalLocalizationInput {
+                visual_features: &visual_features,
+                field_dimensions: &field,
+                ground_to_robot: Isometry3::identity(),
+                robot_to_camera: robot_to_camera(),
+                camera_intrinsic,
+                pose_hint: Some(expected),
+            })
+            .expect("synthetic detections should localize");
+
+        assert!(matches!(
+            &result,
+            GlobalLocalizationResult::UniqueModuloSymmetry(_)
+        ));
+        assert_eq!(result.associations().score.inliers, 3);
+    }
+
+    #[test]
+    fn four_goalposts_are_unique_modulo_symmetry() {
         let field = FieldDimensions::SPL_2025;
         let ground_to_field = ground_to_field();
         let camera_intrinsic = camera_intrinsic();
@@ -1249,25 +1315,26 @@ mod tests {
             })
             .expect("synthetic detections should localize");
 
-        assert!(!result.is_unique());
+        assert!(matches!(
+            &result,
+            GlobalLocalizationResult::UniqueModuloSymmetry(_)
+        ));
         assert_eq!(result.associations().score.inliers, 4);
     }
 
     #[test]
-    fn pose_hint_does_not_make_symmetric_result_unique() {
+    fn pose_hint_selects_branch_for_unique_modulo_symmetry() {
         let field = FieldDimensions::SPL_2025;
         let ground_to_field = ground_to_field();
         let camera_intrinsic = camera_intrinsic();
         let visual_features = DetectedVisualFeatures {
-            goalposts: project_points(ground_to_field, goalpost_candidates(&field)),
+            l_spots: project_points(ground_to_field, [l_spot_candidates(&field)[0]]),
+            t_spots: project_points(ground_to_field, [t_spot_candidates(&field)[1]]),
+            penalty_spots: project_points(ground_to_field, [penalty_spot_candidates(&field)[0]]),
             ..Default::default()
         };
-        let pose_hint = Some(robot_to_field_from_ground_to_field(
-            ground_to_field,
-            Isometry3::identity(),
-        ));
+        let expected = robot_to_field_from_ground_to_field(ground_to_field, Isometry3::identity());
         let localizer = GlobalLocalizer::new(GlobalLocalizerConfig {
-            min_inliers: 4,
             ambiguity_rmse_margin: 1.0e-3,
             ..Default::default()
         });
@@ -1279,10 +1346,22 @@ mod tests {
                 ground_to_robot: Isometry3::identity(),
                 robot_to_camera: robot_to_camera(),
                 camera_intrinsic,
-                pose_hint,
+                pose_hint: Some(expected),
             })
             .expect("synthetic detections should localize");
 
-        assert!(!result.is_unique());
+        assert!(matches!(
+            &result,
+            GlobalLocalizationResult::UniqueModuloSymmetry(_)
+        ));
+        assert!(
+            result
+                .associations()
+                .robot_to_field
+                .inner
+                .rotation
+                .angle_to(&expected.inner.rotation)
+                < 1.0e-3
+        );
     }
 }
