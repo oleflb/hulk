@@ -469,6 +469,28 @@ struct DeadReckoningResult {
     trajectory: PoseTrajectory,
     comparison_start_time: SystemTime,
     vo_stats: VisualOdometryReplayStats,
+    vo_consistency: VisualOdometryConsistencyDiagnostics,
+}
+
+#[derive(Clone)]
+struct AcceptedVisualOdometryMeasurement {
+    current_time: SystemTime,
+    robot_delta: nalgebra::Isometry3<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct VisualOdometryConsistencyDiagnostics {
+    accepted_measurements: usize,
+    normal: VisualOdometryConventionError,
+    inverted: VisualOdometryConventionError,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct VisualOdometryConventionError {
+    translation_error_mean_m: f64,
+    translation_error_max_m: f64,
+    rotation_error_mean_deg: f64,
+    rotation_error_max_deg: f64,
 }
 
 fn build_dead_reckoning(
@@ -478,9 +500,8 @@ fn build_dead_reckoning(
     let mut camera_matrices = OnlineCameraMatrices::default();
     let mut vo_timestamps = VisualOdometryTimestampTracker::default();
     let mut vo_stats = VisualOdometryReplayStats::default();
-    let mut pose = initial_pose_from_camera_matrix(&recording.first_camera_matrix);
-    let mut trajectory = PoseTrajectory::new();
-    trajectory.push(recording.start_source_time(), pose);
+    let initial_pose = initial_pose_from_camera_matrix(&recording.first_camera_matrix);
+    let mut accepted_measurements = Vec::new();
     let mut comparison_start_time = None;
 
     for event in &recording.events {
@@ -521,23 +542,90 @@ fn build_dead_reckoning(
                     lookup.previous.matrix,
                     lookup.current.matrix,
                 );
-                if invert_dead_reckoning_delta() {
-                    pose *= robot_delta.inverse();
-                } else {
-                    pose *= robot_delta;
-                }
-                trajectory.push(current_time, pose);
+                accepted_measurements.push(AcceptedVisualOdometryMeasurement {
+                    current_time,
+                    robot_delta,
+                });
                 comparison_start_time.get_or_insert(current_time);
             }
             _ => {}
         }
     }
 
+    let trajectory = visual_odometry_trajectory(
+        recording.start_source_time(),
+        initial_pose,
+        &accepted_measurements,
+        invert_dead_reckoning_delta(),
+    );
+    let vo_consistency = visual_odometry_consistency(initial_pose, &accepted_measurements);
+
     Ok(DeadReckoningResult {
         trajectory,
         comparison_start_time: comparison_start_time.unwrap_or(recording.start_source_time()),
         vo_stats,
+        vo_consistency,
     })
+}
+
+fn visual_odometry_trajectory(
+    start_time: SystemTime,
+    initial_pose: nalgebra::Isometry3<f64>,
+    measurements: &[AcceptedVisualOdometryMeasurement],
+    invert_delta: bool,
+) -> PoseTrajectory {
+    let mut pose = initial_pose;
+    let mut trajectory = PoseTrajectory::new();
+    trajectory.push(start_time, pose);
+    for measurement in measurements {
+        if invert_delta {
+            pose *= measurement.robot_delta.inverse();
+        } else {
+            pose *= measurement.robot_delta;
+        }
+        trajectory.push(measurement.current_time, pose);
+    }
+    trajectory
+}
+
+fn visual_odometry_consistency(
+    initial_pose: nalgebra::Isometry3<f64>,
+    measurements: &[AcceptedVisualOdometryMeasurement],
+) -> VisualOdometryConsistencyDiagnostics {
+    VisualOdometryConsistencyDiagnostics {
+        accepted_measurements: measurements.len(),
+        normal: visual_odometry_convention_error(initial_pose, measurements, false),
+        inverted: visual_odometry_convention_error(initial_pose, measurements, true),
+    }
+}
+
+fn visual_odometry_convention_error(
+    initial_pose: nalgebra::Isometry3<f64>,
+    measurements: &[AcceptedVisualOdometryMeasurement],
+    invert_delta: bool,
+) -> VisualOdometryConventionError {
+    let mut pose = initial_pose;
+    let mut translation_errors = Vec::with_capacity(measurements.len());
+    let mut rotation_errors = Vec::with_capacity(measurements.len());
+    for measurement in measurements {
+        let previous_pose = pose;
+        if invert_delta {
+            pose *= measurement.robot_delta.inverse();
+        } else {
+            pose *= measurement.robot_delta;
+        }
+        let predicted_delta = previous_pose.inverse() * pose;
+        let delta_error = measurement.robot_delta.inverse() * predicted_delta;
+        translation_errors.push(delta_error.translation.vector.norm());
+        rotation_errors.push(delta_error.rotation.angle().to_degrees());
+    }
+
+    VisualOdometryConventionError {
+        translation_error_mean_m: mean(&translation_errors),
+        translation_error_max_m: max(&translation_errors),
+        rotation_error_mean_deg: mean(&rotation_errors),
+        rotation_error_max_deg: max(&rotation_errors),
+    }
 }
 
 struct CameraMatrixPair<'a> {
@@ -765,7 +853,7 @@ fn replay_graph_variant(
     let summary = summarize_variant(
         variant,
         &samples,
-        &dead_reckoning.vo_stats,
+        dead_reckoning,
         &vo_stats,
         &global_stats,
         &accepted_global_feature_times,
@@ -1099,6 +1187,7 @@ struct VariantSummary {
     covariance_mode: VisualOdometryCovarianceMode,
     sample_count: usize,
     dead_reckoning_vo_stats: VisualOdometryReplayStats,
+    dead_reckoning_vo_consistency: VisualOdometryConsistencyDiagnostics,
     graph_vo_stats: VisualOdometryReplayStats,
     global_feature_stats: GlobalFeatureReplayStats,
     translation_error_mean_m: f64,
@@ -1132,7 +1221,7 @@ struct VariantSummary {
 fn summarize_variant(
     variant: &VariantConfig,
     samples: &[ComparisonSample],
-    dead_reckoning_vo_stats: &VisualOdometryReplayStats,
+    dead_reckoning: &DeadReckoningResult,
     graph_vo_stats: &VisualOdometryReplayStats,
     global_feature_stats: &GlobalFeatureReplayStats,
     accepted_global_feature_times: &[SystemTime],
@@ -1189,7 +1278,8 @@ fn summarize_variant(
         optimizer_iterations: variant.optimizer_iterations,
         covariance_mode: variant.covariance_mode,
         sample_count,
-        dead_reckoning_vo_stats: dead_reckoning_vo_stats.clone(),
+        dead_reckoning_vo_stats: dead_reckoning.vo_stats.clone(),
+        dead_reckoning_vo_consistency: dead_reckoning.vo_consistency.clone(),
         graph_vo_stats: graph_vo_stats.clone(),
         global_feature_stats: global_feature_stats.clone(),
         translation_error_mean_m: mean(&translation_errors),

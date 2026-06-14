@@ -35,7 +35,12 @@ use types::{
 mod global_localizer;
 
 /// Global field-feature localizer thresholds.
-pub use global_localizer::GlobalLocalizerConfig as GlobalLocalizerParameters;
+pub use global_localizer::{
+    GlobalLocalizationDebugAssociation, GlobalLocalizationDebugDetection,
+    GlobalLocalizationDebugProjection, GlobalLocalizationDetailedDebug,
+    GlobalLocalizationDetailedStatus, GlobalLocalizerConfig as GlobalLocalizerParameters,
+    VisualFeatureClass,
+};
 
 /// Runtime parameters for the 3D localization node.
 #[derive(Clone, Debug, Deserialize, Serialize, Message)]
@@ -344,6 +349,25 @@ pub fn localize_global_visual_features(
                 .map(Iterator::collect)
         }),
     }
+}
+
+/// Runs global localization and returns per-feature debug data for visual inspection.
+pub fn localize_global_visual_features_detailed_debug(
+    visual_features: &DetectedVisualFeatures,
+    camera_matrix: &CameraMatrix,
+    field_dimensions: &FieldDimensions,
+    pose_hint: Option<Isometry3<Robot, Field>>,
+    parameters: &GlobalLocalizerParameters,
+) -> Option<GlobalLocalizationDetailedDebug> {
+    let localizer = GlobalLocalizer::new(*parameters);
+    localizer.localize_detailed(GlobalLocalizationInput {
+        visual_features,
+        field_dimensions,
+        ground_to_robot: camera_matrix.ground_to_robot,
+        robot_to_camera: robot_to_camera(camera_matrix),
+        camera_intrinsic: camera_matrix.intrinsics,
+        pose_hint,
+    })
 }
 
 fn global_localization_debug_from_result(

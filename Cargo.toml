@@ -128,6 +128,7 @@ members = [
   "tools/parameter_tester",
   "tools/pepsi",
   "tools/robot_viewer",
+  "tools/localization_mcap_visualizer",
   "tools/tensorrt-compile",
   "tools/twix",
   "tools/vista",

@@ -138,7 +138,7 @@ pub(crate) struct FeatureAssociation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VisualFeatureClass {
+pub enum VisualFeatureClass {
     GoalPost,
     LSpot,
     TSpot,
@@ -159,10 +159,57 @@ impl VisualFeatureClass {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GlobalLocalizationScore {
+pub struct GlobalLocalizationScore {
     pub inliers: usize,
     pub reprojection_rmse: f32,
     pub total_cost: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct GlobalLocalizationDetailedDebug {
+    pub status: GlobalLocalizationDetailedStatus,
+    pub robot_to_field: Isometry3<Robot, Field>,
+    pub score: GlobalLocalizationScore,
+    pub detections: Vec<GlobalLocalizationDebugDetection>,
+    pub projected_features: Vec<GlobalLocalizationDebugProjection>,
+    pub associations: Vec<GlobalLocalizationDebugAssociation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlobalLocalizationDetailedStatus {
+    Ambiguous,
+    Unique,
+    UniqueModuloSymmetry,
+}
+
+#[derive(Clone, Debug)]
+pub struct GlobalLocalizationDebugDetection {
+    pub index: usize,
+    pub class: VisualFeatureClass,
+    pub pixel: Point2<Pixel>,
+    pub ground: Point2<Ground>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GlobalLocalizationDebugProjection {
+    pub index: usize,
+    pub symmetric_index: usize,
+    pub class: VisualFeatureClass,
+    pub field_point: Point2<Field>,
+    pub projected_pixel: Option<Point2<Pixel>>,
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GlobalLocalizationDebugAssociation {
+    pub detection_index: usize,
+    pub feature_index: usize,
+    pub class: VisualFeatureClass,
+    pub detection_pixel: Point2<Pixel>,
+    pub back_projected_ground: Point2<Ground>,
+    pub field_point: Point2<Field>,
+    pub projected_pixel: Option<Point2<Pixel>>,
+    pub reprojection_error_px: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +273,15 @@ impl GlobalLocalizer {
     pub fn localize(&self, input: GlobalLocalizationInput<'_>) -> Option<GlobalLocalizationResult> {
         let problem = Problem::new(input, self.config)?;
         classify(search(&problem), &problem)
+    }
+
+    pub(crate) fn localize_detailed(
+        &self,
+        input: GlobalLocalizationInput<'_>,
+    ) -> Option<GlobalLocalizationDetailedDebug> {
+        let problem = Problem::new(input, self.config)?;
+        let result = classify(search(&problem), &problem)?;
+        Some(detailed_debug_from_result(&result, &problem))
     }
 }
 
@@ -925,6 +981,110 @@ fn to_public(h: Hypothesis, problem: &Problem) -> FeatureAssociations {
             total_cost: h.score.cost,
         },
     }
+}
+
+fn detailed_debug_from_result(
+    result: &GlobalLocalizationResult,
+    problem: &Problem,
+) -> GlobalLocalizationDetailedDebug {
+    let associations = result.associations();
+    let field_to_camera = problem.robot_to_camera * associations.robot_to_field.inverse();
+    let projected_pixels = problem
+        .features
+        .iter()
+        .map(|feature| project_feature(field_to_camera, *feature, problem.k))
+        .collect_vec();
+    let accepted_feature_indices = associations
+        .features
+        .iter()
+        .filter_map(|association| feature_index_for_association(problem, association))
+        .collect_vec();
+
+    GlobalLocalizationDetailedDebug {
+        status: detailed_status(result),
+        robot_to_field: associations.robot_to_field,
+        score: associations.score,
+        detections: problem
+            .detections
+            .iter()
+            .map(|detection| GlobalLocalizationDebugDetection {
+                index: detection.id,
+                class: detection.class,
+                pixel: detection.pixel,
+                ground: detection.ground,
+            })
+            .collect(),
+        projected_features: problem
+            .features
+            .iter()
+            .zip(projected_pixels.iter().copied())
+            .map(
+                |(feature, projected_pixel)| GlobalLocalizationDebugProjection {
+                    index: feature.id,
+                    symmetric_index: feature.symmetric_id,
+                    class: feature.class,
+                    field_point: feature.point,
+                    projected_pixel,
+                    accepted: accepted_feature_indices.contains(&feature.id),
+                },
+            )
+            .collect(),
+        associations: associations
+            .features
+            .iter()
+            .filter_map(|association| {
+                let detection_index = detection_index_for_association(problem, association)?;
+                let feature_index = feature_index_for_association(problem, association)?;
+                let detection = problem.detections[detection_index];
+                let projected_pixel = projected_pixels[feature_index];
+                let reprojection_error_px = projected_pixel
+                    .map(|projected_pixel| (projected_pixel - detection.pixel).inner.norm());
+
+                Some(GlobalLocalizationDebugAssociation {
+                    detection_index,
+                    feature_index,
+                    class: detection.class,
+                    detection_pixel: detection.pixel,
+                    back_projected_ground: detection.ground,
+                    field_point: problem.features[feature_index].point,
+                    projected_pixel,
+                    reprojection_error_px,
+                })
+            })
+            .collect(),
+    }
+}
+
+fn detailed_status(result: &GlobalLocalizationResult) -> GlobalLocalizationDetailedStatus {
+    match result {
+        GlobalLocalizationResult::Ambiguous(_) => GlobalLocalizationDetailedStatus::Ambiguous,
+        GlobalLocalizationResult::Unique(_) => GlobalLocalizationDetailedStatus::Unique,
+        GlobalLocalizationResult::UniqueModuloSymmetry(_) => {
+            GlobalLocalizationDetailedStatus::UniqueModuloSymmetry
+        }
+    }
+}
+
+fn detection_index_for_association(
+    problem: &Problem,
+    association: &FeatureAssociation,
+) -> Option<usize> {
+    problem
+        .detections
+        .iter()
+        .find(|detection| detection.pixel == association.detection)
+        .map(|detection| detection.id)
+}
+
+fn feature_index_for_association(
+    problem: &Problem,
+    association: &FeatureAssociation,
+) -> Option<usize> {
+    problem
+        .features
+        .iter()
+        .find(|feature| feature.point == association.field_point)
+        .map(|feature| feature.id)
 }
 
 fn project_feature(
