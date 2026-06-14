@@ -37,15 +37,15 @@ const EXPECTED_IMU_SAMPLE_COUNT: usize = 5981;
 const EXPECTED_CAMERA_MATRIX_COUNT: usize = 4923;
 const EXPECTED_FIELD_DIMENSIONS_COUNT: usize = 6;
 const EXPECTED_DETECTED_OBJECT_FRAME_COUNT: usize = 710;
-// This recording only has ambiguous goalpost-only global localizations, so the
-// deployed Unique-only backend path must not ingest visual feature frames.
-const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 0;
-const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 0;
-const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 3;
+// Goalpost-only global localizations are unique modulo the unavoidable 180 degree
+// field symmetry and are therefore safe to ingest as fixed associations.
+const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 109;
+const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 137;
+const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 47;
 const EXPECTED_GOALPOST_DETECTION_COUNT: usize = 723;
-const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 184;
-const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 169;
-const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 169;
+const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 185;
+const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 170;
+const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 170;
 const EXPECTED_LANDMARK_COUNT: usize = 4;
 
 #[derive(Debug, Deserialize)]
@@ -93,10 +93,13 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
 
     let initial_state = initial_state_from_camera_matrix(&first_camera_matrix);
 
+    let parameters = Localization3dParameters::default();
     let solve_every_nth_round = solve_every_nth_round();
     let solve_cadence = solve_cadence_duration(solve_every_nth_round);
-    let (mut frontend, mut backend) = initialize(backend_configuration(), initial_state);
-    let parameters = Localization3dParameters::default();
+    let (mut frontend, mut backend) = initialize(
+        backend_configuration(parameters.visual_feature_noise_variance),
+        initial_state,
+    );
     let relaxed_debug_global_localizer = GlobalLocalizerParameters {
         min_inliers: 4,
         ..Default::default()

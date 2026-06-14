@@ -13,7 +13,7 @@ use localization_factrs::{
     BackendConfiguration, CameraIntrinsics, InitialState, VinsFrontend, VinsFrontendError,
     VisualReprojectionAssociation, initialize,
 };
-use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, SVector, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{
     Message,
@@ -38,25 +38,44 @@ mod global_localizer;
 pub use global_localizer::GlobalLocalizerConfig as GlobalLocalizerParameters;
 
 /// Runtime parameters for the 3D localization node.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, Message)]
+#[derive(Clone, Debug, Deserialize, Serialize, Message)]
 #[serde(deny_unknown_fields)]
 pub struct Localization3dParameters {
     /// Parameters for fixed-field-feature global localization from object detections.
     pub global_localizer: GlobalLocalizerParameters,
+    /// Pixel residual variance for accepted visual feature associations.
+    pub visual_feature_noise_variance: f64,
+}
+
+impl Default for Localization3dParameters {
+    fn default() -> Self {
+        Self {
+            global_localizer: GlobalLocalizerParameters::default(),
+            visual_feature_noise_variance: 3600.0,
+        }
+    }
 }
 
 impl Localization3dParameters {
     fn validate(&self) -> std::result::Result<(), String> {
-        self.global_localizer.validate()
+        self.global_localizer.validate()?;
+        if !self.visual_feature_noise_variance.is_finite()
+            || self.visual_feature_noise_variance <= 0.0
+        {
+            return Err("visual_feature_noise_variance must be finite and > 0".to_string());
+        }
+        Ok(())
     }
 }
 
 pub struct GlobalVisualLocalization {
     /// Debug payload for the best visual global localization result, if any.
     pub debug: Option<GlobalLocalizationDebug>,
-    /// Fixed associations that are safe to ingest into the backend graph.
+    /// Fixed associations that are unique up to the field symmetry and safe to ingest.
     pub unique_associations: Option<Vec<VisualReprojectionAssociation>>,
 }
+
+const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 
 struct GlobalLocalizationTaskOutput {
     source_time: Time,
@@ -64,18 +83,17 @@ struct GlobalLocalizationTaskOutput {
     localization: GlobalVisualLocalization,
 }
 
-pub fn backend_configuration() -> BackendConfiguration {
+pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfiguration {
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
         max_optimization_window: Duration::from_secs(3),
-        optimizer_max_iterations: 1,
+        optimizer_max_iterations: 5,
         gyroscope_process_noise: Matrix3::identity() * 0.01,
         roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
         accelerometer_process_noise: Matrix3::identity() * 0.01,
-        visual_feature_noise: Matrix2::identity() * 5.0,
-        visual_odometry_noise: SMatrix::<f64, 6, 6>::from_diagonal(&SVector::<f64, 6>::new(
-            2.5e-3, 2.5e-3, 5.0e-6, 5e-5, 5e-5, 9e-2,
-        )),
+        visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
+        // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
+        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-4,
         foot_ground_softness: 1.0e-3,
         foot_ground_sigma: 0.01,
         gravity: Vector3::new(0.0, 0.0, 9.81),
@@ -146,19 +164,23 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let initial_state = wait_for_initial_state(&camera_matrix_cache).await;
-    let (mut frontend, backend) = initialize(backend_configuration(), initial_state);
+    let initial_parameters = parameters.snapshot().typed().clone();
+    let (mut frontend, backend) = initialize(
+        backend_configuration(initial_parameters.visual_feature_noise_variance),
+        initial_state,
+    );
     let mut backend_handle = std::pin::pin!(tokio::task::spawn_blocking(|| backend.run_loop()));
     let mut global_localization_task: Option<JoinHandle<GlobalLocalizationTaskOutput>> = None;
 
     loop {
         select! {
-            // TODO(oleflb): Use the correct image timestamp, not the source time
+            // The detection publisher announces the originating image time as source time.
             objects = object_subscriber.recv_with_metadata(), if global_localization_task.is_none() => {
                 let objects = objects?;
                 let visual_features = find_detected_visual_features(objects.message);
                 let parameters = parameters.snapshot().typed().clone();
                 if visual_features.supported_feature_count()
-                    < parameters.global_localizer.min_inliers.max(2)
+                    < parameters.global_localizer.min_inliers.max(3)
                 {
                     let debug: Option<GlobalLocalizationDebug> = None;
                     global_localization_publisher.publish(&debug).await?;
@@ -168,6 +190,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 let Some(camera_matrix) = camera_matrix_cache.get_nearest(objects.source_time) else {
                     continue;
                 };
+                if !camera_matrix_is_fresh(&camera_matrix, objects.source_time) {
+                    continue;
+                }
                 let Some(field_dimensions) = field_dimensions_cache.get_nearest(objects.source_time) else {
                     continue;
                 };
@@ -216,7 +241,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                         .wrap_err("ingest of globally associated visual features failed")?;
                 }
             }
-            // TODO(oleflb): Use the correct sensor timestamp, not the source time
+            // IMU payloads have no sensor timestamp; ros-z source time is the aligned clock.
             imu = imu_subscriber.recv_with_metadata() => {
                 let imu = imu?;
                 frontend.ingest_imu(imu.source_time.to_wallclock(), imu.message)
@@ -232,9 +257,15 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 let Some(previous_camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.previous_time) else {
                     continue;
                 };
+                if !camera_matrix_is_fresh(&previous_camera_matrix, visual_odometry.previous_time) {
+                    continue;
+                }
                 let Some(current_camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.current_time) else {
                     continue;
                 };
+                if !camera_matrix_is_fresh(&current_camera_matrix, visual_odometry.current_time) {
+                    continue;
+                }
 
                 ingest_visual_odometry(&mut frontend, visual_odometry, &previous_camera_matrix.inner, &current_camera_matrix.inner)
                     .wrap_err("failed to ingest visual odometry measurement into frontend")?;
@@ -279,7 +310,15 @@ fn pose_hint_from_frontend(frontend: &VinsFrontend) -> Option<Isometry3<Robot, F
         .map(|result| result.transform.cast::<f32>().framed_transform())
 }
 
-/// Runs global localization and returns debug data plus Unique-only backend associations.
+fn camera_matrix_is_fresh(camera_matrix: &TimeWrapper<CameraMatrix>, time: Time) -> bool {
+    time_distance(camera_matrix.time, time) <= MAX_CAMERA_MATRIX_TIME_DISTANCE
+}
+
+fn time_distance(a: Time, b: Time) -> Duration {
+    Duration::from_nanos(a.as_nanos().abs_diff(b.as_nanos()))
+}
+
+/// Runs global localization and returns debug data plus backend-safe associations.
 pub fn localize_global_visual_features(
     visual_features: &DetectedVisualFeatures,
     camera_matrix: &CameraMatrix,
@@ -310,10 +349,12 @@ pub fn localize_global_visual_features(
 fn global_localization_debug_from_result(
     result: &GlobalLocalizationResult,
 ) -> GlobalLocalizationDebug {
-    let status = if result.is_unique() {
-        GlobalLocalizationDebugStatus::Unique
-    } else {
-        GlobalLocalizationDebugStatus::Ambiguous
+    let status = match result {
+        GlobalLocalizationResult::Ambiguous(_) => GlobalLocalizationDebugStatus::Ambiguous,
+        GlobalLocalizationResult::Unique(_) => GlobalLocalizationDebugStatus::Unique,
+        GlobalLocalizationResult::UniqueModuloSymmetry(_) => {
+            GlobalLocalizationDebugStatus::UniqueModuloSymmetry
+        }
     };
     let associations = result.associations();
     GlobalLocalizationDebug {
@@ -396,7 +437,7 @@ impl DetectedVisualFeatures {
 pub struct GlobalLocalizationDebug {
     /// Best robot pose in the field frame for this visual result.
     pub robot_to_field: Isometry3<Robot, Field>,
-    /// Whether the best result was visually unique or ambiguous.
+    /// Whether the best result is ambiguous, unique, or unique modulo field symmetry.
     pub status: GlobalLocalizationDebugStatus,
     /// Number of fixed feature associations accepted by the reprojection gate.
     pub inliers: usize,
@@ -409,10 +450,13 @@ pub struct GlobalLocalizationDebug {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Message)]
 /// Classification of a successful global localization result.
 pub enum GlobalLocalizationDebugStatus {
-    /// A plausible alternative association or field symmetry remains.
+    /// A plausible non-symmetric alternative assignment remains.
     Ambiguous,
     /// No plausible alternative survived the deterministic search.
     Unique,
+    /// The assignment is unique after quotienting the unavoidable 180 degree
+    /// field symmetry. The chosen branch follows the pose hint when available.
+    UniqueModuloSymmetry,
 }
 
 pub fn find_detected_visual_features(

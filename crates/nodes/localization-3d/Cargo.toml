@@ -23,4 +23,6 @@ localization-factrs = { workspace = true }
 projection = { workspace = true }
 
 [dev-dependencies]
+mcap = { workspace = true }
+ros-z-cdr = { workspace = true }
 serde_json = { workspace = true }

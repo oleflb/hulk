@@ -5,11 +5,12 @@ use std::{
 
 use factrs::{
     containers::FactorBuilder,
-    core::{GaussNewton, Graph, PriorResidual, SO3, Values, Vector3},
-    linalg::Matrix3,
+    core::{GaussNewton, Graph, PriorResidual, SE3, SO3, Values, Vector3},
+    linalg::{Matrix3, VectorX},
     noise::GaussianNoise,
     optimizers::{BaseOptParams, OptError, OptStatus},
-    traits::Optimizer,
+    residuals::ErasedResidual,
+    traits::{Optimizer, Variable},
     variables::SE23,
 };
 use itertools::Itertools;
@@ -74,6 +75,33 @@ pub struct BackendConfiguration {
     pub gravity: Vector3<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendOptimizerStatus {
+    Converged,
+    MaxIterations,
+    FailedToStep,
+    InvalidSystem,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResidualDiagnostics {
+    pub factor_count: usize,
+    pub residual_dim: usize,
+    pub mean_rms: f64,
+    pub max_rms: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendSolveDiagnostics {
+    pub optimizer_status: BackendOptimizerStatus,
+    pub value_count: usize,
+    pub factor_count: usize,
+    pub total_error: f64,
+    pub visual_odometry: ResidualDiagnostics,
+    pub visual_reprojection: ResidualDiagnostics,
+    pub gaussian_process_prior: ResidualDiagnostics,
+}
+
 #[derive(Debug, Error)]
 pub enum VinsBackendError {
     #[error("frontend disconnected")]
@@ -131,6 +159,8 @@ pub struct VinsBackend {
     next_imu_attitude_knot_index: u32,
     /// Latest finalized knot orientation, used to form relative yaw and live yaw residuals.
     last_imu_knot_orientation: Option<ImuKnotOrientation>,
+    /// Diagnostics from the most recent solve.
+    last_solve_diagnostics: Option<BackendSolveDiagnostics>,
 }
 
 pub fn initialize_graph(initial_state: &InitialState) -> (Graph, Values) {
@@ -203,11 +233,16 @@ impl VinsBackend {
             latest_imu_attitude_measurement: None,
             next_imu_attitude_knot_index: 0,
             last_imu_knot_orientation: None,
+            last_solve_diagnostics: None,
         }
     }
 
     pub fn values(&self) -> &Values {
         &self.values
+    }
+
+    pub fn last_solve_diagnostics(&self) -> Option<&BackendSolveDiagnostics> {
+        self.last_solve_diagnostics.as_ref()
     }
 
     /// Loops continuously, ingesting measurements and optimizing the graph.
@@ -491,14 +526,16 @@ impl VinsBackend {
         let mut same_interval_deltas = Vec::new();
         let mut adjacent_interval_deltas = Vec::new();
         for measurement in visual_odometry {
-            match self.visual_odometry_delta(&measurement) {
-                Some(TimedVisualOdometryDelta::SameInterval(delta)) => {
-                    same_interval_deltas.push(delta);
+            for measurement in self.split_visual_odometry_measurement(measurement) {
+                match self.visual_odometry_delta(&measurement) {
+                    Some(TimedVisualOdometryDelta::SameInterval(delta)) => {
+                        same_interval_deltas.push(delta);
+                    }
+                    Some(TimedVisualOdometryDelta::AdjacentInterval(delta)) => {
+                        adjacent_interval_deltas.push(delta);
+                    }
+                    None => {}
                 }
-                Some(TimedVisualOdometryDelta::AdjacentInterval(delta)) => {
-                    adjacent_interval_deltas.push(delta);
-                }
-                None => {}
             }
         }
 
@@ -664,6 +701,92 @@ impl VinsBackend {
                 None
             }
         }
+    }
+
+    fn split_visual_odometry_measurement(
+        &self,
+        measurement: VisualOdometryMeasurement,
+    ) -> Vec<VisualOdometryMeasurement> {
+        if measurement.current_time <= measurement.previous_time {
+            return vec![measurement];
+        }
+
+        let Some(previous_interval_start_time) = self
+            .interval_assigner
+            .current_interval_start_time(measurement.previous_time)
+        else {
+            return vec![measurement];
+        };
+        let Some(previous_interval_index) = self
+            .interval_assigner
+            .assign_interval(previous_interval_start_time)
+        else {
+            return vec![measurement];
+        };
+        let Some(current_interval_start_time) = self
+            .interval_assigner
+            .current_interval_start_time(measurement.current_time)
+        else {
+            return vec![measurement];
+        };
+        let Some(current_interval_index) = self
+            .interval_assigner
+            .assign_interval(current_interval_start_time)
+        else {
+            return vec![measurement];
+        };
+        let Some(spanned_intervals) = current_interval_index.checked_sub(previous_interval_index)
+        else {
+            return vec![measurement];
+        };
+        if spanned_intervals == 0 {
+            return vec![measurement];
+        }
+
+        let Ok(total_duration) = measurement
+            .current_time
+            .duration_since(measurement.previous_time)
+        else {
+            return vec![measurement];
+        };
+        if total_duration.is_zero() {
+            return vec![measurement];
+        }
+
+        let tangent = measurement.robot_delta.log();
+        let mut segments = Vec::new();
+        let mut segment_start_time = measurement.previous_time;
+        for boundary_index in (previous_interval_index + 1)..=current_interval_index {
+            let Some(boundary_time) = self.interval_assigner.interval_start_time(boundary_index)
+            else {
+                continue;
+            };
+            if boundary_time <= segment_start_time || boundary_time >= measurement.current_time {
+                continue;
+            }
+            let guarded_boundary_time = boundary_time
+                .checked_sub(Duration::from_nanos(1))
+                .unwrap_or(boundary_time);
+            if guarded_boundary_time > segment_start_time {
+                segments.push(split_visual_odometry_segment(
+                    segment_start_time,
+                    guarded_boundary_time,
+                    total_duration,
+                    &tangent,
+                ));
+            }
+            segment_start_time = boundary_time;
+        }
+        if measurement.current_time > segment_start_time {
+            segments.push(split_visual_odometry_segment(
+                segment_start_time,
+                measurement.current_time,
+                total_duration,
+                &tangent,
+            ));
+        }
+
+        segments
     }
 
     fn ingest_foot_heights(
@@ -841,19 +964,23 @@ impl VinsBackend {
 
         self.add_current_spline_orientation_factor();
 
-        match self.optimizer.optimize(&mut self.values) {
-            Ok(OptStatus::Converged) => {}
+        let optimizer_status = match self.optimizer.optimize(&mut self.values) {
+            Ok(OptStatus::Converged) => BackendOptimizerStatus::Converged,
             Ok(OptStatus::MaxIterations) => {
                 log::warn!("optimizer failed to converge: max iterations reached");
+                BackendOptimizerStatus::MaxIterations
             }
             Err(OptError::FailedToStep) => {
                 log::warn!("optimizer failed: failed to step");
+                BackendOptimizerStatus::FailedToStep
             }
             Err(OptError::InvalidSystem) => {
                 log::warn!("optimizer failed: invalid system");
+                BackendOptimizerStatus::InvalidSystem
             }
         };
         self.remove_current_spline_orientation_factor();
+        self.last_solve_diagnostics = Some(self.solve_diagnostics(optimizer_status));
 
         let interval_start_time = self.interval_assigner.current_interval_start_time(time)?;
         let interval_start_index = self
@@ -872,6 +999,93 @@ impl VinsBackend {
             camera_intrinsics,
         })
     }
+
+    fn solve_diagnostics(
+        &self,
+        optimizer_status: BackendOptimizerStatus,
+    ) -> BackendSolveDiagnostics {
+        let graph = self.optimizer.graph();
+        let mut visual_odometry = self.residual_diagnostics::<VisualOdometryFactor>();
+        visual_odometry.extend(self.residual_diagnostics::<AdjacentVisualOdometryFactor>());
+
+        BackendSolveDiagnostics {
+            optimizer_status,
+            value_count: self.values.len(),
+            factor_count: graph.len(),
+            total_error: graph.error(&self.values),
+            visual_odometry: visual_odometry.finish(),
+            visual_reprojection: self
+                .residual_diagnostics::<VisualReprojectionFactor>()
+                .finish(),
+            gaussian_process_prior: self
+                .residual_diagnostics::<GaussianProcessPriorFactor>()
+                .finish(),
+        }
+    }
+
+    fn residual_diagnostics<R>(&self) -> ResidualDiagnosticsAccumulator
+    where
+        R: ErasedResidual + 'static,
+    {
+        let graph = self.optimizer.graph();
+        let mut diagnostics = ResidualDiagnosticsAccumulator::default();
+        for index in 0..graph.len() {
+            let factor = graph.at(index);
+            if !factor.is_residual::<R>() {
+                continue;
+            }
+            let Ok(error) = factor.try_error(&self.values) else {
+                continue;
+            };
+            let Ok(dim) = factor.try_dim_out(&self.values) else {
+                continue;
+            };
+            diagnostics.add(error, dim);
+        }
+        diagnostics
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResidualDiagnosticsAccumulator {
+    factor_count: usize,
+    residual_dim: usize,
+    sum_squared_norm: f64,
+    max_rms: f64,
+}
+
+impl ResidualDiagnosticsAccumulator {
+    fn add(&mut self, factor_error: f64, residual_dim: usize) {
+        if residual_dim == 0 {
+            return;
+        }
+        let squared_norm = 2.0 * factor_error;
+        let rms = (squared_norm / residual_dim as f64).sqrt();
+        self.factor_count += 1;
+        self.residual_dim += residual_dim;
+        self.sum_squared_norm += squared_norm;
+        self.max_rms = self.max_rms.max(rms);
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.factor_count += other.factor_count;
+        self.residual_dim += other.residual_dim;
+        self.sum_squared_norm += other.sum_squared_norm;
+        self.max_rms = self.max_rms.max(other.max_rms);
+    }
+
+    fn finish(self) -> ResidualDiagnostics {
+        ResidualDiagnostics {
+            factor_count: self.factor_count,
+            residual_dim: self.residual_dim,
+            mean_rms: if self.residual_dim == 0 {
+                0.0
+            } else {
+                (self.sum_squared_norm / self.residual_dim as f64).sqrt()
+            },
+            max_rms: self.max_rms,
+        }
+    }
 }
 
 fn visual_frame_time(visual: &[VisualReprojectionMeasurement]) -> SystemTime {
@@ -879,6 +1093,24 @@ fn visual_frame_time(visual: &[VisualReprojectionMeasurement]) -> SystemTime {
         .first()
         .expect("visual frames must contain at least one measurement")
         .time
+}
+
+fn split_visual_odometry_segment(
+    previous_time: SystemTime,
+    current_time: SystemTime,
+    total_duration: Duration,
+    tangent: &VectorX,
+) -> VisualOdometryMeasurement {
+    let segment_duration = current_time
+        .duration_since(previous_time)
+        .expect("split segment times must be ordered");
+    let fraction = segment_duration.as_secs_f64() / total_duration.as_secs_f64();
+    let scaled_tangent = tangent * fraction;
+    VisualOdometryMeasurement {
+        previous_time,
+        current_time,
+        robot_delta: SE3::exp(scaled_tangent.as_view()),
+    }
 }
 
 struct IntervalGroup<T> {

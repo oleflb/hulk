@@ -1,7 +1,8 @@
 {
+  visual_feature_noise_variance: 3600.0,
   global_localizer: {
-    min_inliers: 5,
-    reprojection_gate: 12.0,
-    ambiguity_rmse_margin: 3.0,
+    min_inliers: 3,
+    reprojection_gate: 100.0,
+    ambiguity_rmse_margin: 0.1,
   },
 }
