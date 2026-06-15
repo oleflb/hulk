@@ -5,9 +5,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
+use color_eyre::{Result, eyre::eyre};
 use coordinate_systems::{Field, Robot};
 use eframe::{
     App, CreationContext, Frame,
@@ -21,18 +22,23 @@ use egui_bevy::BevyWidget;
 use egui_plot::{Line, Plot, PlotPoints};
 use linear_algebra::IntoTransform;
 use localization_3d::{
-    GlobalLocalizationDetailedDebug, VisualFeatureClass, find_detected_visual_features,
+    GlobalLocalizationDetailedDebug, GlobalLocalizerParameters, VisualFeatureClass,
+    find_detected_visual_features, initial_robot_to_field_from_camera_matrix,
     localize_global_visual_features_detailed_debug,
 };
+use projection::camera_matrix::CameraMatrix;
 use types::{
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
 };
 
 use crate::{
-    mcap_recording::{CameraImage, Recording, StereoFrame, TrajectoryPoint},
+    mcap_recording::{
+        CameraImage, Recording, StereoFrame, StereoImageId, TrajectoryPoint, nanos_since_epoch,
+    },
+    nearest_by_distance,
     replay::{ReplayParameters, ResolveMessage, ResolveProgress, ResolveResult, TimestampMode},
-    scene::{self, SceneCameraFrame, SceneData},
+    scene::{self, SceneCameraFrame, SceneCameraSide, SceneData, SceneFrameSequence, SceneVersion},
 };
 
 pub struct LocalizationMcapVisualizerApp {
@@ -50,6 +56,10 @@ pub struct LocalizationMcapVisualizerApp {
     left_texture: Option<TextureHandle>,
     right_texture: Option<TextureHandle>,
     resolve: ResolveState,
+    resolve_version: SceneVersion,
+    camera_matrix_key: Option<CameraMatrixKey>,
+    camera_version: SceneVersion,
+    global_debug_cache: CachedGlobalDebug,
 }
 
 impl LocalizationMcapVisualizerApp {
@@ -57,20 +67,19 @@ impl LocalizationMcapVisualizerApp {
         creation_context: &CreationContext,
         mcap_path: PathBuf,
         recording: Arc<Recording>,
-    ) -> Self {
+    ) -> Result<Self> {
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        let mut widget = BevyWidget::new(
-            creation_context
-                .wgpu_render_state
-                .clone()
-                .expect("no wgpu render state found"),
-        );
+        let render_state = creation_context
+            .wgpu_render_state
+            .clone()
+            .ok_or_else(|| eyre!("no WGPU render state found"))?;
+        let mut widget = BevyWidget::new(render_state);
         scene::configure(&mut widget.bevy_app);
         widget.bevy_app.finish();
         widget.bevy_app.cleanup();
 
-        Self {
+        Ok(Self {
             recorded_trajectory: recording.recorded_localization_trajectory(),
             recording,
             mcap_path,
@@ -85,7 +94,11 @@ impl LocalizationMcapVisualizerApp {
             left_texture: None,
             right_texture: None,
             resolve: ResolveState::Idle,
-        }
+            resolve_version: SceneVersion::default(),
+            camera_matrix_key: None,
+            camera_version: SceneVersion::default(),
+            global_debug_cache: CachedGlobalDebug::default(),
+        })
     }
 }
 
@@ -96,56 +109,61 @@ impl App for LocalizationMcapVisualizerApp {
 
         let log_time = self.recording.log_time_at_seconds(self.position_seconds);
         let snapshot = self.recording.latest_snapshot(log_time);
-        self.update_stereo_textures(context, snapshot.image_index);
+        self.update_stereo_textures(context, snapshot.image_id);
 
+        let camera_matrix_key = snapshot
+            .camera_matrix
+            .as_ref()
+            .map(|matrix| CameraMatrixKey {
+                time_nanos: matrix.time.as_nanos(),
+                calibrated_intrinsics_time_nanos: snapshot
+                    .calibrated_intrinsics_time
+                    .map(nanos_since_epoch),
+            });
         let mut camera_matrix = snapshot.camera_matrix.clone().map(|mut matrix| {
             if let Some(intrinsics) = snapshot.calibrated_intrinsics {
                 matrix.inner.intrinsics = intrinsics;
             }
             matrix.inner
         });
+        if self.camera_matrix_key != camera_matrix_key {
+            self.camera_matrix_key = camera_matrix_key;
+            self.camera_version = self.camera_version.next();
+        }
+
         let current_pose = self.current_robot_to_field(snapshot.recorded_localization);
-        let global_debug = self.global_debug(
+        let debug_pose = self.robot_to_field_at_log_time(snapshot.detected_objects_time);
+        let global_debug = self.update_global_debug_cache(
             camera_matrix.as_ref(),
-            current_pose,
+            camera_matrix_key,
+            snapshot.detected_objects_time,
+            debug_pose,
             &snapshot.detected_objects,
         );
+        self.update_scene_data(camera_matrix.take(), current_pose, global_debug.clone());
 
-        let active_frame = self
-            .image_cache
-            .as_ref()
-            .map(|cache| cache.active(self.selected_camera));
-        let resolved_trajectory = self
-            .resolved_result()
-            .map(ResolveResult::trajectory)
-            .unwrap_or_default();
-        let scene_camera_frame = active_frame.map(|image| SceneCameraFrame {
-            sequence: self
-                .image_cache
-                .as_ref()
-                .map(|cache| {
-                    cache.frame.sequence * 2 + u64::from(self.selected_camera == StereoSide::Right)
-                })
-                .unwrap_or_default(),
-            image: image.clone(),
-        });
-
-        self.widget.bevy_app.world_mut().insert_resource(SceneData {
-            field_dimensions: FieldDimensions::SPL_2025,
-            current_robot_to_field: current_pose.map(|pose| pose.cast()),
-            camera_matrix: camera_matrix.take(),
-            camera_frame: scene_camera_frame,
-            recorded_trajectory: self.recorded_trajectory.clone(),
-            resolved_trajectory,
-            global_debug: global_debug.clone(),
-        });
+        let position_before_ui = self.position_seconds;
+        let selected_camera_before_ui = self.selected_camera;
+        let parameters_before_ui = self.parameters.clone();
+        let resolve_version_before_ui = self.resolve_version;
+        let playing_before_ui = self.playing;
 
         self.header(context);
         self.parameters_panel(context);
-        self.camera_panel(context, &snapshot.detected_objects, global_debug.as_ref());
+        self.camera_panel(context, &snapshot.detected_objects, global_debug.as_deref());
         self.timeline_panel(context);
         self.viewport(context);
-        context.request_repaint();
+        let ui_changed_scene_inputs = self.position_seconds != position_before_ui
+            || self.selected_camera != selected_camera_before_ui
+            || self.parameters != parameters_before_ui
+            || self.resolve_version != resolve_version_before_ui
+            || self.playing != playing_before_ui;
+        if self.playing
+            || matches!(self.resolve, ResolveState::Running { .. })
+            || ui_changed_scene_inputs
+        {
+            context.request_repaint();
+        }
     }
 }
 
@@ -182,6 +200,7 @@ impl LocalizationMcapVisualizerApp {
         }
 
         if let Some(result) = finished {
+            self.resolve_version = self.resolve_version.next();
             self.resolve = ResolveState::Done(result);
         } else if let Some(error) = failed {
             self.resolve = ResolveState::Failed(error);
@@ -190,29 +209,125 @@ impl LocalizationMcapVisualizerApp {
         }
     }
 
-    fn update_stereo_textures(&mut self, context: &Context, image_index: Option<usize>) {
-        let Some(image_index) = image_index else {
+    fn update_scene_data(
+        &mut self,
+        camera_matrix: Option<CameraMatrix>,
+        current_pose: linear_algebra::Isometry3<Robot, Field, f64>,
+        global_debug: Option<Arc<GlobalLocalizationDetailedDebug>>,
+    ) {
+        let selected_frame_sequence = self.selected_scene_frame_sequence();
+        let (
+            current_frame_sequence,
+            field_dimensions_version,
+            camera_version,
+            recorded_trajectory_version,
+            resolved_trajectory_version,
+            global_debug_version,
+        ) = {
+            let scene_data = self.widget.bevy_app.world_mut().resource::<SceneData>();
+            (
+                scene_data.camera_frame_sequence(),
+                scene_data.field_dimensions_version(),
+                scene_data.camera_version(),
+                scene_data.recorded_trajectory_version(),
+                scene_data.resolved_trajectory_version(),
+                scene_data.global_debug_version(),
+            )
+        };
+        let next_camera_frame = if current_frame_sequence != selected_frame_sequence {
+            self.selected_scene_camera_frame()
+        } else {
+            None
+        };
+        let next_recorded_trajectory = if recorded_trajectory_version != SceneVersion::READY {
+            Some(self.recorded_trajectory.clone())
+        } else {
+            None
+        };
+        let next_resolved_trajectory = if resolved_trajectory_version != self.resolve_version {
+            Some(match self.resolved_result() {
+                Some(result) => result.trajectory(),
+                None => Vec::new(),
+            })
+        } else {
+            None
+        };
+
+        let mut scene_data = self.widget.bevy_app.world_mut().resource_mut::<SceneData>();
+        if field_dimensions_version != SceneVersion::READY {
+            scene_data.set_field_dimensions(FieldDimensions::SPL_2025);
+        }
+        scene_data.set_current_robot_to_field(Some(current_pose.inner.cast().framed_transform()));
+
+        if camera_version != self.camera_version {
+            scene_data.set_camera_matrix(camera_matrix);
+        }
+        if current_frame_sequence != selected_frame_sequence {
+            scene_data.set_camera_frame(next_camera_frame);
+        }
+        if let Some(recorded_trajectory) = next_recorded_trajectory {
+            scene_data.set_recorded_trajectory(recorded_trajectory);
+        }
+        if let Some(resolved_trajectory) = next_resolved_trajectory {
+            scene_data.set_resolved_trajectory(resolved_trajectory);
+        }
+        if global_debug_version != self.global_debug_cache.version {
+            scene_data.set_global_debug(global_debug);
+        }
+    }
+
+    fn selected_scene_frame_sequence(&self) -> Option<SceneFrameSequence> {
+        self.image_cache
+            .as_ref()
+            .map(|cache| self.scene_frame_sequence_for(&cache.frame, self.scene_camera_side()))
+    }
+
+    fn selected_scene_camera_frame(&self) -> Option<SceneCameraFrame> {
+        let side = self.scene_camera_side();
+        self.image_cache.as_ref().map(|cache| SceneCameraFrame {
+            sequence: self.scene_frame_sequence_for(&cache.frame, side),
+            image: cache.active(self.scene_stereo_side(side)).clone(),
+        })
+    }
+
+    fn scene_frame_sequence_for(
+        &self,
+        frame: &StereoFrame,
+        side: SceneCameraSide,
+    ) -> SceneFrameSequence {
+        SceneFrameSequence::stereo(frame.sequence, side)
+    }
+
+    fn scene_camera_side(&self) -> SceneCameraSide {
+        SceneCameraSide::Left
+    }
+
+    fn scene_stereo_side(&self, side: SceneCameraSide) -> StereoSide {
+        match side {
+            SceneCameraSide::Left => StereoSide::Left,
+        }
+    }
+
+    fn update_stereo_textures(&mut self, context: &Context, image_id: Option<StereoImageId>) {
+        let Some(image_id) = image_id else {
             return;
         };
         if self
             .image_cache
             .as_ref()
-            .is_some_and(|cache| cache.index == image_index)
+            .is_some_and(|cache| cache.image_id == image_id)
         {
             return;
         }
 
-        match self.recording.decode_stereo_image(image_index) {
+        match self.recording.decode_stereo_image(image_id) {
             Ok(frame) => {
                 self.set_texture(context, StereoSide::Left, &frame.left);
                 self.set_texture(context, StereoSide::Right, &frame.right);
-                self.image_cache = Some(CachedStereoFrame {
-                    index: image_index,
-                    frame,
-                });
+                self.image_cache = Some(CachedStereoFrame { image_id, frame });
             }
             Err(error) => {
-                eprintln!("failed to decode stereo frame {image_index}: {error:#}");
+                eprintln!("failed to decode stereo frame {image_id}: {error:#}");
             }
         }
     }
@@ -243,19 +358,82 @@ impl LocalizationMcapVisualizerApp {
     fn current_robot_to_field(
         &self,
         recorded_localization: Option<linear_algebra::Isometry3<Field, Robot>>,
-    ) -> Option<nalgebra::Isometry3<f64>> {
-        self.resolved_result()
+    ) -> linear_algebra::Isometry3<Robot, Field, f64> {
+        let pose = self
+            .resolved_result()
             .and_then(|result| nearest_sample(&result.samples, self.position_seconds))
             .map(|sample| sample.robot_to_field)
             .or_else(|| {
-                recorded_localization.map(|field_to_robot| field_to_robot.inverse().inner.cast())
+                recorded_localization
+                    .map(|field_to_robot| field_to_robot.inverse().inner.cast().framed_transform())
             })
+            .or_else(|| {
+                nearest_trajectory_point(&self.recorded_trajectory, self.position_seconds)
+                    .map(|point| point.robot_to_field)
+            });
+        match pose {
+            Some(pose) => pose,
+            None => self.initial_robot_to_field(),
+        }
     }
 
-    fn global_debug(
+    fn robot_to_field_at_log_time(
+        &self,
+        log_time: Option<SystemTime>,
+    ) -> linear_algebra::Isometry3<Robot, Field, f64> {
+        let seconds = match log_time {
+            Some(log_time) => self.recording.seconds_since_start(log_time),
+            None => self.position_seconds,
+        };
+        let pose = self
+            .resolved_result()
+            .and_then(|result| nearest_sample(&result.samples, seconds))
+            .map(|sample| sample.robot_to_field)
+            .or_else(|| {
+                nearest_trajectory_point(&self.recorded_trajectory, seconds)
+                    .map(|point| point.robot_to_field)
+            });
+        match pose {
+            Some(pose) => pose,
+            None => self.initial_robot_to_field(),
+        }
+    }
+
+    fn initial_robot_to_field(&self) -> linear_algebra::Isometry3<Robot, Field, f64> {
+        initial_robot_to_field_from_camera_matrix(&self.recording.first_camera_matrix)
+    }
+
+    fn update_global_debug_cache(
+        &mut self,
+        camera_matrix: Option<&projection::camera_matrix::CameraMatrix>,
+        camera_matrix_key: Option<CameraMatrixKey>,
+        detected_objects_time: Option<SystemTime>,
+        current_pose: linear_algebra::Isometry3<Robot, Field, f64>,
+        objects: &[Object<RobocupObjectLabel>],
+    ) -> Option<Arc<GlobalLocalizationDetailedDebug>> {
+        let key = camera_matrix_key.map(|camera_matrix_key| GlobalDebugKey {
+            camera_matrix_key,
+            detected_objects_time_nanos: detected_objects_time.map(nanos_since_epoch),
+            pose_revision: self.resolve_version,
+            global_localizer: self.parameters.global_localizer,
+        });
+
+        if self.global_debug_cache.key != key {
+            let debug = self
+                .compute_global_debug(camera_matrix, current_pose, objects)
+                .map(Arc::new);
+            self.global_debug_cache.key = key;
+            self.global_debug_cache.version = self.global_debug_cache.version.next();
+            self.global_debug_cache.debug = debug;
+        }
+
+        self.global_debug_cache.debug.clone()
+    }
+
+    fn compute_global_debug(
         &self,
         camera_matrix: Option<&projection::camera_matrix::CameraMatrix>,
-        current_pose: Option<nalgebra::Isometry3<f64>>,
+        current_pose: linear_algebra::Isometry3<Robot, Field, f64>,
         objects: &[Object<RobocupObjectLabel>],
     ) -> Option<GlobalLocalizationDetailedDebug> {
         let camera_matrix = camera_matrix?;
@@ -265,8 +443,7 @@ impl LocalizationMcapVisualizerApp {
         {
             return None;
         }
-        let pose_hint =
-            current_pose.map(|pose| pose.cast::<f32>().framed_transform::<Robot, Field>());
+        let pose_hint = Some(current_pose.inner.cast().framed_transform());
         localize_global_visual_features_detailed_debug(
             &visual_features,
             camera_matrix,
@@ -286,9 +463,9 @@ impl LocalizationMcapVisualizerApp {
                 ui.label(format!(
                     "{:.1}s, {} events, {} stereo frames, {} topics",
                     self.recording.duration().as_secs_f64(),
-                    self.recording.events.len(),
-                    self.recording.images.len(),
-                    self.recording.topic_counts.len(),
+                    self.recording.event_count(),
+                    self.recording.image_count(),
+                    self.recording.topic_count(),
                 ));
                 ui.separator();
                 ui.label(if self.recording.field_dimensions.is_some() {
@@ -434,12 +611,13 @@ impl LocalizationMcapVisualizerApp {
                         cancel.clone(),
                         sender,
                     );
+                    self.resolve_version = self.resolve_version.next();
                     self.resolve = ResolveState::Running {
                         receiver,
                         cancel,
                         progress: ResolveProgress {
                             processed_events: 0,
-                            total_events: self.recording.events.len(),
+                            total_events: self.recording.event_count(),
                             solve_count: 0,
                         },
                     };
@@ -595,7 +773,7 @@ impl LocalizationMcapVisualizerApp {
             ui.label(format!("{} detections", detected_objects.len()));
             if let Some(cache) = &self.image_cache {
                 ui.separator();
-                ui.label(format!("frame {}", cache.index));
+                ui.label(format!("frame {}", cache.image_id));
                 ui.separator();
                 ui.label(format!(
                     "image log {:.2}s source {:?}",
@@ -639,10 +817,10 @@ impl LocalizationMcapVisualizerApp {
             .max_height(180.0)
             .show(ui, |ui| {
                 for association in &debug.associations {
-                    let error = association
-                        .reprojection_error_px
-                        .map(|error| format!("{error:.1}px"))
-                        .unwrap_or_else(|| "not visible".to_string());
+                    let error = match association.reprojection_error_px {
+                        Some(error) => format!("{error:.1}px"),
+                        None => "not visible".to_string(),
+                    };
                     ui.label(format!(
                         "#{}/#{} {:?}: det ({:.1},{:.1}) -> field ({:.2},{:.2}) error {error}",
                         association.detection_index,
@@ -724,15 +902,45 @@ fn numeric_row(ui: &mut Ui, label: &str, value: &mut f64, range: std::ops::Range
     });
 }
 
-fn nearest_sample<'a>(
-    samples: &'a [crate::replay::SolveSample],
+fn nearest_sample(
+    samples: &[crate::replay::SolveSample],
     seconds: f64,
-) -> Option<&'a crate::replay::SolveSample> {
-    samples.iter().min_by(|left, right| {
-        (left.replay_seconds - seconds)
-            .abs()
-            .total_cmp(&(right.replay_seconds - seconds).abs())
-    })
+) -> Option<&crate::replay::SolveSample> {
+    if samples.is_empty() {
+        return None;
+    }
+    let next = samples.partition_point(|sample| sample.replay_seconds <= seconds);
+    nearest_by_seconds(
+        next.checked_sub(1).and_then(|index| samples.get(index)),
+        samples.get(next),
+        seconds,
+        |sample| sample.replay_seconds,
+    )
+}
+
+fn nearest_trajectory_point(points: &[TrajectoryPoint], seconds: f64) -> Option<&TrajectoryPoint> {
+    if points.is_empty() {
+        return None;
+    }
+    let next = points.partition_point(|point| point.seconds <= seconds);
+    nearest_by_seconds(
+        next.checked_sub(1).and_then(|index| points.get(index)),
+        points.get(next),
+        seconds,
+        |point| point.seconds,
+    )
+}
+
+fn nearest_by_seconds<'a, T>(
+    previous: Option<&'a T>,
+    next: Option<&'a T>,
+    seconds: f64,
+    get_seconds: impl Fn(&T) -> f64,
+) -> Option<&'a T> {
+    nearest_by_distance(
+        previous.map(|previous| (previous, (get_seconds(previous) - seconds).abs())),
+        next.map(|next| (next, (get_seconds(next) - seconds).abs())),
+    )
 }
 
 fn draw_detected_objects(
@@ -856,7 +1064,7 @@ enum StereoSide {
 
 #[derive(Clone)]
 struct CachedStereoFrame {
-    index: usize,
+    image_id: StereoImageId,
     frame: StereoFrame,
 }
 
@@ -867,6 +1075,27 @@ impl CachedStereoFrame {
             StereoSide::Right => &self.frame.right,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CameraMatrixKey {
+    time_nanos: i64,
+    calibrated_intrinsics_time_nanos: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GlobalDebugKey {
+    camera_matrix_key: CameraMatrixKey,
+    detected_objects_time_nanos: Option<u128>,
+    pose_revision: SceneVersion,
+    global_localizer: GlobalLocalizerParameters,
+}
+
+#[derive(Default)]
+struct CachedGlobalDebug {
+    key: Option<GlobalDebugKey>,
+    version: SceneVersion,
+    debug: Option<Arc<GlobalLocalizationDetailedDebug>>,
 }
 
 enum ResolveState {

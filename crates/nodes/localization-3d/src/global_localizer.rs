@@ -27,7 +27,7 @@ pub(crate) struct GlobalLocalizer {
     config: GlobalLocalizerConfig,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Message)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, Message)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalLocalizerConfig {
     /// Minimum accepted fixed associations for any published result.

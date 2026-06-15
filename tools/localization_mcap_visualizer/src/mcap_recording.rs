@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fmt, fs,
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -12,7 +12,6 @@ use coordinate_systems::{Field, Pixel, Robot};
 use image::RgbImage;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, vector};
-use localization_3d::GlobalLocalizationDebug;
 use mcap::{Message, MessageStream};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::time::Time;
@@ -27,14 +26,27 @@ use types::{
     visual_odometry::VisualOdometryDelta,
 };
 
-#[derive(Clone)]
+use crate::nearest_by_distance;
+
+pub const TOPIC_IMU_STATE: &str = "inputs/imu_state";
+pub const TOPIC_STEREO_IMAGE_PAIR: &str = "inputs/stereo_image_pair";
+pub const TOPIC_ROBOT_KINEMATICS: &str = "robot_kinematics";
+pub const TOPIC_CAMERA_MATRIX: &str = "camera_matrix";
+pub const TOPIC_DETECTED_OBJECTS: &str = "detected_objects";
+pub const TOPIC_FIELD_DIMENSIONS: &str = "field_dimensions";
+pub const TOPIC_LOCALIZATION: &str = "localization";
+pub const TOPIC_VISUAL_ODOMETRY: &str =
+    "visual_odometry/current_left_camera_to_previous_left_camera";
+pub const TOPIC_CALIBRATED_INTRINSICS: &str = "debug/calibrated_intrinsics";
+
 pub struct Recording {
-    bytes: Arc<[u8]>,
-    pub events: Vec<RecordedEvent>,
-    pub images: Vec<StereoImageIndex>,
+    events: Vec<RecordedEvent>,
+    images: Vec<StereoImageIndex>,
+    images_by_embedded_time: Vec<usize>,
+    snapshot_index: SnapshotIndex,
     pub first_camera_matrix: CameraMatrix,
     pub field_dimensions: Option<FieldDimensions>,
-    pub topic_counts: BTreeMap<String, usize>,
+    topic_counts: BTreeMap<String, usize>,
 }
 
 impl Recording {
@@ -60,46 +72,48 @@ impl Recording {
             let log_time = system_time_from_nanos(message.log_time);
             let publish_time = system_time_from_nanos(message.publish_time);
             let kind = match message.channel.topic.as_str() {
-                "inputs/imu_state" => Some(EventKind::Imu(decode_recorded_message(&message)?)),
-                "visual_odometry/current_left_camera_to_previous_left_camera" => Some(
-                    EventKind::VisualOdometry(decode_recorded_visual_odometry(&message)?),
-                ),
-                "robot_kinematics" => Some(EventKind::RobotKinematics(decode_recorded_message(
-                    &message,
-                )?)),
-                "camera_matrix" => {
+                TOPIC_IMU_STATE => Some(EventKind::Imu(decode_recorded_message(&message)?)),
+                TOPIC_VISUAL_ODOMETRY => Some(EventKind::VisualOdometry(
+                    decode_recorded_visual_odometry(&message)?,
+                )),
+                TOPIC_ROBOT_KINEMATICS => Some(EventKind::RobotKinematics(Box::new(
+                    decode_recorded_message(&message)?,
+                ))),
+                TOPIC_CAMERA_MATRIX => {
                     let camera_matrix = decode_recorded_camera_matrix(&message)?;
                     if first_camera_matrix.is_none() {
                         first_camera_matrix = Some(camera_matrix.inner.clone());
                     }
                     Some(EventKind::CameraMatrix(camera_matrix))
                 }
-                "detected_objects" => Some(EventKind::DetectedObjects(decode_recorded_message(
-                    &message,
-                )?)),
-                "field_dimensions" => {
+                TOPIC_DETECTED_OBJECTS => Some(EventKind::DetectedObjects(
+                    decode_recorded_message(&message)?,
+                )),
+                TOPIC_FIELD_DIMENSIONS => {
                     let dimensions = decode_recorded_message(&message)?;
                     field_dimensions = Some(dimensions);
-                    Some(EventKind::FieldDimensions(dimensions))
+                    None
                 }
-                "localization" => Some(EventKind::RecordedLocalization(decode_recorded_message(
-                    &message,
-                )?)),
-                "visual_odometry/current_left_camera_to_visual_odometer" => Some(
-                    EventKind::VisualOdometer(decode_recorded_message(&message)?),
-                ),
-                "debug/global_localization" => Some(EventKind::RecordedGlobalLocalization(
+                TOPIC_LOCALIZATION => Some(EventKind::RecordedLocalization(
                     decode_recorded_message(&message)?,
                 )),
-                "debug/calibrated_intrinsics" => Some(EventKind::CalibratedIntrinsics(
+                TOPIC_CALIBRATED_INTRINSICS => Some(EventKind::CalibratedIntrinsics(
                     decode_recorded_message(&message)?,
                 )),
-                "inputs/stereo_image_pair" => {
+                TOPIC_STEREO_IMAGE_PAIR => {
+                    let data: Arc<[u8]> = message.data.into_owned().into();
+                    let embedded_time = decode_time_prefix(&data).wrap_err_with(|| {
+                        format!(
+                            "failed to decode {TOPIC_STEREO_IMAGE_PAIR} time prefix order {order} sequence {}",
+                            message.sequence
+                        )
+                    })?;
                     images.push(StereoImageIndex {
                         order,
                         log_time,
                         publish_time,
-                        embedded_time: decode_time_prefix(&message.data)?,
+                        embedded_time,
+                        data,
                     });
                     None
                 }
@@ -117,12 +131,17 @@ impl Recording {
         }
 
         events.sort_by_key(|event| (nanos_since_epoch(event.log_time), event.order));
+        let snapshot_index = SnapshotIndex::new(&events);
         images.sort_by_key(|image| (nanos_since_epoch(image.log_time), image.order));
+        let mut images_by_embedded_time = (0..images.len()).collect::<Vec<_>>();
+        images_by_embedded_time
+            .sort_by_key(|&index| (images[index].embedded_time.as_nanos(), images[index].order));
 
         Ok(Self {
-            bytes,
             events,
             images,
+            images_by_embedded_time,
+            snapshot_index,
             first_camera_matrix: first_camera_matrix
                 .ok_or_else(|| color_eyre::eyre::eyre!("recording has no camera_matrix topic"))?,
             field_dimensions,
@@ -131,35 +150,64 @@ impl Recording {
     }
 
     pub fn start_log_time(&self) -> SystemTime {
-        self.events
+        match self
+            .events
             .first()
             .map(|event| event.log_time)
             .or_else(|| self.images.first().map(|image| image.log_time))
-            .unwrap_or(UNIX_EPOCH)
+        {
+            Some(time) => time,
+            None => UNIX_EPOCH,
+        }
     }
 
     pub fn start_source_time(&self) -> SystemTime {
-        self.events
+        match self
+            .events
             .first()
             .map(|event| event.publish_time)
             .or_else(|| self.images.first().map(|image| image.publish_time))
-            .unwrap_or(UNIX_EPOCH)
+        {
+            Some(time) => time,
+            None => UNIX_EPOCH,
+        }
     }
 
     pub fn end_log_time(&self) -> SystemTime {
-        self.events
+        match self
+            .events
             .last()
             .map(|event| event.log_time)
             .into_iter()
             .chain(self.images.last().map(|image| image.log_time))
             .max()
-            .unwrap_or_else(|| self.start_log_time())
+        {
+            Some(time) => time,
+            None => self.start_log_time(),
+        }
     }
 
     pub fn duration(&self) -> Duration {
-        self.end_log_time()
-            .duration_since(self.start_log_time())
-            .unwrap_or_default()
+        match self.end_log_time().duration_since(self.start_log_time()) {
+            Ok(duration) => duration,
+            Err(_) => Duration::ZERO,
+        }
+    }
+
+    pub fn events(&self) -> &[RecordedEvent] {
+        &self.events
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn topic_count(&self) -> usize {
+        self.topic_counts.len()
     }
 
     pub fn log_time_at_seconds(&self, seconds: f64) -> SystemTime {
@@ -171,53 +219,68 @@ impl Recording {
     }
 
     pub fn aligned_image_time(&self, embedded_time: Time) -> Option<SystemTime> {
-        let embedded_time = embedded_time.to_wallclock();
-        self.images
-            .iter()
-            .min_by_key(|candidate| {
-                nanos_abs_diff(candidate.embedded_time.to_wallclock(), embedded_time)
-            })
-            .map(|candidate| candidate.publish_time)
+        let target_nanos = embedded_time.as_nanos();
+        let next = self
+            .images_by_embedded_time
+            .partition_point(|&index| self.images[index].embedded_time.as_nanos() <= target_nanos);
+        nearest_by_distance(
+            next.checked_sub(1)
+                .and_then(|index| self.images_by_embedded_time.get(index))
+                .and_then(|&index| self.images.get(index))
+                .map(|image| {
+                    (
+                        image,
+                        u128::from(image.embedded_time.as_nanos().abs_diff(target_nanos)),
+                    )
+                }),
+            self.images_by_embedded_time
+                .get(next)
+                .and_then(|&index| self.images.get(index))
+                .map(|image| {
+                    (
+                        image,
+                        u128::from(image.embedded_time.as_nanos().abs_diff(target_nanos)),
+                    )
+                }),
+        )
+        .map(|candidate| candidate.publish_time)
     }
 
     pub fn latest_snapshot(&self, log_time: SystemTime) -> RecordingSnapshot {
-        let mut snapshot = RecordingSnapshot::default();
-        snapshot.image_index = self.nearest_image_index(log_time);
+        let mut snapshot = RecordingSnapshot {
+            image_id: self.nearest_image_id(log_time),
+            ..Default::default()
+        };
 
-        for event in self
-            .events
-            .iter()
-            .take_while(|event| event.log_time <= log_time)
+        if let Some(EventKind::CameraMatrix(camera_matrix)) = self
+            .snapshot_index
+            .latest_camera_matrix(&self.events, log_time)
+            .map(|event| &event.kind)
         {
-            match &event.kind {
-                EventKind::Imu(_) => {}
-                EventKind::VisualOdometry(_) => {}
-                EventKind::RobotKinematics(robot_kinematics) => {
-                    snapshot.robot_kinematics = Some(robot_kinematics.clone());
-                }
-                EventKind::CameraMatrix(camera_matrix) => {
-                    snapshot.camera_matrix = Some(camera_matrix.clone());
-                }
-                EventKind::DetectedObjects(objects) => {
-                    snapshot.detected_objects = objects.clone();
-                    snapshot.detected_objects_time = Some(event.publish_time);
-                }
-                EventKind::FieldDimensions(field_dimensions) => {
-                    snapshot.field_dimensions = Some(*field_dimensions);
-                }
-                EventKind::RecordedLocalization(localization) => {
-                    snapshot.recorded_localization = *localization;
-                }
-                EventKind::VisualOdometer(visual_odometer) => {
-                    snapshot.visual_odometer = Some(*visual_odometer);
-                }
-                EventKind::RecordedGlobalLocalization(global_localization) => {
-                    snapshot.recorded_global_localization = global_localization.clone();
-                }
-                EventKind::CalibratedIntrinsics(intrinsics) => {
-                    snapshot.calibrated_intrinsics = Some(*intrinsics);
-                }
-            }
+            snapshot.camera_matrix = Some(camera_matrix.clone());
+        }
+        if let Some(event) = self
+            .snapshot_index
+            .latest_detected_objects(&self.events, log_time)
+            && let EventKind::DetectedObjects(objects) = &event.kind
+        {
+            snapshot.detected_objects = objects.clone();
+            snapshot.detected_objects_time = Some(event.publish_time);
+        }
+        if let Some(EventKind::RecordedLocalization(localization)) = self
+            .snapshot_index
+            .latest_recorded_localization(&self.events, log_time)
+            .map(|event| &event.kind)
+        {
+            snapshot.recorded_localization = *localization;
+        }
+        if let Some(event) = self
+            .snapshot_index
+            .latest_calibrated_intrinsics(&self.events, log_time)
+            && let EventKind::CalibratedIntrinsics(intrinsics) = &event.kind
+        {
+            snapshot.calibrated_intrinsics = Some(*intrinsics);
+            snapshot.calibrated_intrinsics_time = Some(event.publish_time);
         }
 
         snapshot
@@ -229,51 +292,56 @@ impl Recording {
             .filter_map(|event| match &event.kind {
                 EventKind::RecordedLocalization(Some(field_to_robot)) => Some(TrajectoryPoint {
                     seconds: self.seconds_since_start(event.log_time),
-                    robot_to_field: field_to_robot.inverse().inner.cast(),
+                    robot_to_field: field_to_robot.inverse().inner.cast().framed_transform(),
                 }),
                 _ => None,
             })
             .collect()
     }
 
-    pub fn decode_stereo_image(&self, image_index: usize) -> Result<StereoFrame> {
-        let Some(index) = self.images.get(image_index) else {
+    pub fn decode_stereo_image(&self, image_id: StereoImageId) -> Result<StereoFrame> {
+        let Some(index) = self.images.get(image_id.index()) else {
             return Err(color_eyre::eyre::eyre!(
-                "image index {image_index} is out of bounds"
+                "image id {image_id} is out of bounds"
             ));
         };
 
-        for (order, message) in MessageStream::new(&self.bytes)
-            .wrap_err("failed to open MCAP message stream")?
-            .enumerate()
-        {
-            if order != index.order {
-                continue;
-            }
-            let message = message.wrap_err("failed to read MCAP image message")?;
-            let stereo: TimeWrapper<StereoImagePair> = decode_recorded_message(&message)?;
-            return Ok(StereoFrame {
-                sequence: index.order as u64,
-                source_time: stereo.time,
-                log_time: index.log_time,
-                publish_time: index.publish_time,
-                left: camera_image_from_ros(stereo.inner.left)?,
-                right: camera_image_from_ros(stereo.inner.right)?,
-            });
-        }
-
-        Err(color_eyre::eyre::eyre!(
-            "failed to find image message with order {}",
-            index.order
-        ))
+        let stereo: TimeWrapper<StereoImagePair> =
+            decode_message(&index.data).wrap_err_with(|| {
+                format!(
+                    "failed to decode {TOPIC_STEREO_IMAGE_PAIR} image id {image_id} order {}",
+                    index.order
+                )
+            })?;
+        Ok(StereoFrame {
+            sequence: index.order as u64,
+            source_time: stereo.time,
+            log_time: index.log_time,
+            publish_time: index.publish_time,
+            left: camera_image_from_ros(stereo.inner.left)?,
+            right: camera_image_from_ros(stereo.inner.right)?,
+        })
     }
 
-    fn nearest_image_index(&self, log_time: SystemTime) -> Option<usize> {
-        self.images
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, image)| nanos_abs_diff(image.log_time, log_time))
-            .map(|(index, _)| index)
+    fn nearest_image_id(&self, log_time: SystemTime) -> Option<StereoImageId> {
+        if self.images.is_empty() {
+            return None;
+        }
+        let next = self
+            .images
+            .partition_point(|image| image.log_time <= log_time);
+        nearest_by_distance(
+            next.checked_sub(1).map(|previous| {
+                (
+                    previous,
+                    nanos_abs_diff(self.images[previous].log_time, log_time),
+                )
+            }),
+            self.images
+                .get(next)
+                .map(|next_image| (next, nanos_abs_diff(next_image.log_time, log_time))),
+        )
+        .map(StereoImageId)
     }
 }
 
@@ -285,40 +353,120 @@ pub struct RecordedEvent {
     pub kind: EventKind,
 }
 
+#[derive(Default)]
+struct SnapshotIndex {
+    camera_matrices: Vec<usize>,
+    detected_objects: Vec<usize>,
+    recorded_localizations: Vec<usize>,
+    calibrated_intrinsics: Vec<usize>,
+}
+
+impl SnapshotIndex {
+    fn new(events: &[RecordedEvent]) -> Self {
+        let mut index = Self::default();
+        for (event_index, event) in events.iter().enumerate() {
+            match event.kind {
+                EventKind::CameraMatrix(_) => index.camera_matrices.push(event_index),
+                EventKind::DetectedObjects(_) => index.detected_objects.push(event_index),
+                EventKind::RecordedLocalization(_) => {
+                    index.recorded_localizations.push(event_index)
+                }
+                EventKind::CalibratedIntrinsics(_) => index.calibrated_intrinsics.push(event_index),
+                EventKind::Imu(_)
+                | EventKind::VisualOdometry(_)
+                | EventKind::RobotKinematics(_) => {}
+            }
+        }
+        index
+    }
+
+    fn latest_camera_matrix<'a>(
+        &self,
+        events: &'a [RecordedEvent],
+        log_time: SystemTime,
+    ) -> Option<&'a RecordedEvent> {
+        Self::latest(events, &self.camera_matrices, log_time)
+    }
+
+    fn latest_detected_objects<'a>(
+        &self,
+        events: &'a [RecordedEvent],
+        log_time: SystemTime,
+    ) -> Option<&'a RecordedEvent> {
+        Self::latest(events, &self.detected_objects, log_time)
+    }
+
+    fn latest_recorded_localization<'a>(
+        &self,
+        events: &'a [RecordedEvent],
+        log_time: SystemTime,
+    ) -> Option<&'a RecordedEvent> {
+        Self::latest(events, &self.recorded_localizations, log_time)
+    }
+
+    fn latest_calibrated_intrinsics<'a>(
+        &self,
+        events: &'a [RecordedEvent],
+        log_time: SystemTime,
+    ) -> Option<&'a RecordedEvent> {
+        Self::latest(events, &self.calibrated_intrinsics, log_time)
+    }
+
+    fn latest<'a>(
+        events: &'a [RecordedEvent],
+        indexes: &[usize],
+        log_time: SystemTime,
+    ) -> Option<&'a RecordedEvent> {
+        let next = indexes.partition_point(|&index| events[index].log_time <= log_time);
+        next.checked_sub(1)
+            .and_then(|index| indexes.get(index))
+            .and_then(|&index| events.get(index))
+    }
+}
+
 #[derive(Clone)]
 pub enum EventKind {
     Imu(ImuState),
     VisualOdometry(VisualOdometryDelta),
-    RobotKinematics(TimeWrapper<RobotKinematics>),
+    RobotKinematics(Box<TimeWrapper<RobotKinematics>>),
     CameraMatrix(TimeWrapper<CameraMatrix>),
     DetectedObjects(Vec<Object<RobocupObjectLabel>>),
-    FieldDimensions(FieldDimensions),
     RecordedLocalization(Option<Isometry3<Field, Robot>>),
-    VisualOdometer(nalgebra::Isometry3<f32>),
-    RecordedGlobalLocalization(Option<GlobalLocalizationDebug>),
     CalibratedIntrinsics(Intrinsic),
 }
 
-#[derive(Clone)]
 pub struct StereoImageIndex {
     pub order: usize,
     pub log_time: SystemTime,
     pub publish_time: SystemTime,
     pub embedded_time: Time,
+    data: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StereoImageId(usize);
+
+impl StereoImageId {
+    fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for StereoImageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct RecordingSnapshot {
-    pub image_index: Option<usize>,
+    pub image_id: Option<StereoImageId>,
     pub camera_matrix: Option<TimeWrapper<CameraMatrix>>,
-    pub robot_kinematics: Option<TimeWrapper<RobotKinematics>>,
     pub detected_objects: Vec<Object<RobocupObjectLabel>>,
     pub detected_objects_time: Option<SystemTime>,
     pub recorded_localization: Option<Isometry3<Field, Robot>>,
-    pub visual_odometer: Option<nalgebra::Isometry3<f32>>,
-    pub recorded_global_localization: Option<GlobalLocalizationDebug>,
     pub calibrated_intrinsics: Option<Intrinsic>,
-    pub field_dimensions: Option<FieldDimensions>,
+    pub calibrated_intrinsics_time: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -341,7 +489,7 @@ pub struct CameraImage {
 #[derive(Clone)]
 pub struct TrajectoryPoint {
     pub seconds: f64,
-    pub robot_to_field: nalgebra::Isometry3<f64>,
+    pub robot_to_field: Isometry3<Robot, Field, f64>,
 }
 
 fn camera_image_from_ros(image: RosImage) -> Result<CameraImage> {
@@ -524,9 +672,10 @@ fn system_time_from_nanos(nanos: u64) -> SystemTime {
 }
 
 pub fn nanos_since_epoch(time: SystemTime) -> u128 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos(),
+        Err(_) => 0,
+    }
 }
 
 pub fn nanos_abs_diff(a: SystemTime, b: SystemTime) -> u128 {
@@ -534,9 +683,10 @@ pub fn nanos_abs_diff(a: SystemTime, b: SystemTime) -> u128 {
 }
 
 pub fn seconds_since(time: SystemTime, start: SystemTime) -> f64 {
-    time.duration_since(start)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_else(|error| -error.duration().as_secs_f64())
+    match time.duration_since(start) {
+        Ok(duration) => duration.as_secs_f64(),
+        Err(error) => -error.duration().as_secs_f64(),
+    }
 }
 
 #[cfg(test)]
@@ -551,16 +701,12 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recording.mcap");
         let recording = Recording::load(&path)?;
 
-        assert!(!recording.events.is_empty());
-        assert!(!recording.images.is_empty());
-        assert!(recording.topic_counts.contains_key("camera_matrix"));
-        assert!(
-            recording
-                .topic_counts
-                .contains_key("inputs/stereo_image_pair")
-        );
+        assert!(recording.event_count() > 0);
+        assert!(recording.image_count() > 0);
+        assert!(recording.topic_counts.contains_key(TOPIC_CAMERA_MATRIX));
+        assert!(recording.topic_counts.contains_key(TOPIC_STEREO_IMAGE_PAIR));
 
-        let frame = recording.decode_stereo_image(0)?;
+        let frame = recording.decode_stereo_image(StereoImageId(0))?;
         assert!(frame.left.width > 0);
         assert!(frame.left.height > 0);
         assert_eq!(

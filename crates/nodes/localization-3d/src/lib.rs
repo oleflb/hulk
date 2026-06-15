@@ -403,17 +403,24 @@ async fn wait_for_initial_state(
 }
 
 pub fn initial_state_from_camera_matrix(camera_matrix: &CameraMatrix) -> InitialState {
-    let robot_to_ground = camera_matrix.ground_to_robot.inverse().inner;
-    let initial_pose = nalgebra::Isometry3::from_parts(
-        nalgebra::Translation3::new(0.0, 0.0, robot_to_ground.translation.vector.z as f64),
-        robot_to_ground.rotation.cast::<f64>(),
-    );
+    let initial_pose = initial_robot_to_field_from_camera_matrix(camera_matrix).inner;
 
     InitialState::from_isometry_and_intrinsics(
         initial_pose,
         Vector3::zeros(),
         camera_intrinsics_from_matrix(camera_matrix),
     )
+}
+
+pub fn initial_robot_to_field_from_camera_matrix(
+    camera_matrix: &CameraMatrix,
+) -> Isometry3<Robot, Field, f64> {
+    let robot_to_ground = camera_matrix.ground_to_robot.inverse().inner;
+    nalgebra::Isometry3::from_parts(
+        nalgebra::Translation3::new(0.0, 0.0, robot_to_ground.translation.vector.z as f64),
+        robot_to_ground.rotation.cast::<f64>(),
+    )
+    .framed_transform()
 }
 
 pub fn camera_intrinsics_from_matrix(camera_matrix: &CameraMatrix) -> CameraIntrinsics {

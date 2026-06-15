@@ -30,7 +30,7 @@ use crate::mcap_recording::{
     EventKind, RecordedEvent, Recording, TrajectoryPoint, nanos_abs_diff, seconds_since,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplayParameters {
     pub timestamp_mode: TimestampMode,
     pub solve_cadence_ms: f64,
@@ -108,7 +108,7 @@ pub struct SolveSample {
     pub replay_seconds: f64,
     pub graph_seconds: f64,
     pub solve_duration: Duration,
-    pub robot_to_field: nalgebra::Isometry3<f64>,
+    pub robot_to_field: linear_algebra::Isometry3<Robot, Field, f64>,
     pub diagnostics: Option<BackendSolveDiagnostics>,
     pub stats: ReplayStats,
 }
@@ -166,9 +166,9 @@ fn run_resolve(
     let mut has_pending_measurements = false;
     let cadence = Duration::from_secs_f64((parameters.solve_cadence_ms / 1000.0).max(0.001));
     let mut next_solve_time = recording.start_log_time() + cadence;
-    let total_events = recording.events.len();
+    let total_events = recording.event_count();
 
-    for (index, event) in recording.events.iter().enumerate() {
+    for (index, event) in recording.events().iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -190,7 +190,7 @@ fn run_resolve(
 
         match &event.kind {
             EventKind::Imu(imu) if parameters.include_imu => {
-                frontend.ingest_imu(event.publish_time, imu.clone())?;
+                frontend.ingest_imu(event.publish_time, *imu)?;
                 stats.imu_ingested += 1;
                 has_pending_measurements = true;
             }
@@ -198,7 +198,7 @@ fn run_resolve(
                 camera_matrices.push(event, camera_matrix.clone());
             }
             EventKind::RobotKinematics(robot_kinematics) if parameters.include_foot_heights => {
-                let mut robot_kinematics = robot_kinematics.clone();
+                let mut robot_kinematics = robot_kinematics.as_ref().clone();
                 if parameters.timestamp_mode == TimestampMode::McapPublish {
                     robot_kinematics.time = Time::from_wallclock(event.publish_time);
                 }
@@ -414,7 +414,7 @@ fn solve_and_record(
         replay_seconds: recording.seconds_since_start(replay_time),
         graph_seconds: seconds_since(result.time, recording.start_source_time()),
         solve_duration,
-        robot_to_field: result.transform,
+        robot_to_field: result.transform.framed_transform(),
         diagnostics: backend.last_solve_diagnostics().cloned(),
         stats: stats.clone(),
     });
@@ -495,9 +495,10 @@ impl VisualOdometryTimestampTracker {
                 delta.current_time.to_wallclock(),
             )),
             TimestampMode::McapPublish => {
-                let current = recording
-                    .aligned_image_time(delta.current_time)
-                    .unwrap_or(event.publish_time);
+                let current = match recording.aligned_image_time(delta.current_time) {
+                    Some(time) => time,
+                    None => event.publish_time,
+                };
                 let previous = recording
                     .aligned_image_time(delta.previous_time)
                     .or(self.previous_mcap_publish_time)

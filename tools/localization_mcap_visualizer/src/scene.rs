@@ -1,9 +1,13 @@
+use std::sync::Arc;
+
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
+use bevy_panorbit_camera::PanOrbitCamera;
+use coordinate_systems::{Field, Robot};
 use localization_3d::GlobalLocalizationDetailedDebug;
 use projection::camera_matrix::CameraMatrix;
 use types::field_dimensions::FieldDimensions;
@@ -23,9 +27,9 @@ pub fn configure(app: &mut App) {
         .add_systems(
             Update,
             (
-                position_camera_once,
                 update_field_plane,
                 update_field_markings,
+                configure_view_camera_once,
                 update_robot_marker,
                 update_camera_viewport,
                 update_camera_image,
@@ -37,19 +41,114 @@ pub fn configure(app: &mut App) {
 
 #[derive(Clone, Default, Resource)]
 pub struct SceneData {
-    pub field_dimensions: FieldDimensions,
-    pub current_robot_to_field: Option<nalgebra::Isometry3<f32>>,
-    pub camera_matrix: Option<CameraMatrix>,
-    pub camera_frame: Option<SceneCameraFrame>,
-    pub recorded_trajectory: Vec<TrajectoryPoint>,
-    pub resolved_trajectory: Vec<TrajectoryPoint>,
-    pub global_debug: Option<GlobalLocalizationDetailedDebug>,
+    field_dimensions: FieldDimensions,
+    field_dimensions_version: SceneVersion,
+    current_robot_to_field: Option<linear_algebra::Isometry3<Robot, Field>>,
+    camera_matrix: Option<CameraMatrix>,
+    camera_version: SceneVersion,
+    camera_frame: Option<SceneCameraFrame>,
+    recorded_trajectory: Vec<TrajectoryPoint>,
+    recorded_trajectory_version: SceneVersion,
+    resolved_trajectory: Vec<TrajectoryPoint>,
+    resolved_trajectory_version: SceneVersion,
+    global_debug: Option<Arc<GlobalLocalizationDetailedDebug>>,
+    global_debug_version: SceneVersion,
+}
+
+impl SceneData {
+    pub fn camera_frame_sequence(&self) -> Option<SceneFrameSequence> {
+        self.camera_frame.as_ref().map(|frame| frame.sequence)
+    }
+
+    pub fn field_dimensions_version(&self) -> SceneVersion {
+        self.field_dimensions_version
+    }
+
+    pub fn camera_version(&self) -> SceneVersion {
+        self.camera_version
+    }
+
+    pub fn recorded_trajectory_version(&self) -> SceneVersion {
+        self.recorded_trajectory_version
+    }
+
+    pub fn resolved_trajectory_version(&self) -> SceneVersion {
+        self.resolved_trajectory_version
+    }
+
+    pub fn global_debug_version(&self) -> SceneVersion {
+        self.global_debug_version
+    }
+
+    pub fn set_field_dimensions(&mut self, field_dimensions: FieldDimensions) {
+        self.field_dimensions = field_dimensions;
+        self.field_dimensions_version = self.field_dimensions_version.next();
+    }
+
+    pub fn set_current_robot_to_field(
+        &mut self,
+        current_robot_to_field: Option<linear_algebra::Isometry3<Robot, Field>>,
+    ) {
+        self.current_robot_to_field = current_robot_to_field;
+    }
+
+    pub fn set_camera_matrix(&mut self, camera_matrix: Option<CameraMatrix>) {
+        self.camera_matrix = camera_matrix;
+        self.camera_version = self.camera_version.next();
+    }
+
+    pub fn set_camera_frame(&mut self, camera_frame: Option<SceneCameraFrame>) {
+        self.camera_frame = camera_frame;
+    }
+
+    pub fn set_recorded_trajectory(&mut self, trajectory: Vec<TrajectoryPoint>) {
+        self.recorded_trajectory = trajectory;
+        self.recorded_trajectory_version = self.recorded_trajectory_version.next();
+    }
+
+    pub fn set_resolved_trajectory(&mut self, trajectory: Vec<TrajectoryPoint>) {
+        self.resolved_trajectory = trajectory;
+        self.resolved_trajectory_version = self.resolved_trajectory_version.next();
+    }
+
+    pub fn set_global_debug(&mut self, global_debug: Option<Arc<GlobalLocalizationDetailedDebug>>) {
+        self.global_debug = global_debug;
+        self.global_debug_version = self.global_debug_version.next();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SceneVersion(u64);
+
+impl SceneVersion {
+    pub const READY: Self = Self(1);
+
+    pub fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
 }
 
 #[derive(Clone)]
 pub struct SceneCameraFrame {
-    pub sequence: u64,
+    pub sequence: SceneFrameSequence,
     pub image: CameraImage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SceneFrameSequence(u64);
+
+impl SceneFrameSequence {
+    pub fn stereo(stereo_sequence: u64, side: SceneCameraSide) -> Self {
+        let side_offset = match side {
+            SceneCameraSide::Left => 0,
+        };
+        Self(stereo_sequence * 2 + side_offset)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SceneCameraSide {
+    Left,
 }
 
 #[derive(Component)]
@@ -67,7 +166,7 @@ struct CameraFrustum;
 #[derive(Component)]
 struct CameraImagePlane {
     texture: Handle<Image>,
-    sequence: u64,
+    sequence: Option<SceneFrameSequence>,
 }
 
 #[derive(Component)]
@@ -79,16 +178,26 @@ struct ResolvedTrajectory;
 #[derive(Component)]
 struct GlobalDebugLines;
 
+type CameraMeshQuery<'world, 'state, Filter> = Query<
+    'world,
+    'state,
+    (
+        &'static Mesh3d,
+        &'static mut Transform,
+        &'static mut Visibility,
+    ),
+    Filter,
+>;
+type CameraFrustumQuery<'world, 'state> = CameraMeshQuery<'world, 'state, With<CameraFrustum>>;
+type CameraImagePlaneQuery<'world, 'state> =
+    CameraMeshQuery<'world, 'state, (With<CameraImagePlane>, Without<CameraFrustum>)>;
+
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(4.0, 6.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
     commands.spawn((
         PointLight {
             intensity: 2_500.0,
@@ -174,7 +283,7 @@ fn setup_scene(
     commands.spawn((
         CameraImagePlane {
             texture: camera_image_texture,
-            sequence: 0,
+            sequence: None,
         },
         Mesh3d(meshes.add(empty_mesh(PrimitiveTopology::TriangleList))),
         MeshMaterial3d(camera_image_material),
@@ -201,20 +310,36 @@ fn setup_scene(
     ));
 }
 
-fn position_camera_once(
+fn configure_view_camera_once(
     mut positioned: Local<bool>,
-    mut cameras: Query<&mut Transform, With<Camera3d>>,
+    mut cameras: Query<(&mut Transform, &mut PanOrbitCamera), With<Camera3d>>,
 ) {
     if *positioned {
         return;
     }
-    for mut transform in &mut cameras {
+    for (mut transform, mut pan_orbit) in &mut cameras {
         *transform = Transform::from_xyz(4.0, 6.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y);
+        pan_orbit.focus = Vec3::ZERO;
+        pan_orbit.target_focus = Vec3::ZERO;
+        pan_orbit.radius = None;
+        pan_orbit.target_radius = 10.0;
+        pan_orbit.zoom_lower_limit = 1.0;
+        pan_orbit.zoom_upper_limit = Some(35.0);
+        pan_orbit.orbit_smoothness = 0.0;
+        pan_orbit.pan_smoothness = 0.0;
+        pan_orbit.zoom_smoothness = 0.0;
         *positioned = true;
     }
 }
 
-fn update_field_plane(data: Res<SceneData>, mut field: Query<&mut Transform, With<FieldPlane>>) {
+fn update_field_plane(
+    data: Res<SceneData>,
+    mut previous_version: Local<SceneVersion>,
+    mut field: Query<&mut Transform, With<FieldPlane>>,
+) {
+    if *previous_version == data.field_dimensions_version {
+        return;
+    }
     let dimensions = data.field_dimensions;
     let length = dimensions.length + 2.0 * dimensions.border_strip_width;
     let width = dimensions.width + 2.0 * dimensions.border_strip_width;
@@ -222,16 +347,22 @@ fn update_field_plane(data: Res<SceneData>, mut field: Query<&mut Transform, Wit
     for mut transform in &mut field {
         transform.scale = Vec3::new(length, 1.0, width);
     }
+    *previous_version = data.field_dimensions_version;
 }
 
 fn update_field_markings(
     data: Res<SceneData>,
+    mut previous_version: Local<SceneVersion>,
     markings: Query<&Mesh3d, With<FieldMarkings>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    if *previous_version == data.field_dimensions_version {
+        return;
+    }
     for markings in &markings {
         let _ = meshes.insert(markings.id(), field_markings_mesh(&data.field_dimensions));
     }
+    *previous_version = data.field_dimensions_version;
 }
 
 fn update_robot_marker(
@@ -243,18 +374,16 @@ fn update_robot_marker(
             *visibility = Visibility::Hidden;
             continue;
         };
-        *transform = transform_from_isometry(robot_to_field);
+        *transform = transform_from_isometry(robot_to_field.inner);
         *visibility = Visibility::Visible;
     }
 }
 
 fn update_camera_viewport(
     data: Res<SceneData>,
-    mut frustums: Query<(&Mesh3d, &mut Transform, &mut Visibility), With<CameraFrustum>>,
-    mut image_planes: Query<
-        (&Mesh3d, &mut Transform, &mut Visibility),
-        (With<CameraImagePlane>, Without<CameraFrustum>),
-    >,
+    mut previous_version: Local<SceneVersion>,
+    mut frustums: CameraFrustumQuery,
+    mut image_planes: CameraImagePlaneQuery,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
     let Some(camera_matrix) = &data.camera_matrix else {
@@ -271,16 +400,22 @@ fn update_camera_viewport(
     };
 
     let transform = camera_to_field_transform(robot_to_field, camera_matrix);
+    let geometry_changed = *previous_version != data.camera_version;
     for (mesh, mut entity_transform, mut visibility) in &mut frustums {
         *entity_transform = transform;
         *visibility = Visibility::Visible;
-        let _ = meshes.insert(mesh.id(), camera_frustum_mesh(camera_matrix));
+        if geometry_changed {
+            let _ = meshes.insert(mesh.id(), camera_frustum_mesh(camera_matrix));
+        }
     }
     for (mesh, mut entity_transform, mut visibility) in &mut image_planes {
         *entity_transform = transform;
         *visibility = Visibility::Visible;
-        let _ = meshes.insert(mesh.id(), camera_image_plane_mesh(camera_matrix));
+        if geometry_changed {
+            let _ = meshes.insert(mesh.id(), camera_image_plane_mesh(camera_matrix));
+        }
     }
+    *previous_version = data.camera_version;
 }
 
 fn update_camera_image(
@@ -292,44 +427,56 @@ fn update_camera_image(
         return;
     };
     for mut image_plane in &mut image_planes {
-        if image_plane.sequence == frame.sequence {
+        if image_plane.sequence == Some(frame.sequence) {
             continue;
         }
         let _ = images.insert(image_plane.texture.id(), camera_frame_image(&frame.image));
-        image_plane.sequence = frame.sequence;
+        image_plane.sequence = Some(frame.sequence);
     }
 }
 
 fn update_trajectories(
     data: Res<SceneData>,
+    mut previous_versions: Local<(SceneVersion, SceneVersion)>,
     recorded: Query<&Mesh3d, With<RecordedTrajectory>>,
     resolved: Query<&Mesh3d, With<ResolvedTrajectory>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    for mesh in &recorded {
-        let _ = meshes.insert(mesh.id(), trajectory_mesh(&data.recorded_trajectory));
+    if previous_versions.0 != data.recorded_trajectory_version {
+        for mesh in &recorded {
+            let _ = meshes.insert(mesh.id(), trajectory_mesh(&data.recorded_trajectory));
+        }
+        previous_versions.0 = data.recorded_trajectory_version;
     }
-    for mesh in &resolved {
-        let _ = meshes.insert(mesh.id(), trajectory_mesh(&data.resolved_trajectory));
+    if previous_versions.1 != data.resolved_trajectory_version {
+        for mesh in &resolved {
+            let _ = meshes.insert(mesh.id(), trajectory_mesh(&data.resolved_trajectory));
+        }
+        previous_versions.1 = data.resolved_trajectory_version;
     }
 }
 
 fn update_global_debug_lines(
     data: Res<SceneData>,
+    mut previous_version: Local<SceneVersion>,
     lines: Query<&Mesh3d, With<GlobalDebugLines>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    if *previous_version == data.global_debug_version {
+        return;
+    }
     for mesh in &lines {
         let _ = meshes.insert(mesh.id(), global_debug_lines_mesh(&data));
     }
+    *previous_version = data.global_debug_version;
 }
 
 fn camera_to_field_transform(
-    robot_to_field: nalgebra::Isometry3<f32>,
+    robot_to_field: linear_algebra::Isometry3<Robot, Field>,
     camera_matrix: &CameraMatrix,
 ) -> Transform {
     let camera_to_robot = robot_to_camera(camera_matrix).inverse();
-    transform_from_isometry(robot_to_field * camera_to_robot)
+    transform_from_isometry(robot_to_field.inner * camera_to_robot)
 }
 
 fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
@@ -426,8 +573,18 @@ fn trajectory_mesh(points: &[TrajectoryPoint]) -> Mesh {
         if !window[0].seconds.is_finite() || !window[1].seconds.is_finite() {
             continue;
         }
-        let a = window[0].robot_to_field.translation.vector.cast::<f32>();
-        let b = window[1].robot_to_field.translation.vector.cast::<f32>();
+        let a = window[0]
+            .robot_to_field
+            .inner
+            .translation
+            .vector
+            .cast::<f32>();
+        let b = window[1]
+            .robot_to_field
+            .inner
+            .translation
+            .vector
+            .cast::<f32>();
         positions.push(convert_point([a.x, a.y, a.z]).to_array());
         positions.push(convert_point([b.x, b.y, b.z]).to_array());
     }
@@ -438,7 +595,7 @@ fn trajectory_mesh(points: &[TrajectoryPoint]) -> Mesh {
 }
 
 fn global_debug_lines_mesh(data: &SceneData) -> Mesh {
-    let Some(debug) = &data.global_debug else {
+    let Some(debug) = data.global_debug.as_deref() else {
         return empty_mesh(PrimitiveTopology::LineList);
     };
     let Some(camera_matrix) = &data.camera_matrix else {

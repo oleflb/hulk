@@ -40,11 +40,12 @@ fn main() -> Result<()> {
             ..Default::default()
         },
         Box::new(move |creation_context| {
-            Ok(Box::new(LocalizationMcapVisualizerApp::new(
+            let app = LocalizationMcapVisualizerApp::new(
                 creation_context,
                 arguments.mcap.clone(),
                 recording.clone(),
-            )))
+            )?;
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| eyre!("failed to run localization MCAP visualizer: {error}"))?;
@@ -65,4 +66,25 @@ fn wgpu_options() -> WgpuConfiguration {
         });
     }
     options
+}
+
+fn nearest_by_distance<T, Distance>(
+    previous: Option<(T, Distance)>,
+    next: Option<(T, Distance)>,
+) -> Option<T>
+where
+    Distance: PartialOrd,
+{
+    match (previous, next) {
+        (Some((previous, previous_distance)), Some((next, next_distance))) => {
+            Some(if previous_distance <= next_distance {
+                previous
+            } else {
+                next
+            })
+        }
+        (Some((previous, _)), None) => Some(previous),
+        (None, Some((next, _))) => Some(next),
+        (None, None) => None,
+    }
 }

@@ -14,7 +14,8 @@ use linear_algebra::{IntoTransform, vector};
 use localization_3d::{
     GlobalLocalizationDebugStatus, GlobalLocalizerParameters, Localization3dParameters,
     backend_configuration, find_detected_visual_features, ingest_foot_heights,
-    ingest_visual_odometry, initial_state_from_camera_matrix, localize_global_visual_features,
+    ingest_visual_odometry, initial_robot_to_field_from_camera_matrix,
+    initial_state_from_camera_matrix, localize_global_visual_features,
 };
 use localization_factrs::{
     BackendConfiguration, VinsBackend, VinsFrontend, backend::BackendSolveDiagnostics, initialize,
@@ -500,7 +501,8 @@ fn build_dead_reckoning(
     let mut camera_matrices = OnlineCameraMatrices::default();
     let mut vo_timestamps = VisualOdometryTimestampTracker::default();
     let mut vo_stats = VisualOdometryReplayStats::default();
-    let initial_pose = initial_pose_from_camera_matrix(&recording.first_camera_matrix);
+    let initial_pose =
+        initial_robot_to_field_from_camera_matrix(&recording.first_camera_matrix).inner;
     let mut accepted_measurements = Vec::new();
     let mut comparison_start_time = None;
 
@@ -1612,14 +1614,6 @@ fn robot_delta_from_visual_odometry_delta(
 
 fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
     (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
-}
-
-fn initial_pose_from_camera_matrix(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f64> {
-    let robot_to_ground = camera_matrix.ground_to_robot.inverse().inner;
-    nalgebra::Isometry3::from_parts(
-        nalgebra::Translation3::new(0.0, 0.0, robot_to_ground.translation.vector.z as f64),
-        robot_to_ground.rotation.cast::<f64>(),
-    )
 }
 
 fn decode_message<T>(data: &[u8]) -> Result<T, Box<dyn Error>>

@@ -244,7 +244,7 @@ fn update_camera_render_target(
         BevyRenderTarget::TEXTURE_HANDLE,
         ManualTextureView::with_default_format(
             texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            UVec2::new(target.texture.size().width, target.texture.size().width),
+            UVec2::new(target.texture.size().width, target.texture.size().height),
         ),
     );
     camera.viewport = Some(Viewport {
@@ -270,6 +270,14 @@ fn process_egui_input(world: &mut World, ui: &mut Ui, response: &Response) {
     };
 
     ui.input(|input| {
+        let pointer_delta = input.pointer.delta();
+        if pointer_delta != egui::Vec2::ZERO {
+            let mut mouse = world.resource_mut::<Messages<MouseMotion>>();
+            mouse.write(MouseMotion {
+                delta: Vec2::new(pointer_delta.x, pointer_delta.y),
+            });
+        }
+
         for event in &input.events {
             match event {
                 // TODO: Forward these events
@@ -284,13 +292,8 @@ fn process_egui_input(world: &mut World, ui: &mut Ui, response: &Response) {
                 //     repeat,
                 //     modifiers,
                 // } => {}
-                // Event::PointerMoved(pos2) => {}
-                Event::MouseMoved(egui::Vec2 { x, y }) => {
-                    let mut mouse = world.resource_mut::<Messages<MouseMotion>>();
-                    mouse.write(MouseMotion {
-                        delta: Vec2 { x: *x, y: *y },
-                    });
-                }
+                // Pointer movement is forwarded once per frame above via input.pointer.delta().
+                Event::MouseMoved(_) => {}
                 Event::PointerButton {
                     pos: _,
                     button,
