@@ -206,6 +206,20 @@ impl Recording {
         self.images.len()
     }
 
+    pub fn image_id_from_index(&self, index: usize) -> Option<StereoImageId> {
+        if index < self.images.len() {
+            Some(StereoImageId(index))
+        } else {
+            None
+        }
+    }
+
+    pub fn image_log_time(&self, image_id: StereoImageId) -> Option<SystemTime> {
+        self.images
+            .get(image_id.index())
+            .map(|image| image.log_time)
+    }
+
     pub fn topic_count(&self) -> usize {
         self.topic_counts.len()
     }
@@ -247,36 +261,41 @@ impl Recording {
     }
 
     pub fn latest_snapshot(&self, log_time: SystemTime) -> RecordingSnapshot {
+        let image_id = self.nearest_image_id(log_time);
+        let snapshot_time = match image_id.and_then(|image_id| self.images.get(image_id.index())) {
+            Some(image) => image.log_time,
+            None => log_time,
+        };
         let mut snapshot = RecordingSnapshot {
-            image_id: self.nearest_image_id(log_time),
+            image_id,
             ..Default::default()
         };
 
         if let Some(EventKind::CameraMatrix(camera_matrix)) = self
             .snapshot_index
-            .latest_camera_matrix(&self.events, log_time)
+            .latest_camera_matrix(&self.events, snapshot_time)
             .map(|event| &event.kind)
         {
             snapshot.camera_matrix = Some(camera_matrix.clone());
         }
         if let Some(event) = self
             .snapshot_index
-            .latest_detected_objects(&self.events, log_time)
+            .nearest_detected_objects(&self.events, snapshot_time)
             && let EventKind::DetectedObjects(objects) = &event.kind
         {
             snapshot.detected_objects = objects.clone();
-            snapshot.detected_objects_time = Some(event.publish_time);
+            snapshot.detected_objects_time = Some(event.log_time);
         }
         if let Some(EventKind::RecordedLocalization(localization)) = self
             .snapshot_index
-            .latest_recorded_localization(&self.events, log_time)
+            .latest_recorded_localization(&self.events, snapshot_time)
             .map(|event| &event.kind)
         {
             snapshot.recorded_localization = *localization;
         }
         if let Some(event) = self
             .snapshot_index
-            .latest_calibrated_intrinsics(&self.events, log_time)
+            .latest_calibrated_intrinsics(&self.events, snapshot_time)
             && let EventKind::CalibratedIntrinsics(intrinsics) = &event.kind
         {
             snapshot.calibrated_intrinsics = Some(*intrinsics);
@@ -388,12 +407,12 @@ impl SnapshotIndex {
         Self::latest(events, &self.camera_matrices, log_time)
     }
 
-    fn latest_detected_objects<'a>(
+    fn nearest_detected_objects<'a>(
         &self,
         events: &'a [RecordedEvent],
         log_time: SystemTime,
     ) -> Option<&'a RecordedEvent> {
-        Self::latest(events, &self.detected_objects, log_time)
+        Self::nearest(events, &self.detected_objects, log_time)
     }
 
     fn latest_recorded_localization<'a>(
@@ -422,6 +441,30 @@ impl SnapshotIndex {
             .and_then(|index| indexes.get(index))
             .and_then(|&index| events.get(index))
     }
+
+    fn nearest<'a>(
+        events: &'a [RecordedEvent],
+        indexes: &[usize],
+        log_time: SystemTime,
+    ) -> Option<&'a RecordedEvent> {
+        let next = indexes.partition_point(|&index| events[index].log_time <= log_time);
+        nearest_by_distance(
+            next.checked_sub(1)
+                .and_then(|index| indexes.get(index))
+                .map(|&index| {
+                    (
+                        &events[index],
+                        nanos_abs_diff(events[index].log_time, log_time),
+                    )
+                }),
+            indexes.get(next).map(|&index| {
+                (
+                    &events[index],
+                    nanos_abs_diff(events[index].log_time, log_time),
+                )
+            }),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -447,7 +490,7 @@ pub struct StereoImageIndex {
 pub struct StereoImageId(usize);
 
 impl StereoImageId {
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self.0
     }
 }

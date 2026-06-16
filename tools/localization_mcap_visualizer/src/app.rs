@@ -52,6 +52,7 @@ pub struct LocalizationMcapVisualizerApp {
     parameters: ReplayParameters,
     recorded_trajectory: Vec<TrajectoryPoint>,
     selected_camera: StereoSide,
+    image_zoom: f32,
     image_cache: Option<CachedStereoFrame>,
     left_texture: Option<TextureHandle>,
     right_texture: Option<TextureHandle>,
@@ -90,6 +91,7 @@ impl LocalizationMcapVisualizerApp {
             last_frame_time: Instant::now(),
             parameters: ReplayParameters::default(),
             selected_camera: StereoSide::Left,
+            image_zoom: 1.0,
             image_cache: None,
             left_texture: None,
             right_texture: None,
@@ -140,6 +142,7 @@ impl App for LocalizationMcapVisualizerApp {
             debug_pose,
             &snapshot.detected_objects,
         );
+        let camera_matrix_for_ui = camera_matrix.clone();
         self.update_scene_data(camera_matrix.take(), current_pose, global_debug.clone());
 
         let position_before_ui = self.position_seconds;
@@ -150,7 +153,13 @@ impl App for LocalizationMcapVisualizerApp {
 
         self.header(context);
         self.parameters_panel(context);
-        self.camera_panel(context, &snapshot.detected_objects, global_debug.as_deref());
+        self.camera_panel(
+            context,
+            &snapshot.detected_objects,
+            snapshot.detected_objects_time,
+            camera_matrix_for_ui.as_ref(),
+            global_debug.as_deref(),
+        );
         self.timeline_panel(context);
         self.viewport(context);
         let ui_changed_scene_inputs = self.position_seconds != position_before_ui
@@ -706,6 +715,8 @@ impl LocalizationMcapVisualizerApp {
         &mut self,
         context: &Context,
         detected_objects: &[Object<RobocupObjectLabel>],
+        detected_objects_time: Option<SystemTime>,
+        camera_matrix: Option<&CameraMatrix>,
         global_debug: Option<&GlobalLocalizationDetailedDebug>,
     ) {
         SidePanel::right("camera_panel")
@@ -717,6 +728,13 @@ impl LocalizationMcapVisualizerApp {
                     ui.selectable_value(&mut self.selected_camera, StereoSide::Left, "left");
                     ui.selectable_value(&mut self.selected_camera, StereoSide::Right, "right");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("zoom");
+                    ui.add(Slider::new(&mut self.image_zoom, 0.1..=8.0).logarithmic(true));
+                    if ui.button("1:1").clicked() {
+                        self.image_zoom = 1.0;
+                    }
+                });
                 let texture = match self.selected_camera {
                     StereoSide::Left => self.left_texture.as_ref(),
                     StereoSide::Right => self.right_texture.as_ref(),
@@ -726,9 +744,14 @@ impl LocalizationMcapVisualizerApp {
                     .as_ref()
                     .map(|cache| cache.active(self.selected_camera));
                 match (texture, image) {
-                    (Some(texture), Some(image)) => {
-                        self.camera_image(ui, texture, image, detected_objects, global_debug)
-                    }
+                    (Some(texture), Some(image)) => self.camera_image(
+                        ui,
+                        texture,
+                        image,
+                        detected_objects,
+                        detected_objects_time,
+                        global_debug,
+                    ),
                     _ => {
                         ui.centered_and_justified(|ui| {
                             ui.label(
@@ -740,6 +763,8 @@ impl LocalizationMcapVisualizerApp {
                 }
                 ui.separator();
                 self.global_debug_panel(ui, global_debug);
+                ui.separator();
+                self.top_down_association_view(ui, global_debug, camera_matrix);
             });
     }
 
@@ -749,24 +774,39 @@ impl LocalizationMcapVisualizerApp {
         texture: &TextureHandle,
         image: &CameraImage,
         detected_objects: &[Object<RobocupObjectLabel>],
+        detected_objects_time: Option<SystemTime>,
         global_debug: Option<&GlobalLocalizationDetailedDebug>,
     ) {
         let image_size = vec2(image.width as f32, image.height as f32);
         let available = ui.available_size().max(vec2(1.0, 1.0));
-        let scale = (available.x / image_size.x)
-            .min((available.y - 220.0).max(1.0) / image_size.y)
+        let fit_scale = (available.x / image_size.x)
+            .min((available.y - 300.0).max(1.0) / image_size.y)
             .max(0.05);
-        let response = ui.add(
-            egui::Image::new((texture.id(), texture.size_vec2()))
-                .fit_to_exact_size(image_size * scale)
-                .sense(Sense::hover()),
-        );
-        if self.selected_camera == StereoSide::Left {
-            draw_detected_objects(ui, response.rect, image_size, detected_objects);
-            if let Some(debug) = global_debug {
-                draw_global_debug_overlay(ui, response.rect, image_size, debug);
-            }
-        }
+        let scale = fit_scale * self.image_zoom;
+        egui::ScrollArea::both()
+            .max_height((available.y - 280.0).max(220.0))
+            .show(ui, |ui| {
+                let response = ui.add(
+                    egui::Image::new((texture.id(), texture.size_vec2()))
+                        .fit_to_exact_size(image_size * scale)
+                        .sense(Sense::hover()),
+                );
+                if self.selected_camera == StereoSide::Left {
+                    draw_detected_objects(ui, response.rect, image_size, detected_objects);
+                    if let Some(debug) = global_debug {
+                        draw_global_debug_overlay(ui, response.rect, image_size, debug);
+                    }
+                    let hover_info =
+                        image_hover_info(&response, image_size, detected_objects, global_debug);
+                    if !hover_info.is_empty() {
+                        response.on_hover_ui(|ui| {
+                            for line in hover_info {
+                                ui.label(line);
+                            }
+                        });
+                    }
+                }
+            });
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}x{}", image.width, image.height));
             ui.separator();
@@ -785,6 +825,13 @@ impl LocalizationMcapVisualizerApp {
                     "publish {:.2}s",
                     self.recording.seconds_since_start(cache.frame.publish_time),
                 ));
+                if let Some(detected_objects_time) = detected_objects_time {
+                    let delta_ms = (self.recording.seconds_since_start(detected_objects_time)
+                        - self.recording.seconds_since_start(cache.frame.log_time))
+                        * 1000.0;
+                    ui.separator();
+                    ui.label(format!("detections Δ {delta_ms:.1} ms"));
+                }
             }
         });
     }
@@ -835,6 +882,85 @@ impl LocalizationMcapVisualizerApp {
             });
     }
 
+    fn top_down_association_view(
+        &self,
+        ui: &mut Ui,
+        global_debug: Option<&GlobalLocalizationDetailedDebug>,
+        camera_matrix: Option<&CameraMatrix>,
+    ) {
+        ui.heading("Top-Down Associations");
+        let (Some(debug), Some(camera_matrix)) = (global_debug, camera_matrix) else {
+            ui.label(RichText::new("No associations for this frame.").color(Color32::GRAY));
+            return;
+        };
+
+        let available_width = ui.available_width().max(240.0);
+        let (rect, response) = ui.allocate_exact_size(vec2(available_width, 220.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            Color32::from_rgb(24, 44, 31),
+        );
+
+        let dimensions = FieldDimensions::SPL_2025;
+        let field_rect = top_down_field_rect(rect, &dimensions);
+        painter.rect_stroke(
+            field_rect,
+            egui::CornerRadius::same(2),
+            Stroke::new(1.5, Color32::WHITE),
+            StrokeKind::Inside,
+        );
+        painter.line_segment(
+            [
+                pos2(field_rect.center().x, field_rect.top()),
+                pos2(field_rect.center().x, field_rect.bottom()),
+            ],
+            Stroke::new(1.0, Color32::GRAY),
+        );
+
+        let ground_to_field = debug.robot_to_field.inner * camera_matrix.ground_to_robot.inner;
+        for association in &debug.associations {
+            let ground = association.back_projected_ground;
+            let detected_field =
+                ground_to_field * nalgebra::Point3::new(ground.x(), ground.y(), 0.0);
+            let detected_position =
+                field_to_screen(field_rect, &dimensions, detected_field.x, detected_field.y);
+            let feature_position = field_to_screen(
+                field_rect,
+                &dimensions,
+                association.field_point.x(),
+                association.field_point.y(),
+            );
+            let color = feature_class_color(association.class);
+            painter.line_segment(
+                [detected_position, feature_position],
+                Stroke::new(1.5, color.gamma_multiply(0.75)),
+            );
+            painter.circle_filled(detected_position, 3.5, color);
+            painter.circle_stroke(feature_position, 5.0, Stroke::new(1.5, Color32::WHITE));
+        }
+
+        let robot_translation = debug.robot_to_field.inner.translation.vector;
+        painter.circle_filled(
+            field_to_screen(
+                field_rect,
+                &dimensions,
+                robot_translation.x,
+                robot_translation.y,
+            ),
+            4.0,
+            Color32::from_rgb(82, 170, 255),
+        );
+
+        response.on_hover_text(format!(
+            "{} associations, robot ({:.2}, {:.2})",
+            debug.associations.len(),
+            robot_translation.x,
+            robot_translation.y
+        ));
+    }
+
     fn timeline_panel(&mut self, context: &Context) {
         TopBottomPanel::bottom("timeline_panel").show(context, |ui| {
             ui.horizontal(|ui| {
@@ -850,6 +976,12 @@ impl LocalizationMcapVisualizerApp {
                 if ui.button(">").clicked() {
                     self.position_seconds =
                         (self.position_seconds + 1.0).min(self.recording.duration().as_secs_f64());
+                }
+                if ui.button("< frame").clicked() {
+                    self.step_frame(-1);
+                }
+                if ui.button("frame >").clicked() {
+                    self.step_frame(1);
                 }
                 ui.label("speed");
                 ui.add(
@@ -870,7 +1002,51 @@ impl LocalizationMcapVisualizerApp {
                 )
                 .show_value(false),
             );
+            if self.recording.image_count() > 0 {
+                let mut frame_index = self.current_frame_index();
+                let max_frame_index = self.recording.image_count() - 1;
+                if ui
+                    .add(Slider::new(&mut frame_index, 0..=max_frame_index).text("frame"))
+                    .changed()
+                {
+                    self.set_frame_index(frame_index);
+                }
+            }
         });
+    }
+
+    fn current_frame_index(&self) -> usize {
+        match &self.image_cache {
+            Some(cache) => cache.image_id.index(),
+            None => 0,
+        }
+    }
+
+    fn step_frame(&mut self, offset: isize) {
+        if self.recording.image_count() == 0 {
+            return;
+        }
+        let max_frame_index = self.recording.image_count() - 1;
+        let current = self.current_frame_index();
+        let next = if offset.is_negative() {
+            current.saturating_sub(offset.unsigned_abs())
+        } else {
+            current.saturating_add(offset as usize).min(max_frame_index)
+        };
+        self.set_frame_index(next);
+    }
+
+    fn set_frame_index(&mut self, frame_index: usize) {
+        let Some(image_id) = self.recording.image_id_from_index(frame_index) else {
+            return;
+        };
+        let Some(log_time) = self.recording.image_log_time(image_id) else {
+            return;
+        };
+        self.position_seconds = self
+            .recording
+            .seconds_since_start(log_time)
+            .clamp(0.0, self.recording.duration().as_secs_f64());
     }
 
     fn viewport(&mut self, context: &Context) {
@@ -990,6 +1166,124 @@ fn draw_detected_objects(
     }
 }
 
+fn image_hover_info(
+    response: &egui::Response,
+    image_size: Vec2,
+    detected_objects: &[Object<RobocupObjectLabel>],
+    global_debug: Option<&GlobalLocalizationDetailedDebug>,
+) -> Vec<String> {
+    let Some(pointer) = response.hover_pos() else {
+        return Vec::new();
+    };
+    let Some(pixel) = screen_to_image_pixel(response.rect, image_size, pointer) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+
+    for object in detected_objects {
+        let min = vec2(
+            object.bounding_box.area.min.x(),
+            object.bounding_box.area.min.y(),
+        );
+        let max = vec2(
+            object.bounding_box.area.max.x(),
+            object.bounding_box.area.max.y(),
+        );
+        if pixel.x >= min.x && pixel.x <= max.x && pixel.y >= min.y && pixel.y <= max.y {
+            let label: String = object.label.into();
+            lines.push(format!(
+                "detection: {label} {:.0}% bbox ({:.0},{:.0})-({:.0},{:.0})",
+                object.bounding_box.confidence * 100.0,
+                min.x,
+                min.y,
+                max.x,
+                max.y,
+            ));
+        }
+    }
+
+    if let Some(debug) = global_debug {
+        for detection in &debug.detections {
+            if pixel_distance(pixel, vec2(detection.pixel.x(), detection.pixel.y())) <= 10.0 {
+                lines.push(format!(
+                    "feature detection #{} {:?} pixel ({:.1},{:.1}) ground ({:.2},{:.2})",
+                    detection.index,
+                    detection.class,
+                    detection.pixel.x(),
+                    detection.pixel.y(),
+                    detection.ground.x(),
+                    detection.ground.y(),
+                ));
+            }
+        }
+        for projection in &debug.projected_features {
+            let Some(projected_pixel) = projection.projected_pixel else {
+                continue;
+            };
+            if pixel_distance(pixel, vec2(projected_pixel.x(), projected_pixel.y())) <= 10.0 {
+                lines.push(format!(
+                    "projection #{} sym #{} {:?} field ({:.2},{:.2}) {}",
+                    projection.index,
+                    projection.symmetric_index,
+                    projection.class,
+                    projection.field_point.x(),
+                    projection.field_point.y(),
+                    if projection.accepted {
+                        "accepted"
+                    } else {
+                        "candidate"
+                    },
+                ));
+            }
+        }
+        for association in &debug.associations {
+            let detection_distance = pixel_distance(
+                pixel,
+                vec2(
+                    association.detection_pixel.x(),
+                    association.detection_pixel.y(),
+                ),
+            );
+            let projection_distance = match association.projected_pixel {
+                Some(projected_pixel) => {
+                    pixel_distance(pixel, vec2(projected_pixel.x(), projected_pixel.y()))
+                }
+                None => f32::INFINITY,
+            };
+            if detection_distance <= 10.0 || projection_distance <= 10.0 {
+                let error = match association.reprojection_error_px {
+                    Some(error) => format!("{error:.1}px"),
+                    None => "not visible".to_string(),
+                };
+                lines.push(format!(
+                    "association det #{} -> feature #{} {:?} error {error} field ({:.2},{:.2})",
+                    association.detection_index,
+                    association.feature_index,
+                    association.class,
+                    association.field_point.x(),
+                    association.field_point.y(),
+                ));
+            }
+        }
+    }
+
+    lines
+}
+
+fn screen_to_image_pixel(image_rect: Rect, image_size: Vec2, pointer: egui::Pos2) -> Option<Vec2> {
+    if !image_rect.contains(pointer) {
+        return None;
+    }
+    Some(vec2(
+        (pointer.x - image_rect.left()) / image_rect.width().max(1.0) * image_size.x,
+        (pointer.y - image_rect.top()) / image_rect.height().max(1.0) * image_size.y,
+    ))
+}
+
+fn pixel_distance(left: Vec2, right: Vec2) -> f32 {
+    (left - right).length()
+}
+
 fn draw_global_debug_overlay(
     ui: &mut Ui,
     image_rect: Rect,
@@ -1033,6 +1327,27 @@ fn draw_global_debug_overlay(
         painter.circle_filled(detection, 4.0, color);
         painter.circle_filled(projection, 3.0, Color32::WHITE);
     }
+}
+
+fn top_down_field_rect(rect: Rect, dimensions: &FieldDimensions) -> Rect {
+    let field_length = dimensions.length.max(1.0);
+    let field_width = dimensions.width.max(1.0);
+    let scale = (rect.width() / field_length).min(rect.height() / field_width) * 0.92;
+    Rect::from_center_size(
+        rect.center(),
+        vec2(field_length * scale, field_width * scale),
+    )
+}
+
+fn field_to_screen(
+    field_rect: Rect,
+    dimensions: &FieldDimensions,
+    field_x: f32,
+    field_y: f32,
+) -> egui::Pos2 {
+    let x = field_rect.center().x + field_x / dimensions.length.max(1.0) * field_rect.width();
+    let y = field_rect.center().y - field_y / dimensions.width.max(1.0) * field_rect.height();
+    pos2(x, y)
 }
 
 fn object_label_color(label: RobocupObjectLabel) -> Color32 {

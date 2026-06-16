@@ -381,7 +381,7 @@ fn update_robot_marker(
 
 fn update_camera_viewport(
     data: Res<SceneData>,
-    mut previous_version: Local<SceneVersion>,
+    mut previous_geometry: Local<(SceneVersion, Option<SceneFrameSequence>)>,
     mut frustums: CameraFrustumQuery,
     mut image_planes: CameraImagePlaneQuery,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -400,22 +400,27 @@ fn update_camera_viewport(
     };
 
     let transform = camera_to_field_transform(robot_to_field, camera_matrix);
-    let geometry_changed = *previous_version != data.camera_version;
+    let camera_frame = data.camera_frame.as_ref();
+    let frame_sequence = camera_frame.map(|frame| frame.sequence);
+    let geometry_changed = *previous_geometry != (data.camera_version, frame_sequence);
     for (mesh, mut entity_transform, mut visibility) in &mut frustums {
         *entity_transform = transform;
         *visibility = Visibility::Visible;
         if geometry_changed {
-            let _ = meshes.insert(mesh.id(), camera_frustum_mesh(camera_matrix));
+            let _ = meshes.insert(mesh.id(), camera_frustum_mesh(camera_matrix, camera_frame));
         }
     }
     for (mesh, mut entity_transform, mut visibility) in &mut image_planes {
         *entity_transform = transform;
         *visibility = Visibility::Visible;
         if geometry_changed {
-            let _ = meshes.insert(mesh.id(), camera_image_plane_mesh(camera_matrix));
+            let _ = meshes.insert(
+                mesh.id(),
+                camera_image_plane_mesh(camera_matrix, camera_frame),
+            );
         }
     }
-    *previous_version = data.camera_version;
+    *previous_geometry = (data.camera_version, frame_sequence);
 }
 
 fn update_camera_image(
@@ -483,8 +488,8 @@ fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
     (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
 }
 
-fn camera_frustum_mesh(camera_matrix: &CameraMatrix) -> Mesh {
-    let corners = camera_viewport_corners(camera_matrix, CAMERA_VIEWPORT_DEPTH);
+fn camera_frustum_mesh(camera_matrix: &CameraMatrix, frame: Option<&SceneCameraFrame>) -> Mesh {
+    let corners = camera_viewport_corners(camera_matrix, frame, CAMERA_VIEWPORT_DEPTH);
     let mut positions = Vec::with_capacity(16);
 
     for corner in corners {
@@ -501,8 +506,8 @@ fn camera_frustum_mesh(camera_matrix: &CameraMatrix) -> Mesh {
     mesh
 }
 
-fn camera_image_plane_mesh(camera_matrix: &CameraMatrix) -> Mesh {
-    let corners = camera_viewport_corners(camera_matrix, CAMERA_VIEWPORT_DEPTH);
+fn camera_image_plane_mesh(camera_matrix: &CameraMatrix, frame: Option<&SceneCameraFrame>) -> Mesh {
+    let corners = camera_viewport_corners(camera_matrix, frame, CAMERA_VIEWPORT_DEPTH);
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
@@ -517,13 +522,23 @@ fn camera_image_plane_mesh(camera_matrix: &CameraMatrix) -> Mesh {
     mesh
 }
 
-fn camera_viewport_corners(camera_matrix: &CameraMatrix, depth: f32) -> [[f32; 3]; 4] {
-    let width = camera_matrix.image_size.x().max(1.0);
-    let height = camera_matrix.image_size.y().max(1.0);
-    let fx = camera_matrix.intrinsics.focals.x.max(f32::EPSILON);
-    let fy = camera_matrix.intrinsics.focals.y.max(f32::EPSILON);
-    let cx = camera_matrix.intrinsics.optical_center.x();
-    let cy = camera_matrix.intrinsics.optical_center.y();
+fn camera_viewport_corners(
+    camera_matrix: &CameraMatrix,
+    frame: Option<&SceneCameraFrame>,
+    depth: f32,
+) -> [[f32; 3]; 4] {
+    let matrix_width = camera_matrix.image_size.x().max(1.0);
+    let matrix_height = camera_matrix.image_size.y().max(1.0);
+    let (width, height) = match frame {
+        Some(frame) => (frame.image.width as f32, frame.image.height as f32),
+        None => (matrix_width, matrix_height),
+    };
+    let scale_x = width.max(1.0) / matrix_width;
+    let scale_y = height.max(1.0) / matrix_height;
+    let fx = (camera_matrix.intrinsics.focals.x * scale_x).max(f32::EPSILON);
+    let fy = (camera_matrix.intrinsics.focals.y * scale_y).max(f32::EPSILON);
+    let cx = camera_matrix.intrinsics.optical_center.x() * scale_x;
+    let cy = camera_matrix.intrinsics.optical_center.y() * scale_y;
 
     [
         camera_viewport_corner(0.0, 0.0, depth, fx, fy, cx, cy),
