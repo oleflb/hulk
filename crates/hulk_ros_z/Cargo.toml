@@ -23,6 +23,7 @@ detection = { workspace = true, features = ["ort-dynamic"] }
 fake_odometry = { workspace = true }
 fall_down_state_receiver = { workspace = true }
 field_border_detection = { workspace = true }
+field_mark_association = { workspace = true }
 game_controller_filter = { workspace = true }
 game_controller_state_filter = { workspace = true }
 global_parameter_provider = { workspace = true }

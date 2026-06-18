@@ -120,6 +120,7 @@ async fn spawn_all(ctx: Arc<Context>) -> Result<RunningStack> {
     join_set.spawn(fake_odometry::run_boxed(ctx.clone()));
     join_set.spawn(fall_down_state_receiver::run_boxed(ctx.clone()));
     join_set.spawn(field_border_detection::run_boxed(ctx.clone()));
+    join_set.spawn(field_mark_association::run_boxed(ctx.clone()));
     join_set.spawn(game_controller_filter::run_boxed(ctx.clone()));
     join_set.spawn(game_controller_state_filter::run_boxed(ctx.clone()));
     join_set.spawn(global_parameter_provider::run_boxed(ctx.clone()));

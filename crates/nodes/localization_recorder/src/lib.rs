@@ -16,9 +16,9 @@ use color_eyre::{
     eyre::{WrapErr, eyre},
 };
 use coordinate_systems::{Field, Robot};
+use field_mark_association::{FieldMarkAssociations, GlobalLocalizationDebug};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
-use localization_3d::GlobalLocalizationDebug;
 use mcap::{Writer, records::MessageHeader};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{Message, attachment::Attachment, prelude::*, time::Time};
@@ -174,6 +174,13 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         &mut recorders,
         sample_sender.clone(),
         "debug/global_localization",
+    )
+    .await?;
+    spawn_topic::<TimeWrapper<FieldMarkAssociations>>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "field_mark_association/associations",
     )
     .await?;
     spawn_topic::<Intrinsic>(

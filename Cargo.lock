@@ -4358,6 +4358,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "field_mark_association"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "coordinate_systems",
+ "geometry",
+ "hungarian_algorithm",
+ "itertools 0.14.0",
+ "linear_algebra",
+ "nalgebra 0.34.2",
+ "ndarray",
+ "ordered-float 4.6.0",
+ "projection",
+ "ros-z",
+ "ros-z-streams",
+ "serde",
+ "tokio",
+ "types",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5892,6 +5913,7 @@ dependencies = [
  "fake_odometry",
  "fall_down_state_receiver",
  "field_border_detection",
+ "field_mark_association",
  "game_controller_filter",
  "game_controller_state_filter",
  "global_parameter_provider",
@@ -6977,17 +6999,12 @@ dependencies = [
  "booster",
  "color-eyre",
  "coordinate_systems",
- "geometry",
- "hsl_network_messages",
- "hungarian_algorithm",
- "itertools 0.14.0",
+ "field_mark_association",
  "kinematics",
  "linear_algebra",
  "localization-factrs",
  "mcap",
  "nalgebra 0.34.2",
- "ndarray",
- "ordered-float 4.6.0",
  "projection",
  "ros-z",
  "ros-z-cdr",
@@ -7039,6 +7056,7 @@ dependencies = [
  "eframe",
  "egui_bevy",
  "egui_plot",
+ "field_mark_association",
  "image",
  "itertools 0.14.0",
  "kinematics",
@@ -7064,6 +7082,7 @@ dependencies = [
  "booster",
  "color-eyre",
  "coordinate_systems",
+ "field_mark_association",
  "kinematics",
  "linear_algebra",
  "localization-3d",
@@ -10216,6 +10235,7 @@ dependencies = [
  "coordinate_systems",
  "eframe",
  "egui_bevy",
+ "field_mark_association",
  "image",
  "kinematics",
  "linear_algebra",

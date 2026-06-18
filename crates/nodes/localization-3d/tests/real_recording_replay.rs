@@ -7,14 +7,17 @@ use std::{
 };
 
 use booster::ImuState;
-use linear_algebra::IntoTransform;
-use localization_3d::{
-    GlobalLocalizerParameters, Localization3dParameters, backend_configuration,
-    find_detected_visual_features, initial_state_from_camera_matrix,
+use field_mark_association::{
+    FieldMarkAssociationParameters, GlobalLocalizerParameters, find_detected_visual_features,
     localize_global_visual_features,
 };
+use linear_algebra::IntoTransform;
+use localization_3d::{
+    Localization3dParameters, backend_configuration, initial_state_from_camera_matrix,
+};
 use localization_factrs::{
-    OptimizationResult, backend::OptimizationResult as BackendResult, initialize,
+    OptimizationResult, VisualReprojectionAssociation,
+    backend::OptimizationResult as BackendResult, initialize,
 };
 use projection::camera_matrix::CameraMatrix;
 use ros_z::time::Time;
@@ -94,6 +97,7 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
     let initial_state = initial_state_from_camera_matrix(&first_camera_matrix);
 
     let parameters = Localization3dParameters::default();
+    let association_parameters = FieldMarkAssociationParameters::default();
     let solve_every_nth_round = solve_every_nth_round();
     let solve_cadence = solve_cadence_duration(solve_every_nth_round);
     let (mut frontend, mut backend) = initialize(
@@ -183,7 +187,7 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                     camera_matrix,
                     field_dimensions.as_ref(),
                     pose_hint,
-                    &parameters.global_localizer,
+                    &association_parameters.global_localizer,
                 );
                 let relaxed_debug_localization = localize_global_visual_features(
                     &visual_features,
@@ -199,6 +203,13 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                     relaxed_global_localization_debug_frame_count += 1;
                 }
                 if let Some(associations) = localization.unique_associations {
+                    let associations =
+                        associations
+                            .into_iter()
+                            .map(|association| VisualReprojectionAssociation {
+                                detection: association.detection,
+                                field_point: association.field_point,
+                            });
                     frontend.ingest_visual_reprojection_associations(
                         source_time.to_wallclock(),
                         associations,

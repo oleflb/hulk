@@ -17,10 +17,9 @@ use crate::{DetectedVisualFeature, DetectedVisualFeatures};
 
 use super::{
     CLASS_COUNT, FeatureAssociation, FeatureAssociations, GLOBAL_LOCALIZER_MAX_DETECTIONS,
-    GlobalLocalizationDebugAssociation, GlobalLocalizationDebugDetection,
+    GlobalAssociationConfig, GlobalLocalizationDebugAssociation, GlobalLocalizationDebugDetection,
     GlobalLocalizationDebugProjection, GlobalLocalizationDetailedDebug,
-    GlobalLocalizationDetailedStatus, GlobalLocalizationScore, GlobalLocalizerConfig,
-    VisualFeatureClass,
+    GlobalLocalizationDetailedStatus, GlobalLocalizationScore, VisualFeatureClass,
     map::{LandmarkMap, MapTriplet, MapTripletBin, triplet_bin},
 };
 
@@ -49,7 +48,7 @@ pub(crate) use types::{GlobalLocalizationInput, GlobalLocalizationResult};
 
 pub(crate) fn solve(
     input: GlobalLocalizationInput<'_>,
-    config: GlobalLocalizerConfig,
+    config: GlobalAssociationConfig,
 ) -> Option<GlobalLocalizationResult> {
     let problem = Problem::new(input, config)?;
     solve_problem(&problem)
@@ -57,7 +56,7 @@ pub(crate) fn solve(
 
 pub(crate) fn solve_detailed(
     input: GlobalLocalizationInput<'_>,
-    config: GlobalLocalizerConfig,
+    config: GlobalAssociationConfig,
 ) -> Option<GlobalLocalizationDetailedDebug> {
     let problem = Problem::new(input, config)?;
     let result = solve_problem(&problem)?;

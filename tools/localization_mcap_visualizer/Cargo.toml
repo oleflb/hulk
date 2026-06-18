@@ -18,6 +18,7 @@ egui_plot = { workspace = true }
 image = { workspace = true }
 itertools = { workspace = true }
 kinematics = { workspace = true }
+field_mark_association = { workspace = true }
 linear_algebra = { workspace = true }
 localization-3d = { workspace = true }
 localization-factrs = { workspace = true }

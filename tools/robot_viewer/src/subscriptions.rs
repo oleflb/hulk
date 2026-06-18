@@ -4,6 +4,7 @@ use color_eyre::{
 };
 use coordinate_systems::{Field, Robot};
 use eframe::egui::Context as EguiContext;
+use field_mark_association::FieldMarkAssociations;
 use image::RgbImage;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
@@ -34,6 +35,7 @@ const ROBOT_KINEMATICS_TOPIC: &str = "robot_kinematics";
 const CAMERA_MATRIX_TOPIC: &str = "camera_matrix";
 const CALIBRATED_INTRINSICS_TOPIC: &str = "debug/calibrated_intrinsics";
 const DETECTED_OBJECTS_TOPIC: &str = "detected_objects";
+const FIELD_MARK_ASSOCIATIONS_TOPIC: &str = "field_mark_association/associations";
 
 pub(crate) fn spawn(
     runtime: &Runtime,
@@ -108,6 +110,10 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         .subscriber::<Vec<Object<RobocupObjectLabel>>>(DETECTED_OBJECTS_TOPIC)?
         .build()
         .await?;
+    let field_mark_associations = node
+        .subscriber::<TimeWrapper<FieldMarkAssociations>>(FIELD_MARK_ASSOCIATIONS_TOPIC)?
+        .build()
+        .await?;
 
     update_state(&state, &egui_context, |state| {
         state.connection = ConnectionStatus::Subscribed;
@@ -134,6 +140,10 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         );
         update_publisher_count(&mut state.camera_status, camera.publisher_count());
         update_publisher_count(&mut state.objects_status, objects.publisher_count());
+        update_publisher_count(
+            &mut state.field_mark_associations_status,
+            field_mark_associations.publisher_count(),
+        );
     });
 
     let mut publisher_count_interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -149,6 +159,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                     update_publisher_count(&mut state.calibrated_intrinsics_status, calibrated_intrinsics.publisher_count());
                     update_publisher_count(&mut state.camera_status, camera.publisher_count());
                     update_publisher_count(&mut state.objects_status, objects.publisher_count());
+                    update_publisher_count(&mut state.field_mark_associations_status, field_mark_associations.publisher_count());
                 });
             }
             message = field_dimensions.recv() => match message {
@@ -230,6 +241,15 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                 }),
                 Err(error) => update_state(&state, &egui_context, |state| {
                     state.objects_status.mark_error(objects.publisher_count(), format!("{error:#}"));
+                }),
+            },
+            message = field_mark_associations.recv() => match message {
+                Ok(message) => update_state(&state, &egui_context, |state| {
+                    state.field_mark_associations = Some(message.inner);
+                    state.field_mark_associations_status.mark_live(field_mark_associations.publisher_count());
+                }),
+                Err(error) => update_state(&state, &egui_context, |state| {
+                    state.field_mark_associations_status.mark_error(field_mark_associations.publisher_count(), format!("{error:#}"));
                 }),
             },
         }

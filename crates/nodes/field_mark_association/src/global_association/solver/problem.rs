@@ -3,7 +3,7 @@ use super::*;
 impl Problem {
     pub(super) fn new(
         input: GlobalLocalizationInput<'_>,
-        cfg: GlobalLocalizerConfig,
+        cfg: GlobalAssociationConfig,
     ) -> Option<Self> {
         if !valid_intrinsic(input.camera_intrinsic) {
             return None;
@@ -121,7 +121,7 @@ fn detection_points(
     map: &LandmarkMap,
     camera_to_ground: &Isometry3<Camera, Ground>,
     intrinsic: Intrinsic,
-    cfg: GlobalLocalizerConfig,
+    cfg: GlobalAssociationConfig,
 ) -> DetectionSet {
     let camera_origin = camera_to_ground.inner.translation.vector;
     let camera_height = camera_origin.z.abs();

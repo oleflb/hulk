@@ -6,11 +6,11 @@ use std::{
 };
 
 use coordinate_systems::{Camera, Field, Pixel, Robot};
-use linear_algebra::{Isometry3, Point2};
-use localization_3d::{
+use field_mark_association::{
     DetectedVisualFeature, GlobalLocalizationDebugStatus, GlobalLocalizerParameters,
     find_detected_visual_features, localize_global_visual_features,
 };
+use linear_algebra::{Isometry3, Point2};
 use mcap::MessageStream;
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use serde::{Deserialize, Serialize};

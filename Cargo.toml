@@ -49,6 +49,7 @@ members = [
   "crates/nodes/fake_odometry",
   "crates/nodes/fall_down_state_receiver",
   "crates/nodes/field_border_detection",
+  "crates/nodes/field_mark_association",
   "crates/nodes/game_controller_filter",
   "crates/nodes/game_controller_state_filter",
   "crates/nodes/global_parameter_provider",
@@ -215,6 +216,7 @@ fake_odometry = { path = "crates/nodes/fake_odometry" }
 fall_down_state_receiver = { path = "crates/nodes/fall_down_state_receiver" }
 fern = { version = "0.7.1", features = ["colored"] }
 field_border_detection = { path = "crates/nodes/field_border_detection" }
+field_mark_association = { path = "crates/nodes/field_mark_association" }
 filtering = { path = "crates/filtering" }
 flume = "0.11.1"
 framework = { path = "crates/framework" }

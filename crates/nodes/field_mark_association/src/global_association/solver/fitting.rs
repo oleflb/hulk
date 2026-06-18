@@ -346,7 +346,7 @@ pub(super) fn fit_similarity(problem: &Problem, matches: &[Match]) -> Option<Sim
     Some(Similarity2::new(translation, theta, scale))
 }
 
-pub(super) fn height_is_plausible(height: f32, cfg: GlobalLocalizerConfig) -> bool {
+pub(super) fn height_is_plausible(height: f32, cfg: GlobalAssociationConfig) -> bool {
     height.is_finite() && height >= cfg.height_min && height <= cfg.height_max
 }
 

@@ -248,14 +248,29 @@ impl VinsBackend {
     /// Loops continuously, ingesting measurements and optimizing the graph.
     /// Only returns if an error occurs.
     pub fn run_loop(mut self) -> Result<(), VinsBackendError> {
+        let mut measurements = Vec::new();
+
         loop {
-            let _ = self.solve_once()?;
+            measurements.clear();
+            if self
+                .measurement_receiver
+                .blocking_recv_many(&mut measurements, usize::MAX)
+                == 0
+            {
+                return Err(VinsBackendError::FrontendDisconnected);
+            }
+
+            self.ingest_sensor_measurements(measurements.drain(..))?;
+            let _ = self.optimize_and_publish()?;
         }
     }
 
     pub fn solve_once(&mut self) -> Result<Option<OptimizationResult>, VinsBackendError> {
         self.ingest_until_empty()?;
+        self.optimize_and_publish()
+    }
 
+    fn optimize_and_publish(&mut self) -> Result<Option<OptimizationResult>, VinsBackendError> {
         let result = self.optimize();
         if self.result_sender.send(result.clone()).is_err() {
             return Err(VinsBackendError::FrontendDisconnected);
@@ -918,17 +933,10 @@ impl VinsBackend {
     }
 
     fn ingest_until_empty(&mut self) -> Result<(), VinsBackendError> {
-        let mut new_measurements = IntervalMeasurements::new();
+        let mut measurements = IntervalMeasurements::new();
         loop {
             match self.measurement_receiver.try_recv() {
-                Ok(SensorMeasurement::Imu(imu)) => new_measurements.push_imu(imu),
-                Ok(SensorMeasurement::Visual(visual)) => new_measurements.push_visual(visual),
-                Ok(SensorMeasurement::VisualOdometry(visual_odometry)) => {
-                    new_measurements.push_visual_odometry(visual_odometry)
-                }
-                Ok(SensorMeasurement::FootHeights(foot_heights)) => {
-                    new_measurements.push_foot_heights(foot_heights)
-                }
+                Ok(measurement) => measurements.push(measurement),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     return Err(VinsBackendError::FrontendDisconnected);
@@ -936,6 +944,25 @@ impl VinsBackend {
             }
         }
 
+        self.ingest_measurements(measurements)
+    }
+
+    fn ingest_sensor_measurements(
+        &mut self,
+        measurements: impl IntoIterator<Item = SensorMeasurement>,
+    ) -> Result<(), VinsBackendError> {
+        let mut interval_measurements = IntervalMeasurements::new();
+        for measurement in measurements {
+            interval_measurements.push(measurement);
+        }
+
+        self.ingest_measurements(interval_measurements)
+    }
+
+    fn ingest_measurements(
+        &mut self,
+        new_measurements: IntervalMeasurements,
+    ) -> Result<(), VinsBackendError> {
         self.ingest_imu(new_measurements.imu)?;
         self.ingest_visual(new_measurements.visual)?;
         self.ingest_visual_odometry(new_measurements.visual_odometry)?;
@@ -1451,6 +1478,27 @@ mod tests {
     }
 
     #[test]
+    fn first_visual_batch_measurement_is_ingested() {
+        let (_measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        backend
+            .ingest_sensor_measurements([visual_reprojection(start)])
+            .expect("first measurement should ingest");
+
+        assert!(backend.values().get_raw(State(0)).is_some());
+        assert!(backend.values().get_raw(State(1)).is_some());
+        assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 1);
+    }
+
+    #[test]
     fn visual_odometry_measurements_create_interval_factor() {
         let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
@@ -1495,7 +1543,7 @@ mod tests {
         measurement_sender
             .send(visual_odometry(
                 start + Duration::from_millis(100),
-                start + Duration::from_millis(300),
+                start + Duration::from_millis(200),
                 0.1,
             ))
             .expect("visual odometry should send");

@@ -55,7 +55,7 @@ pub(super) fn stable_candidate(problem: &Problem, candidates: &[Candidate]) -> O
 fn near_optimal_candidates<'a>(
     best: &'a Candidate,
     candidates: &'a [Candidate],
-    cfg: GlobalLocalizerConfig,
+    cfg: GlobalAssociationConfig,
 ) -> Vec<&'a Candidate> {
     candidates
         .iter()
@@ -155,7 +155,7 @@ fn symmetry_relation(
     }
 }
 
-pub(super) fn passes_basic_acceptance(candidate: &Candidate, cfg: GlobalLocalizerConfig) -> bool {
+pub(super) fn passes_basic_acceptance(candidate: &Candidate, cfg: GlobalAssociationConfig) -> bool {
     candidate.matches.len() >= cfg.min_inliers
         && candidate.metric_rms_residual <= cfg.rms_threshold
         && candidate.transform.scaling() >= cfg.height_min
@@ -163,6 +163,6 @@ pub(super) fn passes_basic_acceptance(candidate: &Candidate, cfg: GlobalLocalize
         && candidate.score > cfg.min_score.max(0.0)
 }
 
-fn passes_score_ratio(best: &Candidate, second: &Candidate, cfg: GlobalLocalizerConfig) -> bool {
+fn passes_score_ratio(best: &Candidate, second: &Candidate, cfg: GlobalAssociationConfig) -> bool {
     second.score > 0.0 && best.score / second.score >= cfg.score_ratio.max(1.0)
 }

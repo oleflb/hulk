@@ -1,16 +1,3 @@
 {
-  visual_feature_noise_variance: 3600.0,
-  global_localizer: {
-    min_inliers: 3,
-    min_confidence: 0.3,
-    min_detection_baseline: 0.1,
-    min_map_baseline: 0.25,
-    height_min: 0.2,
-    height_max: 1.0,
-    association_gate: 0.6,
-    rms_threshold: 0.45,
-    min_score: 0.0,
-    score_ratio: 1.05,
-    residual_weight: 0.1,
-  },
+  visual_feature_noise_variance: 100.0,
 }

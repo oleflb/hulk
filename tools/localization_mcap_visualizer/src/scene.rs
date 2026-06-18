@@ -8,7 +8,7 @@ use bevy::{
 };
 use bevy_panorbit_camera::PanOrbitCamera;
 use coordinate_systems::{Field, Robot};
-use localization_3d::GlobalLocalizationDetailedDebug;
+use field_mark_association::GlobalLocalizationDetailedDebug;
 use projection::camera_matrix::CameraMatrix;
 use types::field_dimensions::FieldDimensions;
 

@@ -56,7 +56,7 @@ pub(crate) enum GlobalLocalizationResult {
 }
 
 pub(super) struct Problem {
-    pub(super) cfg: GlobalLocalizerConfig,
+    pub(super) cfg: GlobalAssociationConfig,
     pub(super) k: Intrinsic,
     pub(super) ground_to_robot: Isometry3<Ground, Robot>,
     pub(super) robot_to_camera: Isometry3<Robot, Camera>,

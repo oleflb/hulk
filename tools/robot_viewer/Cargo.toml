@@ -14,6 +14,7 @@ eframe = { workspace = true }
 egui_bevy = { workspace = true }
 image = { workspace = true }
 kinematics = { workspace = true }
+field_mark_association = { workspace = true }
 linear_algebra = { workspace = true }
 nalgebra = { workspace = true }
 projection = { workspace = true }

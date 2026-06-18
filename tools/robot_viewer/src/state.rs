@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use coordinate_systems::{Field, Robot};
+use field_mark_association::FieldMarkAssociations;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
@@ -23,6 +24,7 @@ pub(crate) struct ViewerState {
     pub(crate) camera_frame: Option<CameraFrame>,
     pub(crate) camera_sequence: u64,
     pub(crate) detected_objects: Vec<Object<RobocupObjectLabel>>,
+    pub(crate) field_mark_associations: Option<FieldMarkAssociations>,
     pub(crate) field_status: StreamStatus,
     pub(crate) localization_status: StreamStatus,
     pub(crate) visual_odometer_status: StreamStatus,
@@ -31,6 +33,7 @@ pub(crate) struct ViewerState {
     pub(crate) calibrated_intrinsics_status: StreamStatus,
     pub(crate) camera_status: StreamStatus,
     pub(crate) objects_status: StreamStatus,
+    pub(crate) field_mark_associations_status: StreamStatus,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]

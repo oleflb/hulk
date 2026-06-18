@@ -9,14 +9,17 @@ use std::{
 
 use color_eyre::Result;
 use coordinate_systems::{Field, Robot};
+use field_mark_association::{
+    FieldMarkAssociationParameters, GlobalLocalizationDebugStatus, GlobalLocalizerParameters,
+    find_detected_visual_features, localize_global_visual_features,
+};
 use linear_algebra::IntoTransform;
 use localization_3d::{
-    GlobalLocalizationDebugStatus, GlobalLocalizerParameters, Localization3dParameters,
-    backend_configuration, find_detected_visual_features, ingest_foot_heights,
-    ingest_visual_odometry, localize_global_visual_features,
+    Localization3dParameters, backend_configuration, ingest_foot_heights, ingest_visual_odometry,
 };
 use localization_factrs::{
-    BackendConfiguration, VinsBackend, VinsFrontend, backend::BackendSolveDiagnostics, initialize,
+    BackendConfiguration, VinsBackend, VinsFrontend, VisualReprojectionAssociation,
+    backend::BackendSolveDiagnostics, initialize,
 };
 use nalgebra::SMatrix;
 use projection::camera_matrix::CameraMatrix;
@@ -46,18 +49,19 @@ pub struct ReplayParameters {
 
 impl Default for ReplayParameters {
     fn default() -> Self {
-        let node_parameters = Localization3dParameters::default();
+        let localization_parameters = Localization3dParameters::default();
+        let association_parameters = FieldMarkAssociationParameters::default();
         Self {
             timestamp_mode: TimestampMode::McapPublish,
             solve_cadence_ms: 30.0,
             optimizer_iterations: 5,
             max_window_seconds: 3.0,
-            visual_feature_noise_variance: node_parameters.visual_feature_noise_variance,
+            visual_feature_noise_variance: localization_parameters.visual_feature_noise_variance,
             visual_odometry_covariance: 1.0e-4,
             include_global_features: true,
             include_imu: true,
             include_foot_heights: true,
-            global_localizer: node_parameters.global_localizer,
+            global_localizer: association_parameters.global_localizer,
         }
     }
 }
@@ -382,6 +386,13 @@ fn ingest_global_features(
     if let Some(associations) = localization.unique_associations {
         stats.global_frames_ingested += 1;
         stats.global_associations_ingested += associations.len();
+        let associations =
+            associations
+                .into_iter()
+                .map(|association| VisualReprojectionAssociation {
+                    detection: association.detection,
+                    field_point: association.field_point,
+                });
         frontend.ingest_visual_reprojection_associations(
             event.publish_time,
             associations,

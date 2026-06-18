@@ -1,6 +1,5 @@
 use coordinate_systems::{Field, Ground, Pixel, Robot};
 use linear_algebra::{Isometry3, Point2};
-use localization_factrs::VisualReprojectionAssociation;
 use ros_z::Message;
 use serde::{Deserialize, Serialize};
 mod map;
@@ -12,17 +11,17 @@ pub(crate) const CLASS_COUNT: usize = 4;
 pub(crate) const GLOBAL_LOCALIZER_MAX_DETECTIONS: usize = 32;
 
 #[derive(Clone, Debug)]
-pub(crate) struct GlobalLocalizer {
-    config: GlobalLocalizerConfig,
+pub(crate) struct GlobalAssociator {
+    config: GlobalAssociationConfig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, Message)]
-#[serde(deny_unknown_fields)]
 /// Configuration for global field-feature association and pose recovery.
 ///
 /// These parameters gate detections, candidate associations, and uniqueness certification before
 /// any visual associations are exposed to the backend as fixed reprojection factors.
-pub struct GlobalLocalizerConfig {
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, Message)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalAssociationConfig {
     /// Minimum accepted fixed associations for any published result.
     pub min_inliers: usize,
     /// Minimum detector confidence for a field-feature detection.
@@ -47,7 +46,7 @@ pub struct GlobalLocalizerConfig {
     pub residual_weight: f32,
 }
 
-impl Default for GlobalLocalizerConfig {
+impl Default for GlobalAssociationConfig {
     fn default() -> Self {
         Self {
             min_inliers: 3,
@@ -65,7 +64,7 @@ impl Default for GlobalLocalizerConfig {
     }
 }
 
-impl GlobalLocalizerConfig {
+impl GlobalAssociationConfig {
     /// Validates that global-localizer parameters are finite, positive where required, and
     /// consistent with the solver's fixed detection cap.
     pub fn validate(&self) -> Result<(), String> {
@@ -132,9 +131,9 @@ fn validate_positive_f32(value: f32, message: &str) -> Result<(), String> {
     }
 }
 
-impl GlobalLocalizer {
+impl GlobalAssociator {
     /// Creates a global localizer with fixed association and scoring parameters.
-    pub fn new(config: GlobalLocalizerConfig) -> Self {
+    pub fn new(config: GlobalAssociationConfig) -> Self {
         Self { config }
     }
 
@@ -154,9 +153,9 @@ impl GlobalLocalizer {
     }
 }
 
-impl Default for GlobalLocalizer {
+impl Default for GlobalAssociator {
     fn default() -> Self {
-        Self::new(GlobalLocalizerConfig::default())
+        Self::new(GlobalAssociationConfig::default())
     }
 }
 
@@ -314,27 +313,11 @@ impl GlobalLocalizationResult {
         matches!(self, Self::UniqueModuloSymmetry(_))
     }
 
-    /// Converts certified associations into backend visual reprojection factors.
-    ///
-    /// Returns `None` for ambiguous results so unsafe hard associations are never ingested by the
-    /// optimizer.
-    pub fn unique_reprojection_associations(
-        &self,
-    ) -> Option<impl Iterator<Item = VisualReprojectionAssociation> + '_> {
-        let associations = match self {
-            Self::UniqueModuloSymmetry(associations) => associations,
-            Self::Ambiguous(_) => return None,
-        };
-
-        Some(
-            associations
-                .features
-                .iter()
-                .map(|association| VisualReprojectionAssociation {
-                    detection: association.detection,
-                    field_point: association.field_point.extend(0.0),
-                }),
-        )
+    pub(crate) fn unique_feature_associations(&self) -> Option<&[FeatureAssociation]> {
+        match self {
+            Self::UniqueModuloSymmetry(associations) => Some(&associations.features),
+            Self::Ambiguous(_) => None,
+        }
     }
 }
 
@@ -396,7 +379,7 @@ mod tests {
     fn recovers_mixed_feature_associations_with_static_height_gate() -> Result<(), String> {
         let field = FieldDimensions::SPL_2025;
         let features = synthetic_features(&field);
-        let localizer = GlobalLocalizer::default();
+        let localizer = GlobalAssociator::default();
 
         let Some(result) = localizer.localize(input(
             &features,
@@ -416,7 +399,7 @@ mod tests {
     fn rejects_static_height_outside_gate() {
         let field = FieldDimensions::SPL_2025;
         let features = synthetic_features(&field);
-        let localizer = GlobalLocalizer::new(GlobalLocalizerConfig {
+        let localizer = GlobalAssociator::new(GlobalAssociationConfig {
             height_max: 0.4,
             association_gate: 0.01,
             ..Default::default()
@@ -446,7 +429,7 @@ mod tests {
         {
             feature.confidence = 0.1;
         }
-        let localizer = GlobalLocalizer::default();
+        let localizer = GlobalAssociator::default();
 
         assert!(
             localizer

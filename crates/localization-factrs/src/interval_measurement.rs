@@ -2,7 +2,7 @@ use crate::{
     factors::{
         foot_above_ground::FootHeightMeasurement, visual_odometry::VisualOdometryMeasurement,
     },
-    measurements::{ImuMeasurement, VisualReprojectionMeasurement},
+    measurements::{ImuMeasurement, SensorMeasurement, VisualReprojectionMeasurement},
 };
 
 pub struct IntervalMeasurements {
@@ -24,6 +24,17 @@ impl IntervalMeasurements {
 
     pub fn push_imu(&mut self, imu: ImuMeasurement) {
         insert_sorted(&mut self.imu, imu, |imu| imu.time);
+    }
+
+    pub fn push(&mut self, measurement: SensorMeasurement) {
+        match measurement {
+            SensorMeasurement::Imu(imu) => self.push_imu(imu),
+            SensorMeasurement::Visual(visual) => self.push_visual(visual),
+            SensorMeasurement::VisualOdometry(visual_odometry) => {
+                self.push_visual_odometry(visual_odometry)
+            }
+            SensorMeasurement::FootHeights(foot_heights) => self.push_foot_heights(foot_heights),
+        }
     }
 
     pub fn push_visual(&mut self, visual: Vec<VisualReprojectionMeasurement>) {

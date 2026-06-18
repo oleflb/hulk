@@ -20,12 +20,12 @@ use eframe::{
 };
 use egui_bevy::BevyWidget;
 use egui_plot::{Line, Plot, PlotPoints};
-use linear_algebra::IntoTransform;
-use localization_3d::{
+use field_mark_association::{
     GlobalLocalizationDetailedDebug, GlobalLocalizerParameters, VisualFeatureClass,
-    find_detected_visual_features, initial_robot_to_field_from_camera_matrix,
-    localize_global_visual_features_detailed_debug,
+    find_detected_visual_features, localize_global_visual_features_detailed_debug,
 };
+use linear_algebra::IntoTransform;
+use localization_3d::initial_robot_to_field_from_camera_matrix;
 use projection::camera_matrix::CameraMatrix;
 use types::{
     field_dimensions::FieldDimensions,

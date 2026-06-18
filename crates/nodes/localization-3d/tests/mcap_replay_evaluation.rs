@@ -8,16 +8,19 @@ use std::{
 };
 
 use booster::ImuState;
+use field_mark_association::{
+    GlobalLocalizationDebugStatus, GlobalLocalizerParameters, find_detected_visual_features,
+    localize_global_visual_features,
+};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::IntoTransform;
 use localization_3d::{
-    GlobalLocalizationDebugStatus, GlobalLocalizerParameters, Localization3dParameters,
-    backend_configuration, find_detected_visual_features, ingest_foot_heights,
-    ingest_visual_odometry, initial_robot_to_field_from_camera_matrix,
-    initial_state_from_camera_matrix, localize_global_visual_features,
+    Localization3dParameters, backend_configuration, ingest_foot_heights, ingest_visual_odometry,
+    initial_robot_to_field_from_camera_matrix, initial_state_from_camera_matrix,
 };
 use localization_factrs::{
-    BackendConfiguration, VinsBackend, VinsFrontend, backend::BackendSolveDiagnostics, initialize,
+    BackendConfiguration, VinsBackend, VinsFrontend, VisualReprojectionAssociation,
+    backend::BackendSolveDiagnostics, initialize,
 };
 use mcap::{Message, MessageStream};
 use nalgebra::{SMatrix, SVector};
@@ -823,6 +826,13 @@ fn replay_graph_variant(
                     global_stats.frames_ingested += 1;
                     global_stats.accepted_associations += associations.len();
                     accepted_global_feature_times.push(event.publish_time);
+                    let associations =
+                        associations
+                            .into_iter()
+                            .map(|association| VisualReprojectionAssociation {
+                                detection: association.detection,
+                                field_point: association.field_point,
+                            });
                     frontend.ingest_visual_reprojection_associations(
                         event.publish_time,
                         associations,

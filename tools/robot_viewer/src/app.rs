@@ -9,6 +9,7 @@ use eframe::{
     },
 };
 use egui_bevy::BevyWidget;
+use field_mark_association::FieldMarkAssociations;
 use tokio::runtime::Runtime;
 use types::object_detection::{Object, RobocupObjectLabel};
 
@@ -147,6 +148,7 @@ impl RobotViewerApp {
                         );
                         stream_status(ui, "camera", &state.camera_status);
                         stream_status(ui, "objects", &state.objects_status);
+                        stream_status(ui, "associations", &state.field_mark_associations_status);
                         ui.separator();
                         ui.label(format!("pose: {}", pose_source_label(self.pose_source)));
                         if ui
@@ -205,12 +207,19 @@ impl RobotViewerApp {
                 .sense(Sense::hover()),
         );
         draw_detected_objects(ui, response.rect, image_size, &state.detected_objects);
+        if let Some(associations) = &state.field_mark_associations {
+            draw_field_mark_associations(ui, response.rect, image_size, associations);
+        }
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}x{}", frame.width, frame.height));
             ui.separator();
             ui.label(format!("{} detections", state.detected_objects.len()));
+            if let Some(associations) = &state.field_mark_associations {
+                ui.separator();
+                ui.label(format!("{} associations", associations.associations.len()));
+            }
             if let Some(intrinsics) = state.calibrated_intrinsics {
                 ui.separator();
                 ui.label(format!(
@@ -328,6 +337,41 @@ fn draw_detected_objects(
             color.gamma_multiply(0.85),
         );
         painter.galley(text_position, galley, Color32::WHITE);
+    }
+}
+
+fn draw_field_mark_associations(
+    ui: &mut Ui,
+    image_rect: Rect,
+    image_size: Vec2,
+    associations: &FieldMarkAssociations,
+) {
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+    let painter = ui.painter();
+    for (index, association) in associations.associations.iter().enumerate() {
+        let position = image_rect.min
+            + vec2(
+                association.detection.x() * scale.x,
+                association.detection.y() * scale.y,
+            );
+        if !image_rect.contains(position) {
+            continue;
+        }
+        painter.circle_stroke(
+            position,
+            7.0,
+            Stroke::new(2.5, Color32::from_rgb(255, 80, 200)),
+        );
+        painter.text(
+            position + vec2(8.0, -8.0),
+            egui::Align2::LEFT_TOP,
+            index.to_string(),
+            FontId::proportional(12.0),
+            Color32::from_rgb(255, 180, 235),
+        );
     }
 }
 
