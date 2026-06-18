@@ -126,7 +126,6 @@ pub struct ReplayStats {
     pub global_candidates: usize,
     pub global_none: usize,
     pub global_ambiguous: usize,
-    pub global_unique: usize,
     pub global_unique_modulo_symmetry: usize,
     pub global_frames_ingested: usize,
     pub global_associations_ingested: usize,
@@ -339,7 +338,7 @@ fn ingest_global_features(
     has_pending_measurements: &mut bool,
 ) -> Result<()> {
     stats.global_frames += 1;
-    let visual_features = find_detected_visual_features(objects.to_vec());
+    let visual_features = find_detected_visual_features(objects);
     if visual_features.supported_feature_count() < parameters.global_localizer.min_inliers.max(3) {
         return Ok(());
     }
@@ -373,7 +372,8 @@ fn ingest_global_features(
     match localization.debug.as_ref().map(|debug| debug.status) {
         None => stats.global_none += 1,
         Some(GlobalLocalizationDebugStatus::Ambiguous) => stats.global_ambiguous += 1,
-        Some(GlobalLocalizationDebugStatus::Unique) => stats.global_unique += 1,
+        #[allow(deprecated)]
+        Some(GlobalLocalizationDebugStatus::Unique) => stats.global_ambiguous += 1,
         Some(GlobalLocalizationDebugStatus::UniqueModuloSymmetry) => {
             stats.global_unique_modulo_symmetry += 1;
         }

@@ -6979,12 +6979,15 @@ dependencies = [
  "coordinate_systems",
  "geometry",
  "hsl_network_messages",
+ "hungarian_algorithm",
  "itertools 0.14.0",
  "kinematics",
  "linear_algebra",
  "localization-factrs",
  "mcap",
  "nalgebra 0.34.2",
+ "ndarray",
+ "ordered-float 4.6.0",
  "projection",
  "ros-z",
  "ros-z-cdr",
@@ -7028,6 +7031,7 @@ name = "localization_mcap_visualizer"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_panorbit_camera",
  "booster",
  "clap",
  "color-eyre",

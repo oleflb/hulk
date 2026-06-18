@@ -11,9 +11,12 @@ color-eyre = { workspace = true }
 coordinate_systems = { workspace = true }
 geometry = { workspace = true }
 hsl_network_messages = { workspace = true }
+hungarian_algorithm = { workspace = true }
 itertools = { workspace = true }
 linear_algebra = { workspace = true }
 nalgebra = { workspace = true }
+ndarray = { workspace = true }
+ordered-float = { workspace = true }
 ros-z = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 types = { workspace = true }

@@ -34,12 +34,12 @@ use types::{
 
 mod global_localizer;
 
-/// Global field-feature localizer thresholds.
+/// Public global-localization debug types and parameter thresholds.
 pub use global_localizer::{
     GlobalLocalizationDebugAssociation, GlobalLocalizationDebugDetection,
     GlobalLocalizationDebugProjection, GlobalLocalizationDetailedDebug,
-    GlobalLocalizationDetailedStatus, GlobalLocalizerConfig as GlobalLocalizerParameters,
-    VisualFeatureClass,
+    GlobalLocalizationDetailedStatus, GlobalLocalizationScore,
+    GlobalLocalizerConfig as GlobalLocalizerParameters, VisualFeatureClass,
 };
 
 /// Runtime parameters for the 3D localization node.
@@ -73,6 +73,7 @@ impl Localization3dParameters {
     }
 }
 
+/// Result of running visual global localization on one object-detection frame.
 pub struct GlobalVisualLocalization {
     /// Debug payload for the best visual global localization result, if any.
     pub debug: Option<GlobalLocalizationDebug>,
@@ -88,6 +89,10 @@ struct GlobalLocalizationTaskOutput {
     localization: GlobalVisualLocalization,
 }
 
+/// Builds the VINS backend configuration used by the localization node.
+///
+/// `visual_feature_noise_variance` is the pixel-space variance assigned to fixed
+/// field-feature reprojection factors that were accepted by global localization.
 pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfiguration {
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
@@ -105,10 +110,17 @@ pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfi
     }
 }
 
+/// Starts the localization node and erases the concrete future type for node runners.
+///
+/// `ctx` is the ROS-Z context used to create publishers, subscribers, caches, and parameters.
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(run(ctx))
 }
 
+/// Runs the asynchronous 3D localization node until its input streams terminate or fail.
+///
+/// The node consumes IMU, camera matrix, object detection, visual odometry, field-dimension,
+/// and kinematics topics, then publishes the optimized robot pose and debug streams.
 pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("localization3d").build().await?;
     let parameters = node.bind_parameter_as::<Localization3dParameters>("localization3d")?;
@@ -182,7 +194,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             // The detection publisher announces the originating image time as source time.
             objects = object_subscriber.recv_with_metadata(), if global_localization_task.is_none() => {
                 let objects = objects?;
-                let visual_features = find_detected_visual_features(objects.message);
+                let visual_features = find_detected_visual_features(&objects.message);
                 let parameters = parameters.snapshot().typed().clone();
                 if visual_features.supported_feature_count()
                     < parameters.global_localizer.min_inliers.max(3)
@@ -324,6 +336,12 @@ fn time_distance(a: Time, b: Time) -> Duration {
 }
 
 /// Runs global localization and returns debug data plus backend-safe associations.
+///
+/// `visual_features` are field-feature detections extracted from object detections.
+/// `camera_matrix` supplies the current camera geometry and intrinsics.
+/// `field_dimensions` define the fixed field landmark map.
+/// `pose_hint` only selects between the two symmetric final poses; it does not prune or score.
+/// `parameters` configure global-localizer gates and score thresholds.
 pub fn localize_global_visual_features(
     visual_features: &DetectedVisualFeatures,
     camera_matrix: &CameraMatrix,
@@ -352,6 +370,9 @@ pub fn localize_global_visual_features(
 }
 
 /// Runs global localization and returns per-feature debug data for visual inspection.
+///
+/// This follows the same inputs and safety contract as `localize_global_visual_features`, but
+/// returns projected landmark/debug association details instead of backend factors.
 pub fn localize_global_visual_features_detailed_debug(
     visual_features: &DetectedVisualFeatures,
     camera_matrix: &CameraMatrix,
@@ -375,7 +396,6 @@ fn global_localization_debug_from_result(
 ) -> GlobalLocalizationDebug {
     let status = match result {
         GlobalLocalizationResult::Ambiguous(_) => GlobalLocalizationDebugStatus::Ambiguous,
-        GlobalLocalizationResult::Unique(_) => GlobalLocalizationDebugStatus::Unique,
         GlobalLocalizationResult::UniqueModuloSymmetry(_) => {
             GlobalLocalizationDebugStatus::UniqueModuloSymmetry
         }
@@ -385,6 +405,8 @@ fn global_localization_debug_from_result(
         robot_to_field: associations.robot_to_field,
         status,
         inliers: associations.score.inliers,
+        candidate_score: associations.score.candidate_score,
+        metric_rms_residual: associations.score.metric_rms_residual,
         reprojection_rmse: associations.score.reprojection_rmse,
         total_cost: associations.score.total_cost,
     }
@@ -402,6 +424,10 @@ async fn wait_for_initial_state(
     }
 }
 
+/// Constructs the backend initial state from the first live camera matrix.
+///
+/// The initial pose uses the observed robot height and orientation, zero velocity, and the camera
+/// intrinsics contained in `camera_matrix`.
 pub fn initial_state_from_camera_matrix(camera_matrix: &CameraMatrix) -> InitialState {
     let initial_pose = initial_robot_to_field_from_camera_matrix(camera_matrix).inner;
 
@@ -412,6 +438,10 @@ pub fn initial_state_from_camera_matrix(camera_matrix: &CameraMatrix) -> Initial
     )
 }
 
+/// Estimates the initial robot pose in the field frame from live camera geometry.
+///
+/// The pose preserves measured robot height and ground orientation while initializing the robot at
+/// the field origin in x/y.
 pub fn initial_robot_to_field_from_camera_matrix(
     camera_matrix: &CameraMatrix,
 ) -> Isometry3<Robot, Field, f64> {
@@ -423,6 +453,7 @@ pub fn initial_robot_to_field_from_camera_matrix(
     .framed_transform()
 }
 
+/// Converts ROS-Z camera-matrix intrinsics into the optimizer camera-intrinsics type.
 pub fn camera_intrinsics_from_matrix(camera_matrix: &CameraMatrix) -> CameraIntrinsics {
     CameraIntrinsics::new(
         nalgebra::vector![
@@ -436,6 +467,7 @@ pub fn camera_intrinsics_from_matrix(camera_matrix: &CameraMatrix) -> CameraIntr
     )
 }
 
+/// Converts optimizer camera intrinsics back into the projection crate's intrinsic model.
 pub fn intrinsic_from_camera_intrinsics(camera_intrinsics: &CameraIntrinsics) -> Intrinsic {
     let focals = camera_intrinsics.focals();
     let optical_center = camera_intrinsics.optical_center();
@@ -445,19 +477,53 @@ pub fn intrinsic_from_camera_intrinsics(camera_intrinsics: &CameraIntrinsics) ->
     )
 }
 
-pub fn find_detected_goalposts(detections: Vec<Object<RobocupObjectLabel>>) -> Vec<Point2<Pixel>> {
-    find_detected_visual_features(detections).goalposts
+/// Extracts goalpost image points from object detections.
+///
+/// Goalpost detections use the bottom-center pixel of the bounding box because that approximates
+/// the post contact point with the field.
+pub fn find_detected_goalposts(detections: &[Object<RobocupObjectLabel>]) -> Vec<Point2<Pixel>> {
+    find_detected_visual_features(detections)
+        .goalposts
+        .into_iter()
+        .map(|feature| feature.pixel)
+        .collect()
 }
 
+/// Field-feature detection used by global localization.
+///
+/// `pixel` is the image point fed to projection: spot detections use the box
+/// center, while goalposts use the bottom center. `confidence` is the detector
+/// score in `[0, 1]`; non-finite scores or scores below the configured minimum
+/// are ignored by the global localizer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetectedVisualFeature {
+    /// Image point used for projection and association.
+    pub pixel: Point2<Pixel>,
+    /// Detector confidence in `[0, 1]`; invalid or low-confidence detections are ignored later.
+    pub confidence: f32,
+}
+
+impl DetectedVisualFeature {
+    fn new(pixel: Point2<Pixel>, confidence: f32) -> Self {
+        Self { pixel, confidence }
+    }
+}
+
+/// Field-feature detections grouped by the landmark class used by global localization.
 #[derive(Debug, Default, PartialEq)]
 pub struct DetectedVisualFeatures {
-    pub goalposts: Vec<Point2<Pixel>>,
-    pub l_spots: Vec<Point2<Pixel>>,
-    pub t_spots: Vec<Point2<Pixel>>,
-    pub penalty_spots: Vec<Point2<Pixel>>,
+    /// Goalpost detections, represented by bottom-center image points.
+    pub goalposts: Vec<DetectedVisualFeature>,
+    /// L-crossing spot detections, represented by bounding-box centers.
+    pub l_spots: Vec<DetectedVisualFeature>,
+    /// T-crossing spot detections, represented by bounding-box centers.
+    pub t_spots: Vec<DetectedVisualFeature>,
+    /// Penalty spot detections, represented by bounding-box centers.
+    pub penalty_spots: Vec<DetectedVisualFeature>,
 }
 
 impl DetectedVisualFeatures {
+    /// Counts detections from classes supported by global localization.
     pub fn supported_feature_count(&self) -> usize {
         self.goalposts.len() + self.l_spots.len() + self.t_spots.len() + self.penalty_spots.len()
     }
@@ -468,55 +534,71 @@ impl DetectedVisualFeatures {
 pub struct GlobalLocalizationDebug {
     /// Best robot pose in the field frame for this visual result.
     pub robot_to_field: Isometry3<Robot, Field>,
-    /// Whether the best result is ambiguous, unique, or unique modulo field symmetry.
+    /// Whether the best result is ambiguous or unique modulo field symmetry.
     pub status: GlobalLocalizationDebugStatus,
-    /// Number of fixed feature associations accepted by the reprojection gate.
+    /// Number of fixed feature associations accepted by the global-localizer gates.
     pub inliers: usize,
     /// Root-mean-square reprojection error in pixels.
     pub reprojection_rmse: f32,
     /// Sum of squared reprojection errors in pixels squared.
     pub total_cost: f32,
+    /// Weighted internal candidate score used by `min_score` and `score_ratio`.
+    pub candidate_score: f32,
+    /// Metric field-space RMS residual used by `rms_threshold`.
+    pub metric_rms_residual: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Message)]
 /// Classification of a successful global localization result.
 pub enum GlobalLocalizationDebugStatus {
-    /// A plausible non-symmetric alternative assignment remains.
+    /// Uniqueness was not certified because a competitor may remain or the bounded search ended
+    /// inconclusively.
     Ambiguous,
-    /// No plausible alternative survived the deterministic search.
+    /// Reserved old wire tag for the removed strict-unique status. New code must not emit it.
+    #[deprecated(note = "strict unique is no longer emitted; use UniqueModuloSymmetry")]
     Unique,
     /// The assignment is unique after quotienting the unavoidable 180 degree
     /// field symmetry. The chosen branch follows the pose hint when available.
     UniqueModuloSymmetry,
 }
 
+/// Extracts all field-feature detections supported by global localization.
+///
+/// Goalposts use the bounding-box bottom center; spot-like landmarks use the bounding-box center.
 pub fn find_detected_visual_features(
-    detections: Vec<Object<RobocupObjectLabel>>,
+    detections: &[Object<RobocupObjectLabel>],
 ) -> DetectedVisualFeatures {
     detections
-        .into_iter()
+        .iter()
         .fold(DetectedVisualFeatures::default(), |mut features, object| {
+            let confidence = object.bounding_box.confidence;
             match object.label {
-                RobocupObjectLabel::GoalPost => {
-                    features.goalposts.push(pixel_bottom_center(object))
-                }
-                RobocupObjectLabel::LSpot => features.l_spots.push(pixel_center(object)),
-                RobocupObjectLabel::TSpot => features.t_spots.push(pixel_center(object)),
-                RobocupObjectLabel::PenaltySpot => {
-                    features.penalty_spots.push(pixel_center(object))
-                }
+                RobocupObjectLabel::GoalPost => features.goalposts.push(
+                    DetectedVisualFeature::new(pixel_bottom_center(&object), confidence),
+                ),
+                RobocupObjectLabel::LSpot => features.l_spots.push(DetectedVisualFeature::new(
+                    pixel_center(&object),
+                    confidence,
+                )),
+                RobocupObjectLabel::TSpot => features.t_spots.push(DetectedVisualFeature::new(
+                    pixel_center(&object),
+                    confidence,
+                )),
+                RobocupObjectLabel::PenaltySpot => features.penalty_spots.push(
+                    DetectedVisualFeature::new(pixel_center(&object), confidence),
+                ),
                 _ => {}
             }
             features
         })
 }
 
-fn pixel_bottom_center(object: Object<RobocupObjectLabel>) -> Point2<Pixel> {
+fn pixel_bottom_center(object: &Object<RobocupObjectLabel>) -> Point2<Pixel> {
     let area = object.bounding_box.area;
     point![(area.min.x() + area.max.x()) * 0.5, area.max.y()]
 }
 
-fn pixel_center(object: Object<RobocupObjectLabel>) -> Point2<Pixel> {
+fn pixel_center(object: &Object<RobocupObjectLabel>) -> Point2<Pixel> {
     let area = object.bounding_box.area;
     point![
         (area.min.x() + area.max.x()) * 0.5,
@@ -524,6 +606,10 @@ fn pixel_center(object: Object<RobocupObjectLabel>) -> Point2<Pixel> {
     ]
 }
 
+/// Ingests one visual-odometry delta into the VINS frontend.
+///
+/// `previous_camera_matrix` and `current_camera_matrix` provide the robot-to-camera extrinsics for
+/// the two endpoints of the visual-odometry measurement.
 pub fn ingest_visual_odometry(
     frontend: &mut VinsFrontend,
     delta: VisualOdometryDeltaMessage,
@@ -539,6 +625,10 @@ pub fn ingest_visual_odometry(
     )
 }
 
+/// Ingests left and right foot-height observations into the VINS frontend.
+///
+/// The sole positions are read from `robot_kinematics` in the robot frame and timestamped with the
+/// kinematics message time.
 pub fn ingest_foot_heights(
     frontend: &mut VinsFrontend,
     robot_kinematics: TimeWrapper<RobotKinematics>,
@@ -598,7 +688,7 @@ mod tests {
             },
         }];
 
-        let goalposts = find_detected_goalposts(detections);
+        let goalposts = find_detected_goalposts(&detections);
 
         assert_eq!(goalposts.len(), 1);
         assert_eq!(goalposts[0], point![20.0, 50.0]);
@@ -639,11 +729,18 @@ mod tests {
             },
         ];
 
-        let features = find_detected_visual_features(detections);
+        let features = find_detected_visual_features(&detections);
 
-        assert_eq!(features.l_spots, vec![point![20.0, 35.0]]);
-        assert_eq!(features.t_spots, vec![point![50.0, 70.0]]);
-        assert_eq!(features.penalty_spots, vec![point![80.0, 100.0]]);
+        assert_eq!(feature_pixels(&features.l_spots), vec![point![20.0, 35.0]]);
+        assert_eq!(feature_pixels(&features.t_spots), vec![point![50.0, 70.0]]);
+        assert_eq!(
+            feature_pixels(&features.penalty_spots),
+            vec![point![80.0, 100.0]]
+        );
+        assert_eq!(
+            features.l_spots.first().map(|feature| feature.confidence),
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -756,5 +853,9 @@ mod tests {
 
         assert!((left - nalgebra::Point3::new(0.1, 0.2, -0.3)).norm() < 1.0e-6);
         assert!((right - nalgebra::Point3::new(0.4, -0.5, -0.6)).norm() < 1.0e-6);
+    }
+
+    fn feature_pixels(features: &[DetectedVisualFeature]) -> Vec<Point2<Pixel>> {
+        features.iter().map(|feature| feature.pixel).collect()
     }
 }

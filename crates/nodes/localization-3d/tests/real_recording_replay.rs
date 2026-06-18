@@ -37,11 +37,11 @@ const EXPECTED_IMU_SAMPLE_COUNT: usize = 5981;
 const EXPECTED_CAMERA_MATRIX_COUNT: usize = 4923;
 const EXPECTED_FIELD_DIMENSIONS_COUNT: usize = 6;
 const EXPECTED_DETECTED_OBJECT_FRAME_COUNT: usize = 710;
-// Goalpost-only global localizations are unique modulo the unavoidable 180 degree
-// field symmetry and are therefore safe to ingest as fixed associations.
-const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 109;
-const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 137;
-const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 47;
+// Static-height-gated global localizations are ingested only when the landmark
+// associations are unique enough to be safe as fixed backend factors.
+const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 75;
+const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 84;
+const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 41;
 const EXPECTED_GOALPOST_DETECTION_COUNT: usize = 723;
 const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 185;
 const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 170;
@@ -157,7 +157,7 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                 object_frame_count += 1;
                 let objects: Vec<Object<RobocupObjectLabel>> =
                     serde_json::from_value(envelope.message)?;
-                let visual_features = find_detected_visual_features(objects);
+                let visual_features = find_detected_visual_features(&objects);
                 if visual_features.goalposts.is_empty()
                     && visual_features.l_spots.is_empty()
                     && visual_features.t_spots.is_empty()

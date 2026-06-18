@@ -446,7 +446,7 @@ impl LocalizationMcapVisualizerApp {
         objects: &[Object<RobocupObjectLabel>],
     ) -> Option<GlobalLocalizationDetailedDebug> {
         let camera_matrix = camera_matrix?;
-        let visual_features = find_detected_visual_features(objects.to_vec());
+        let visual_features = find_detected_visual_features(objects);
         if visual_features.supported_feature_count()
             < self.parameters.global_localizer.min_inliers.max(3)
         {
@@ -565,19 +565,88 @@ impl LocalizationMcapVisualizerApp {
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("reprojection gate px");
+                    ui.label("min confidence");
                     ui.add(
-                        DragValue::new(&mut self.parameters.global_localizer.reprojection_gate)
-                            .speed(1.0)
-                            .range(1.0..=500.0),
+                        DragValue::new(&mut self.parameters.global_localizer.min_confidence)
+                            .speed(0.01)
+                            .range(0.0..=1.0),
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("ambiguity margin px");
+                    ui.label("detection baseline");
                     ui.add(
-                        DragValue::new(&mut self.parameters.global_localizer.ambiguity_rmse_margin)
+                        DragValue::new(
+                            &mut self.parameters.global_localizer.min_detection_baseline,
+                        )
+                        .speed(0.01)
+                        .range(0.01..=2.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("map baseline m");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.min_map_baseline)
                             .speed(0.01)
-                            .range(0.0..=50.0),
+                            .range(0.01..=2.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("height min/max");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.height_min)
+                            .speed(0.01)
+                            .range(0.05..=2.0),
+                    );
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.height_max)
+                            .speed(0.01)
+                            .range(0.05..=2.0),
+                    );
+                });
+                if self.parameters.global_localizer.height_min
+                    > self.parameters.global_localizer.height_max
+                {
+                    self.parameters.global_localizer.height_max =
+                        self.parameters.global_localizer.height_min;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("association gate m");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.association_gate)
+                            .speed(0.01)
+                            .range(0.05..=2.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("RMS threshold m");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.rms_threshold)
+                            .speed(0.01)
+                            .range(0.01..=2.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("min score");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.min_score)
+                            .speed(0.01)
+                            .range(0.0..=10.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("score ratio");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.score_ratio)
+                            .speed(0.01)
+                            .range(1.0..=10.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("residual weight");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.global_localizer.residual_weight)
+                            .speed(0.01)
+                            .range(0.0..=10.0),
                     );
                 });
                 ui.separator();
@@ -851,6 +920,14 @@ impl LocalizationMcapVisualizerApp {
         };
         ui.label(format!("status: {:?}", debug.status));
         ui.label(format!("inliers: {}", debug.score.inliers));
+        ui.label(format!(
+            "candidate score: {:.3}",
+            debug.score.candidate_score
+        ));
+        ui.label(format!(
+            "metric RMS: {:.3}m",
+            debug.score.metric_rms_residual
+        ));
         ui.label(format!("RMSE: {:.2}px", debug.score.reprojection_rmse));
         ui.label(format!("total cost: {:.1}", debug.score.total_cost));
         ui.label(format!(

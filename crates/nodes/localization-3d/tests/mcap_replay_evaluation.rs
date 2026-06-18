@@ -2,15 +2,14 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fs,
-    io::{BufWriter, Write},
+    io::{BufWriter, Error as IoError, ErrorKind, Write},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use booster::ImuState;
-use coordinate_systems::Pixel;
 use kinematics::robot_kinematics::RobotKinematics;
-use linear_algebra::{IntoTransform, vector};
+use linear_algebra::IntoTransform;
 use localization_3d::{
     GlobalLocalizationDebugStatus, GlobalLocalizerParameters, Localization3dParameters,
     backend_configuration, find_detected_visual_features, ingest_foot_heights,
@@ -24,13 +23,19 @@ use mcap::{Message, MessageStream};
 use nalgebra::{SMatrix, SVector};
 use projection::camera_matrix::CameraMatrix;
 use ros_z::time::Time;
-use ros_z_cdr::{LittleEndian, from_bytes};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use types::{
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
     time_wrapper::TimeWrapper,
     visual_odometry::VisualOdometryDelta,
+};
+
+#[path = "support/recording_decode.rs"]
+mod recording_decode;
+
+use recording_decode::{
+    WireIsometry3, decode_recorded_camera_matrix, decode_recorded_message, decode_time_prefix,
 };
 
 const DEFAULT_RECORDING_RELATIVE_PATH: &str = "../../../recording.mcap";
@@ -687,7 +692,7 @@ fn replay_graph_variant(
     let mut alignment = None;
     let mut has_pending_measurements = false;
     let mut next_solve_time = recording.start_log_time() + solve_cadence;
-    let global_localizer_parameters = global_localizer_parameters();
+    let global_localizer_parameters = global_localizer_parameters()?;
 
     for event in &recording.events {
         while next_solve_time <= event.log_time {
@@ -775,7 +780,7 @@ fn replay_graph_variant(
             }
             EventKind::DetectedObjects(objects) if variant.include_global_features => {
                 global_stats.detected_object_frames += 1;
-                let visual_features = find_detected_visual_features(objects.clone());
+                let visual_features = find_detected_visual_features(objects);
                 if visual_features.supported_feature_count()
                     < global_localizer_parameters.min_inliers.max(3)
                 {
@@ -806,8 +811,9 @@ fn replay_graph_variant(
                     Some(GlobalLocalizationDebugStatus::Ambiguous) => {
                         global_stats.localizer_ambiguous += 1;
                     }
+                    #[allow(deprecated)]
                     Some(GlobalLocalizationDebugStatus::Unique) => {
-                        global_stats.localizer_unique += 1;
+                        global_stats.localizer_ambiguous += 1;
                     }
                     Some(GlobalLocalizationDebugStatus::UniqueModuloSymmetry) => {
                         global_stats.localizer_unique_modulo_symmetry += 1;
@@ -1027,7 +1033,6 @@ struct GlobalFeatureReplayStats {
     localizer_candidate_frames: usize,
     localizer_none: usize,
     localizer_ambiguous: usize,
-    localizer_unique: usize,
     localizer_unique_modulo_symmetry: usize,
     frames_ingested: usize,
     accepted_associations: usize,
@@ -1574,29 +1579,93 @@ fn max_optimization_window_override() -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn global_localizer_parameters() -> GlobalLocalizerParameters {
+fn global_localizer_parameters() -> Result<GlobalLocalizerParameters, Box<dyn Error>> {
+    reject_removed_env("LOCALIZATION_3D_REPLAY_GLOBAL_REPROJECTION_GATE")?;
+    reject_removed_env("LOCALIZATION_3D_REPLAY_GLOBAL_AMBIGUITY_RMSE_MARGIN")?;
+
     let mut parameters = GlobalLocalizerParameters::default();
-    if let Some(min_inliers) = std::env::var("LOCALIZATION_3D_REPLAY_GLOBAL_MIN_INLIERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-    {
+    if let Some(min_inliers) = usize_env("LOCALIZATION_3D_REPLAY_GLOBAL_MIN_INLIERS")? {
         parameters.min_inliers = min_inliers;
     }
-    if let Some(reprojection_gate) =
-        std::env::var("LOCALIZATION_3D_REPLAY_GLOBAL_REPROJECTION_GATE")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
-    {
-        parameters.reprojection_gate = reprojection_gate;
+    if let Some(min_confidence) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_MIN_CONFIDENCE")? {
+        parameters.min_confidence = min_confidence;
     }
-    if let Some(ambiguity_rmse_margin) =
-        std::env::var("LOCALIZATION_3D_REPLAY_GLOBAL_AMBIGUITY_RMSE_MARGIN")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
+    if let Some(min_detection_baseline) =
+        f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_MIN_DETECTION_BASELINE")?
     {
-        parameters.ambiguity_rmse_margin = ambiguity_rmse_margin;
+        parameters.min_detection_baseline = min_detection_baseline;
+    }
+    if let Some(min_map_baseline) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_MIN_MAP_BASELINE")? {
+        parameters.min_map_baseline = min_map_baseline;
+    }
+    if let Some(height_min) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_HEIGHT_MIN")? {
+        parameters.height_min = height_min;
+    }
+    if let Some(height_max) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_HEIGHT_MAX")? {
+        parameters.height_max = height_max;
+    }
+    if let Some(association_gate) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_ASSOCIATION_GATE")? {
+        parameters.association_gate = association_gate;
+    }
+    if let Some(rms_threshold) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_RMS_THRESHOLD")? {
+        parameters.rms_threshold = rms_threshold;
+    }
+    if let Some(min_score) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_MIN_SCORE")? {
+        parameters.min_score = min_score;
+    }
+    if let Some(score_ratio) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_SCORE_RATIO")? {
+        parameters.score_ratio = score_ratio;
+    }
+    if let Some(residual_weight) = f32_env("LOCALIZATION_3D_REPLAY_GLOBAL_RESIDUAL_WEIGHT")? {
+        parameters.residual_weight = residual_weight;
     }
     parameters
+        .validate()
+        .map_err(|error| IoError::new(ErrorKind::InvalidInput, error))?;
+    Ok(parameters)
+}
+
+fn reject_removed_env(name: &str) -> Result<(), IoError> {
+    if std::env::var_os(name).is_some() {
+        Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{name} was removed; use LOCALIZATION_3D_REPLAY_GLOBAL_ASSOCIATION_GATE, \
+                 LOCALIZATION_3D_REPLAY_GLOBAL_RMS_THRESHOLD, and \
+                 LOCALIZATION_3D_REPLAY_GLOBAL_SCORE_RATIO instead"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn usize_env(name: &str) -> Result<Option<usize>, IoError> {
+    parse_env(name)
+}
+
+fn f32_env(name: &str) -> Result<Option<f32>, IoError> {
+    parse_env(name)
+}
+
+fn parse_env<T>(name: &str) -> Result<Option<T>, IoError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Ok(value) => value.parse::<T>().map(Some).map_err(|error| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid {name}={value:?}: {error}"),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid {name}: {error}"),
+        )),
+    }
 }
 
 fn robot_delta_from_visual_odometry_delta(
@@ -1616,103 +1685,11 @@ fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
     (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
 }
 
-fn decode_message<T>(data: &[u8]) -> Result<T, Box<dyn Error>>
-where
-    T: DeserializeOwned,
-{
-    let (value, _consumed) = from_bytes::<T, LittleEndian>(cdr_payload(data))?;
-    Ok(value)
-}
-
-fn cdr_payload(data: &[u8]) -> &[u8] {
-    if data.len() >= 4 && matches!(&data[..4], [0, 1, 0, 0] | [0, 0, 0, 0]) {
-        &data[4..]
-    } else {
-        data
-    }
-}
-
-fn decode_time_prefix(data: &[u8]) -> Result<Time, Box<dyn Error>> {
-    let data = cdr_payload(data);
-    if data.len() < 12 {
-        return Err("payload too short for Time prefix".into());
-    }
-    let secs = u64::from_le_bytes(data[0..8].try_into()?);
-    let nanos = u32::from_le_bytes(data[8..12].try_into()?);
-    let total_nanos = secs
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::from(nanos));
-    Ok(Time::from_nanos(total_nanos.min(i64::MAX as u64) as i64))
-}
-
-#[derive(Deserialize)]
-struct WireTimeWrapper<T> {
-    time: Time,
-    inner: T,
-}
-
-#[derive(Deserialize)]
-struct WireCameraMatrix {
-    ground_to_robot: WireIsometry3,
-    robot_to_head: WireIsometry3,
-    head_to_camera: WireIsometry3,
-    intrinsics: WireIntrinsic,
-    field_of_view: [f32; 2],
-    horizon: Option<WireHorizon>,
-    image_size: [f32; 2],
-}
-
-#[derive(Deserialize)]
-struct WireIntrinsic {
-    focals: [f32; 2],
-    optical_center: [f32; 2],
-}
-
-#[derive(Deserialize)]
-struct WireHorizon {
-    vanishing_point: [f32; 2],
-    normal: [f32; 2],
-}
-
 #[derive(Deserialize)]
 struct WireVisualOdometryDelta {
     previous_time: Time,
     current_time: Time,
     current_left_camera_to_previous_left_camera: WireIsometry3,
-}
-
-#[derive(Deserialize)]
-struct WireIsometry3 {
-    rotation: [f32; 4],
-    translation: [f32; 3],
-}
-
-impl WireCameraMatrix {
-    fn into_camera_matrix(self) -> CameraMatrix {
-        let image_size: linear_algebra::Vector2<Pixel> =
-            vector![self.image_size[0], self.image_size[1]];
-        let normalized_focal = nalgebra::vector![
-            self.intrinsics.focals[0] / image_size.inner.x,
-            self.intrinsics.focals[1] / image_size.inner.y,
-        ];
-        let normalized_center = nalgebra::point![
-            self.intrinsics.optical_center[0] / image_size.inner.x,
-            self.intrinsics.optical_center[1] / image_size.inner.y,
-        ];
-        let _ = self.field_of_view;
-        if let Some(horizon) = self.horizon {
-            let _ = (horizon.vanishing_point, horizon.normal);
-        }
-
-        CameraMatrix::from_normalized_focal_and_center(
-            normalized_focal,
-            normalized_center,
-            image_size,
-            self.ground_to_robot.framed(),
-            self.robot_to_head.framed(),
-            self.head_to_camera.framed(),
-        )
-    }
 }
 
 impl WireVisualOdometryDelta {
@@ -1727,57 +1704,11 @@ impl WireVisualOdometryDelta {
     }
 }
 
-impl WireIsometry3 {
-    fn into_isometry(self) -> nalgebra::Isometry3<f32> {
-        let rotation = nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
-            self.rotation[3],
-            self.rotation[0],
-            self.rotation[1],
-            self.rotation[2],
-        ));
-        nalgebra::Isometry3::from_parts(
-            nalgebra::Translation3::new(
-                self.translation[0],
-                self.translation[1],
-                self.translation[2],
-            ),
-            rotation,
-        )
-    }
-
-    fn framed<From, To>(self) -> linear_algebra::Isometry3<From, To> {
-        self.into_isometry().framed_transform()
-    }
-}
-
-fn decode_recorded_camera_matrix(
-    message: &Message<'_>,
-) -> Result<TimeWrapper<CameraMatrix>, Box<dyn Error>> {
-    let wire: WireTimeWrapper<WireCameraMatrix> = decode_recorded_message(message)?;
-    Ok(TimeWrapper {
-        time: wire.time,
-        inner: wire.inner.into_camera_matrix(),
-    })
-}
-
 fn decode_recorded_visual_odometry(
     message: &Message<'_>,
 ) -> Result<VisualOdometryDelta, Box<dyn Error>> {
     let wire: WireVisualOdometryDelta = decode_recorded_message(message)?;
     Ok(wire.into_visual_odometry_delta())
-}
-
-fn decode_recorded_message<T>(message: &Message<'_>) -> Result<T, Box<dyn Error>>
-where
-    T: DeserializeOwned,
-{
-    decode_message(&message.data).map_err(|error| {
-        format!(
-            "failed to decode topic {} sequence {}: {error}",
-            message.channel.topic, message.sequence
-        )
-        .into()
-    })
 }
 
 fn write_summary_json(output_dir: &PathBuf, report: &ReplayReport) -> Result<(), Box<dyn Error>> {
