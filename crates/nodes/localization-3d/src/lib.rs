@@ -59,13 +59,13 @@ pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfi
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
         max_optimization_window: Duration::from_secs(3),
-        optimizer_max_iterations: 5,
+        optimizer_max_iterations: 15,
         gyroscope_process_noise: Matrix3::identity() * 0.01,
         roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
         accelerometer_process_noise: Matrix3::identity() * 0.01,
         visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
-        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-4,
+        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-3,
         foot_ground_softness: 1.0e-3,
         foot_ground_sigma: 0.01,
         gravity: Vector3::new(0.0, 0.0, 9.81),

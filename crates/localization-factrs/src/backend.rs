@@ -45,8 +45,8 @@ use tokio::sync::{
     watch,
 };
 
-const INITIAL_CAMERA_INTRINSICS_PRIOR_SIGMA: f64 = 1.0e-6;
-const INITIAL_POSE_PRIOR_SIGMA: f64 = 1.0e-1;
+const INITIAL_CAMERA_INTRINSICS_PRIOR_SIGMA: f64 = 1e-3;
+const INITIAL_POSE_PRIOR_SIGMA: f64 = 10.0;
 // Empty intervals are inserted only to keep graph components connected across
 // dropped recording data. They use zero-start-velocity GP priors so stale
 // pre-gap velocity is not treated as measured ballistic motion.
