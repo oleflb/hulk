@@ -1,17 +1,23 @@
 use std::sync::{Arc, Mutex};
 
+use coordinate_systems::{Camera, Field, Robot};
 use eframe::{
     App, CreationContext, Frame,
     egui::{
-        self, CentralPanel, Color32, ColorImage, Context, FontId, Rect, RichText, Sense, SidePanel,
-        Stroke, StrokeKind, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2, Widget, pos2,
-        vec2,
+        self, CentralPanel, Color32, ColorImage, Context, FontId, PointerButton, Pos2, Rect,
+        RichText, Sense, SidePanel, Stroke, StrokeKind, TextureHandle, TextureOptions,
+        TopBottomPanel, Ui, Vec2, Widget, pos2, vec2,
     },
 };
 use egui_bevy::BevyWidget;
 use field_mark_association::FieldMarkAssociations;
+use linear_algebra::{Isometry3, Point2, point};
+use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use tokio::runtime::Runtime;
-use types::object_detection::{Object, RobocupObjectLabel};
+use types::{
+    field_dimensions::FieldDimensions,
+    object_detection::{Object, RobocupObjectLabel},
+};
 
 use crate::{
     cli::Arguments,
@@ -31,8 +37,20 @@ pub(crate) struct RobotViewerApp {
     pose_source: PoseSource,
     camera_texture: Option<TextureHandle>,
     camera_texture_sequence: u64,
+    camera_zoom: f32,
+    camera_pan: Vec2,
+    show_projected_field_lines: bool,
     _runtime: Arc<Runtime>,
 }
+
+const CAMERA_MIN_ZOOM: f32 = 1.0;
+const CAMERA_MAX_ZOOM: f32 = 25.0;
+const CAMERA_FOOTER_HEIGHT: f32 = 88.0;
+const FIELD_LINE_SAMPLE_STEP: f32 = 0.05;
+const PROJECTED_FIELD_LINE_STROKE: Stroke = Stroke {
+    width: 2.0,
+    color: Color32::from_rgba_premultiplied(80, 220, 255, 190),
+};
 
 impl RobotViewerApp {
     pub(crate) fn new(
@@ -71,6 +89,9 @@ impl RobotViewerApp {
             pose_source: PoseSource::default(),
             camera_texture: None,
             camera_texture_sequence: 0,
+            camera_zoom: 1.0,
+            camera_pan: Vec2::ZERO,
+            show_projected_field_lines: false,
             _runtime: runtime,
         }
     }
@@ -191,24 +212,38 @@ impl RobotViewerApp {
             });
             return;
         };
-        let Some(texture) = &self.camera_texture else {
+        let Some(texture_id) = self.camera_texture.as_ref().map(TextureHandle::id) else {
             return;
         };
 
         let image_size = vec2(frame.width as f32, frame.height as f32);
         let available = ui.available_size().max(vec2(1.0, 1.0));
-        let scale = (available.x / image_size.x)
-            .min((available.y - 72.0).max(1.0) / image_size.y)
-            .max(0.05);
+        let viewport_size = vec2(available.x, (available.y - CAMERA_FOOTER_HEIGHT).max(1.0));
 
-        let response = ui.add(
-            egui::Image::new((texture.id(), texture.size_vec2()))
-                .fit_to_exact_size(image_size * scale)
-                .sense(Sense::hover()),
+        let (viewport_rect, response) =
+            ui.allocate_exact_size(viewport_size, Sense::click_and_drag());
+        self.update_camera_view(ui, &response, viewport_rect, image_size);
+
+        let image_rect = self.camera_image_rect(viewport_rect, image_size);
+        ui.painter_at(viewport_rect).image(
+            texture_id,
+            image_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
         );
-        draw_detected_objects(ui, response.rect, image_size, &state.detected_objects);
+
+        if self.show_projected_field_lines {
+            draw_projected_field_lines(ui, viewport_rect, image_rect, image_size, state);
+        }
+        draw_detected_objects(
+            ui,
+            viewport_rect,
+            image_rect,
+            image_size,
+            &state.detected_objects,
+        );
         if let Some(associations) = &state.field_mark_associations {
-            draw_field_mark_associations(ui, response.rect, image_size, associations);
+            draw_field_mark_associations(ui, viewport_rect, image_rect, image_size, associations);
         }
 
         ui.add_space(8.0);
@@ -230,7 +265,67 @@ impl RobotViewerApp {
                     intrinsics.optical_center.y(),
                 ));
             }
+            ui.separator();
+            ui.label(format!("zoom {:.1}x", self.camera_zoom));
+            ui.separator();
+            ui.checkbox(&mut self.show_projected_field_lines, "project field lines");
         });
+    }
+
+    fn update_camera_view(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        viewport_rect: Rect,
+        image_size: Vec2,
+    ) {
+        if response.double_clicked_by(PointerButton::Primary)
+            || response.double_clicked_by(PointerButton::Secondary)
+        {
+            self.camera_zoom = 1.0;
+            self.camera_pan = Vec2::ZERO;
+            return;
+        }
+
+        if response.dragged() {
+            self.camera_pan += ui.input(|input| input.pointer.delta());
+        }
+
+        let Some(pointer) = response.hover_pos() else {
+            return;
+        };
+        let scroll_y = ui.input(|input| input.smooth_scroll_delta.y);
+        if scroll_y.abs() <= f32::EPSILON {
+            return;
+        }
+
+        let old_zoom = self.camera_zoom;
+        let zoom_factor = 1.01_f32.powf(scroll_y);
+        let new_zoom = (old_zoom * zoom_factor).clamp(CAMERA_MIN_ZOOM, CAMERA_MAX_ZOOM);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+
+        let fit_scale = fitted_image_scale(viewport_rect.size(), image_size);
+        let old_rect = camera_image_rect(viewport_rect, image_size, old_zoom, self.camera_pan);
+        let old_scale = fit_scale * old_zoom;
+        let image_pixel_under_pointer = (pointer - old_rect.min) / old_scale.max(f32::EPSILON);
+
+        let new_scale = fit_scale * new_zoom;
+        let new_size = image_size * new_scale;
+        let new_min = pointer
+            - vec2(
+                image_pixel_under_pointer.x * new_scale,
+                image_pixel_under_pointer.y * new_scale,
+            );
+        let new_center = new_min + new_size * 0.5;
+
+        self.camera_zoom = new_zoom;
+        self.camera_pan = new_center - viewport_rect.center();
+    }
+
+    fn camera_image_rect(&self, viewport_rect: Rect, image_size: Vec2) -> Rect {
+        camera_image_rect(viewport_rect, image_size, self.camera_zoom, self.camera_pan)
     }
 
     fn viewport(&mut self, context: &Context) {
@@ -247,6 +342,18 @@ impl RobotViewerApp {
                 });
             });
     }
+}
+
+fn camera_image_rect(viewport_rect: Rect, image_size: Vec2, zoom: f32, pan: Vec2) -> Rect {
+    let scale = fitted_image_scale(viewport_rect.size(), image_size) * zoom;
+    let size = image_size * scale;
+    Rect::from_center_size(viewport_rect.center() + pan, size)
+}
+
+fn fitted_image_scale(viewport_size: Vec2, image_size: Vec2) -> f32 {
+    (viewport_size.x / image_size.x.max(1.0))
+        .min(viewport_size.y / image_size.y.max(1.0))
+        .max(0.05)
 }
 
 fn pose_source_label(pose_source: PoseSource) -> &'static str {
@@ -292,6 +399,7 @@ fn stream_status(ui: &mut Ui, name: &str, status: &StreamStatus) {
 
 fn draw_detected_objects(
     ui: &mut Ui,
+    clip_rect: Rect,
     image_rect: Rect,
     image_size: Vec2,
     detected_objects: &[Object<RobocupObjectLabel>],
@@ -300,6 +408,7 @@ fn draw_detected_objects(
         image_rect.width() / image_size.x.max(1.0),
         image_rect.height() / image_size.y.max(1.0),
     );
+    let painter = ui.painter_at(clip_rect);
 
     for object in detected_objects {
         let color = object_label_color(object.label);
@@ -313,9 +422,8 @@ fn draw_detected_objects(
                 object.bounding_box.area.max.x() * scale.x,
                 object.bounding_box.area.max.y() * scale.y,
             );
-        let rect = Rect::from_min_max(min, max).intersect(image_rect);
+        let rect = Rect::from_min_max(min, max).intersect(clip_rect);
 
-        let painter = ui.painter();
         painter.rect_stroke(
             rect,
             egui::CornerRadius::same(4),
@@ -342,6 +450,7 @@ fn draw_detected_objects(
 
 fn draw_field_mark_associations(
     ui: &mut Ui,
+    clip_rect: Rect,
     image_rect: Rect,
     image_size: Vec2,
     associations: &FieldMarkAssociations,
@@ -350,14 +459,14 @@ fn draw_field_mark_associations(
         image_rect.width() / image_size.x.max(1.0),
         image_rect.height() / image_size.y.max(1.0),
     );
-    let painter = ui.painter();
+    let painter = ui.painter_at(clip_rect);
     for (index, association) in associations.associations.iter().enumerate() {
         let position = image_rect.min
             + vec2(
                 association.detection.x() * scale.x,
                 association.detection.y() * scale.y,
             );
-        if !image_rect.contains(position) {
+        if !clip_rect.contains(position) {
             continue;
         }
         painter.circle_stroke(
@@ -373,6 +482,396 @@ fn draw_field_mark_associations(
             Color32::from_rgb(255, 180, 235),
         );
     }
+}
+
+fn draw_projected_field_lines(
+    ui: &mut Ui,
+    clip_rect: Rect,
+    image_rect: Rect,
+    image_size: Vec2,
+    state: &ViewerState,
+) {
+    let (Some(field_to_robot), Some(camera_matrix)) =
+        (state.localization, state.camera_matrix.as_ref())
+    else {
+        return;
+    };
+    let dimensions = state.field_dimensions.unwrap_or(FieldDimensions::SPL_2025);
+    let intrinsics = state
+        .calibrated_intrinsics
+        .unwrap_or(camera_matrix.intrinsics);
+    let robot_to_camera = robot_to_camera(camera_matrix);
+    let field_to_camera = robot_to_camera * field_to_robot;
+    let painter = ui.painter_at(clip_rect);
+
+    draw_projected_field_markings(
+        &painter,
+        image_rect,
+        image_size,
+        &field_to_camera,
+        intrinsics,
+        dimensions,
+    );
+}
+
+fn robot_to_camera(camera_matrix: &CameraMatrix) -> Isometry3<Robot, Camera> {
+    camera_matrix.head_to_camera * camera_matrix.robot_to_head
+}
+
+fn draw_projected_field_markings(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    dimensions: FieldDimensions,
+) {
+    let half_length = dimensions.length / 2.0;
+    let half_width = dimensions.width / 2.0;
+
+    draw_projected_rect(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        -half_length,
+        -half_width,
+        half_length,
+        half_width,
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [0.0, -half_width],
+        [0.0, half_width],
+    );
+    draw_projected_arc(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [0.0, 0.0],
+        dimensions.center_circle_diameter / 2.0,
+        0.0,
+        std::f32::consts::TAU,
+    );
+
+    for sign in [-1.0, 1.0] {
+        draw_projected_goal_area(
+            painter,
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            dimensions,
+            sign,
+            dimensions.goal_box_area_length,
+            dimensions.goal_box_area_width,
+        );
+        draw_projected_goal_area(
+            painter,
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            dimensions,
+            sign,
+            dimensions.penalty_area_length,
+            dimensions.penalty_area_width,
+        );
+
+        let penalty_x = sign * (half_length - dimensions.penalty_marker_distance);
+        draw_projected_marker_cross(
+            painter,
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            [penalty_x, 0.0],
+            dimensions.penalty_marker_size,
+        );
+
+        if dimensions.corner_arc_radius > 0.0 {
+            draw_projected_corner_arcs(
+                painter,
+                image_rect,
+                image_size,
+                field_to_camera,
+                intrinsics,
+                dimensions,
+                sign,
+            );
+        }
+    }
+}
+
+fn draw_projected_rect(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+) {
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [min_x, min_y],
+        [max_x, min_y],
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [max_x, min_y],
+        [max_x, max_y],
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [max_x, max_y],
+        [min_x, max_y],
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [min_x, max_y],
+        [min_x, min_y],
+    );
+}
+
+fn draw_projected_goal_area(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    dimensions: FieldDimensions,
+    sign: f32,
+    length: f32,
+    width: f32,
+) {
+    let goal_line_x = sign * dimensions.length / 2.0;
+    let inner_x = goal_line_x - sign * length;
+    let half_width = width / 2.0;
+
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [goal_line_x, -half_width],
+        [inner_x, -half_width],
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [inner_x, -half_width],
+        [inner_x, half_width],
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [inner_x, half_width],
+        [goal_line_x, half_width],
+    );
+}
+
+fn draw_projected_marker_cross(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    center: [f32; 2],
+    size: f32,
+) {
+    let half_size = size / 2.0;
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [center[0] - half_size, center[1]],
+        [center[0] + half_size, center[1]],
+    );
+    draw_projected_segment(
+        painter,
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        [center[0], center[1] - half_size],
+        [center[0], center[1] + half_size],
+    );
+}
+
+fn draw_projected_corner_arcs(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    dimensions: FieldDimensions,
+    sign: f32,
+) {
+    let half_length = dimensions.length / 2.0;
+    let half_width = dimensions.width / 2.0;
+    for side in [-1.0, 1.0] {
+        let center = [sign * half_length, side * half_width];
+        let start = if sign > 0.0 { 0.5 } else { 0.0 };
+        let start = std::f32::consts::PI * (start + if side > 0.0 { 0.0 } else { 1.0 });
+        draw_projected_arc(
+            painter,
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            center,
+            dimensions.corner_arc_radius,
+            start,
+            start + std::f32::consts::FRAC_PI_2,
+        );
+    }
+}
+
+fn draw_projected_segment(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    start: [f32; 2],
+    end: [f32; 2],
+) {
+    let delta = [end[0] - start[0], end[1] - start[1]];
+    let distance = delta[0].hypot(delta[1]);
+    let samples = (distance / FIELD_LINE_SAMPLE_STEP).ceil().max(1.0) as usize;
+    let mut previous = None;
+
+    for index in 0..=samples {
+        let t = index as f32 / samples as f32;
+        let point = [start[0] + delta[0] * t, start[1] + delta[1] * t];
+        draw_projected_point_step(
+            painter,
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            point,
+            &mut previous,
+        );
+    }
+}
+
+fn draw_projected_arc(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    center: [f32; 2],
+    radius: f32,
+    start: f32,
+    end: f32,
+) {
+    if radius <= 0.0 {
+        return;
+    }
+
+    let samples = ((radius * (end - start).abs()) / FIELD_LINE_SAMPLE_STEP)
+        .ceil()
+        .clamp(8.0, 160.0) as usize;
+    let mut previous = None;
+
+    for index in 0..=samples {
+        let angle = start + (end - start) * index as f32 / samples as f32;
+        let point = [
+            center[0] + radius * angle.cos(),
+            center[1] + radius * angle.sin(),
+        ];
+        draw_projected_point_step(
+            painter,
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            point,
+            &mut previous,
+        );
+    }
+}
+
+fn draw_projected_point_step(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    point: [f32; 2],
+    previous: &mut Option<Pos2>,
+) {
+    match project_field_point_to_image(image_rect, image_size, field_to_camera, intrinsics, point) {
+        Some(position) => {
+            if let Some(previous) = previous {
+                painter.line_segment([*previous, position], PROJECTED_FIELD_LINE_STROKE);
+            }
+            *previous = Some(position);
+        }
+        None => *previous = None,
+    }
+}
+
+fn project_field_point_to_image(
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    field_point: [f32; 2],
+) -> Option<Pos2> {
+    let point: Point2<Field> = point![<Field>, field_point[0], field_point[1]];
+    let camera_point = field_to_camera * point.extend(0.0);
+    if !camera_point.inner.iter().all(|value| value.is_finite()) || camera_point.z() <= 1.0e-4 {
+        return None;
+    }
+
+    let pixel = intrinsics.project(camera_point.coords());
+    if !pixel.inner.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+    Some(image_rect.min + vec2(pixel.x() * scale.x, pixel.y() * scale.y))
 }
 
 fn object_label_color(label: RobocupObjectLabel) -> Color32 {

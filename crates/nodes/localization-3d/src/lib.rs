@@ -56,13 +56,14 @@ const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 /// `visual_feature_noise_variance` is the pixel-space variance assigned to fixed
 /// field-feature reprojection factors that were accepted by global localization.
 pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfiguration {
+    let process_noise = Matrix3::identity() * 0.01;
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
         max_optimization_window: Duration::from_secs(3),
         optimizer_max_iterations: 15,
-        gyroscope_process_noise: Matrix3::identity() * 0.01,
-        roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
-        accelerometer_process_noise: Matrix3::identity() * 0.01,
+        gyroscope_process_noise: process_noise,
+        roll_pitch_yaw_noise: process_noise,
+        accelerometer_process_noise: process_noise,
         visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-3,
@@ -126,9 +127,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let initial_state = wait_for_initial_state(&camera_matrix_cache).await;
-    let initial_parameters = parameters.snapshot().typed().clone();
+    let visual_feature_noise_variance = parameters.snapshot().typed().visual_feature_noise_variance;
     let (mut frontend, backend) = initialize(
-        backend_configuration(initial_parameters.visual_feature_noise_variance),
+        backend_configuration(visual_feature_noise_variance),
         initial_state,
     );
     let mut backend_handle = std::pin::pin!(tokio::task::spawn_blocking(|| backend.run_loop()));
@@ -145,26 +146,15 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 let imu = imu?;
                 frontend.ingest_imu(imu.source_time.to_wallclock(), imu.message)
                     .wrap_err("failed to ingest imu measurement into frontend")?;
-
-                // let transform = frontend
-                //     .last_optimization_result()
-                //     .map(|result| result.transform.cast::<f32>().framed_transform());
-                // localization_publisher.publish(&transform).await?;
             }
             visual_odometry = visual_odometry_subscriber.recv() => {
                 let visual_odometry = visual_odometry?;
-                let Some(previous_camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.previous_time) else {
+                let Some(previous_camera_matrix) = fresh_camera_matrix(&camera_matrix_cache, visual_odometry.previous_time) else {
                     continue;
                 };
-                if !camera_matrix_is_fresh(&previous_camera_matrix, visual_odometry.previous_time) {
-                    continue;
-                }
-                let Some(current_camera_matrix) = camera_matrix_cache.get_nearest(visual_odometry.current_time) else {
+                let Some(current_camera_matrix) = fresh_camera_matrix(&camera_matrix_cache, visual_odometry.current_time) else {
                     continue;
                 };
-                if !camera_matrix_is_fresh(&current_camera_matrix, visual_odometry.current_time) {
-                    continue;
-                }
 
                 ingest_visual_odometry(&mut frontend, visual_odometry, &previous_camera_matrix.inner, &current_camera_matrix.inner)
                     .wrap_err("failed to ingest visual odometry measurement into frontend")?;
@@ -205,6 +195,14 @@ fn localization_transform_from_backend_pose(
 
 fn camera_matrix_is_fresh(camera_matrix: &TimeWrapper<CameraMatrix>, time: Time) -> bool {
     time_distance(camera_matrix.time, time) <= MAX_CAMERA_MATRIX_TIME_DISTANCE
+}
+
+fn fresh_camera_matrix(
+    camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+    time: Time,
+) -> Option<Arc<TimeWrapper<CameraMatrix>>> {
+    let camera_matrix = camera_matrix_cache.get_nearest(time)?;
+    camera_matrix_is_fresh(&camera_matrix, time).then_some(camera_matrix)
 }
 
 fn time_distance(a: Time, b: Time) -> Duration {
@@ -263,10 +261,10 @@ pub fn initial_state_from_camera_matrix(camera_matrix: &CameraMatrix) -> Initial
 pub fn initial_robot_to_field_from_camera_matrix(
     camera_matrix: &CameraMatrix,
 ) -> Isometry3<Robot, Field, f64> {
-    let robot_to_ground = camera_matrix.ground_to_robot.inverse().inner;
+    let robot_to_ground = camera_matrix.ground_to_robot.inverse().inner.cast::<f64>();
     nalgebra::Isometry3::from_parts(
-        nalgebra::Translation3::new(0.0, 0.0, robot_to_ground.translation.vector.z as f64),
-        robot_to_ground.rotation.cast::<f64>(),
+        nalgebra::Translation3::new(0.0, 0.0, robot_to_ground.translation.vector.z),
+        robot_to_ground.rotation,
     )
     .framed_transform()
 }
@@ -308,8 +306,8 @@ pub fn ingest_visual_odometry(
     frontend.ingest_visual_odometry_delta(
         delta.previous_time.to_wallclock(),
         delta.current_time.to_wallclock(),
-        robot_to_left_camera(previous_camera_matrix),
-        robot_to_left_camera(current_camera_matrix),
+        robot_to_camera(previous_camera_matrix).inner,
+        robot_to_camera(current_camera_matrix).inner,
         delta.current_left_camera_to_previous_left_camera,
     )
 }
@@ -346,10 +344,6 @@ fn foot_height_points(robot_kinematics: &RobotKinematics) -> (Point3<f64>, Point
             .inner
             .cast(),
     )
-}
-
-fn robot_to_left_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
-    robot_to_camera(camera_matrix).inner
 }
 
 fn robot_to_camera(camera_matrix: &CameraMatrix) -> Isometry3<Robot, Camera> {
@@ -443,7 +437,7 @@ mod tests {
             ..Default::default()
         };
 
-        let robot_to_camera = robot_to_left_camera(&camera_matrix);
+        let robot_to_camera = robot_to_camera(&camera_matrix).inner;
         let expected = (head_to_camera * robot_to_head).inner;
 
         assert!((robot_to_camera.translation.vector - expected.translation.vector).norm() < 1.0e-6);

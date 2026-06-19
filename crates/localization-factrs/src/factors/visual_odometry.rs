@@ -185,14 +185,14 @@ impl VisualOdometryDelta {
     }
 
     pub fn from_measurement(
-        measurement: &VisualOdometryMeasurement,
+        measurement: VisualOdometryMeasurement,
         start_time: SystemTime,
         end_time: SystemTime,
     ) -> Self {
         Self {
             start_tau: tau::<f64>(start_time, end_time, measurement.previous_time),
             end_tau: tau::<f64>(start_time, end_time, measurement.current_time),
-            robot_delta: measurement.robot_delta.clone(),
+            robot_delta: measurement.robot_delta,
         }
     }
 }

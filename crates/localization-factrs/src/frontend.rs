@@ -52,14 +52,18 @@ impl VinsFrontend {
 
     /// Returns the latest backend result and marks it observed for `wait_for_optimization_result`.
     pub fn last_optimization_result(&mut self) -> Option<OptimizationResult> {
-        let backend_result = self.result_receiver.borrow_and_update().clone()?;
-        Some(optimization_result_from_backend_result(backend_result))
+        self.result_receiver
+            .borrow_and_update()
+            .as_ref()
+            .map(optimization_result_from_backend_result)
     }
 
     /// Returns the latest backend result without marking it observed.
     pub fn peek_last_optimization_result(&self) -> Option<OptimizationResult> {
-        let backend_result = self.result_receiver.borrow().clone()?;
-        Some(optimization_result_from_backend_result(backend_result))
+        self.result_receiver
+            .borrow()
+            .as_ref()
+            .map(optimization_result_from_backend_result)
     }
 
     /// Adds an IMU measurement to the optimization pipeline.
@@ -165,19 +169,19 @@ fn isometry3_to_se3(isometry: nalgebra::Isometry3<f32>) -> SE3 {
 }
 
 fn optimization_result_from_backend_result(
-    backend_result: BackendOptimizationResult,
+    backend_result: &BackendOptimizationResult,
 ) -> OptimizationResult {
-    let (transform, velocity) = se23_to_isometry3_and_velocity(backend_result.latest_pose);
+    let (transform, velocity) = se23_to_isometry3_and_velocity(&backend_result.latest_pose);
     OptimizationResult {
         time: backend_result.time,
         transform,
         velocity,
-        camera_intrinsics: backend_result.camera_intrinsics,
+        camera_intrinsics: backend_result.camera_intrinsics.clone(),
     }
 }
 
 pub(crate) fn se23_to_isometry3_and_velocity(
-    se23: SE23,
+    se23: &SE23,
 ) -> (nalgebra::Isometry3<f64>, nalgebra::Vector3<f64>) {
     let rotation = se23.rot();
     let local_velocity = rotation.inverse().apply(se23.uvw());

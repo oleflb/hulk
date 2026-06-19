@@ -281,25 +281,20 @@ impl VinsBackend {
 
     /// Ingests a batch of IMU measurements into the graph.
     /// Assumes the measurements are already sorted by time.
-    fn ingest_imu(&mut self, measurements: Vec<ImuMeasurement>) -> Result<(), VinsBackendError> {
-        let Some(last) = measurements.last() else {
-            return Ok(());
+    fn ingest_imu(&mut self, measurements: Vec<ImuMeasurement>) {
+        let (Some(first), Some(last)) = (measurements.first(), measurements.last()) else {
+            return;
         };
-        let first_time = measurements
-            .first()
-            .expect("non-empty IMU measurements must have first sample")
-            .time;
+        let first_time = first.time;
         let last_time = last.time;
         let _ = self.interval_assigner.assign_interval(first_time);
         self.update_last_knot_time(last_time);
 
         let Some(last_interval_index) = self.interval_assigner.assign_interval(last_time) else {
-            return Ok(());
+            return;
         };
         self.init_intervals_through(last_interval_index);
         self.process_imu_attitude_measurements(measurements);
-
-        Ok(())
     }
 
     fn process_imu_attitude_measurements(&mut self, measurements: Vec<ImuMeasurement>) {
@@ -316,10 +311,10 @@ impl VinsBackend {
                 self.add_exact_imu_attitude_knot(&measurement);
             }
 
-            self.latest_imu_attitude_measurement = Some(measurement.clone());
             previous = Some(measurement);
         }
 
+        self.latest_imu_attitude_measurement = previous.clone();
         self.last_imu_attitude_measurement = previous;
     }
 
@@ -476,17 +471,10 @@ impl VinsBackend {
         });
     }
 
-    fn ingest_visual(
-        &mut self,
-        mut visuals: Vec<Vec<VisualReprojectionMeasurement>>,
-    ) -> Result<(), VinsBackendError> {
+    fn ingest_visual(&mut self, mut visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
         visuals.retain(|visual| !visual.is_empty());
-        if visuals.is_empty() {
-            return Ok(());
-        }
-
         let Some(last) = visuals.last() else {
-            return Ok(());
+            return;
         };
 
         let last_time = visual_frame_time(last);
@@ -525,16 +513,11 @@ impl VinsBackend {
                 graph.add_factor(factor);
             }
         }
-
-        Ok(())
     }
 
-    fn ingest_visual_odometry(
-        &mut self,
-        visual_odometry: Vec<VisualOdometryMeasurement>,
-    ) -> Result<(), VinsBackendError> {
+    fn ingest_visual_odometry(&mut self, visual_odometry: Vec<VisualOdometryMeasurement>) {
         let Some(last) = visual_odometry.last() else {
-            return Ok(());
+            return;
         };
         let last_timestamp = last.current_time;
 
@@ -542,7 +525,7 @@ impl VinsBackend {
         let mut adjacent_interval_deltas = Vec::new();
         for measurement in visual_odometry {
             for measurement in self.split_visual_odometry_measurement(measurement) {
-                match self.visual_odometry_delta(&measurement) {
+                match self.visual_odometry_delta(measurement) {
                     Some(TimedVisualOdometryDelta::SameInterval(delta)) => {
                         same_interval_deltas.push(delta);
                     }
@@ -555,13 +538,11 @@ impl VinsBackend {
         }
 
         if same_interval_deltas.is_empty() && adjacent_interval_deltas.is_empty() {
-            return Ok(());
+            return;
         }
         self.update_last_knot_time(last_timestamp);
         self.add_visual_odometry_factors(same_interval_deltas);
         self.add_adjacent_visual_odometry_factors(adjacent_interval_deltas);
-
-        Ok(())
     }
 
     fn add_visual_odometry_factors(&mut self, deltas: Vec<IntervalVisualOdometryDelta>) {
@@ -660,7 +641,7 @@ impl VinsBackend {
 
     fn visual_odometry_delta(
         &self,
-        measurement: &VisualOdometryMeasurement,
+        measurement: VisualOdometryMeasurement,
     ) -> Option<TimedVisualOdometryDelta> {
         if measurement.current_time <= measurement.previous_time {
             log::debug!("dropping non-forward visual odometry measurement");
@@ -705,7 +686,7 @@ impl VinsBackend {
                             current_interval_start_time + self.config.knot_spacing,
                             measurement.current_time,
                         ),
-                        measurement.robot_delta.clone(),
+                        measurement.robot_delta,
                     ),
                 },
             )),
@@ -804,12 +785,9 @@ impl VinsBackend {
         segments
     }
 
-    fn ingest_foot_heights(
-        &mut self,
-        foot_heights: Vec<FootHeightMeasurement>,
-    ) -> Result<(), VinsBackendError> {
+    fn ingest_foot_heights(&mut self, foot_heights: Vec<FootHeightMeasurement>) {
         let Some(last) = foot_heights.last() else {
-            return Ok(());
+            return;
         };
         self.update_last_knot_time(last.time);
 
@@ -843,8 +821,6 @@ impl VinsBackend {
                 graph.add_factor(factor);
             }
         }
-
-        Ok(())
     }
 
     fn init_intervals_through(&mut self, interval_start_index: u32) {
@@ -963,10 +939,10 @@ impl VinsBackend {
         &mut self,
         new_measurements: IntervalMeasurements,
     ) -> Result<(), VinsBackendError> {
-        self.ingest_imu(new_measurements.imu)?;
-        self.ingest_visual(new_measurements.visual)?;
-        self.ingest_visual_odometry(new_measurements.visual_odometry)?;
-        self.ingest_foot_heights(new_measurements.foot_heights)?;
+        self.ingest_imu(new_measurements.imu);
+        self.ingest_visual(new_measurements.visual);
+        self.ingest_visual_odometry(new_measurements.visual_odometry);
+        self.ingest_foot_heights(new_measurements.foot_heights);
 
         Ok(())
     }

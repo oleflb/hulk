@@ -39,10 +39,10 @@ impl Residual for CurrentSplineOrientationFactor {
     }
 
     fn residual<T: Numeric>(&self, (start, end): (SE23<T>, SE23<T>)) -> VectorX<T> {
-        let spline = SE23Spline::new(start.clone(), end, T::from(self.duration));
+        let start_rpy = roll_pitch_yaw_from_so3(start.rot());
+        let spline = SE23Spline::new(start, end, T::from(self.duration));
         let current_pose = spline.evaluate(T::from(self.measurement_tau));
 
-        let start_rpy = roll_pitch_yaw_from_so3(start.rot());
         let current_rpy = roll_pitch_yaw_from_so3(current_pose.rot());
         let measured_roll_pitch = self.measured_roll_pitch.cast::<T>();
 

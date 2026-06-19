@@ -124,7 +124,8 @@ mod tests {
 
     use factrs::{
         core::{SE3, SO3, Vector3},
-        traits::Residual,
+        linalg::VectorX,
+        traits::{Residual, Variable},
         variables::SE23,
     };
     use nalgebra::{Matrix2, Point2, Point3, vector};
@@ -180,5 +181,57 @@ mod tests {
         ));
 
         assert!(residual.norm() > 1.0);
+    }
+
+    #[test]
+    fn translation_jacobian_pulls_pose_toward_observation() {
+        let time = SystemTime::UNIX_EPOCH;
+        let factor = VisualReprojectionFactor::new(
+            time,
+            time + Duration::from_secs(1),
+            vec![vec![VisualReprojectionMeasurement {
+                time,
+                detection: Point2::new(0.0, 0.0),
+                field_point: Point3::new(0.0, 0.0, 2.0),
+                robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
+            }]],
+            Matrix2::identity(),
+        );
+        let intrinsics = CameraIntrinsics::new(vector![100.0, 100.0], vector![0.0, 0.0]);
+        let pose = state(vector![0.1, -0.2, 0.0]);
+
+        let linearized = factor.residual_jacobian((pose.clone(), pose.clone(), intrinsics.clone()));
+
+        assert_close(linearized.value[0], -5.0, 1.0e-9);
+        assert_close(linearized.value[1], 10.0, 1.0e-9);
+
+        // SE23 tangent order is [rot_x, rot_y, rot_z, vel_x, vel_y, vel_z, x, y, z].
+        let start_x_column = 6;
+        let start_y_column = 7;
+        assert_close(linearized.diff[(0, start_x_column)], -50.0, 1.0e-9);
+        assert_close(linearized.diff[(1, start_y_column)], -50.0, 1.0e-9);
+        assert_close(linearized.diff[(0, start_y_column)], 0.0, 1.0e-9);
+        assert_close(linearized.diff[(1, start_x_column)], 0.0, 1.0e-9);
+
+        let mut translation_step = VectorX::zeros(9);
+        translation_step[start_x_column] =
+            -linearized.value[0] / linearized.diff[(0, start_x_column)];
+        translation_step[start_y_column] =
+            -linearized.value[1] / linearized.diff[(1, start_y_column)];
+
+        assert_close(translation_step[start_x_column], -0.1, 1.0e-9);
+        assert_close(translation_step[start_y_column], 0.2, 1.0e-9);
+
+        let corrected_pose = pose.oplus(translation_step.as_view());
+        let corrected_residual = factor.residual((corrected_pose, pose, intrinsics));
+
+        assert!(corrected_residual.norm() < 1.0e-9);
+    }
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {actual} to be within {tolerance} of {expected}"
+        );
     }
 }
