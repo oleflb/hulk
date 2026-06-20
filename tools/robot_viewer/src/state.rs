@@ -19,6 +19,7 @@ pub(crate) type SharedState = Arc<Mutex<ViewerState>>;
 
 const CAMERA_FRAME_BUFFER_CAPACITY: usize = 12;
 const STREAM_BUFFER_CAPACITY: usize = 64;
+const HIGH_RATE_STREAM_BUFFER_CAPACITY: usize = 1024;
 const MAX_ALIGNED_STREAM_AGE: Duration = Duration::from_secs(1);
 const MAX_NEAREST_SAMPLE_DISTANCE: Duration = Duration::from_millis(100);
 
@@ -52,8 +53,8 @@ impl Default for ViewerState {
             field_dimensions: None,
             localization: None,
             visual_odometer: None,
-            robot_kinematics: CacheInner::new(STREAM_BUFFER_CAPACITY),
-            camera_matrices: CacheInner::new(STREAM_BUFFER_CAPACITY),
+            robot_kinematics: CacheInner::new(HIGH_RATE_STREAM_BUFFER_CAPACITY),
+            camera_matrices: CacheInner::new(HIGH_RATE_STREAM_BUFFER_CAPACITY),
             calibrated_intrinsics: None,
             camera_frames: CacheInner::new(CAMERA_FRAME_BUFFER_CAPACITY),
             camera_sequence: 0,
@@ -69,6 +70,40 @@ impl Default for ViewerState {
             objects_status: StreamStatus::default(),
             field_mark_associations_status: StreamStatus::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_rate_alignment_streams_retain_delayed_render_samples() {
+        let mut state = ViewerState::default();
+        let anchor_time = Time::from_nanos(0);
+
+        for index in 0..600 {
+            let time = Time::from_nanos(index * 2_000_000);
+            state.push_camera_matrix(time, CameraMatrix::default());
+            state.push_robot_kinematics(time, RobotKinematics::default());
+        }
+
+        assert!(
+            nearest_sample(
+                &state.camera_matrices,
+                anchor_time,
+                MAX_NEAREST_SAMPLE_DISTANCE
+            )
+            .is_some()
+        );
+        assert!(
+            nearest_sample(
+                &state.robot_kinematics,
+                anchor_time,
+                MAX_NEAREST_SAMPLE_DISTANCE
+            )
+            .is_some()
+        );
     }
 }
 
