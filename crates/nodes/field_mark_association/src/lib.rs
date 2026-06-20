@@ -1,4 +1,9 @@
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::{Future, ready},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::{Result, eyre::Context as _};
 use coordinate_systems::{Camera, Field, Pixel, Robot};
@@ -171,6 +176,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     .as_ref()
                     .map(|field_to_robot| field_to_robot.clone().inverse())
             });
+            let include_debug = global_localization_publisher.has_subscribers();
 
             let localization = tokio::task::spawn_blocking(move || {
                 let visual_features = find_detected_visual_features(&objects);
@@ -183,19 +189,21 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     };
                 }
 
-                localize_global_visual_features(
+                localize_global_visual_features_with_debug(
                     &visual_features,
                     &camera_matrix,
                     &field_dimensions,
                     pose_hint,
                     &parameters.global_localizer,
+                    include_debug,
                 )
             })
             .await
             .wrap_err("field mark association task failed")?;
 
+            let debug = localization.debug.clone();
             global_localization_publisher
-                .publish(&localization.debug)
+                .publish_if_subscribed(|| ready(debug))
                 .await?;
 
             let message = TimeWrapper {
@@ -229,6 +237,24 @@ pub fn localize_global_visual_features(
     pose_hint: Option<Isometry3<Robot, Field>>,
     parameters: &GlobalLocalizerParameters,
 ) -> GlobalVisualLocalization {
+    localize_global_visual_features_with_debug(
+        visual_features,
+        camera_matrix,
+        field_dimensions,
+        pose_hint,
+        parameters,
+        true,
+    )
+}
+
+fn localize_global_visual_features_with_debug(
+    visual_features: &DetectedVisualFeatures,
+    camera_matrix: &CameraMatrix,
+    field_dimensions: &FieldDimensions,
+    pose_hint: Option<Isometry3<Robot, Field>>,
+    parameters: &GlobalLocalizerParameters,
+    include_debug: bool,
+) -> GlobalVisualLocalization {
     let localizer = GlobalAssociator::new(*parameters);
     let result = localizer.localize(GlobalLocalizationInput {
         visual_features,
@@ -240,7 +266,11 @@ pub fn localize_global_visual_features(
     });
 
     GlobalVisualLocalization {
-        debug: result.as_ref().map(global_localization_debug_from_result),
+        debug: if include_debug {
+            result.as_ref().map(global_localization_debug_from_result)
+        } else {
+            None
+        },
         unique_associations: result.as_ref().and_then(|result| {
             result.unique_feature_associations().map(|associations| {
                 associations

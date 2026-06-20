@@ -306,7 +306,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 
                 if let Some(result) = result {
                     calibrated_intrinsics_publisher
-                        .publish(&intrinsic_from_camera_intrinsics(&result.camera_intrinsics))
+                        .publish_if_subscribed(|| {
+                            ready(intrinsic_from_camera_intrinsics(&result.camera_intrinsics))
+                        })
                         .await?;
                 }
             }

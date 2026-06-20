@@ -167,7 +167,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         &node,
         &mut recorders,
         sample_sender.clone(),
-        "visual_odometry/previous_left_camera_to_current_left_camera",
+        "debug/visual_odometry/previous_left_camera_to_current_left_camera",
     )
     .await?;
     spawn_topic::<Option<GlobalLocalizationDebug>>(

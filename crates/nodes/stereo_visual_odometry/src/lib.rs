@@ -9,7 +9,7 @@ pub use pipeline::VisualOdometryPipeline;
 
 use std::{
     boxed::Box,
-    future::Future,
+    future::{Future, ready},
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -55,13 +55,13 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let feature_duration_pub = node
-        .publisher::<Duration>("visual_odometry/feature_extraction_duration")?
+        .publisher::<Duration>("debug/visual_odometry/feature_extraction_duration")?
         .build()
         .await?;
 
-    let odometry_pub = node
+    let debug_odometry_pub = node
         .publisher::<Option<na::Isometry3<f32>>>(
-            "visual_odometry/previous_left_camera_to_current_left_camera",
+            "debug/visual_odometry/previous_left_camera_to_current_left_camera",
         )?
         .build()
         .await?;
@@ -82,7 +82,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
     // Caution: We don't yet differentiate between left and right camera frames.
     let triangulated_features_pub = node
-        .publisher::<Vec<Point3<Camera>>>("visual_odometry/triangulated_features")?
+        .publisher::<Vec<Point3<Camera>>>("debug/visual_odometry/triangulated_features")?
         .build()
         .await?;
 
@@ -108,7 +108,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             pipeline.process(&stereo_image_pair, &parameters.pose_estimation_parameters)?;
         let duration = start_time.elapsed();
 
-        odometry_pub.publish(&odometry).await?;
+        debug_odometry_pub
+            .publish_if_subscribed(|| ready(odometry.clone()))
+            .await?;
         if let (Some(previous_time), Some(previous_left_camera_to_current_left_camera)) =
             (previous_image_time, odometry.as_ref())
         {
@@ -128,9 +130,14 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 inner: pipeline.current_left_camera_to_visual_odometer(),
             })
             .await?;
-        triangulated_features_pub
-            .publish(&pipeline.triangulated_features())
+        if triangulated_features_pub.has_subscribers() {
+            let triangulated_features = pipeline.triangulated_features();
+            triangulated_features_pub
+                .publish_if_subscribed(|| ready(triangulated_features))
+                .await?;
+        }
+        feature_duration_pub
+            .publish_if_subscribed(|| ready(duration))
             .await?;
-        feature_duration_pub.publish(&duration).await?;
     }
 }
