@@ -950,18 +950,6 @@ impl VinsBackend {
 
         self.remove_current_spline_orientation_factor();
 
-        // do Schur marginalization
-        let cutoff_time = time - self.config.max_optimization_window;
-        if let Some(smallest_interval_index_in_window) =
-            self.interval_assigner.assign_interval(cutoff_time)
-        {
-            marginalize(
-                &mut self.optimizer,
-                &mut self.values,
-                State(smallest_interval_index_in_window),
-            );
-        }
-
         self.add_current_spline_orientation_factor();
 
         let optimizer_status = match self.optimizer.optimize(&mut self.values) {
@@ -980,6 +968,24 @@ impl VinsBackend {
             }
         };
         self.remove_current_spline_orientation_factor();
+
+        if matches!(
+            optimizer_status,
+            BackendOptimizerStatus::Converged | BackendOptimizerStatus::MaxIterations
+        ) {
+            // Marginalize only after the current batch has influenced the optimized state.
+            let cutoff_time = time - self.config.max_optimization_window;
+            if let Some(smallest_interval_index_in_window) =
+                self.interval_assigner.assign_interval(cutoff_time)
+            {
+                marginalize(
+                    &mut self.optimizer,
+                    &mut self.values,
+                    State(smallest_interval_index_in_window),
+                );
+            }
+        }
+
         self.last_solve_diagnostics = Some(self.solve_diagnostics(optimizer_status));
 
         let interval_start_time = self.interval_assigner.current_interval_start_time(time)?;
@@ -1250,11 +1256,32 @@ impl InitStateExt for Values {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use super::*;
     use booster::ImuState;
-    use factrs::core::{SE3, SO3};
-    use factrs::traits::Variable;
+    use factrs::{
+        core::{SE3, SO3, Values},
+        optimizers::OptObserver,
+        traits::{Optimizer, Variable},
+    };
     use linear_algebra::IntoFramed;
+
+    struct StatePresenceObserver {
+        state: State,
+        seen: Arc<AtomicBool>,
+    }
+
+    impl OptObserver for StatePresenceObserver {
+        fn on_step(&self, values: &Values, _time: i64) {
+            if values.get_raw(self.state).is_some() {
+                self.seen.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 
     fn backend_configuration() -> BackendConfiguration {
         BackendConfiguration {
@@ -1687,6 +1714,51 @@ mod tests {
         assert!(boundary_state.uvw().norm() < 1.0e-9);
         assert!(bridge_state.uvw().norm() < 1.0e-9);
         assert!(target_state.uvw().norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn marginalization_happens_after_optimizer_step() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut config = backend_configuration();
+        config.max_optimization_window = Duration::from_millis(400);
+        let mut backend = VinsBackend::new(
+            config,
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let state_seen_during_optimization = Arc::new(AtomicBool::new(false));
+        backend.optimizer.add_observer(StatePresenceObserver {
+            state: State(0),
+            seen: Arc::clone(&state_seen_during_optimization),
+        });
+
+        let start = SystemTime::UNIX_EPOCH;
+        measurement_sender
+            .send(stationary_imu(start))
+            .expect("first IMU should send");
+        measurement_sender
+            .send(stationary_imu(start + Duration::from_secs(2)))
+            .expect("later IMU should send");
+        measurement_sender
+            .send(visual_odometry(
+                start,
+                start + Duration::from_millis(100),
+                0.1,
+            ))
+            .expect("visual odometry should send");
+
+        let _ = backend.solve_once().expect("solve should succeed");
+
+        assert!(
+            state_seen_during_optimization.load(Ordering::SeqCst),
+            "state 0 must still be available while optimizing the current batch"
+        );
+        assert!(
+            backend.values().get_raw(State(0)).is_none(),
+            "state 0 should be marginalized after optimization"
+        );
     }
 
     #[test]
