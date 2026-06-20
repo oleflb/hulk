@@ -72,8 +72,10 @@ where
 // CacheInner — shared mutable state
 // ---------------------------------------------------------------------------
 
-/// Internal cache storage — public for benchmarks only.
-#[doc(hidden)]
+/// In-memory timestamp-indexed cache storage.
+///
+/// This is the storage backing [`Cache`]. It is also useful for decoded or derived data that
+/// already carries a timestamp but does not need its own subscriber task.
 pub struct CacheInner<T> {
     entries: BTreeMap<Time, VecDeque<Arc<T>>>,
     capacity: usize,
@@ -83,6 +85,7 @@ pub struct CacheInner<T> {
 }
 
 impl<T> CacheInner<T> {
+    /// Creates an empty cache retaining at most `capacity` inserted messages.
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -92,6 +95,8 @@ impl<T> CacheInner<T> {
         }
     }
 
+    /// Inserts one message at `stamp`, evicting from the earliest timestamp bucket once capacity
+    /// is exceeded. Within one timestamp bucket, entries are evicted in insertion order.
     pub fn insert(&mut self, stamp: Time, message: T) {
         if self.capacity == 0 {
             return;
@@ -118,6 +123,8 @@ impl<T> CacheInner<T> {
         }
     }
 
+    /// All messages with timestamp in `[t_start, t_end]`, inclusive, ordered by timestamp and then
+    /// insertion order.
     pub fn get_interval(&self, t_start: Time, t_end: Time) -> Vec<Arc<T>> {
         if t_start > t_end {
             return Vec::new();
@@ -129,6 +136,8 @@ impl<T> CacheInner<T> {
             .collect()
     }
 
+    /// The most recent message with timestamp ≤ `t`, or `None` if the cache is empty or all
+    /// messages are strictly after `t`.
     pub fn get_before(&self, t: Time) -> Option<Arc<T>> {
         self.entries
             .range(..=t)
@@ -136,6 +145,15 @@ impl<T> CacheInner<T> {
             .and_then(|(_, bucket)| bucket.back().map(Arc::clone))
     }
 
+    /// The most recent message with timestamp exactly equal to `t`.
+    pub fn get_exact(&self, t: Time) -> Option<Arc<T>> {
+        self.entries
+            .get(&t)
+            .and_then(|bucket| bucket.back().map(Arc::clone))
+    }
+
+    /// The earliest message with timestamp ≥ `t`, or `None` if the cache is empty or all messages
+    /// are strictly before `t`.
     pub fn get_after(&self, t: Time) -> Option<Arc<T>> {
         self.entries
             .range(t..)
@@ -143,7 +161,21 @@ impl<T> CacheInner<T> {
             .and_then(|(_, bucket)| bucket.front().map(Arc::clone))
     }
 
+    /// The message whose timestamp is nearest to `t`.
+    ///
+    /// When two messages are equidistant, the one with the earlier timestamp is returned.
+    /// For duplicate timestamps, the latest inserted message is used for the before/exact side and
+    /// the earliest inserted message is used for the after side.
     pub fn get_nearest(&self, t: Time) -> Option<Arc<T>> {
+        self.get_nearest_with_stamp(t).map(|(_, value)| value)
+    }
+
+    /// The message whose timestamp is nearest to `t`, together with its timestamp.
+    ///
+    /// When two messages are equidistant, the one with the earlier timestamp is returned.
+    /// For duplicate timestamps, the latest inserted message is used for the before/exact side and
+    /// the earliest inserted message is used for the after side.
+    pub fn get_nearest_with_stamp(&self, t: Time) -> Option<(Time, Arc<T>)> {
         if self.entries.is_empty() {
             return None;
         }
@@ -160,42 +192,48 @@ impl<T> CacheInner<T> {
             .and_then(|(k, bucket)| bucket.front().map(|v| (*k, Arc::clone(v))));
 
         match (before, after) {
-            (None, Some((_, v))) => Some(v),
-            (Some((_, v)), None) => Some(v),
+            (None, Some((k, v))) => Some((k, v)),
+            (Some((k, v)), None) => Some((k, v)),
             (Some((kb, vb)), Some((ka, va))) => {
                 let dist_before = t.duration_since(kb);
                 let dist_after = ka.duration_since(t);
                 // On a tie prefer earlier (before) timestamp.
                 if dist_after < dist_before {
-                    Some(va)
+                    Some((ka, va))
                 } else {
-                    Some(vb)
+                    Some((kb, vb))
                 }
             }
             (None, None) => None,
         }
     }
 
+    /// The newest inserted message at the latest cached timestamp.
     pub fn get_latest(&self) -> Option<Arc<T>> {
         self.entries.values().next_back()?.back().cloned()
     }
 
+    /// Timestamp of the oldest cached message, or `None` if empty.
     pub fn earliest_stamp(&self) -> Option<Time> {
         self.entries.keys().next().copied()
     }
 
+    /// Timestamp of the newest cached message, or `None` if empty.
     pub fn latest_stamp(&self) -> Option<Time> {
         self.entries.keys().next_back().copied()
     }
 
+    /// Number of messages currently retained.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// `true` when no messages are retained.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Removes all retained messages.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.len = 0;
@@ -274,6 +312,17 @@ impl<T> Cache<T> {
         inner.get_before(t)
     }
 
+    /// The most recent message with timestamp exactly equal to `t`, or `None` if no cached
+    /// message has that timestamp.
+    pub fn get_exact<TStamp>(&self, t: TStamp) -> Option<Arc<T>>
+    where
+        TStamp: Into<Time>,
+    {
+        let t = t.into();
+        let inner = self.inner.read();
+        inner.get_exact(t)
+    }
+
     /// The earliest message with timestamp ≥ `t`, or `None` if the cache is
     /// empty or all messages are strictly before `t`.
     ///
@@ -317,6 +366,21 @@ impl<T> Cache<T> {
         let t = t.into();
         let inner = self.inner.read();
         inner.get_nearest(t)
+    }
+
+    /// The message whose timestamp is nearest to `t`, together with its timestamp.
+    ///
+    /// When two messages are equidistant, the one with the earlier timestamp is returned.
+    /// For duplicate timestamps, the selected bucket is stable: the latest inserted message is used
+    /// for the before/exact side and the earliest inserted message is used for the after side.
+    /// Returns `None` if the cache is empty.
+    pub fn get_nearest_with_stamp<TStamp>(&self, t: TStamp) -> Option<(Time, Arc<T>)>
+    where
+        TStamp: Into<Time>,
+    {
+        let t = t.into();
+        let inner = self.inner.read();
+        inner.get_nearest_with_stamp(t)
     }
 
     pub fn get_latest(&self) -> Option<Arc<T>> {
@@ -597,7 +661,13 @@ mod tests {
 
         assert_eq!(*inner.get_before(stamp).unwrap(), "second");
         assert_eq!(*inner.get_after(stamp).unwrap(), "first");
+        assert_eq!(*inner.get_exact(stamp).unwrap(), "second");
         assert_eq!(*inner.get_nearest(stamp).unwrap(), "second");
+        let (nearest_stamp, nearest) = inner
+            .get_nearest_with_stamp(Time::from_nanos(1_500))
+            .unwrap();
+        assert_eq!(nearest_stamp, stamp);
+        assert_eq!(*nearest, "second");
         assert_eq!(*inner.get_after(Time::from_nanos(1_500)).unwrap(), "third");
     }
 }

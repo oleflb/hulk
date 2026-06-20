@@ -13,6 +13,7 @@ use egui_bevy::BevyWidget;
 use field_mark_association::FieldMarkAssociations;
 use linear_algebra::{Isometry3, Point2, point};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
+use ros_z::time::Time;
 use tokio::runtime::Runtime;
 use types::{
     field_dimensions::FieldDimensions,
@@ -23,8 +24,8 @@ use crate::{
     cli::Arguments,
     scene::{self, ViewerData},
     state::{
-        CameraFrame, ConnectionStatus, PoseSource, SharedState, StreamState, StreamStatus,
-        ViewerState,
+        AlignedViewerState, CameraFrame, ConnectionStatus, PoseSource, SharedState, StreamState,
+        StreamStatus, ViewerState, ViewerStatusSnapshot,
     },
     subscriptions,
 };
@@ -99,19 +100,27 @@ impl RobotViewerApp {
 
 impl App for RobotViewerApp {
     fn update(&mut self, context: &Context, _frame: &mut Frame) {
-        let snapshot = self
-            .state
-            .lock()
-            .expect("viewer state lock should not be poisoned")
-            .clone();
+        let (status, aligned) = {
+            let state = self
+                .state
+                .lock()
+                .expect("viewer state lock should not be poisoned");
+            (state.status_snapshot(), state.aligned_snapshot())
+        };
 
-        self.update_camera_texture(context, snapshot.camera_frame.as_ref());
-        self.header(context, &snapshot);
-        self.camera_panel(context, &snapshot);
+        self.update_camera_texture(
+            context,
+            aligned
+                .camera_frame
+                .as_ref()
+                .map(|camera_frame| camera_frame.inner.as_ref()),
+        );
+        self.header(context, &status);
+        self.camera_panel(context, &aligned);
         self.widget
             .bevy_app
             .world_mut()
-            .insert_resource(ViewerData::from_state(&snapshot, self.pose_source));
+            .insert_resource(ViewerData::from_aligned_state(aligned, self.pose_source));
         self.viewport(context);
     }
 }
@@ -138,7 +147,7 @@ impl RobotViewerApp {
         self.camera_texture_sequence = frame.sequence;
     }
 
-    fn header(&mut self, context: &Context, state: &ViewerState) {
+    fn header(&mut self, context: &Context, state: &ViewerStatusSnapshot) {
         TopBottomPanel::top("header")
             .min_height(86.0)
             .show(context, |ui| {
@@ -186,7 +195,7 @@ impl RobotViewerApp {
             });
     }
 
-    fn camera_panel(&mut self, context: &Context, state: &ViewerState) {
+    fn camera_panel(&mut self, context: &Context, state: &AlignedViewerState) {
         SidePanel::right("camera_panel")
             .resizable(true)
             .default_width(440.0)
@@ -205,8 +214,12 @@ impl RobotViewerApp {
             });
     }
 
-    fn camera_image(&mut self, ui: &mut Ui, state: &ViewerState) {
-        let Some(frame) = &state.camera_frame else {
+    fn camera_image(&mut self, ui: &mut Ui, state: &AlignedViewerState) {
+        let Some(frame) = state
+            .camera_frame
+            .as_ref()
+            .map(|camera_frame| camera_frame.inner.as_ref())
+        else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("waiting for camera image").color(Color32::GRAY));
             });
@@ -235,27 +248,48 @@ impl RobotViewerApp {
         if self.show_projected_field_lines {
             draw_projected_field_lines(ui, viewport_rect, image_rect, image_size, state);
         }
-        draw_detected_objects(
-            ui,
-            viewport_rect,
-            image_rect,
-            image_size,
-            &state.detected_objects,
-        );
-        if let Some(associations) = &state.field_mark_associations {
+        let detected_objects = state
+            .detected_objects
+            .as_ref()
+            .map_or([].as_slice(), |objects| objects.inner.as_ref().as_slice());
+        draw_detected_objects(ui, viewport_rect, image_rect, image_size, detected_objects);
+        if let Some(associations) = state
+            .field_mark_associations
+            .as_ref()
+            .map(|associations| associations.inner.as_ref())
+        {
             draw_field_mark_associations(ui, viewport_rect, image_rect, image_size, associations);
         }
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}x{}", frame.width, frame.height));
+            if let Some(time) = state.anchor_time {
+                ui.separator();
+                ui.label(format!("aligned {:.3}s", time.as_nanos() as f64 / 1.0e9));
+            }
+            if let (Some(anchor_time), Some(camera_matrix)) =
+                (state.anchor_time, state.camera_matrix.as_ref())
+            {
+                ui.separator();
+                ui.label(format!(
+                    "matrix {:+.0}ms",
+                    time_delta_ms(camera_matrix.time, anchor_time)
+                ));
+            }
             ui.separator();
-            ui.label(format!("{} detections", state.detected_objects.len()));
+            match &state.detected_objects {
+                Some(objects) => ui.label(format!("{} detections", objects.inner.len())),
+                None => ui.label(RichText::new("detections unavailable").color(Color32::GRAY)),
+            };
             if let Some(associations) = &state.field_mark_associations {
                 ui.separator();
-                ui.label(format!("{} associations", associations.associations.len()));
+                ui.label(format!(
+                    "{} associations",
+                    associations.inner.associations.len()
+                ));
             }
-            if let Some(intrinsics) = state.calibrated_intrinsics {
+            if let Some(intrinsics) = state.latest_calibrated_intrinsics {
                 ui.separator();
                 ui.label(format!(
                     "calibrated fx/fy {:.1}/{:.1} cx/cy {:.1}/{:.1}",
@@ -358,9 +392,13 @@ fn fitted_image_scale(viewport_size: Vec2, image_size: Vec2) -> f32 {
 
 fn pose_source_label(pose_source: PoseSource) -> &'static str {
     match pose_source {
-        PoseSource::Localization => "localization",
-        PoseSource::VisualOdometer => "visual odometer",
+        PoseSource::Localization => "localization latest",
+        PoseSource::VisualOdometer => "visual odometer latest",
     }
+}
+
+fn time_delta_ms(sample_time: Time, anchor_time: Time) -> f64 {
+    (sample_time.as_nanos() as i128 - anchor_time.as_nanos() as i128) as f64 / 1.0e6
 }
 
 fn pose_source_button_label(pose_source: PoseSource) -> &'static str {
@@ -489,16 +527,20 @@ fn draw_projected_field_lines(
     clip_rect: Rect,
     image_rect: Rect,
     image_size: Vec2,
-    state: &ViewerState,
+    state: &AlignedViewerState,
 ) {
-    let (Some(field_to_robot), Some(camera_matrix)) =
-        (state.localization, state.camera_matrix.as_ref())
-    else {
+    let (Some(field_to_robot), Some(camera_matrix)) = (
+        state.latest_localization,
+        state
+            .camera_matrix
+            .as_ref()
+            .map(|sample| sample.inner.as_ref()),
+    ) else {
         return;
     };
     let dimensions = state.field_dimensions.unwrap_or(FieldDimensions::SPL_2025);
     let intrinsics = state
-        .calibrated_intrinsics
+        .latest_calibrated_intrinsics
         .unwrap_or(camera_matrix.intrinsics);
     let robot_to_camera = robot_to_camera(camera_matrix);
     let field_to_camera = robot_to_camera * field_to_robot;

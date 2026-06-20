@@ -139,8 +139,9 @@ impl GlobalAssociator {
 
     /// Attempts to localize one frame of field-feature detections against the known field map.
     ///
-    /// Returns `None` when no candidate passes the configured gates. Returned ambiguous results are
-    /// diagnostic only; only `UniqueModuloSymmetry` results are safe for backend ingestion.
+    /// Returns `None` when no safe stable association set passes the configured gates. Returned
+    /// ambiguous results are diagnostic only; only `UniqueModuloSymmetry` results are safe for
+    /// backend ingestion.
     pub fn localize(&self, input: GlobalLocalizationInput<'_>) -> Option<GlobalLocalizationResult> {
         solver::solve(input, self.config)
     }

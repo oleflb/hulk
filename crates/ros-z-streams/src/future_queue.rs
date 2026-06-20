@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeSet, VecDeque},
+    num::NonZeroUsize,
     time::Duration,
 };
 
@@ -30,22 +31,24 @@ pub struct FutureQueueSubscriber<T: Message> {
     inflight: BTreeSet<Announcement>,
     pending_data: VecDeque<Received<T>>,
     transit_lag: Duration,
+    max_pending: Option<NonZeroUsize>,
 }
 
 /// Events from a single stream subscription.
 ///
-/// The subscriber emits these events to the fusion engine, which buffers them
-/// according to their timestamp and arrival pattern.
+/// Direct subscribers can use these events to distinguish timestamp announcements from payloads.
+/// [`FutureMap`](crate::FutureMap) additionally buffers them according to their timestamp and
+/// arrival pattern for multi-stream fusion.
 pub enum QueueEvent<T> {
     /// A new timestamp announcement was received for future data on this stream.
     ///
-    /// This indicates that data with the announced timestamp is coming.
-    /// The fusion engine uses this to update its global safe-time boundaries.
+    /// This indicates that data with the announced timestamp is expected. Fusion consumers use this
+    /// to update global safe-time boundaries.
     Announcement,
     /// Data message with matched announcement arrived on this stream.
     ///
-    /// The timestamp is the value announced earlier. The data is now available
-    /// for inclusion in the time-ordered persistent buffer.
+    /// The timestamp is the value announced earlier. Direct subscribers can consume the payload
+    /// immediately; fusion consumers can include it in their time-ordered buffer.
     Data(Time, T),
 }
 
@@ -74,6 +77,13 @@ impl<T: Message> FutureQueueSubscriber<T> {
     /// Returns the transit lag for this stream.
     pub(crate) fn transit_lag(&self) -> Duration {
         self.transit_lag
+    }
+
+    /// Returns how many publisher pairs currently match this stream.
+    pub fn publisher_count(&self) -> usize {
+        self.data_subscriber
+            .publisher_count()
+            .min(self.announcement_subscriber.publisher_count())
     }
 
     /// Check if any of the pending data messages matches the first outstanding announcement
@@ -105,12 +115,27 @@ impl<T: Message> FutureQueueSubscriber<T> {
             select! {
                 announcement = self.announcement_subscriber.recv() => {
                     self.inflight.insert(announcement?);
+                    self.trim_pending();
                     return Ok(QueueEvent::Announcement);
                 }
                 data = self.data_subscriber.recv_with_metadata() => {
                     self.pending_data.push_back(data?);
+                    self.trim_pending();
                 }
             }
+        }
+    }
+
+    fn trim_pending(&mut self) {
+        let Some(max_pending) = self.max_pending else {
+            return;
+        };
+        let max_pending = max_pending.get();
+        while self.inflight.len() > max_pending {
+            self.inflight.pop_first();
+        }
+        while self.pending_data.len() > max_pending {
+            self.pending_data.pop_front();
         }
     }
 }
@@ -140,6 +165,28 @@ pub trait CreateFutureQueue {
         topic: &str,
         transit_lag: Duration,
     ) -> impl Future<Output = Result<FutureQueueSubscriber<T>>>;
+
+    /// Subscribe to an announced topic with bounded buffering for unmatched announcements and data.
+    ///
+    /// The data stream must be published with [`crate::AnnouncingPublisher`] or an equivalent
+    /// publisher that sends matching announcements on `{topic}/announce`. `recv()` yields
+    /// [`QueueEvent::Announcement`] when an announcement arrives, and [`QueueEvent::Data`] only
+    /// after the corresponding payload arrives.
+    ///
+    /// This constructor is intended for UI/tools or other consumers that must stay bounded even if
+    /// an announcement/data pair is dropped. `max_pending` bounds unmatched announcements and
+    /// unmatched data payloads separately; when the bound is exceeded, the oldest unmatched entries
+    /// are discarded so later matching pairs can still make progress.
+    ///
+    /// `transit_lag` has the same meaning as for [`CreateFutureQueue::create_future_subscriber`]:
+    /// it is the maximum expected duration between announcement and payload receipt used by
+    /// higher-level fusion maps to decide when timestamps are safe to finalize.
+    fn create_bounded_future_subscriber<T: Message>(
+        &self,
+        topic: &str,
+        transit_lag: Duration,
+        max_pending: NonZeroUsize,
+    ) -> impl Future<Output = Result<FutureQueueSubscriber<T>>>;
 }
 
 impl CreateFutureQueue for Node {
@@ -148,29 +195,49 @@ impl CreateFutureQueue for Node {
         topic: &str,
         transit_lag: Duration,
     ) -> Result<FutureQueueSubscriber<T>> {
-        let data_subscriber = self
-            .subscriber(topic)?
-            .qos(QosProfile {
-                history: QosHistory::KeepAll,
-                ..Default::default()
-            })
-            .build()
-            .await?;
-        let announcement_subscriber = self
-            .subscriber(&format!("{}/announce", topic))?
-            .qos(QosProfile {
-                history: QosHistory::KeepAll,
-                ..Default::default()
-            })
-            .build()
-            .await?;
-
-        Ok(FutureQueueSubscriber {
-            data_subscriber,
-            announcement_subscriber,
-            inflight: BTreeSet::new(),
-            pending_data: VecDeque::new(),
-            transit_lag,
-        })
+        create_future_subscriber_with_bound(self, topic, transit_lag, None).await
     }
+
+    async fn create_bounded_future_subscriber<T: Message>(
+        &self,
+        topic: &str,
+        transit_lag: Duration,
+        max_pending: NonZeroUsize,
+    ) -> Result<FutureQueueSubscriber<T>> {
+        create_future_subscriber_with_bound(self, topic, transit_lag, Some(max_pending)).await
+    }
+}
+
+async fn create_future_subscriber_with_bound<T: Message>(
+    node: &Node,
+    topic: &str,
+    transit_lag: Duration,
+    max_pending: Option<NonZeroUsize>,
+) -> Result<FutureQueueSubscriber<T>> {
+    let history = max_pending.map_or(QosHistory::KeepAll, QosHistory::KeepLast);
+    let data_subscriber = node
+        .subscriber(topic)?
+        .qos(QosProfile {
+            history,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    let announcement_subscriber = node
+        .subscriber(&format!("{}/announce", topic))?
+        .qos(QosProfile {
+            history,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+
+    Ok(FutureQueueSubscriber {
+        data_subscriber,
+        announcement_subscriber,
+        inflight: BTreeSet::new(),
+        pending_data: VecDeque::new(),
+        transit_lag,
+        max_pending,
+    })
 }

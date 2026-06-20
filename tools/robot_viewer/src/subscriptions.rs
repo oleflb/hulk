@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use color_eyre::{
     Result,
     eyre::{WrapErr as _, eyre},
@@ -13,6 +15,7 @@ use ros_z::{
     prelude::ContextBuilder,
     qos::{QosDurability, QosProfile},
 };
+use ros_z_streams::{CreateFutureQueue, QueueEvent};
 use ros2::sensor_msgs::image::Image as RosImage;
 use tokio::runtime::Runtime;
 use types::{
@@ -34,8 +37,12 @@ const VISUAL_ODOMETER_TOPIC: &str = "visual_odometry/current_left_camera_to_visu
 const ROBOT_KINEMATICS_TOPIC: &str = "robot_kinematics";
 const CAMERA_MATRIX_TOPIC: &str = "camera_matrix";
 const CALIBRATED_INTRINSICS_TOPIC: &str = "debug/calibrated_intrinsics";
+// Detections are an announced stream: replays/simulators must provide both this base topic and
+// `{DETECTED_OBJECTS_TOPIC}/announce` so the viewer can recover the original image timestamp.
 const DETECTED_OBJECTS_TOPIC: &str = "detected_objects";
 const FIELD_MARK_ASSOCIATIONS_TOPIC: &str = "field_mark_association/associations";
+const DETECTED_OBJECTS_SAFETY_LAG: std::time::Duration = std::time::Duration::from_millis(50);
+const DETECTED_OBJECTS_PENDING_CAPACITY: usize = 64;
 
 pub(crate) fn spawn(
     runtime: &Runtime,
@@ -106,9 +113,12 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         .subscriber::<TimeWrapper<RosImage>>(CAMERA_IMAGE_TOPIC)?
         .build()
         .await?;
-    let objects = node
-        .subscriber::<Vec<Object<RobocupObjectLabel>>>(DETECTED_OBJECTS_TOPIC)?
-        .build()
+    let mut objects = node
+        .create_bounded_future_subscriber::<Vec<Object<RobocupObjectLabel>>>(
+            DETECTED_OBJECTS_TOPIC,
+            DETECTED_OBJECTS_SAFETY_LAG,
+            NonZeroUsize::new(DETECTED_OBJECTS_PENDING_CAPACITY).expect("capacity is non-zero"),
+        )
         .await?;
     let field_mark_associations = node
         .subscriber::<TimeWrapper<FieldMarkAssociations>>(FIELD_MARK_ASSOCIATIONS_TOPIC)?
@@ -191,7 +201,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
             },
             message = robot_kinematics.recv() => match message {
                 Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.robot_kinematics = Some(message.inner);
+                    state.push_robot_kinematics(message.time, message.inner);
                     state.robot_kinematics_status.mark_live(robot_kinematics.publisher_count());
                 }),
                 Err(error) => update_state(&state, &egui_context, |state| {
@@ -200,7 +210,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
             },
             message = camera_matrix.recv() => match message {
                 Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.camera_matrix = Some(message.inner);
+                    state.push_camera_matrix(message.time, message.inner);
                     state.camera_matrix_status.mark_live(camera_matrix.publisher_count());
                 }),
                 Err(error) => update_state(&state, &egui_context, |state| {
@@ -217,35 +227,39 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                 }),
             },
             message = camera.recv() => match message {
-                Ok(image) => match decode_camera_frame(image.inner) {
-                    Ok(frame) => update_state(&state, &egui_context, |state| {
-                        state.camera_sequence += 1;
-                        state.camera_frame = Some(CameraFrame {
-                            sequence: state.camera_sequence,
-                            ..frame
-                        });
-                        state.camera_status.mark_live(camera.publisher_count());
-                    }),
-                    Err(error) => update_state(&state, &egui_context, |state| {
-                        state.camera_status.mark_error(camera.publisher_count(), format!("{error:#}"));
-                    }),
-                },
+                Ok(image) => {
+                    let time = image.time;
+                    match decode_camera_frame(image.inner) {
+                        Ok(frame) => update_state(&state, &egui_context, |state| {
+                            state.camera_sequence += 1;
+                            state.push_camera_frame(time, CameraFrame {
+                                sequence: state.camera_sequence,
+                                ..frame
+                            });
+                            state.camera_status.mark_live(camera.publisher_count());
+                        }),
+                        Err(error) => update_state(&state, &egui_context, |state| {
+                            state.camera_status.mark_error(camera.publisher_count(), format!("{error:#}"));
+                        }),
+                    }
+                }
                 Err(error) => update_state(&state, &egui_context, |state| {
                     state.camera_status.mark_error(camera.publisher_count(), format!("{error:#}"));
                 }),
             },
             message = objects.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.detected_objects = message;
+                Ok(QueueEvent::Data(time, message)) => update_state(&state, &egui_context, |state| {
+                    state.push_detected_objects(time, message);
                     state.objects_status.mark_live(objects.publisher_count());
                 }),
+                Ok(QueueEvent::Announcement) => {}
                 Err(error) => update_state(&state, &egui_context, |state| {
                     state.objects_status.mark_error(objects.publisher_count(), format!("{error:#}"));
                 }),
             },
             message = field_mark_associations.recv() => match message {
                 Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.field_mark_associations = Some(message.inner);
+                    state.push_field_mark_associations(message.time, message.inner);
                     state.field_mark_associations_status.mark_live(field_mark_associations.publisher_count());
                 }),
                 Err(error) => update_state(&state, &egui_context, |state| {

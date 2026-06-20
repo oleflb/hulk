@@ -47,8 +47,8 @@ pub(crate) struct GlobalLocalizationInput<'a> {
 #[derive(Clone, Debug)]
 /// Association result for one global localization frame.
 pub(crate) enum GlobalLocalizationResult {
-    /// The returned associations are plausible, but uniqueness was not certified.
-    /// This can be caused by a competing assignment or by a truncated search.
+    /// Reserved for plausible associations whose uniqueness was not certified.
+    #[allow(dead_code)]
     Ambiguous(FeatureAssociations),
     /// The returned stable association set is unique after quotienting the unavoidable 180 degree
     /// field symmetry.

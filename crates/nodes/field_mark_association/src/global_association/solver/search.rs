@@ -12,23 +12,20 @@ pub(super) fn solve_problem(problem: &Problem) -> Option<GlobalLocalizationResul
         .into_iter()
         .filter(|candidate| passes_basic_acceptance(candidate, problem.cfg))
         .collect::<Vec<_>>();
-    let best = accepted_candidates.first()?;
-    let stable = stable_candidate(problem, &accepted_candidates);
-
-    let candidate = oriented_candidate(problem, stable.as_ref().unwrap_or(best));
-    let associations = to_public(&candidate, problem);
+    accepted_candidates.first()?;
     if problem.detections_truncated || truncated {
-        return Some(GlobalLocalizationResult::Ambiguous(associations));
+        return None;
     }
 
+    let stable = stable_candidate(problem, &accepted_candidates);
+
     let Some(stable) = stable else {
-        return Some(GlobalLocalizationResult::Ambiguous(associations));
+        return None;
     };
     let stable = oriented_candidate(problem, &stable);
+    let associations = to_public(&stable, problem);
 
-    Some(GlobalLocalizationResult::UniqueModuloSymmetry(to_public(
-        &stable, problem,
-    )))
+    Some(GlobalLocalizationResult::UniqueModuloSymmetry(associations))
 }
 
 fn candidate_hypotheses(problem: &Problem) -> CandidateSearch {

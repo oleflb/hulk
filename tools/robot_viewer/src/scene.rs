@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -13,7 +13,7 @@ use linear_algebra::Isometry3;
 use projection::{Projection, camera_matrix::CameraMatrix};
 use types::field_dimensions::FieldDimensions;
 
-use crate::state::{CameraFrame, PoseSource, ViewerState};
+use crate::state::{AlignedViewerState, CameraFrame, PoseSource};
 
 const K1_ASSET_DIRECTORY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -48,16 +48,17 @@ pub(crate) struct ViewerData {
     field_dimensions: Option<FieldDimensions>,
     localization: Option<Isometry3<Field, Robot>>,
     visual_odometer: Option<nalgebra::Isometry3<f32>>,
-    robot_kinematics: Option<RobotKinematics>,
+    robot_kinematics: Option<Arc<RobotKinematics>>,
     camera_matrix: Option<CameraMatrix>,
-    camera_frame: Option<CameraFrame>,
-    field_mark_associations: Option<FieldMarkAssociations>,
+    camera_frame: Option<Arc<CameraFrame>>,
+    field_mark_associations: Option<Arc<FieldMarkAssociations>>,
 }
 
 impl ViewerData {
-    pub(crate) fn from_state(state: &ViewerState, pose_source: PoseSource) -> Self {
-        let camera_matrix = state.camera_matrix.clone().map(|mut camera_matrix| {
-            if let Some(intrinsics) = state.calibrated_intrinsics {
+    pub(crate) fn from_aligned_state(state: AlignedViewerState, pose_source: PoseSource) -> Self {
+        let camera_matrix = state.camera_matrix.map(|sample| {
+            let mut camera_matrix = sample.inner.as_ref().clone();
+            if let Some(intrinsics) = state.latest_calibrated_intrinsics {
                 camera_matrix.intrinsics = intrinsics;
             }
             camera_matrix
@@ -66,12 +67,12 @@ impl ViewerData {
         Self {
             pose_source,
             field_dimensions: state.field_dimensions,
-            localization: state.localization,
-            visual_odometer: state.visual_odometer,
-            robot_kinematics: state.robot_kinematics.clone(),
+            localization: state.latest_localization,
+            visual_odometer: state.latest_visual_odometer,
+            robot_kinematics: state.robot_kinematics.map(|sample| sample.inner),
             camera_matrix,
-            camera_frame: state.camera_frame.clone(),
-            field_mark_associations: state.field_mark_associations.clone(),
+            camera_frame: state.camera_frame.map(|sample| sample.inner),
+            field_mark_associations: state.field_mark_associations.map(|sample| sample.inner),
         }
     }
 }
@@ -551,7 +552,7 @@ fn update_camera_image(
     }
 
     images
-        .insert(image_plane.texture.id(), camera_frame_image(frame))
+        .insert(image_plane.texture.id(), camera_frame_image(frame.as_ref()))
         .expect("camera image texture handle should be valid");
     image_plane.sequence = frame.sequence;
 }
@@ -578,7 +579,7 @@ fn update_field_mark_associations(
     meshes
         .insert(
             lines.0.id(),
-            field_mark_associations_mesh(associations, camera_matrix, field_to_robot),
+            field_mark_associations_mesh(associations.as_ref(), camera_matrix, field_to_robot),
         )
         .expect("field mark association mesh handle should be valid");
     *lines.1 = Visibility::Visible;
