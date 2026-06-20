@@ -426,7 +426,7 @@ fn solve_and_record(
         graph_seconds: seconds_since(result.time, recording.start_source_time()),
         solve_duration,
         robot_to_field: result.transform.framed_transform(),
-        diagnostics: backend.last_solve_diagnostics().cloned(),
+        diagnostics: backend.compute_last_solve_diagnostics(),
         stats: stats.clone(),
     });
     Ok(())

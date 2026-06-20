@@ -894,10 +894,10 @@ fn solve_and_record(
     samples: &mut Vec<ComparisonSample>,
 ) -> Result<(), Box<dyn Error>> {
     let backend_result = backend.solve_once()?;
-    let diagnostics = backend.last_solve_diagnostics().cloned();
     if backend_result.is_none() {
         return Ok(());
     }
+    let diagnostics = backend.compute_last_solve_diagnostics();
     let Some(result) = frontend.last_optimization_result() else {
         return Ok(());
     };

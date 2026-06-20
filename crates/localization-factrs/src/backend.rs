@@ -157,8 +157,8 @@ pub struct VinsBackend {
     next_imu_attitude_knot_index: u32,
     /// Latest finalized knot orientation, used to form relative yaw and live yaw residuals.
     last_imu_knot_orientation: Option<ImuKnotOrientation>,
-    /// Diagnostics from the most recent solve.
-    last_solve_diagnostics: Option<BackendSolveDiagnostics>,
+    /// Optimizer status from the most recent solve.
+    last_optimizer_status: Option<BackendOptimizerStatus>,
 }
 
 pub fn initialize_graph(initial_state: &InitialState) -> (Graph, Values) {
@@ -231,7 +231,7 @@ impl VinsBackend {
             latest_imu_attitude_measurement: None,
             next_imu_attitude_knot_index: 0,
             last_imu_knot_orientation: None,
-            last_solve_diagnostics: None,
+            last_optimizer_status: None,
         }
     }
 
@@ -239,28 +239,24 @@ impl VinsBackend {
         &self.values
     }
 
-    pub fn last_solve_diagnostics(&self) -> Option<&BackendSolveDiagnostics> {
-        self.last_solve_diagnostics.as_ref()
+    pub fn compute_last_solve_diagnostics(&self) -> Option<BackendSolveDiagnostics> {
+        self.last_optimizer_status
+            .map(|optimizer_status| self.solve_diagnostics(optimizer_status))
     }
 
-    /// Loops continuously, ingesting measurements and optimizing the graph.
-    /// Only returns if an error occurs.
-    pub fn run_loop(mut self) -> Result<(), VinsBackendError> {
+    /// Blocks until new measurements are available, ingests them, and optimizes the graph once.
+    pub fn solve_next_blocking(&mut self) -> Result<Option<OptimizationResult>, VinsBackendError> {
         let mut measurements = Vec::new();
-
-        loop {
-            measurements.clear();
-            if self
-                .measurement_receiver
-                .blocking_recv_many(&mut measurements, usize::MAX)
-                == 0
-            {
-                return Err(VinsBackendError::FrontendDisconnected);
-            }
-
-            self.ingest_sensor_measurements(measurements.drain(..))?;
-            let _ = self.optimize_and_publish()?;
+        if self
+            .measurement_receiver
+            .blocking_recv_many(&mut measurements, usize::MAX)
+            == 0
+        {
+            return Err(VinsBackendError::FrontendDisconnected);
         }
+
+        self.ingest_sensor_measurements(measurements.drain(..))?;
+        self.optimize_and_publish()
     }
 
     pub fn solve_once(&mut self) -> Result<Option<OptimizationResult>, VinsBackendError> {
@@ -945,6 +941,7 @@ impl VinsBackend {
     }
 
     fn optimize(&mut self) -> Option<OptimizationResult> {
+        self.last_optimizer_status = None;
         let time = self.last_knot_time?;
         log::info!("solving graph with {} values", self.values.len());
 
@@ -986,7 +983,7 @@ impl VinsBackend {
             }
         }
 
-        self.last_solve_diagnostics = Some(self.solve_diagnostics(optimizer_status));
+        self.last_optimizer_status = Some(optimizer_status);
 
         let interval_start_time = self.interval_assigner.current_interval_start_time(time)?;
         let interval_start_index = self

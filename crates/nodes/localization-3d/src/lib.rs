@@ -1,4 +1,9 @@
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::{Future, ready},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use booster::ImuState;
 use color_eyre::{
@@ -11,7 +16,12 @@ use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, point};
 use localization_factrs::{
     BackendConfiguration, CameraIntrinsics, InitialState, OptimizationResult, VinsFrontend,
-    VinsFrontendError, VisualReprojectionAssociation, initialize,
+    VinsFrontendError, VisualReprojectionAssociation,
+    backend::{
+        BackendOptimizerStatus, BackendSolveDiagnostics,
+        ResidualDiagnostics as BackendResidualDiagnostics,
+    },
+    initialize,
 };
 use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
@@ -46,6 +56,69 @@ impl Localization3dParameters {
             return Err("visual_feature_noise_variance must be finite and > 0".to_string());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+pub struct SolveDiagnostics {
+    pub optimizer_status: SolveOptimizerStatus,
+    pub value_count: usize,
+    pub factor_count: usize,
+    pub total_error: f64,
+    pub visual_odometry: SolveResidualDiagnostics,
+    pub visual_reprojection: SolveResidualDiagnostics,
+    pub gaussian_process_prior: SolveResidualDiagnostics,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Message)]
+pub enum SolveOptimizerStatus {
+    Converged,
+    MaxIterations,
+    FailedToStep,
+    InvalidSystem,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Message)]
+pub struct SolveResidualDiagnostics {
+    pub factor_count: usize,
+    pub residual_dim: usize,
+    pub mean_rms: f64,
+    pub max_rms: f64,
+}
+
+impl From<BackendSolveDiagnostics> for SolveDiagnostics {
+    fn from(diagnostics: BackendSolveDiagnostics) -> Self {
+        Self {
+            optimizer_status: diagnostics.optimizer_status.into(),
+            value_count: diagnostics.value_count,
+            factor_count: diagnostics.factor_count,
+            total_error: diagnostics.total_error,
+            visual_odometry: diagnostics.visual_odometry.into(),
+            visual_reprojection: diagnostics.visual_reprojection.into(),
+            gaussian_process_prior: diagnostics.gaussian_process_prior.into(),
+        }
+    }
+}
+
+impl From<BackendOptimizerStatus> for SolveOptimizerStatus {
+    fn from(status: BackendOptimizerStatus) -> Self {
+        match status {
+            BackendOptimizerStatus::Converged => Self::Converged,
+            BackendOptimizerStatus::MaxIterations => Self::MaxIterations,
+            BackendOptimizerStatus::FailedToStep => Self::FailedToStep,
+            BackendOptimizerStatus::InvalidSystem => Self::InvalidSystem,
+        }
+    }
+}
+
+impl From<BackendResidualDiagnostics> for SolveResidualDiagnostics {
+    fn from(diagnostics: BackendResidualDiagnostics) -> Self {
+        Self {
+            factor_count: diagnostics.factor_count,
+            residual_dim: diagnostics.residual_dim,
+            mean_rms: diagnostics.mean_rms,
+            max_rms: diagnostics.max_rms,
+        }
     }
 }
 
@@ -135,6 +208,10 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .publisher::<Intrinsic>("debug/calibrated_intrinsics")?
         .build()
         .await?;
+    let solve_diagnostics_publisher = node
+        .publisher::<TimeWrapper<SolveDiagnostics>>("debug/solve_diagnostics")?
+        .build()
+        .await?;
 
     let initial_state = wait_for_initial_state(&camera_matrix_cache).await;
     let visual_feature_noise_variance = parameters.snapshot().typed().visual_feature_noise_variance;
@@ -142,7 +219,28 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         backend_configuration(visual_feature_noise_variance),
         initial_state,
     );
-    let mut backend_handle = std::pin::pin!(tokio::task::spawn_blocking(|| backend.run_loop()));
+    let runtime = tokio::runtime::Handle::current();
+    let mut backend_handle = std::pin::pin!(tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut backend = backend;
+        loop {
+            let Some(result) = backend.solve_next_blocking()? else {
+                continue;
+            };
+
+            runtime
+                .block_on(solve_diagnostics_publisher.publish_if_subscribed(|| {
+                    let diagnostics = backend
+                        .compute_last_solve_diagnostics()
+                        .expect("diagnostics are available after a successful solve");
+
+                    ready(TimeWrapper {
+                        time: Time::from_wallclock(result.time),
+                        inner: diagnostics.into(),
+                    })
+                }))
+                .wrap_err("failed to publish solve diagnostics")?;
+        }
+    }));
     let mut live_localization = LiveVisualOdometryLocalization::default();
 
     loop {
