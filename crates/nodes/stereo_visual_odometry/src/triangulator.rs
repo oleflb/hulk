@@ -77,6 +77,8 @@ impl StereoTriangulator {
         output: &mut Vec<StereoPoint>,
     ) {
         output.clear();
+        let mut disparity_checks = 0;
+        let mut disparity_failures = 0;
 
         for (left_index, right_index, _score) in matches.left_to_right() {
             let Some(left_keypoint) = left.keypoint(left_index) else {
@@ -91,9 +93,14 @@ impl StereoTriangulator {
 
             let left_pixel = self.left_pixel(left_keypoint);
             let right_pixel = self.right_pixel(right_keypoint);
-            if let Some((position, disparity)) =
-                self.triangulate_point(left_pixel, right_pixel, max_vertical_disparity_px)
-            {
+            disparity_checks += 1;
+            let Some(disparity) =
+                self.disparity(left_pixel, right_pixel, max_vertical_disparity_px)
+            else {
+                disparity_failures += 1;
+                continue;
+            };
+            if let Some(position) = self.triangulate_disparity(left_pixel, disparity) {
                 output.push(StereoPoint {
                     left_index,
                     right_pixel,
@@ -101,6 +108,14 @@ impl StereoTriangulator {
                     disparity,
                 });
             }
+        }
+
+        if disparity_checks > 0 && disparity_failures == disparity_checks {
+            tracing::warn!(
+                disparity_checks,
+                max_vertical_disparity_px,
+                "all stereo visual odometry matches failed disparity check"
+            );
         }
     }
 
@@ -140,18 +155,12 @@ impl StereoTriangulator {
         &self.intrinsics
     }
 
-    fn triangulate_point(
-        &self,
-        left: Vec2F32,
-        right: Vec2F32,
-        max_vertical_disparity_px: f32,
-    ) -> Option<(Vec3AF32, f32)> {
-        let disparity = self.disparity(left, right, max_vertical_disparity_px)?;
+    fn triangulate_disparity(&self, left: Vec2F32, disparity: f32) -> Option<Vec3AF32> {
         let z = self.fx * self.baseline / disparity;
         let x = (left.x - self.cx) * z / self.fx;
         let y = (left.y - self.cy) * z / self.fy;
         (z.is_finite() && z > 0.0 && x.is_finite() && y.is_finite())
-            .then_some((Vec3AF32::new(x, y, z), disparity))
+            .then_some(Vec3AF32::new(x, y, z))
     }
 }
 
