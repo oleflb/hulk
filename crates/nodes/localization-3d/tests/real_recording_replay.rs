@@ -43,8 +43,8 @@ const EXPECTED_DETECTED_OBJECT_FRAME_COUNT: usize = 710;
 // Static-height-gated global localizations are ingested only when the landmark
 // associations are unique enough to be safe as fixed backend factors.
 const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 75;
-const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 84;
-const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 41;
+const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 75;
+const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 37;
 const EXPECTED_GOALPOST_DETECTION_COUNT: usize = 723;
 const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 185;
 const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 170;

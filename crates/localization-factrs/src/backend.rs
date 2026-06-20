@@ -70,7 +70,6 @@ pub struct BackendConfiguration {
     pub roll_pitch_yaw_noise: Matrix3<f64>,
     pub visual_feature_noise: Matrix2<f64>,
     pub visual_odometry_noise: SMatrix<f64, 6, 6>,
-    pub foot_ground_softness: f64,
     pub foot_ground_sigma: f64,
     pub gravity: Vector3<f64>,
 }
@@ -813,7 +812,6 @@ impl VinsBackend {
                     group.measurements,
                     group.start_time,
                     group.end_time,
-                    self.config.foot_ground_softness,
                     self.config.foot_ground_sigma,
                 );
                 let factor = FactorBuilder::new(residual, keys).build();
@@ -1269,7 +1267,6 @@ mod tests {
             roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
             visual_feature_noise: Matrix2::identity() * 5.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
-            foot_ground_softness: 1.0e-3,
             foot_ground_sigma: 0.01,
             gravity: Vector3::new(0.0, 0.0, 9.81),
         }

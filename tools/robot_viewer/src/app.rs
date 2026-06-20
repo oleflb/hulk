@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use coordinate_systems::{Camera, Field, Robot};
 use eframe::{
@@ -11,13 +14,15 @@ use eframe::{
 };
 use egui_bevy::BevyWidget;
 use field_mark_association::FieldMarkAssociations;
-use linear_algebra::{Isometry3, Point2, point};
+use kinematics::robot_kinematics::RobotKinematics;
+use linear_algebra::{Isometry3, Point2, Point3, point};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::time::Time;
 use tokio::runtime::Runtime;
 use types::{
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
+    time_wrapper::TimeWrapper,
 };
 
 use crate::{
@@ -41,6 +46,7 @@ pub(crate) struct RobotViewerApp {
     camera_zoom: f32,
     camera_pan: Vec2,
     show_projected_field_lines: bool,
+    render_samples: RenderSampleStabilizer,
     _runtime: Arc<Runtime>,
 }
 
@@ -48,10 +54,76 @@ const CAMERA_MIN_ZOOM: f32 = 1.0;
 const CAMERA_MAX_ZOOM: f32 = 25.0;
 const CAMERA_FOOTER_HEIGHT: f32 = 88.0;
 const FIELD_LINE_SAMPLE_STEP: f32 = 0.05;
+const RENDER_SAMPLE_GRACE: Duration = Duration::from_millis(250);
 const PROJECTED_FIELD_LINE_STROKE: Stroke = Stroke {
     width: 2.0,
     color: Color32::from_rgba_premultiplied(80, 220, 255, 190),
 };
+const ASSOCIATION_RESIDUAL_STROKE: Stroke = Stroke {
+    width: 2.0,
+    color: Color32::from_rgba_premultiplied(255, 80, 200, 220),
+};
+
+#[derive(Default)]
+struct RenderSampleStabilizer {
+    camera_matrix: Option<StabilizedSample<CameraMatrix>>,
+    robot_kinematics: Option<StabilizedSample<RobotKinematics>>,
+}
+
+struct StabilizedSample<T> {
+    anchor_time: Time,
+    sample: TimeWrapper<Arc<T>>,
+}
+
+impl RenderSampleStabilizer {
+    fn stabilize(&mut self, state: &mut AlignedViewerState) {
+        state.camera_matrix = stabilize_sample(
+            &mut self.camera_matrix,
+            state.camera_matrix.take(),
+            state.anchor_time,
+        );
+        state.robot_kinematics = stabilize_sample(
+            &mut self.robot_kinematics,
+            state.robot_kinematics.take(),
+            state.anchor_time,
+        );
+    }
+}
+
+fn stabilize_sample<T>(
+    stabilized: &mut Option<StabilizedSample<T>>,
+    sample: Option<TimeWrapper<Arc<T>>>,
+    anchor_time: Option<Time>,
+) -> Option<TimeWrapper<Arc<T>>> {
+    match (sample, anchor_time) {
+        (Some(sample), Some(anchor_time)) => {
+            *stabilized = Some(StabilizedSample {
+                anchor_time,
+                sample: sample.clone(),
+            });
+            Some(sample)
+        }
+        (Some(sample), None) => {
+            *stabilized = None;
+            Some(sample)
+        }
+        (None, Some(anchor_time)) => {
+            let Some(last) = stabilized.as_ref() else {
+                return None;
+            };
+            if anchor_time.abs_diff(last.anchor_time) <= RENDER_SAMPLE_GRACE {
+                Some(last.sample.clone())
+            } else {
+                *stabilized = None;
+                None
+            }
+        }
+        (None, None) => {
+            *stabilized = None;
+            None
+        }
+    }
+}
 
 impl RobotViewerApp {
     pub(crate) fn new(
@@ -93,6 +165,7 @@ impl RobotViewerApp {
             camera_zoom: 1.0,
             camera_pan: Vec2::ZERO,
             show_projected_field_lines: false,
+            render_samples: RenderSampleStabilizer::default(),
             _runtime: runtime,
         }
     }
@@ -100,13 +173,14 @@ impl RobotViewerApp {
 
 impl App for RobotViewerApp {
     fn update(&mut self, context: &Context, _frame: &mut Frame) {
-        let (status, aligned) = {
+        let (status, mut aligned) = {
             let state = self
                 .state
                 .lock()
                 .expect("viewer state lock should not be poisoned");
             (state.status_snapshot(), state.aligned_snapshot())
         };
+        self.render_samples.stabilize(&mut aligned);
 
         self.update_camera_texture(
             context,
@@ -554,6 +628,20 @@ fn draw_projected_field_lines(
         intrinsics,
         dimensions,
     );
+    if let Some(associations) = state
+        .field_mark_associations
+        .as_ref()
+        .map(|associations| associations.inner.as_ref())
+    {
+        draw_projected_field_mark_association_residuals(
+            &painter,
+            image_rect,
+            image_size,
+            &field_to_camera,
+            intrinsics,
+            associations,
+        );
+    }
 }
 
 fn robot_to_camera(camera_matrix: &CameraMatrix) -> Isometry3<Robot, Camera> {
@@ -649,6 +737,43 @@ fn draw_projected_field_markings(
                 sign,
             );
         }
+    }
+}
+
+fn draw_projected_field_mark_association_residuals(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    associations: &FieldMarkAssociations,
+) {
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+
+    for association in &associations.associations {
+        let detection_position = image_rect.min
+            + vec2(
+                association.detection.x() * scale.x,
+                association.detection.y() * scale.y,
+            );
+        let Some(projected_position) = project_field_point3_to_image(
+            image_rect,
+            image_size,
+            field_to_camera,
+            intrinsics,
+            association.field_point,
+        ) else {
+            continue;
+        };
+
+        painter.line_segment(
+            [detection_position, projected_position],
+            ASSOCIATION_RESIDUAL_STROKE,
+        );
+        painter.circle_filled(projected_position, 3.5, ASSOCIATION_RESIDUAL_STROKE.color);
     }
 }
 
@@ -899,7 +1024,23 @@ fn project_field_point_to_image(
     field_point: [f32; 2],
 ) -> Option<Pos2> {
     let point: Point2<Field> = point![<Field>, field_point[0], field_point[1]];
-    let camera_point = field_to_camera * point.extend(0.0);
+    project_field_point3_to_image(
+        image_rect,
+        image_size,
+        field_to_camera,
+        intrinsics,
+        point.extend(0.0),
+    )
+}
+
+fn project_field_point3_to_image(
+    image_rect: Rect,
+    image_size: Vec2,
+    field_to_camera: &Isometry3<Field, Camera>,
+    intrinsics: Intrinsic,
+    field_point: Point3<Field>,
+) -> Option<Pos2> {
+    let camera_point = field_to_camera * field_point;
     if !camera_point.inner.iter().all(|value| value.is_finite()) || camera_point.z() <= 1.0e-4 {
         return None;
     }
@@ -925,5 +1066,49 @@ fn object_label_color(label: RobocupObjectLabel) -> Color32 {
         RobocupObjectLabel::LSpot | RobocupObjectLabel::TSpot | RobocupObjectLabel::XSpot => {
             Color32::from_rgb(120, 255, 170)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrapped_sample(value: u8, time_nanos: i64) -> TimeWrapper<Arc<u8>> {
+        TimeWrapper {
+            time: Time::from_nanos(time_nanos),
+            inner: Arc::new(value),
+        }
+    }
+
+    #[test]
+    fn stabilize_sample_reuses_last_sample_during_short_gap() {
+        let mut stabilized = None;
+        let first_anchor = Time::from_nanos(1_000_000_000);
+        let first_sample = wrapped_sample(7, first_anchor.as_nanos());
+
+        let sample = stabilize_sample(&mut stabilized, Some(first_sample), Some(first_anchor))
+            .expect("current sample should be used");
+        assert_eq!(*sample.inner, 7);
+
+        let gap_anchor = first_anchor.saturating_add(RENDER_SAMPLE_GRACE);
+        let sample = stabilize_sample::<u8>(&mut stabilized, None, Some(gap_anchor))
+            .expect("last sample should be reused inside grace window");
+        assert_eq!(*sample.inner, 7);
+    }
+
+    #[test]
+    fn stabilize_sample_expires_after_grace_window() {
+        let mut stabilized = None;
+        let first_anchor = Time::from_nanos(1_000_000_000);
+        let first_sample = wrapped_sample(7, first_anchor.as_nanos());
+
+        stabilize_sample(&mut stabilized, Some(first_sample), Some(first_anchor))
+            .expect("current sample should be used");
+
+        let expired_anchor = first_anchor
+            .saturating_add(RENDER_SAMPLE_GRACE)
+            .saturating_add(Duration::from_nanos(1));
+        assert!(stabilize_sample::<u8>(&mut stabilized, None, Some(expired_anchor)).is_none());
+        assert!(stabilized.is_none());
     }
 }

@@ -26,7 +26,6 @@ pub struct IntervalFootAboveGroundFactor {
     start_time: SystemTime,
     end_time: SystemTime,
     duration: f64,
-    softness: f64,
     sigma: f64,
 }
 
@@ -49,10 +48,8 @@ impl IntervalFootAboveGroundFactor {
         measurements: Vec<FootHeightMeasurement>,
         start_time: SystemTime,
         end_time: SystemTime,
-        softness: f64,
         sigma: f64,
     ) -> Self {
-        assert!(softness > 0.0, "foot ground softness must be positive");
         assert!(sigma > 0.0, "foot ground sigma must be positive");
 
         let duration = interval_dt::<f64>(start_time, end_time);
@@ -67,7 +64,6 @@ impl IntervalFootAboveGroundFactor {
             start_time,
             end_time,
             duration,
-            softness,
             sigma,
         }
     }
@@ -113,11 +109,11 @@ fn foot_residual<T: Numeric>(
     factor: &IntervalFootAboveGroundFactor,
 ) -> T {
     let sole_in_field = pose.rot().apply(sole_in_robot.coords.cast::<T>().as_view()) + pose.xyz();
-    smooth_hinge(-sole_in_field.z, T::from(factor.softness)) / T::from(factor.sigma)
-}
-
-fn smooth_hinge<T: Numeric>(x: T, softness: T) -> T {
-    T::from(0.5) * (x + (x * x + softness * softness).sqrt())
+    if sole_in_field.z < T::zero() {
+        -sole_in_field.z / T::from(factor.sigma)
+    } else {
+        T::zero()
+    }
 }
 
 #[cfg(test)]
@@ -152,7 +148,6 @@ mod tests {
             vec![measurement(start_time, 0.0, -0.1)],
             start_time,
             start_time + Duration::from_secs(1),
-            1.0e-6,
             0.01,
         );
 
@@ -169,7 +164,6 @@ mod tests {
             vec![measurement(start_time, -0.2, 0.1)],
             start_time,
             start_time + Duration::from_secs(1),
-            1.0e-6,
             0.01,
         );
 
@@ -186,7 +180,6 @@ mod tests {
             vec![measurement(start_time, 0.1, -0.2)],
             start_time,
             start_time + Duration::from_secs(1),
-            1.0e-6,
             0.01,
         );
 
@@ -203,7 +196,6 @@ mod tests {
             vec![measurement(start_time, -0.1, -0.1)],
             start_time,
             start_time + Duration::from_secs(1),
-            1.0e-6,
             0.01,
         );
 

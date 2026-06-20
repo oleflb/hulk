@@ -26,7 +26,6 @@ fn imu_on_spline() {
             roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
             visual_feature_noise: Matrix2::identity() * 5.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
-            foot_ground_softness: 1.0e-3,
             foot_ground_sigma: 0.01,
             gravity: Vector3::new(0., 0., 9.81),
         },

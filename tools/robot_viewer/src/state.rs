@@ -121,7 +121,8 @@ impl ViewerState {
     /// The anchor is the newest camera frame that has aligned field-mark associations, then the
     /// newest camera frame that has aligned object detections, and finally the newest camera frame.
     /// Object detections and field-mark associations are exact timestamp matches. Camera matrix and
-    /// kinematics are nearest samples within `MAX_NEAREST_SAMPLE_DISTANCE`. Pose sources and
+    /// kinematics are nearest samples within `MAX_NEAREST_SAMPLE_DISTANCE`; the UI may briefly reuse
+    /// the last valid render sample to avoid flicker from message-ordering jitter. Pose sources and
     /// calibrated intrinsics remain latest-value streams because their current topics do not carry a
     /// frame timestamp; the UI labels pose sources as latest for this reason.
     pub(crate) fn aligned_snapshot(&self) -> AlignedViewerState {

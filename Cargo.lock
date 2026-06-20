@@ -884,12 +884,12 @@ dependencies = [
  "hsl_network_messages",
  "linear_algebra",
  "log",
- "nalgebra",
+ "nalgebra 0.34.2",
  "ordered-float 4.6.0",
  "path_planner",
  "ros-z",
  "serde",
- "smallvec 1.15.1",
+ "smallvec 1.15.2",
  "types",
  "voronoi",
 ]
@@ -8822,7 +8822,7 @@ dependencies = [
  "linear_algebra",
  "log",
  "ordered-float 4.6.0",
- "smallvec 1.15.1",
+ "smallvec 1.15.2",
  "types",
 ]
 
@@ -10870,7 +10870,7 @@ dependencies = [
  "hsl_network_messages",
  "itertools 0.14.0",
  "linear_algebra",
- "nalgebra",
+ "nalgebra 0.34.2",
  "ndarray",
  "ndarray-conv",
  "ros-z",
