@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use ros_z::prelude::*;
+use ros_z::time::Time;
 use ros_z_debug::{ManagerOptions, RetentionPolicy, SubscriptionManager};
 
 #[allow(dead_code)]
@@ -68,6 +69,18 @@ async fn typed_subscription_receives_latest_sample() {
         .await
         .expect("subscription should build");
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if handle.publisher_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for publisher count"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     publisher
         .publish(&"hello".to_string())
         .await
@@ -105,6 +118,72 @@ async fn typed_subscription_receives_latest_sample() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for latest sample replacement"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_subscription_retains_payload_stamps() {
+    let context = ContextBuilder::default()
+        .disable_multicast_scouting()
+        .with_json("connect/endpoints", serde_json::json!([]))
+        .build()
+        .await
+        .expect("context should build");
+    let publisher_node = context
+        .create_node("stamp_pub")
+        .build()
+        .await
+        .expect("publisher node");
+    let subscriber_node = Arc::new(
+        context
+            .create_node("stamp_sub")
+            .build()
+            .await
+            .expect("subscriber node"),
+    );
+    let publisher = publisher_node
+        .publisher::<String>("stamped_debug_text")
+        .expect("publisher builder")
+        .build()
+        .await
+        .expect("publisher");
+    let manager = SubscriptionManager::new(subscriber_node, ManagerOptions::default());
+    let handle = manager
+        .subscribe_typed::<String>("stamped_debug_text")
+        .retention(RetentionPolicy::time_window(Duration::from_secs(10)).unwrap())
+        .with_stamp(|message| match message.as_str() {
+            "first" => Time::from_nanos(1),
+            "second" => Time::from_nanos(2),
+            _ => Time::zero(),
+        })
+        .build()
+        .await
+        .expect("subscription should build");
+
+    publisher
+        .publish(&"first".to_string())
+        .await
+        .expect("publish should work");
+    publisher
+        .publish(&"second".to_string())
+        .await
+        .expect("publish should work");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let retained = handle.window(Time::from_nanos(1), Time::from_nanos(2));
+        if retained.len() == 2 {
+            assert_eq!(retained[0].value, "first");
+            assert_eq!(retained[0].source_time, Time::from_nanos(1));
+            assert_eq!(retained[1].value, "second");
+            assert_eq!(retained[1].source_time, Time::from_nanos(2));
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for stamped samples"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

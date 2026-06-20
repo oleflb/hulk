@@ -1,7 +1,7 @@
 use std::{error::Error as _, fmt::Write as _, marker::PhantomData, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use ros_z::{Message, dynamic::DynamicPayload, node::Node};
+use ros_z::{Message, dynamic::DynamicPayload, node::Node, qos::QosProfile, time::Time};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -11,6 +11,8 @@ use crate::{
     subscription::{ManagedSubscription, SubscriptionState},
     topic::normalize_target_namespace,
 };
+
+type StampExtractor<T> = Arc<dyn Fn(&T) -> Time + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -99,6 +101,8 @@ impl SubscriptionManager {
             manager: self,
             topic: topic.into(),
             retention: RetentionPolicy::LatestOnly,
+            qos: None,
+            stamp: None,
             value: PhantomData,
         }
     }
@@ -170,6 +174,8 @@ pub struct TypedSubscriptionBuilder<'a, T> {
     pub(crate) manager: &'a SubscriptionManager,
     pub(crate) topic: String,
     pub(crate) retention: RetentionPolicy,
+    pub(crate) qos: Option<QosProfile>,
+    pub(crate) stamp: Option<StampExtractor<T>>,
     value: PhantomData<T>,
 }
 
@@ -177,6 +183,21 @@ impl<T> TypedSubscriptionBuilder<'_, T> {
     /// Configure how many samples the handle retains.
     pub fn retention(mut self, retention: RetentionPolicy) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Configure QoS for the underlying typed subscription.
+    pub fn qos(mut self, qos: QosProfile) -> Self {
+        self.qos = Some(qos);
+        self
+    }
+
+    /// Configure a payload timestamp extractor used for retained history indexing.
+    pub fn with_stamp<F>(mut self, stamp: F) -> Self
+    where
+        F: Fn(&T) -> Time + Send + Sync + 'static,
+    {
+        self.stamp = Some(Arc::new(stamp));
         self
     }
 
@@ -202,27 +223,29 @@ impl<T> TypedSubscriptionBuilder<'_, T> {
         T::Codec: Send + Sync,
     {
         let retention = self.retention;
+        let qos = self.qos;
+        let stamp = self.stamp;
         let requested_topic = TopicSelector::new(self.topic)?;
         let resolved_topic = requested_topic.resolve(self.manager.target_namespace())?;
-        let subscriber = self
-            .manager
-            .node()
-            .subscriber::<T>(&resolved_topic)?
-            .build()
-            .await?;
+        let mut builder = self.manager.node().subscriber::<T>(&resolved_topic)?;
+        if let Some(qos) = qos {
+            builder = builder.qos(qos);
+        }
+        let subscriber = builder.build().await?;
         let type_info = subscriber.entity().type_info.clone();
         let metadata = Arc::new(SampleMetadata {
             requested_topic,
             resolved_topic: resolved_topic.clone(),
             type_info: type_info.clone(),
         });
-        let state = Arc::new(SubscriptionState::new(
+        let state = Arc::new(SubscriptionState::new_with_graph(
             SubscriptionStatusSnapshot::with_metadata(
                 SubscriptionStatus::WaitingForFirstSample,
                 resolved_topic,
                 type_info,
             ),
             retention,
+            Arc::clone(self.manager.node().graph()),
         ));
         let handle = state.handle();
         self.manager.subscriptions.register(&state);
@@ -232,6 +255,7 @@ impl<T> TypedSubscriptionBuilder<'_, T> {
             Arc::downgrade(&state),
             state.cancellation_token(),
             metadata,
+            stamp,
         ));
         state.set_receive_task(receive_task.abort_handle());
 
@@ -309,13 +333,14 @@ impl DynamicSubscriptionBuilder<'_> {
             resolved_topic: resolved_topic.clone(),
             type_info: type_info.clone(),
         });
-        let state = Arc::new(SubscriptionState::new(
+        let state = Arc::new(SubscriptionState::new_with_graph(
             SubscriptionStatusSnapshot::with_metadata(
                 SubscriptionStatus::WaitingForFirstSample,
                 resolved_topic,
                 type_info,
             ),
             retention,
+            Arc::clone(self.manager.node().graph()),
         ));
         let handle = state.handle();
         self.manager.subscriptions.register(&state);
@@ -337,6 +362,7 @@ async fn receive_typed_loop<T>(
     state: std::sync::Weak<SubscriptionState<T>>,
     cancellation: CancellationToken,
     metadata: Arc<SampleMetadata>,
+    stamp: Option<StampExtractor<T>>,
 ) where
     T: Message,
     T::Codec: Send + Sync,
@@ -354,9 +380,12 @@ async fn receive_typed_loop<T>(
         match received {
             Ok(received) => {
                 let publication_id = received.publication_id();
+                let source_time = stamp
+                    .as_ref()
+                    .map_or(received.source_time, |stamp| stamp(&received.message));
                 state.store_latest(Arc::new(SampleRecord {
                     value: received.message,
-                    source_time: received.source_time,
+                    source_time,
                     transport_time: received.transport_time,
                     publication_id,
                     metadata: Arc::clone(&metadata),

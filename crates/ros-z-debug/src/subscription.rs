@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
-use ros_z::dynamic::DynamicPayload;
 use ros_z::time::Time;
+use ros_z::{dynamic::DynamicPayload, graph::Graph};
 use serde_json::Value;
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,11 @@ impl<V> SubscriptionHandle<V> {
     /// Return the current status snapshot.
     pub fn status(&self) -> SubscriptionStatusSnapshot {
         self.state.status()
+    }
+
+    /// Return the number of matched publishers currently visible for this subscription topic.
+    pub fn publisher_count(&self) -> usize {
+        self.state.publisher_count()
     }
 
     /// Return the latest retained sample, if one has arrived.
@@ -77,6 +82,11 @@ impl JsonSubscriptionHandle {
         self.dynamic.status()
     }
 
+    /// Return the number of matched publishers currently visible for this subscription topic.
+    pub fn publisher_count(&self) -> usize {
+        self.dynamic.publisher_count()
+    }
+
     /// Render the latest retained dynamic payload as JSON.
     pub fn latest_json(&self) -> Option<Value> {
         self.dynamic
@@ -103,6 +113,7 @@ pub(crate) struct SubscriptionState<V> {
     latest: ArcSwapOption<SampleRecord<V>>,
     history: Option<Mutex<TimeIndexedHistory<V>>>,
     meta: Mutex<SubscriptionMeta>,
+    graph: Option<Arc<Graph>>,
     cancellation_token: CancellationToken,
 }
 
@@ -127,8 +138,19 @@ impl<V> SubscriptionState<V> {
                 events: EventBuffer::new(256),
                 receive_task: None,
             }),
+            graph: None,
             cancellation_token: CancellationToken::new(),
         }
+    }
+
+    pub(crate) fn new_with_graph(
+        status: SubscriptionStatusSnapshot,
+        retention: RetentionPolicy,
+        graph: Arc<Graph>,
+    ) -> Self {
+        let mut state = Self::new(status, retention);
+        state.graph = Some(graph);
+        state
     }
 
     pub(crate) fn handle(self: &Arc<Self>) -> SubscriptionHandle<V> {
@@ -208,6 +230,17 @@ impl<V> SubscriptionState<V> {
 
     fn status(&self) -> SubscriptionStatusSnapshot {
         self.meta.lock().status.clone()
+    }
+
+    fn publisher_count(&self) -> usize {
+        let meta = self.meta.lock();
+        let Some(graph) = &self.graph else {
+            return 0;
+        };
+        let Some(topic) = meta.status.resolved_topic() else {
+            return 0;
+        };
+        graph.view().publishers_on(topic).len()
     }
 
     fn latest(&self) -> Option<Arc<SampleRecord<V>>> {
