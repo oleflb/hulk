@@ -10,6 +10,7 @@ use factrs::{
 };
 use faer::{Conj, Mat, MatMut, MatRef, Par, prelude::ReborrowMut};
 use faer_ext::IntoNalgebra;
+use itertools::Itertools;
 
 const RANK_RELATIVE_TOLERANCE_SCALE: f64 = 64.0;
 
@@ -31,39 +32,32 @@ pub fn marginalize(optimizer: &mut GaussNewton, values: &mut Values, cutoff_stat
 
     let boundary_keys = find_markov_blanket(&keys_to_marginalize_set, &removed_factors);
 
-    let mut temporary_graph = Graph::default();
-    for factor in removed_factors {
-        temporary_graph.add_factor(factor);
-    }
-
-    let mut local_keys = Vec::new();
-    for k in &keys_to_marginalize {
-        local_keys.push(*k);
-    }
-    let keep_offset_keys = local_keys.len();
-    for k in &boundary_keys {
-        local_keys.push(*k);
+    if boundary_keys.is_empty() {
+        values.retain(|key| !keys_to_marginalize_set.contains(key));
+        return;
     }
 
     let mut map = HashMap::default();
     let mut offset = 0usize;
-    let mut marginal_dim = 0usize;
 
-    for (index, key) in local_keys.iter().enumerate() {
-        let dim = values.get_raw(*key).expect("missing key").dim();
-        map.insert(*key, factrs::containers::Idx { idx: offset, dim });
+    for key in keys_to_marginalize.iter().copied() {
+        let dim = values.get_raw(key).expect("missing key").dim();
+        map.insert(key, factrs::containers::Idx { idx: offset, dim });
         offset += dim;
+    }
 
-        if index + 1 == keep_offset_keys {
-            marginal_dim = offset;
-        }
+    let marginal_dim = offset;
+    for key in boundary_keys.iter().copied() {
+        let dim = values.get_raw(key).expect("missing key").dim();
+        map.insert(key, factrs::containers::Idx { idx: offset, dim });
+        offset += dim;
     }
 
     log::debug!("marginalizing {marginal_dim} DOFs");
 
-    if boundary_keys.is_empty() {
-        values.retain(|key| !keys_to_marginalize_set.contains(key));
-        return;
+    let mut temporary_graph = Graph::default();
+    for factor in removed_factors {
+        temporary_graph.add_factor(factor);
     }
 
     let value_order = ValuesOrder::new(map);
@@ -139,10 +133,14 @@ fn square_root_marginalize(
         0
     } else {
         let j_m = jacobian.get(.., ..marginal_dim);
-        let qr = j_m.col_piv_qr();
-        let rank = numerical_rank_from_r(qr.thin_R(), rank_relative_tolerance);
-        apply_q_transpose_in_place(qr.Q_basis(), qr.Q_coeff(), projected.rb_mut());
-        rank
+        if j_m.norm_max() == 0.0 {
+            0
+        } else {
+            let qr = j_m.col_piv_qr();
+            let rank = numerical_rank_from_r(qr.thin_R(), rank_relative_tolerance);
+            apply_q_transpose_in_place(qr.Q_basis(), qr.Q_coeff(), projected.rb_mut());
+            rank
+        }
     };
 
     let raw_prior = projected.as_ref().get(marginal_rank.., ..);
@@ -159,6 +157,10 @@ fn compact_prior(
 ) -> SquareRootPrior {
     let keep_dim = jacobian.ncols();
     if keep_dim == 0 || jacobian.nrows() == 0 {
+        return empty_prior(keep_dim);
+    }
+
+    if jacobian.norm_max() == 0.0 {
         return empty_prior(keep_dim);
     }
 
@@ -196,16 +198,10 @@ fn apply_q_transpose_in_place(
 }
 
 fn split_prior(prior: MatRef<'_, f64>, keep_dim: usize) -> SquareRootPrior {
-    let mut jacobian = Mat::zeros(prior.nrows(), keep_dim);
-    let mut target = Mat::zeros(prior.nrows(), 1);
-    for row in 0..prior.nrows() {
-        for col in 0..keep_dim {
-            jacobian[(row, col)] = prior[(row, col)];
-        }
-        target[(row, 0)] = prior[(row, keep_dim)];
+    SquareRootPrior {
+        jacobian: prior.get(.., ..keep_dim).to_owned(),
+        target: prior.get(.., keep_dim..keep_dim + 1).to_owned(),
     }
-
-    SquareRootPrior { jacobian, target }
 }
 
 fn augment_with_target(jacobian: MatRef<'_, f64>, target: MatRef<'_, f64>) -> Mat<f64> {
@@ -213,12 +209,14 @@ fn augment_with_target(jacobian: MatRef<'_, f64>, target: MatRef<'_, f64>) -> Ma
     assert_eq!(target.ncols(), 1);
 
     let mut augmented = Mat::zeros(jacobian.nrows(), jacobian.ncols() + 1);
-    for row in 0..jacobian.nrows() {
-        for col in 0..jacobian.ncols() {
-            augmented[(row, col)] = jacobian[(row, col)];
-        }
-        augmented[(row, jacobian.ncols())] = target[(row, 0)];
-    }
+    augmented
+        .as_mut()
+        .subcols_mut(0, jacobian.ncols())
+        .copy_from(jacobian);
+    augmented
+        .as_mut()
+        .col_mut(jacobian.ncols())
+        .copy_from(target.col(0));
     augmented
 }
 
@@ -256,7 +254,7 @@ fn find_markov_blanket(
     keys_to_marginalize_set: &HashSet<Key>,
     removed_factors: &[factrs::core::Factor],
 ) -> Vec<Key> {
-    let mut boundary_keys = removed_factors
+    removed_factors
         .iter()
         .flat_map(|factor| {
             factor
@@ -265,11 +263,8 @@ fn find_markov_blanket(
                 .filter(|key| !keys_to_marginalize_set.contains(key))
         })
         .copied()
-        .collect::<Vec<_>>();
-
-    let mut unique_boundary_key = HashSet::new();
-    boundary_keys.retain(|key| unique_boundary_key.insert(*key));
-    boundary_keys
+        .unique()
+        .collect()
 }
 
 fn find_keys_to_marginalize(values: &Values, cutoff_key: State) -> Vec<Key> {
@@ -296,19 +291,7 @@ fn make_linearization_point(values: &Values, keys: &[Key]) -> Vec<Box<dyn Variab
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mat_from_rows(rows: &[&[f64]]) -> Mat<f64> {
-        let row_count = rows.len();
-        let col_count = rows.first().map_or(0, |row| row.len());
-        let mut matrix = Mat::zeros(row_count, col_count);
-        for (row_index, row) in rows.iter().enumerate() {
-            assert_eq!(row.len(), col_count);
-            for (col_index, value) in row.iter().enumerate() {
-                matrix[(row_index, col_index)] = *value;
-            }
-        }
-        matrix
-    }
+    use faer::mat;
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
@@ -329,13 +312,13 @@ mod tests {
 
     #[test]
     fn householder_projection_matches_explicit_q_projection() {
-        let matrix = mat_from_rows(&[
-            &[1.0, 0.0, 2.0],
-            &[2.0, 1.0, 0.0],
-            &[0.0, 3.0, 1.0],
-            &[1.0, -1.0, 4.0],
-        ]);
-        let mut actual = mat_from_rows(&[&[1.0, 2.0], &[3.0, 5.0], &[8.0, 13.0], &[21.0, 34.0]]);
+        let matrix = mat![
+            [1.0, 0.0, 2.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 3.0, 1.0],
+            [1.0, -1.0, 4.0],
+        ];
+        let mut actual = mat![[1.0, 2.0], [3.0, 5.0], [8.0, 13.0], [21.0, 34.0],];
         let qr = matrix.as_ref().col_piv_qr();
         let expected = qr.compute_Q().transpose() * &actual;
 
@@ -346,8 +329,8 @@ mod tests {
 
     #[test]
     fn square_root_marginalization_preserves_factrs_rhs_sign() {
-        let jacobian = mat_from_rows(&[&[1.0, 0.0], &[0.0, 2.0]]);
-        let target = mat_from_rows(&[&[0.0], &[3.0]]);
+        let jacobian = mat![[1.0, 0.0], [0.0, 2.0]];
+        let target = mat![[0.0], [3.0]];
 
         let prior = square_root_marginalize(
             jacobian.as_ref(),
@@ -363,9 +346,27 @@ mod tests {
     }
 
     #[test]
+    fn square_root_marginalization_preserves_kept_terms_with_zero_marginal_block() {
+        let jacobian = mat![[0.0, 2.0], [0.0, 5.0]];
+        let target = mat![[3.0], [7.0]];
+
+        let prior = square_root_marginalize(
+            jacobian.as_ref(),
+            target.as_ref(),
+            1,
+            rank_relative_tolerance(2),
+        );
+
+        assert_eq!(prior.jacobian.nrows(), 1);
+        assert_eq!(prior.jacobian.ncols(), 1);
+        assert_close(prior.jacobian[(0, 0)] * prior.jacobian[(0, 0)], 29.0);
+        assert_close(prior.jacobian[(0, 0)] * prior.target[(0, 0)], 41.0);
+    }
+
+    #[test]
     fn square_root_marginalization_does_not_anchor_relative_only_factor() {
-        let jacobian = mat_from_rows(&[&[1.0, -1.0]]);
-        let target = mat_from_rows(&[&[3.0]]);
+        let jacobian = mat![[1.0, -1.0]];
+        let target = mat![[3.0]];
 
         let prior = square_root_marginalize(
             jacobian.as_ref(),
@@ -381,8 +382,8 @@ mod tests {
 
     #[test]
     fn square_root_marginalization_matches_schur_normal_equations() {
-        let jacobian = mat_from_rows(&[&[1.0, 1.0], &[1.0, 0.0]]);
-        let target = mat_from_rows(&[&[2.0], &[0.0]]);
+        let jacobian = mat![[1.0, 1.0], [1.0, 0.0]];
+        let target = mat![[2.0], [0.0]];
 
         let prior = square_root_marginalize(
             jacobian.as_ref(),
