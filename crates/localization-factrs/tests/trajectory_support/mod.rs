@@ -184,6 +184,9 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             knot_spacing: KNOT_SPACING,
             max_optimization_window: MAX_OPTIMIZATION_WINDOW,
             optimizer_max_iterations: config.optimizer_max_iterations,
+            gyroscope_noise: Matrix3::identity() * solver_variance(config.gyro_noise_std),
+            accelerometer_noise: Matrix3::identity() * solver_variance(config.accel_noise_std),
+            use_accelerometer_measurements: false,
             gyroscope_process_noise: Matrix3::identity() * 0.01,
             accelerometer_process_noise: Matrix3::identity() * 0.01,
             roll_pitch_yaw_noise: Matrix3::identity()

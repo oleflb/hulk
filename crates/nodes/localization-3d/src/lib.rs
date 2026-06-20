@@ -23,7 +23,7 @@ use localization_factrs::{
     },
     initialize,
 };
-use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3, vector};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{Message, cache::Cache, context::Context, parameter::NodeParametersExt, time::Time};
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,14 @@ fn backend_configuration_with_pose_hint(
         knot_spacing: Duration::from_millis(200),
         max_optimization_window: Duration::from_secs(3),
         optimizer_max_iterations: 2,
+        gyroscope_noise: Matrix3::identity() * 0.1_f64.powi(2),
+        // TODO: tune accelerometer noise
+        accelerometer_noise: Matrix3::from_diagonal(&vector![
+            5.0_f64.powi(2),   // x sigma = 5 m/s^2
+            5.0_f64.powi(2),   // y sigma = 5 m/s^2
+            100.0_f64.powi(2), // z disabled
+        ]),
+        use_accelerometer_measurements: true,
         gyroscope_process_noise: process_noise,
         roll_pitch_yaw_noise: process_noise,
         accelerometer_process_noise: process_noise,

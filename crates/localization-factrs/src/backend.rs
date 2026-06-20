@@ -22,8 +22,8 @@ use crate::{
         foot_above_ground::{FootHeightMeasurement, IntervalFootAboveGroundFactor},
         gaussian_process_prior::GaussianProcessPriorFactor,
         imu::{
-            CurrentSplineOrientationFactor, RelativeYawFactor, RollPitchPriorFactor,
-            interpolate_measurement_orientation,
+            CurrentSplineOrientationFactor, IntervalGaussianProcessImuFactor, RelativeYawFactor,
+            RollPitchPriorFactor, interpolate_measurement_orientation,
         },
         visual_odometry::{
             AdjacentVisualOdometryFactor, VisualOdometryDelta, VisualOdometryFactor,
@@ -52,6 +52,7 @@ const INITIAL_POSE_PRIOR_SIGMA: f64 = 10.0;
 // pre-gap velocity is not treated as measured ballistic motion.
 const EMPTY_INTERVAL_PROCESS_COVARIANCE_SCALE: f64 = 10.0;
 const LONG_GAP_MIN_EMPTY_INTERVALS: u32 = 5;
+const IMU_KINEMATICS_MIN_SPACING: Duration = Duration::from_millis(20); // 50Hz
 
 pub struct BackendConfiguration {
     /// The spacing between control knots on the Gaussian Process
@@ -64,6 +65,9 @@ pub struct BackendConfiguration {
     /// Slow solve cadences can spend more iterations on each larger batch.
     pub optimizer_max_iterations: usize,
 
+    pub gyroscope_noise: Matrix3<f64>,
+    pub accelerometer_noise: Matrix3<f64>,
+    pub use_accelerometer_measurements: bool,
     pub gyroscope_process_noise: Matrix3<f64>,
     pub accelerometer_process_noise: Matrix3<f64>,
 
@@ -161,6 +165,9 @@ pub struct VinsBackend {
     last_imu_knot_orientation: Option<ImuKnotOrientation>,
     /// Optimizer status from the most recent solve.
     last_optimizer_status: Option<BackendOptimizerStatus>,
+    /// Diagnostics from the most recent solve.
+    last_solve_diagnostics: Option<BackendSolveDiagnostics>,
+    last_imu_kinematics_measurement_time: Option<SystemTime>,
 }
 
 pub fn initialize_graph(initial_state: &InitialState) -> (Graph, Values) {
@@ -234,6 +241,8 @@ impl VinsBackend {
             next_imu_attitude_knot_index: 0,
             last_imu_knot_orientation: None,
             last_optimizer_status: None,
+            last_solve_diagnostics: None,
+            last_imu_kinematics_measurement_time: None,
         }
     }
 
@@ -290,6 +299,11 @@ impl VinsBackend {
             return;
         };
         self.init_intervals_through(last_interval_index);
+
+        let kinematics_measurements =
+            self.keep_imu_kinematics_measurements(measurements.iter().cloned());
+        self.add_imu_kinematics_factors(kinematics_measurements);
+
         self.process_imu_attitude_measurements(measurements);
     }
 
@@ -465,6 +479,69 @@ impl VinsBackend {
                 .residual_as::<CurrentSplineOrientationFactor>()
                 .is_some()
         });
+    }
+
+    /// filter out measurements in order to keep graph from exploding with too many IMU kinematics factors when the frontend provides high-frequency IMU data
+    fn keep_imu_kinematics_measurements(
+        &mut self,
+        measurements: impl IntoIterator<Item = ImuMeasurement>,
+    ) -> Vec<ImuMeasurement> {
+        let mut kept = Vec::new();
+
+        for measurement in measurements {
+            let keep = match self.last_imu_kinematics_measurement_time {
+                None => true,
+                Some(last) => measurement
+                    .time
+                    .duration_since(last)
+                    .is_ok_and(|dt| dt >= IMU_KINEMATICS_MIN_SPACING),
+            };
+
+            if keep {
+                self.last_imu_kinematics_measurement_time = Some(measurement.time);
+                kept.push(measurement);
+            }
+        }
+
+        kept
+    }
+
+    fn add_imu_kinematics_factors(&mut self, measurements: Vec<ImuMeasurement>) {
+        if measurements.is_empty() {
+            return;
+        }
+
+        let interval_groups = self.interval_groups(measurements, |measurement| measurement.time);
+
+        for group in interval_groups {
+            if !self.prepare_interval_for_measurements(group.start_index, "imu kinematics") {
+                continue;
+            }
+
+            let keys = (State(group.start_index), State(group.start_index + 1));
+            let graph = self.optimizer.graph_mut();
+
+            if let Some(factor) = graph
+                .factors_for_residual_mut::<IntervalGaussianProcessImuFactor, _>(keys)
+                .next()
+            {
+                factor
+                    .residual_as_mut::<IntervalGaussianProcessImuFactor>()
+                    .expect("factor query must return matching residual")
+                    .extend_measurements(group.measurements);
+            } else {
+                let residual = IntervalGaussianProcessImuFactor::new(
+                    group.measurements,
+                    self.config.gyroscope_noise,
+                    self.config.accelerometer_noise,
+                    self.config.use_accelerometer_measurements,
+                    self.config.gravity,
+                    group.start_time,
+                    group.end_time,
+                );
+                graph.add_factor(FactorBuilder::new(residual, keys).build());
+            }
+        }
     }
 
     fn ingest_visual(&mut self, mut visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
@@ -1326,6 +1403,9 @@ mod tests {
             knot_spacing: Duration::from_millis(200),
             max_optimization_window: Duration::from_secs(3),
             optimizer_max_iterations: 1,
+            gyroscope_noise: Matrix3::identity() * 0.05_f64.powi(2),
+            accelerometer_noise: Matrix3::identity() * 0.5_f64.powi(2),
+            use_accelerometer_measurements: false,
             gyroscope_process_noise: Matrix3::identity() * 0.01,
             accelerometer_process_noise: Matrix3::identity() * 0.01,
             roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
