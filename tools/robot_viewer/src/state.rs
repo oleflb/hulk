@@ -76,6 +76,14 @@ impl Default for ViewerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coordinate_systems::Camera;
+
+    fn empty_associations() -> FieldMarkAssociations {
+        FieldMarkAssociations {
+            robot_to_camera: Isometry3::<Robot, Camera>::identity(),
+            associations: Vec::new(),
+        }
+    }
 
     #[test]
     fn high_rate_alignment_streams_retain_delayed_render_samples() {
@@ -104,6 +112,44 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn aligned_snapshot_prefers_associations_over_newer_detections() {
+        let mut state = ViewerState::default();
+        let association_time = Time::from_nanos(1_000_000_000);
+        let detection_time = Time::from_nanos(1_100_000_000);
+
+        state.push_camera_frame(association_time, CameraFrame::default());
+        state.push_camera_frame(detection_time, CameraFrame::default());
+        state.push_field_mark_associations(association_time, empty_associations());
+        state.push_detected_objects(detection_time, Vec::new());
+
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(association_time));
+        assert!(aligned.field_mark_associations.is_some());
+        assert!(aligned.detected_objects.is_none());
+    }
+
+    #[test]
+    fn aligned_snapshot_uses_delayed_association_for_buffered_camera_frame() {
+        let mut state = ViewerState::default();
+        let association_time = Time::from_nanos(1_000_000_000);
+        let latest_camera_time = Time::from_nanos(1_100_000_000);
+
+        state.push_camera_frame(association_time, CameraFrame::default());
+        state.push_camera_frame(latest_camera_time, CameraFrame::default());
+        assert_eq!(
+            state.aligned_snapshot().anchor_time,
+            Some(latest_camera_time)
+        );
+
+        state.push_field_mark_associations(association_time, empty_associations());
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(association_time));
+        assert!(aligned.field_mark_associations.is_some());
     }
 }
 
@@ -151,7 +197,7 @@ impl ViewerState {
         }
     }
 
-    /// Builds the data snapshot rendered by the camera panel and 3D scene.
+    /// Builds the data snapshot rendered by the camera panel and 3D scene for a selected frame.
     ///
     /// The anchor is the newest camera frame that has aligned field-mark associations, then the
     /// newest camera frame that has aligned object detections, and finally the newest camera frame.
@@ -240,16 +286,17 @@ fn latest_aligned_stream_time<T>(
     camera_frames: &CacheInner<CameraFrame>,
     latest_camera_time: Option<Time>,
 ) -> Option<Time> {
-    let stream_time = stream.latest_stamp()?;
-    if camera_frames.get_exact(stream_time).is_none() {
-        return None;
+    let latest_camera_time = latest_camera_time?;
+    let mut stream_time = stream.latest_stamp_at_or_before(latest_camera_time)?;
+    loop {
+        if latest_camera_time.abs_diff(stream_time) > MAX_ALIGNED_STREAM_AGE {
+            return None;
+        }
+        if camera_frames.get_exact(stream_time).is_some() {
+            return Some(stream_time);
+        }
+        stream_time = stream.latest_stamp_before(stream_time)?;
     }
-    if latest_camera_time
-        .is_some_and(|latest| stream_time.abs_diff(latest) > MAX_ALIGNED_STREAM_AGE)
-    {
-        return None;
-    }
-    Some(stream_time)
 }
 
 fn exact_sample<T>(cache: &CacheInner<T>, time: Time) -> Option<TimeWrapper<Arc<T>>> {

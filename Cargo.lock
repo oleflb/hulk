@@ -10242,6 +10242,7 @@ dependencies = [
  "nalgebra 0.34.2",
  "projection",
  "ros-z",
+ "ros-z-debug",
  "ros-z-streams",
  "ros2",
  "tokio",

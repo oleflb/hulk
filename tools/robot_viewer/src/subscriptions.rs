@@ -1,4 +1,9 @@
-use std::num::NonZeroUsize;
+use std::{
+    collections::{BTreeSet, VecDeque},
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::{
     Result,
@@ -13,8 +18,11 @@ use linear_algebra::Isometry3;
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{
     prelude::ContextBuilder,
+    pubsub::PublicationId,
     qos::{QosDurability, QosProfile},
+    time::Time,
 };
+use ros_z_debug::{RetentionPolicy, SubscriptionHandle, SubscriptionManager, SubscriptionStatus};
 use ros_z_streams::{CreateFutureQueue, QueueEvent};
 use ros2::sensor_msgs::image::Image as RosImage;
 use tokio::runtime::Runtime;
@@ -41,8 +49,13 @@ const CALIBRATED_INTRINSICS_TOPIC: &str = "debug/calibrated_intrinsics";
 // `{DETECTED_OBJECTS_TOPIC}/announce` so the viewer can recover the original image timestamp.
 const DETECTED_OBJECTS_TOPIC: &str = "detected_objects";
 const FIELD_MARK_ASSOCIATIONS_TOPIC: &str = "field_mark_association/associations";
-const DETECTED_OBJECTS_SAFETY_LAG: std::time::Duration = std::time::Duration::from_millis(50);
+const DETECTED_OBJECTS_SAFETY_LAG: Duration = Duration::from_millis(50);
 const DETECTED_OBJECTS_PENDING_CAPACITY: usize = 64;
+const DEBUG_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
+const DEBUG_HISTORY_WINDOW: Duration = Duration::from_secs(2);
+const DEBUG_HIGH_RATE_HISTORY_CAPACITY: usize = 1024;
+const DEBUG_STREAM_HISTORY_CAPACITY: usize = 64;
+const PROCESSED_PUBLICATION_CAPACITY: usize = 4096;
 
 pub(crate) fn spawn(
     runtime: &Runtime,
@@ -75,40 +88,19 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
             "failed to connect to Zenoh router {router_display}; make sure zenohd is running and listening on that address, or use tcp/127.0.0.1:7447 when running on the robot or through an SSH port forward"
         )
     })?;
-    let node = context
-        .create_node("robot_viewer")
-        .without_schema_service()
-        .build()
-        .await?;
+    let node = Arc::new(
+        context
+            .create_node("robot_viewer")
+            .without_schema_service()
+            .build()
+            .await?,
+    );
+    let debug_manager = SubscriptionManager::new(
+        Arc::clone(&node),
+        ros_z_debug::ManagerOptions::with_target_namespace(arguments.namespace())?,
+    );
+    let mut debug_subscriptions = DebugSubscriptions::build(&debug_manager).await?;
 
-    let field_dimensions = node
-        .subscriber::<FieldDimensions>(FIELD_DIMENSIONS_TOPIC)?
-        .qos(QosProfile {
-            durability: QosDurability::TransientLocal,
-            ..Default::default()
-        })
-        .build()
-        .await?;
-    let localization = node
-        .subscriber::<Option<Isometry3<Field, Robot>>>(LOCALIZATION_TOPIC)?
-        .build()
-        .await?;
-    let visual_odometer = node
-        .subscriber::<TimeWrapper<nalgebra::Isometry3<f32>>>(VISUAL_ODOMETER_TOPIC)?
-        .build()
-        .await?;
-    let robot_kinematics = node
-        .subscriber::<TimeWrapper<RobotKinematics>>(ROBOT_KINEMATICS_TOPIC)?
-        .build()
-        .await?;
-    let camera_matrix = node
-        .subscriber::<TimeWrapper<CameraMatrix>>(CAMERA_MATRIX_TOPIC)?
-        .build()
-        .await?;
-    let calibrated_intrinsics = node
-        .subscriber::<Intrinsic>(CALIBRATED_INTRINSICS_TOPIC)?
-        .build()
-        .await?;
     let camera = node
         .subscriber::<TimeWrapper<RosImage>>(CAMERA_IMAGE_TOPIC)?
         .build()
@@ -120,112 +112,23 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
             NonZeroUsize::new(DETECTED_OBJECTS_PENDING_CAPACITY).expect("capacity is non-zero"),
         )
         .await?;
-    let field_mark_associations = node
-        .subscriber::<TimeWrapper<FieldMarkAssociations>>(FIELD_MARK_ASSOCIATIONS_TOPIC)?
-        .build()
-        .await?;
 
     update_state(&state, &egui_context, |state| {
         state.connection = ConnectionStatus::Subscribed;
-        update_publisher_count(&mut state.field_status, field_dimensions.publisher_count());
-        update_publisher_count(
-            &mut state.localization_status,
-            localization.publisher_count(),
-        );
-        update_publisher_count(
-            &mut state.visual_odometer_status,
-            visual_odometer.publisher_count(),
-        );
-        update_publisher_count(
-            &mut state.robot_kinematics_status,
-            robot_kinematics.publisher_count(),
-        );
-        update_publisher_count(
-            &mut state.camera_matrix_status,
-            camera_matrix.publisher_count(),
-        );
-        update_publisher_count(
-            &mut state.calibrated_intrinsics_status,
-            calibrated_intrinsics.publisher_count(),
-        );
         update_publisher_count(&mut state.camera_status, camera.publisher_count());
         update_publisher_count(&mut state.objects_status, objects.publisher_count());
-        update_publisher_count(
-            &mut state.field_mark_associations_status,
-            field_mark_associations.publisher_count(),
-        );
     });
 
-    let mut publisher_count_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut refresh_interval = tokio::time::interval(DEBUG_REFRESH_INTERVAL);
     loop {
         tokio::select! {
-            _ = publisher_count_interval.tick() => {
+            _ = refresh_interval.tick() => {
                 update_state(&state, &egui_context, |state| {
-                    update_publisher_count(&mut state.field_status, field_dimensions.publisher_count());
-                    update_publisher_count(&mut state.localization_status, localization.publisher_count());
-                    update_publisher_count(&mut state.visual_odometer_status, visual_odometer.publisher_count());
-                    update_publisher_count(&mut state.robot_kinematics_status, robot_kinematics.publisher_count());
-                    update_publisher_count(&mut state.camera_matrix_status, camera_matrix.publisher_count());
-                    update_publisher_count(&mut state.calibrated_intrinsics_status, calibrated_intrinsics.publisher_count());
+                    refresh_debug_streams(state, &mut debug_subscriptions);
                     update_publisher_count(&mut state.camera_status, camera.publisher_count());
                     update_publisher_count(&mut state.objects_status, objects.publisher_count());
-                    update_publisher_count(&mut state.field_mark_associations_status, field_mark_associations.publisher_count());
                 });
             }
-            message = field_dimensions.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.field_dimensions = Some(message);
-                    state.field_status.mark_live(field_dimensions.publisher_count());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.field_status.mark_error(field_dimensions.publisher_count(), format!("{error:#}"));
-                }),
-            },
-            message = localization.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.localization = message;
-                    state.localization_status.mark_value(localization.publisher_count(), state.localization.is_some());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.localization_status.mark_error(localization.publisher_count(), format!("{error:#}"));
-                }),
-            },
-            message = visual_odometer.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.visual_odometer = Some(message.inner);
-                    state.visual_odometer_status.mark_live(visual_odometer.publisher_count());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.visual_odometer_status.mark_error(visual_odometer.publisher_count(), format!("{error:#}"));
-                }),
-            },
-            message = robot_kinematics.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.push_robot_kinematics(message.time, message.inner);
-                    state.robot_kinematics_status.mark_live(robot_kinematics.publisher_count());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.robot_kinematics_status.mark_error(robot_kinematics.publisher_count(), format!("{error:#}"));
-                }),
-            },
-            message = camera_matrix.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.push_camera_matrix(message.time, message.inner);
-                    state.camera_matrix_status.mark_live(camera_matrix.publisher_count());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.camera_matrix_status.mark_error(camera_matrix.publisher_count(), format!("{error:#}"));
-                }),
-            },
-            message = calibrated_intrinsics.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.calibrated_intrinsics = Some(message);
-                    state.calibrated_intrinsics_status.mark_live(calibrated_intrinsics.publisher_count());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.calibrated_intrinsics_status.mark_error(calibrated_intrinsics.publisher_count(), format!("{error:#}"));
-                }),
-            },
             message = camera.recv() => match message {
                 Ok(image) => {
                     let time = image.time;
@@ -257,16 +160,236 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
                     state.objects_status.mark_error(objects.publisher_count(), format!("{error:#}"));
                 }),
             },
-            message = field_mark_associations.recv() => match message {
-                Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.push_field_mark_associations(message.time, message.inner);
-                    state.field_mark_associations_status.mark_live(field_mark_associations.publisher_count());
-                }),
-                Err(error) => update_state(&state, &egui_context, |state| {
-                    state.field_mark_associations_status.mark_error(field_mark_associations.publisher_count(), format!("{error:#}"));
-                }),
-            },
         }
+    }
+}
+
+struct DebugSubscriptions {
+    field_dimensions: SubscriptionHandle<FieldDimensions>,
+    localization: SubscriptionHandle<Option<Isometry3<Field, Robot>>>,
+    visual_odometer: SubscriptionHandle<TimeWrapper<nalgebra::Isometry3<f32>>>,
+    robot_kinematics: WindowedDebugStream<RobotKinematics>,
+    camera_matrix: WindowedDebugStream<CameraMatrix>,
+    calibrated_intrinsics: SubscriptionHandle<Intrinsic>,
+    field_mark_associations: WindowedDebugStream<FieldMarkAssociations>,
+}
+
+impl DebugSubscriptions {
+    async fn build(manager: &SubscriptionManager) -> Result<Self> {
+        let high_rate_history = RetentionPolicy::time_window_with_max_samples(
+            DEBUG_HISTORY_WINDOW,
+            NonZeroUsize::new(DEBUG_HIGH_RATE_HISTORY_CAPACITY).expect("capacity is non-zero"),
+        )?;
+        let stream_history = RetentionPolicy::time_window_with_max_samples(
+            DEBUG_HISTORY_WINDOW,
+            NonZeroUsize::new(DEBUG_STREAM_HISTORY_CAPACITY).expect("capacity is non-zero"),
+        )?;
+
+        Ok(Self {
+            field_dimensions: manager
+                .subscribe_typed::<FieldDimensions>(FIELD_DIMENSIONS_TOPIC)
+                .qos(QosProfile {
+                    durability: QosDurability::TransientLocal,
+                    ..Default::default()
+                })
+                .build()
+                .await?,
+            localization: manager
+                .subscribe_typed::<Option<Isometry3<Field, Robot>>>(LOCALIZATION_TOPIC)
+                .build()
+                .await?,
+            visual_odometer: manager
+                .subscribe_typed::<TimeWrapper<nalgebra::Isometry3<f32>>>(VISUAL_ODOMETER_TOPIC)
+                .with_stamp(time_wrapper_stamp::<nalgebra::Isometry3<f32>>)
+                .build()
+                .await?,
+            robot_kinematics: WindowedDebugStream::new(
+                manager
+                    .subscribe_typed::<TimeWrapper<RobotKinematics>>(ROBOT_KINEMATICS_TOPIC)
+                    .retention(high_rate_history)
+                    .with_stamp(time_wrapper_stamp::<RobotKinematics>)
+                    .build()
+                    .await?,
+            ),
+            camera_matrix: WindowedDebugStream::new(
+                manager
+                    .subscribe_typed::<TimeWrapper<CameraMatrix>>(CAMERA_MATRIX_TOPIC)
+                    .retention(high_rate_history)
+                    .with_stamp(time_wrapper_stamp::<CameraMatrix>)
+                    .build()
+                    .await?,
+            ),
+            calibrated_intrinsics: manager
+                .subscribe_typed::<Intrinsic>(CALIBRATED_INTRINSICS_TOPIC)
+                .build()
+                .await?,
+            field_mark_associations: WindowedDebugStream::new(
+                manager
+                    .subscribe_typed::<TimeWrapper<FieldMarkAssociations>>(
+                        FIELD_MARK_ASSOCIATIONS_TOPIC,
+                    )
+                    .retention(stream_history)
+                    .with_stamp(time_wrapper_stamp::<FieldMarkAssociations>)
+                    .build()
+                    .await?,
+            ),
+        })
+    }
+}
+
+fn time_wrapper_stamp<T>(message: &TimeWrapper<T>) -> Time {
+    message.time
+}
+
+struct WindowedDebugStream<T> {
+    handle: SubscriptionHandle<TimeWrapper<T>>,
+    processed: ProcessedPublications,
+}
+
+impl<T> WindowedDebugStream<T> {
+    fn new(handle: SubscriptionHandle<TimeWrapper<T>>) -> Self {
+        Self {
+            handle,
+            processed: ProcessedPublications::default(),
+        }
+    }
+
+    fn handle(&self) -> &SubscriptionHandle<TimeWrapper<T>> {
+        &self.handle
+    }
+
+    fn latest(&self) -> Option<Arc<ros_z_debug::SampleRecord<TimeWrapper<T>>>> {
+        self.handle.latest()
+    }
+
+    fn drain_new(&mut self) -> Vec<Arc<ros_z_debug::SampleRecord<TimeWrapper<T>>>> {
+        self.handle
+            .window(Time::zero(), Time::from_nanos(i64::MAX))
+            .into_iter()
+            .filter(|record| self.processed.accept(record.publication_id))
+            .collect()
+    }
+}
+
+struct ProcessedPublications {
+    seen: BTreeSet<PublicationId>,
+    order: VecDeque<PublicationId>,
+}
+
+impl Default for ProcessedPublications {
+    fn default() -> Self {
+        Self {
+            seen: BTreeSet::new(),
+            order: VecDeque::with_capacity(PROCESSED_PUBLICATION_CAPACITY),
+        }
+    }
+}
+
+impl ProcessedPublications {
+    fn accept(&mut self, publication_id: PublicationId) -> bool {
+        if !self.seen.insert(publication_id) {
+            return false;
+        }
+
+        self.order.push_back(publication_id);
+        while self.order.len() > PROCESSED_PUBLICATION_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+
+        true
+    }
+}
+
+fn refresh_debug_streams(state: &mut ViewerState, subscriptions: &mut DebugSubscriptions) {
+    if let Some(record) = subscriptions.field_dimensions.latest() {
+        state.field_dimensions = Some(record.value.clone());
+    }
+    update_debug_status(
+        &mut state.field_status,
+        &subscriptions.field_dimensions,
+        state.field_dimensions.is_some(),
+    );
+
+    if let Some(record) = subscriptions.localization.latest() {
+        state.localization = record.value.clone();
+    }
+    update_debug_status(
+        &mut state.localization_status,
+        &subscriptions.localization,
+        state.localization.is_some(),
+    );
+
+    if let Some(record) = subscriptions.visual_odometer.latest() {
+        state.visual_odometer = Some(record.value.inner.clone());
+    }
+    update_debug_status(
+        &mut state.visual_odometer_status,
+        &subscriptions.visual_odometer,
+        state.visual_odometer.is_some(),
+    );
+
+    for record in subscriptions.robot_kinematics.drain_new() {
+        state.push_robot_kinematics(record.source_time, record.value.inner.clone());
+    }
+    update_debug_status(
+        &mut state.robot_kinematics_status,
+        subscriptions.robot_kinematics.handle(),
+        subscriptions.robot_kinematics.latest().is_some(),
+    );
+
+    for record in subscriptions.camera_matrix.drain_new() {
+        state.push_camera_matrix(record.source_time, record.value.inner.clone());
+    }
+    update_debug_status(
+        &mut state.camera_matrix_status,
+        subscriptions.camera_matrix.handle(),
+        subscriptions.camera_matrix.latest().is_some(),
+    );
+
+    if let Some(record) = subscriptions.calibrated_intrinsics.latest() {
+        state.calibrated_intrinsics = Some(record.value.clone());
+    }
+    update_debug_status(
+        &mut state.calibrated_intrinsics_status,
+        &subscriptions.calibrated_intrinsics,
+        state.calibrated_intrinsics.is_some(),
+    );
+
+    for record in subscriptions.field_mark_associations.drain_new() {
+        state.push_field_mark_associations(record.source_time, record.value.inner.clone());
+    }
+    update_debug_status(
+        &mut state.field_mark_associations_status,
+        subscriptions.field_mark_associations.handle(),
+        subscriptions.field_mark_associations.latest().is_some(),
+    );
+}
+
+fn update_debug_status<T>(
+    status: &mut StreamStatus,
+    subscription: &SubscriptionHandle<T>,
+    has_value: bool,
+) {
+    let publisher_count = subscription.publisher_count();
+    let snapshot = subscription.status();
+    match snapshot.status() {
+        SubscriptionStatus::WaitingForFirstSample => status.update_publishers(publisher_count),
+        SubscriptionStatus::Ready => status.mark_value(publisher_count, has_value),
+        SubscriptionStatus::ProtocolError { .. } | SubscriptionStatus::DecodeError { .. } => {
+            status.mark_error(
+                publisher_count,
+                snapshot
+                    .message()
+                    .unwrap_or("subscription error")
+                    .to_string(),
+            );
+        }
+        SubscriptionStatus::Closed => {
+            status.mark_error(publisher_count, "subscription closed".to_string());
+        }
+        _ => status.update_publishers(publisher_count),
     }
 }
 

@@ -223,6 +223,22 @@ impl<T> CacheInner<T> {
         self.entries.keys().next_back().copied()
     }
 
+    /// Newest cached timestamp not after `time`, or `None` if no retained timestamp matches.
+    pub fn latest_stamp_at_or_before(&self, time: Time) -> Option<Time> {
+        self.entries
+            .range(..=time)
+            .next_back()
+            .map(|(stamp, _)| *stamp)
+    }
+
+    /// Newest cached timestamp strictly before `time`, or `None` if no retained timestamp matches.
+    pub fn latest_stamp_before(&self, time: Time) -> Option<Time> {
+        self.entries
+            .range(..time)
+            .next_back()
+            .map(|(stamp, _)| *stamp)
+    }
+
     /// Number of messages currently retained.
     pub fn len(&self) -> usize {
         self.len
