@@ -5,13 +5,59 @@ pub(super) fn oriented_candidate(problem: &Problem, candidate: &Candidate) -> Ca
         return candidate.clone();
     };
     let symmetric = symmetric_candidate(candidate, &problem.map);
-    let current_pose = robot_to_field_for_candidate(problem, candidate);
-    let symmetric_pose = robot_to_field_for_candidate(problem, &symmetric);
-    if closer_to_hint(symmetric_pose, current_pose, hint) {
+    let current_score = hint_reprojection_score(problem, candidate, hint);
+    let symmetric_score = hint_reprojection_score(problem, &symmetric, hint);
+    if symmetric_score.is_better_than(current_score) {
         symmetric
     } else {
         candidate.clone()
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HintReprojectionScore {
+    projected_matches: usize,
+    squared_reprojection_error: f32,
+}
+
+impl HintReprojectionScore {
+    fn is_better_than(self, other: Self) -> bool {
+        self.projected_matches > other.projected_matches
+            || (self.projected_matches == other.projected_matches
+                && self.squared_reprojection_error < other.squared_reprojection_error)
+    }
+}
+
+fn hint_reprojection_score(
+    problem: &Problem,
+    candidate: &Candidate,
+    hint: Isometry3<Robot, Field>,
+) -> HintReprojectionScore {
+    let field_to_camera = field_to_camera_from_robot_to_field(problem.robot_to_camera, hint);
+    let mut score = HintReprojectionScore {
+        projected_matches: 0,
+        squared_reprojection_error: 0.0,
+    };
+
+    for accepted in &candidate.matches {
+        let Some(detection) = problem.detections.get(accepted.detection_index) else {
+            continue;
+        };
+        let Some(landmark) = problem.map.landmarks.get(accepted.landmark_id) else {
+            continue;
+        };
+        let Some(projected) = project_field_point(field_to_camera, problem.k, landmark.xy) else {
+            continue;
+        };
+        let residual_squared = (projected - detection.pixel).inner.norm_squared();
+        if !residual_squared.is_finite() {
+            continue;
+        }
+        score.projected_matches += 1;
+        score.squared_reprojection_error += residual_squared;
+    }
+
+    score
 }
 
 fn symmetric_candidate(candidate: &Candidate, map: &LandmarkMap) -> Candidate {
@@ -236,30 +282,6 @@ fn detailed_status(result: &GlobalLocalizationResult) -> GlobalLocalizationDetai
             GlobalLocalizationDetailedStatus::UniqueModuloSymmetry
         }
     }
-}
-
-fn closer_to_hint(
-    candidate: Isometry3<Robot, Field>,
-    current: Isometry3<Robot, Field>,
-    hint: Isometry3<Robot, Field>,
-) -> bool {
-    let candidate_translation = translation_distance_squared(candidate, hint);
-    let current_translation = translation_distance_squared(current, hint);
-    if (candidate_translation - current_translation).abs()
-        > POSE_HINT_TRANSLATION_TIE_EPSILON_SQUARED
-    {
-        return candidate_translation < current_translation;
-    }
-
-    rotation_distance(candidate, hint) < rotation_distance(current, hint)
-}
-
-fn translation_distance_squared(a: Isometry3<Robot, Field>, b: Isometry3<Robot, Field>) -> f32 {
-    (a.inner.translation.vector - b.inner.translation.vector).norm_squared()
-}
-
-fn rotation_distance(a: Isometry3<Robot, Field>, b: Isometry3<Robot, Field>) -> f32 {
-    a.inner.rotation.angle_to(&b.inner.rotation)
 }
 
 pub(super) fn field_to_camera_from_robot_to_field(

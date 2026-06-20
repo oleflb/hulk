@@ -1,7 +1,6 @@
 use super::*;
 
 pub(super) const HORIZON_EPSILON: f32 = 1.0e-4;
-pub(super) const POSE_HINT_TRANSLATION_TIE_EPSILON_SQUARED: f32 = 1.0e-6;
 pub(super) const MAX_DETECTIONS: usize = GLOBAL_LOCALIZER_MAX_DETECTIONS;
 pub(super) const MAX_TRIPLET_BIN_PROBES: usize = 64_000;
 pub(super) const MAX_TRIPLET_LOOKUP_HITS: usize = 2500;
