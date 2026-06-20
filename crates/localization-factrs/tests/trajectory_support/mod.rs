@@ -190,7 +190,6 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             visual_feature_noise: Matrix2::identity() * solver_variance(config.detection_noise_std),
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
-            gravity: vector![0.0, 0.0, 9.81],
         },
         initial_state,
     );

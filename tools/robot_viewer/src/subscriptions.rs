@@ -94,7 +94,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
         .build()
         .await?;
     let visual_odometer = node
-        .subscriber::<nalgebra::Isometry3<f32>>(VISUAL_ODOMETER_TOPIC)?
+        .subscriber::<TimeWrapper<nalgebra::Isometry3<f32>>>(VISUAL_ODOMETER_TOPIC)?
         .build()
         .await?;
     let robot_kinematics = node
@@ -192,7 +192,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
             },
             message = visual_odometer.recv() => match message {
                 Ok(message) => update_state(&state, &egui_context, |state| {
-                    state.visual_odometer = Some(message);
+                    state.visual_odometer = Some(message.inner);
                     state.visual_odometer_status.mark_live(visual_odometer.publisher_count());
                 }),
                 Err(error) => update_state(&state, &egui_context, |state| {

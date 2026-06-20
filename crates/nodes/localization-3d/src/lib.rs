@@ -10,8 +10,8 @@ use field_mark_association::FieldMarkAssociations;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, point};
 use localization_factrs::{
-    BackendConfiguration, CameraIntrinsics, InitialState, VinsFrontend, VinsFrontendError,
-    VisualReprojectionAssociation, initialize,
+    BackendConfiguration, CameraIntrinsics, InitialState, OptimizationResult, VinsFrontend,
+    VinsFrontendError, VisualReprojectionAssociation, initialize,
 };
 use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
@@ -50,6 +50,9 @@ impl Localization3dParameters {
 }
 
 const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
+const VISUAL_ODOMETER_TOPIC: &str = "visual_odometry/current_left_camera_to_visual_odometer";
+
+type VisualOdometerCache = Cache<TimeWrapper<nalgebra::Isometry3<f32>>>;
 
 /// Builds the VINS backend configuration used by the localization node.
 ///
@@ -68,7 +71,6 @@ pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfi
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-4,
         foot_ground_sigma: 1e-2,
-        gravity: Vector3::new(0.0, 0.0, 9.81),
     }
 }
 
@@ -110,6 +112,15 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         )?
         .build()
         .await?;
+    let visual_odometer_cache = node
+        .create_cache::<TimeWrapper<nalgebra::Isometry3<f32>>>(VISUAL_ODOMETER_TOPIC, 128)?
+        .with_stamp(|message| message.time)
+        .build()
+        .await?;
+    let visual_odometer_subscriber = node
+        .subscriber::<TimeWrapper<nalgebra::Isometry3<f32>>>(VISUAL_ODOMETER_TOPIC)?
+        .build()
+        .await?;
 
     let robot_kinematics_subscriber = node
         .subscriber::<TimeWrapper<RobotKinematics>>("robot_kinematics")?
@@ -132,6 +143,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         initial_state,
     );
     let mut backend_handle = std::pin::pin!(tokio::task::spawn_blocking(|| backend.run_loop()));
+    let mut live_localization = LiveVisualOdometryLocalization::default();
 
     loop {
         select! {
@@ -158,6 +170,21 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 ingest_visual_odometry(&mut frontend, visual_odometry, &previous_camera_matrix.inner, &current_camera_matrix.inner)
                     .wrap_err("failed to ingest visual odometry measurement into frontend")?;
             }
+            visual_odometer = visual_odometer_subscriber.recv() => {
+                let visual_odometer = visual_odometer?;
+                live_localization.try_reset_pending(
+                    &visual_odometer_cache,
+                    &camera_matrix_cache,
+                );
+
+                if let Some(transform) = live_localization.field_to_robot_from_odometer(
+                    &visual_odometer,
+                    &camera_matrix_cache,
+                ) {
+                    let localization = Some(transform);
+                    localization_publisher.publish(&localization).await?;
+                }
+            }
             robot_kinematics = robot_kinematics_subscriber.recv() => {
                 let robot_kinematics = robot_kinematics?;
                 ingest_foot_heights(&mut frontend, robot_kinematics)
@@ -170,9 +197,12 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             result = frontend.wait_for_optimization_result() => {
                 result?;
                 let result = frontend.last_optimization_result();
-                let transform = result
-                    .as_ref()
-                    .map(|result| localization_transform_from_backend_pose(&result.transform));
+                let transform = result.as_ref().map(|result| {
+                    live_localization.reset(result, &visual_odometer_cache, &camera_matrix_cache);
+                    live_localization
+                        .field_to_robot_latest(&visual_odometer_cache, &camera_matrix_cache)
+                        .unwrap_or_else(|| localization_transform_from_backend_pose(&result.transform))
+                });
 
                 localization_publisher.publish(&transform).await?;
 
@@ -184,6 +214,137 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct LiveVisualOdometryLocalization {
+    anchor: Option<LiveVisualOdometryAnchor>,
+    pending_result: Option<OptimizationResult>,
+}
+
+struct LiveVisualOdometryAnchor {
+    time: Time,
+    robot_to_field: nalgebra::Isometry3<f64>,
+    left_camera_to_visual_odometer: nalgebra::Isometry3<f32>,
+    robot_to_camera: nalgebra::Isometry3<f32>,
+}
+
+impl LiveVisualOdometryLocalization {
+    fn reset(
+        &mut self,
+        result: &OptimizationResult,
+        visual_odometer_cache: &VisualOdometerCache,
+        camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+    ) {
+        self.pending_result = Some(result.clone());
+        self.anchor = None;
+        self.try_reset_pending(visual_odometer_cache, camera_matrix_cache);
+    }
+
+    fn try_reset_pending(
+        &mut self,
+        visual_odometer_cache: &VisualOdometerCache,
+        camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+    ) {
+        let Some(result) = self.pending_result.as_ref() else {
+            return;
+        };
+        let time = Time::from_wallclock(result.time);
+        if let Some(anchor) =
+            live_visual_odometry_anchor(result, visual_odometer_cache, camera_matrix_cache, time)
+        {
+            self.anchor = Some(anchor);
+            self.pending_result = None;
+        }
+    }
+
+    fn field_to_robot_latest(
+        &self,
+        visual_odometer_cache: &VisualOdometerCache,
+        camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+    ) -> Option<Isometry3<Field, Robot>> {
+        let latest = visual_odometer_cache.get_latest()?;
+        self.field_to_robot_from_odometer(&latest, camera_matrix_cache)
+    }
+
+    fn field_to_robot_from_odometer(
+        &self,
+        current_odometer: &TimeWrapper<nalgebra::Isometry3<f32>>,
+        camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+    ) -> Option<Isometry3<Field, Robot>> {
+        let anchor = self.anchor.as_ref()?;
+        if current_odometer.time <= anchor.time {
+            return Some(localization_transform_from_backend_pose(
+                &anchor.robot_to_field,
+            ));
+        }
+
+        let current_camera_matrix =
+            fresh_camera_matrix(camera_matrix_cache, current_odometer.time)?;
+        let current_robot_to_camera = robot_to_camera(&current_camera_matrix.inner).inner;
+        let current_camera_to_anchor_camera =
+            anchor.left_camera_to_visual_odometer.inverse() * current_odometer.inner;
+        let current_robot_to_anchor_robot = anchor.robot_to_camera.inverse()
+            * current_camera_to_anchor_camera
+            * current_robot_to_camera;
+        let current_robot_to_field = anchor.robot_to_field * current_robot_to_anchor_robot.cast();
+
+        Some(localization_transform_from_backend_pose(
+            &current_robot_to_field,
+        ))
+    }
+}
+
+fn live_visual_odometry_anchor(
+    result: &OptimizationResult,
+    visual_odometer_cache: &VisualOdometerCache,
+    camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+    time: Time,
+) -> Option<LiveVisualOdometryAnchor> {
+    let left_camera_to_visual_odometer = odometer_at(visual_odometer_cache, time)?.inner;
+    let camera_matrix = fresh_camera_matrix(camera_matrix_cache, time)?;
+    Some(LiveVisualOdometryAnchor {
+        time,
+        robot_to_field: result.transform,
+        left_camera_to_visual_odometer,
+        robot_to_camera: robot_to_camera(&camera_matrix.inner).inner,
+    })
+}
+
+fn odometer_at(
+    visual_odometer_cache: &VisualOdometerCache,
+    time: Time,
+) -> Option<TimeWrapper<nalgebra::Isometry3<f32>>> {
+    if let Some(exact) = visual_odometer_cache.get_exact(time) {
+        return Some(exact.as_ref().clone());
+    }
+
+    let before = visual_odometer_cache.get_before(time)?;
+    let after = visual_odometer_cache.get_after(time)?;
+    if after.time <= before.time {
+        return Some(before.as_ref().clone());
+    }
+
+    let total = after.time.duration_since(before.time).as_secs_f64();
+    let elapsed = time.duration_since(before.time).as_secs_f64();
+    let interpolation = (elapsed / total).clamp(0.0, 1.0) as f32;
+
+    Some(TimeWrapper {
+        time,
+        inner: interpolate_isometry(before.inner, after.inner, interpolation),
+    })
+}
+
+fn interpolate_isometry(
+    start: nalgebra::Isometry3<f32>,
+    end: nalgebra::Isometry3<f32>,
+    interpolation: f32,
+) -> nalgebra::Isometry3<f32> {
+    let translation =
+        start.translation.vector * (1.0 - interpolation) + end.translation.vector * interpolation;
+    let rotation = start.rotation.slerp(&end.rotation, interpolation);
+
+    nalgebra::Isometry3::from_parts(nalgebra::Translation3::from(translation), rotation)
 }
 
 fn localization_transform_from_backend_pose(

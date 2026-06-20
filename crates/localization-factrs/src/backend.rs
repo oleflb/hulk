@@ -71,7 +71,6 @@ pub struct BackendConfiguration {
     pub visual_feature_noise: Matrix2<f64>,
     pub visual_odometry_noise: SMatrix<f64, 6, 6>,
     pub foot_ground_sigma: f64,
-    pub gravity: Vector3<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1268,7 +1267,6 @@ mod tests {
             visual_feature_noise: Matrix2::identity() * 5.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
-            gravity: Vector3::new(0.0, 0.0, 9.81),
         }
     }
 

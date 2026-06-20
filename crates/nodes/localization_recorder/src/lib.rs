@@ -155,7 +155,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         "localization",
     )
     .await?;
-    spawn_topic::<nalgebra::Isometry3<f32>>(
+    spawn_topic::<TimeWrapper<nalgebra::Isometry3<f32>>>(
         &node,
         &mut recorders,
         sample_sender.clone(),

@@ -74,7 +74,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let odometer_pub = node
-        .publisher::<na::Isometry3<f32>>("visual_odometry/current_left_camera_to_visual_odometer")?
+        .publisher::<TimeWrapper<na::Isometry3<f32>>>(
+            "visual_odometry/current_left_camera_to_visual_odometer",
+        )?
         .build()
         .await?;
 
@@ -95,9 +97,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             .wait_for(|parameters| parameters.typed().enable)
             .await?;
 
-        let stereo_image_pair = stereo_image_pair_sub.recv_with_metadata().await?;
-        let current_image_time = stereo_image_pair.source_time;
-        let stereo_image_pair = stereo_image_pair.message.inner;
+        let stereo_image_pair = stereo_image_pair_sub.recv().await?;
+        let current_image_time = stereo_image_pair.time;
+        let stereo_image_pair = stereo_image_pair.inner;
         let parameters = node_parameters.snapshot();
         let parameters = parameters.typed();
 
@@ -121,7 +123,10 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         }
         previous_image_time = Some(current_image_time);
         odometer_pub
-            .publish(&pipeline.current_left_camera_to_visual_odometer())
+            .publish(&TimeWrapper {
+                time: current_image_time,
+                inner: pipeline.current_left_camera_to_visual_odometer(),
+            })
             .await?;
         triangulated_features_pub
             .publish(&pipeline.triangulated_features())
