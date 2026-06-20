@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use color_eyre::{Result, eyre::eyre};
@@ -647,6 +647,49 @@ impl LocalizationMcapVisualizerApp {
                         DragValue::new(&mut self.parameters.global_localizer.residual_weight)
                             .speed(0.01)
                             .range(0.0..=10.0),
+                    );
+                });
+                ui.separator();
+                ui.label(RichText::new("Pose-Hint Fallback").strong());
+                ui.checkbox(&mut self.parameters.pose_hint.enabled, "enabled");
+                ui.horizontal(|ui| {
+                    ui.label("max pose age ms");
+                    let mut max_pose_age_ms =
+                        self.parameters.pose_hint.max_pose_age.as_secs_f64() * 1000.0;
+                    if ui
+                        .add(
+                            DragValue::new(&mut max_pose_age_ms)
+                                .speed(1.0)
+                                .range(1.0..=5000.0),
+                        )
+                        .changed()
+                    {
+                        self.parameters.pose_hint.max_pose_age =
+                            Duration::from_secs_f64(max_pose_age_ms / 1000.0);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("association gate m");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.association_gate)
+                            .speed(0.01)
+                            .range(0.01..=2.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("second-best margin m");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.second_best_margin)
+                            .speed(0.01)
+                            .range(0.0..=2.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("reprojection gate px");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.max_reprojection_error_px)
+                            .speed(1.0)
+                            .range(1.0..=500.0),
                     );
                 });
                 ui.separator();

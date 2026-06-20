@@ -262,14 +262,14 @@ fn rotation_distance(a: Isometry3<Robot, Field>, b: Isometry3<Robot, Field>) -> 
     a.inner.rotation.angle_to(&b.inner.rotation)
 }
 
-fn field_to_camera_from_robot_to_field(
+pub(super) fn field_to_camera_from_robot_to_field(
     robot_to_camera: Isometry3<Robot, Camera>,
     robot_to_field: Isometry3<Robot, Field>,
 ) -> Isometry3<Field, Camera> {
     robot_to_camera * robot_to_field.inverse()
 }
 
-fn project_field_point(
+pub(super) fn project_field_point(
     field_to_camera: Isometry3<Field, Camera>,
     intrinsic: Intrinsic,
     field_point: Point2<Field>,

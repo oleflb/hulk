@@ -20,7 +20,7 @@ use localization_3d::{
 };
 use localization_factrs::{
     BackendConfiguration, VinsBackend, VinsFrontend, VisualReprojectionAssociation,
-    backend::BackendSolveDiagnostics, initialize,
+    VisualReprojectionAssociationKind, backend::BackendSolveDiagnostics, initialize,
 };
 use mcap::{Message, MessageStream};
 use nalgebra::{SMatrix, SVector};
@@ -822,7 +822,8 @@ fn replay_graph_variant(
                         global_stats.localizer_unique_modulo_symmetry += 1;
                     }
                 }
-                if let Some(associations) = localization.unique_associations {
+                let associations = localization.associations;
+                if !associations.is_empty() {
                     global_stats.frames_ingested += 1;
                     global_stats.accepted_associations += associations.len();
                     accepted_global_feature_times.push(event.publish_time);
@@ -832,6 +833,7 @@ fn replay_graph_variant(
                             .map(|association| VisualReprojectionAssociation {
                                 detection: association.detection,
                                 field_point: association.field_point,
+                                kind: VisualReprojectionAssociationKind::GlobalUnique,
                             });
                     frontend.ingest_visual_reprojection_associations(
                         event.publish_time,

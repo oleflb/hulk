@@ -1,3 +1,5 @@
 {
   visual_feature_noise_variance: 25.0,
+  pose_hint_visual_feature_noise_variance: 400.0,
+  pose_hint_visual_huber_threshold: 2.0,
 }

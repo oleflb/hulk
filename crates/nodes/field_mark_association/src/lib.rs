@@ -7,7 +7,9 @@ use std::{
 
 use color_eyre::{Result, eyre::Context as _};
 use coordinate_systems::{Camera, Field, Pixel, Robot};
-use global_association::{GlobalAssociator, GlobalLocalizationInput, GlobalLocalizationResult};
+use global_association::{
+    FeatureAssociation, GlobalAssociator, GlobalLocalizationInput, GlobalLocalizationResult,
+};
 use linear_algebra::{Isometry3, Point2, Point3, point};
 use projection::camera_matrix::CameraMatrix;
 use ros_z::{Message, context::Context, parameter::NodeParametersExt, qos::QosDurability};
@@ -25,7 +27,7 @@ pub use global_association::{
     GlobalAssociationConfig as GlobalLocalizerParameters, GlobalLocalizationDebugAssociation,
     GlobalLocalizationDebugDetection, GlobalLocalizationDebugProjection,
     GlobalLocalizationDetailedDebug, GlobalLocalizationDetailedStatus, GlobalLocalizationScore,
-    VisualFeatureClass,
+    PoseHintAssociationConfig as PoseHintAssociationParameters, VisualFeatureClass,
 };
 
 const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
@@ -35,19 +37,22 @@ const DETECTED_OBJECTS_SAFETY_LAG: Duration = Duration::from_millis(50);
 #[serde(deny_unknown_fields)]
 pub struct FieldMarkAssociationParameters {
     pub global_localizer: GlobalLocalizerParameters,
+    pub pose_hint: PoseHintAssociationParameters,
 }
 
 impl Default for FieldMarkAssociationParameters {
     fn default() -> Self {
         Self {
             global_localizer: GlobalLocalizerParameters::default(),
+            pose_hint: PoseHintAssociationParameters::default(),
         }
     }
 }
 
 impl FieldMarkAssociationParameters {
     fn validate(&self) -> std::result::Result<(), String> {
-        self.global_localizer.validate()
+        self.global_localizer.validate()?;
+        self.pose_hint.validate()
     }
 }
 
@@ -55,6 +60,13 @@ impl FieldMarkAssociationParameters {
 pub struct FieldMarkAssociation {
     pub detection: Point2<Pixel>,
     pub field_point: Point3<Field>,
+    pub kind: FieldMarkAssociationKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Message)]
+pub enum FieldMarkAssociationKind {
+    GlobalUnique,
+    PoseHint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -67,8 +79,8 @@ pub struct FieldMarkAssociations {
 pub struct GlobalVisualLocalization {
     /// Debug payload for the best visual global localization result, if any.
     pub debug: Option<GlobalLocalizationDebug>,
-    /// Fixed associations that are unique up to the field symmetry and safe to ingest.
-    pub unique_associations: Option<Vec<FieldMarkAssociation>>,
+    /// Fixed associations selected by either global uniqueness or pose-hint fallback.
+    pub associations: Vec<FieldMarkAssociation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -171,30 +183,31 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             let camera_matrix = camera_matrix.inner.clone();
             let robot_to_camera = robot_to_camera(&camera_matrix);
             let field_dimensions = *field_dimensions.as_ref();
-            let pose_hint = localization_cache.get_latest().and_then(|localization| {
-                localization
-                    .as_ref()
-                    .map(|field_to_robot| field_to_robot.clone().inverse())
-            });
+            let pose_hint = localization_cache
+                .get_latest()
+                .zip(localization_cache.latest_stamp())
+                .and_then(|(localization, stamp)| {
+                    (time_distance(stamp, image_time) <= parameters.pose_hint.max_pose_age)
+                        .then(|| localization.as_ref().map(|pose| pose.clone().inverse()))
+                        .flatten()
+                });
             let include_debug = global_localization_publisher.has_subscribers();
 
             let localization = tokio::task::spawn_blocking(move || {
                 let visual_features = find_detected_visual_features(&objects);
-                if visual_features.supported_feature_count()
-                    < parameters.global_localizer.min_inliers.max(3)
-                {
+                if visual_features.supported_feature_count() == 0 {
                     return GlobalVisualLocalization {
                         debug: None,
-                        unique_associations: None,
+                        associations: Vec::new(),
                     };
                 }
 
-                localize_global_visual_features_with_debug(
+                associate_visual_features_with_debug(
                     &visual_features,
                     &camera_matrix,
                     &field_dimensions,
                     pose_hint,
-                    &parameters.global_localizer,
+                    &parameters,
                     include_debug,
                 )
             })
@@ -210,7 +223,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 time: image_time,
                 inner: FieldMarkAssociations {
                     robot_to_camera,
-                    associations: localization.unique_associations.unwrap_or_default(),
+                    associations: localization.associations,
                 },
             };
             associations_publisher.publish(&message).await?;
@@ -227,6 +240,63 @@ fn camera_matrix_is_fresh(
 
 fn time_distance(a: ros_z::time::Time, b: ros_z::time::Time) -> Duration {
     Duration::from_nanos(a.as_nanos().abs_diff(b.as_nanos()))
+}
+
+/// Runs global localization first and falls back to pose-hint association when needed.
+pub fn associate_visual_features(
+    visual_features: &DetectedVisualFeatures,
+    camera_matrix: &CameraMatrix,
+    field_dimensions: &FieldDimensions,
+    pose_hint: Option<Isometry3<Robot, Field>>,
+    parameters: &FieldMarkAssociationParameters,
+) -> GlobalVisualLocalization {
+    associate_visual_features_with_debug(
+        visual_features,
+        camera_matrix,
+        field_dimensions,
+        pose_hint,
+        parameters,
+        true,
+    )
+}
+
+fn associate_visual_features_with_debug(
+    visual_features: &DetectedVisualFeatures,
+    camera_matrix: &CameraMatrix,
+    field_dimensions: &FieldDimensions,
+    pose_hint: Option<Isometry3<Robot, Field>>,
+    parameters: &FieldMarkAssociationParameters,
+    include_debug: bool,
+) -> GlobalVisualLocalization {
+    let localizer = GlobalAssociator::new(parameters.global_localizer);
+    let input = GlobalLocalizationInput {
+        visual_features,
+        field_dimensions,
+        ground_to_robot: camera_matrix.ground_to_robot,
+        robot_to_camera: robot_to_camera(camera_matrix),
+        camera_intrinsic: camera_matrix.intrinsics,
+        pose_hint,
+    };
+    let result = localizer.localize(input.clone());
+    let debug = if include_debug {
+        result.as_ref().map(global_localization_debug_from_result)
+    } else {
+        None
+    };
+    let associations = if let Some(associations) = result
+        .as_ref()
+        .and_then(GlobalLocalizationResult::unique_feature_associations)
+    {
+        field_mark_associations(associations.iter(), FieldMarkAssociationKind::GlobalUnique)
+    } else {
+        let associations = localizer.associate_with_pose_hint(input, parameters.pose_hint);
+        field_mark_associations(associations.iter(), FieldMarkAssociationKind::PoseHint)
+    };
+
+    GlobalVisualLocalization {
+        debug,
+        associations,
+    }
 }
 
 /// Runs global localization and returns debug data plus backend-safe associations.
@@ -271,18 +341,28 @@ fn localize_global_visual_features_with_debug(
         } else {
             None
         },
-        unique_associations: result.as_ref().and_then(|result| {
-            result.unique_feature_associations().map(|associations| {
-                associations
-                    .iter()
-                    .map(|association| FieldMarkAssociation {
-                        detection: association.detection,
-                        field_point: association.field_point.extend(0.0),
-                    })
-                    .collect()
+        associations: result
+            .as_ref()
+            .and_then(GlobalLocalizationResult::unique_feature_associations)
+            .map(|associations| {
+                field_mark_associations(associations.iter(), FieldMarkAssociationKind::GlobalUnique)
             })
-        }),
+            .unwrap_or_default(),
     }
+}
+
+fn field_mark_associations<'a>(
+    associations: impl IntoIterator<Item = &'a FeatureAssociation>,
+    kind: FieldMarkAssociationKind,
+) -> Vec<FieldMarkAssociation> {
+    associations
+        .into_iter()
+        .map(|association| FieldMarkAssociation {
+            detection: association.detection,
+            field_point: association.field_point.extend(0.0),
+            kind,
+        })
+        .collect()
 }
 
 /// Runs global localization and returns per-feature debug data for visual inspection.

@@ -16,7 +16,8 @@ use crate::factors::{
     foot_above_ground::FootHeightMeasurement, visual_odometry::VisualOdometryMeasurement,
 };
 use crate::measurements::{
-    ImuMeasurement, SensorMeasurement, VisualReprojectionAssociation, VisualReprojectionMeasurement,
+    ImuMeasurement, SensorMeasurement, VisualReprojectionAssociation,
+    VisualReprojectionAssociationKind, VisualReprojectionMeasurement,
 };
 
 pub struct VinsFrontend {
@@ -78,7 +79,7 @@ impl VinsFrontend {
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 
-    /// Adds globally-associated visual features to the optimization pipeline.
+    /// Adds fixed visual feature associations to the optimization pipeline.
     pub fn ingest_visual_reprojection_associations(
         &mut self,
         time: SystemTime,
@@ -86,23 +87,28 @@ impl VinsFrontend {
         robot_to_camera: nalgebra::Isometry3<f32>,
     ) -> Result<(), VinsFrontendError> {
         let robot_to_camera = isometry3_to_se3(robot_to_camera);
-        let measurements = associations
-            .into_iter()
-            .map(|association| VisualReprojectionMeasurement {
+        let mut global_measurements = Vec::new();
+        let mut pose_hint_measurements = Vec::new();
+
+        for association in associations {
+            let measurement = VisualReprojectionMeasurement {
                 time,
                 detection: association.detection.inner.cast(),
                 field_point: association.field_point.inner.cast(),
                 robot_to_camera: robot_to_camera.clone(),
-            })
-            .collect::<Vec<_>>();
-
-        if measurements.is_empty() {
-            return Ok(());
+            };
+            match association.kind {
+                VisualReprojectionAssociationKind::GlobalUnique => {
+                    global_measurements.push(measurement)
+                }
+                VisualReprojectionAssociationKind::PoseHint => {
+                    pose_hint_measurements.push(measurement)
+                }
+            }
         }
 
-        self.measurement_sender
-            .send(SensorMeasurement::Visual(measurements))
-            .map_err(|_| VinsFrontendError::BackendDisconnected)
+        self.send_visual_measurements(SensorMeasurement::Visual, global_measurements)?;
+        self.send_visual_measurements(SensorMeasurement::PoseHintVisual, pose_hint_measurements)
     }
 
     /// Adds a frame-to-frame visual odometry delta to the optimization pipeline.
@@ -143,6 +149,20 @@ impl VinsFrontend {
 
         self.measurement_sender
             .send(SensorMeasurement::FootHeights(measurement))
+            .map_err(|_| VinsFrontendError::BackendDisconnected)
+    }
+
+    fn send_visual_measurements(
+        &mut self,
+        make_measurement: impl FnOnce(Vec<VisualReprojectionMeasurement>) -> SensorMeasurement,
+        measurements: Vec<VisualReprojectionMeasurement>,
+    ) -> Result<(), VinsFrontendError> {
+        if measurements.is_empty() {
+            return Ok(());
+        }
+
+        self.measurement_sender
+            .send(make_measurement(measurements))
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 }

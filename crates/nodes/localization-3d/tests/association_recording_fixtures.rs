@@ -71,8 +71,7 @@ fn real_recording_association_fixtures_match_expected_landmarks() -> Result<(), 
             &GlobalLocalizerParameters::default(),
         );
         let actual = localization
-            .unique_associations
-            .unwrap_or_default()
+            .associations
             .into_iter()
             .map(|association| {
                 AssociationKey::from_points(association.detection, association.field_point.xy())
@@ -305,10 +304,11 @@ fn new_solver_matches(
         None,
         &GlobalLocalizerParameters::default(),
     );
-    let Some(actual) = localization.unique_associations else {
+    if localization.associations.is_empty() {
         return false;
-    };
-    let actual = actual
+    }
+    let actual = localization
+        .associations
         .into_iter()
         .map(|association| {
             AssociationKey::from_points(association.detection, association.field_point.xy())

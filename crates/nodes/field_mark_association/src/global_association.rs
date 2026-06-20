@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use coordinate_systems::{Field, Ground, Pixel, Robot};
 use linear_algebra::{Isometry3, Point2};
 use ros_z::Message;
@@ -61,6 +63,53 @@ impl Default for GlobalAssociationConfig {
             score_ratio: 1.05,
             residual_weight: 0.1,
         }
+    }
+}
+
+/// Configuration for pose-hint nearest-neighbor association fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, Message)]
+#[serde(deny_unknown_fields)]
+pub struct PoseHintAssociationConfig {
+    /// Enables pose-hint fallback when global uniqueness is unavailable.
+    pub enabled: bool,
+    /// Maximum accepted age difference between image time and pose hint time.
+    pub max_pose_age: Duration,
+    /// Maximum field-space distance from pose-projected detection to same-class landmark.
+    pub association_gate: f32,
+    /// Minimum distance gap between the closest and second-closest same-class landmark.
+    pub second_best_margin: f32,
+    /// Maximum reprojection error under the current pose hint.
+    pub max_reprojection_error_px: f32,
+}
+
+impl Default for PoseHintAssociationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_pose_age: Duration::from_millis(250),
+            association_gate: 0.35,
+            second_best_margin: 0.25,
+            max_reprojection_error_px: 80.0,
+        }
+    }
+}
+
+impl PoseHintAssociationConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_pose_age.is_zero() {
+            return Err("pose_hint.max_pose_age must be > 0".to_string());
+        }
+        validate_positive_f32(
+            self.association_gate,
+            "pose_hint.association_gate must be finite and > 0",
+        )?;
+        if !self.second_best_margin.is_finite() || self.second_best_margin < 0.0 {
+            return Err("pose_hint.second_best_margin must be finite and >= 0".to_string());
+        }
+        validate_positive_f32(
+            self.max_reprojection_error_px,
+            "pose_hint.max_reprojection_error_px must be finite and > 0",
+        )
     }
 }
 
@@ -151,6 +200,14 @@ impl GlobalAssociator {
         input: GlobalLocalizationInput<'_>,
     ) -> Option<GlobalLocalizationDetailedDebug> {
         solver::solve_detailed(input, self.config)
+    }
+
+    pub(crate) fn associate_with_pose_hint(
+        &self,
+        input: GlobalLocalizationInput<'_>,
+        config: PoseHintAssociationConfig,
+    ) -> Vec<FeatureAssociation> {
+        solver::associate_with_pose_hint(input, self.config, config)
     }
 }
 
@@ -374,6 +431,53 @@ mod tests {
             t_spots: vec![project_point(field.t_crossing(Side::Left))],
             penalty_spots: vec![project_point(field.penalty_spot(Half::Opponent))],
         }
+    }
+
+    #[test]
+    fn pose_hint_fallback_associates_single_feature() {
+        let field = FieldDimensions::SPL_2025;
+        let penalty_spot = field.penalty_spot(Half::Opponent);
+        let features = DetectedVisualFeatures {
+            penalty_spots: vec![project_point(penalty_spot)],
+            ..Default::default()
+        };
+        let localizer = GlobalAssociator::default();
+
+        let associations = localizer.associate_with_pose_hint(
+            input(
+                &features,
+                &field,
+                Some(Isometry3::<Robot, Field>::identity()),
+            ),
+            PoseHintAssociationConfig::default(),
+        );
+
+        assert_eq!(associations.len(), 1);
+        assert_eq!(associations[0].field_point, penalty_spot);
+    }
+
+    #[test]
+    fn pose_hint_fallback_rejects_second_best_tie() {
+        let field = FieldDimensions::SPL_2025;
+        let features = DetectedVisualFeatures {
+            penalty_spots: vec![project_point(point![<Field>, 0.0, 0.0])],
+            ..Default::default()
+        };
+        let localizer = GlobalAssociator::default();
+
+        let associations = localizer.associate_with_pose_hint(
+            input(
+                &features,
+                &field,
+                Some(Isometry3::<Robot, Field>::identity()),
+            ),
+            PoseHintAssociationConfig {
+                association_gate: FieldDimensions::SPL_2025.penalty_marker_distance + 0.1,
+                ..Default::default()
+            },
+        );
+
+        assert!(associations.is_empty());
     }
 
     #[test]

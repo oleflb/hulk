@@ -11,12 +11,12 @@ use color_eyre::{
     eyre::{Context as _, bail},
 };
 use coordinate_systems::{Camera, Field, Robot};
-use field_mark_association::FieldMarkAssociations;
+use field_mark_association::{FieldMarkAssociationKind, FieldMarkAssociations};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, point};
 use localization_factrs::{
     BackendConfiguration, CameraIntrinsics, InitialState, OptimizationResult, VinsFrontend,
-    VinsFrontendError, VisualReprojectionAssociation,
+    VinsFrontendError, VisualReprojectionAssociation, VisualReprojectionAssociationKind,
     backend::{
         BackendOptimizerStatus, BackendSolveDiagnostics,
         ResidualDiagnostics as BackendResidualDiagnostics,
@@ -38,12 +38,19 @@ use types::{
 pub struct Localization3dParameters {
     /// Pixel residual variance for accepted visual feature associations.
     pub visual_feature_noise_variance: f64,
+    /// Pixel residual variance for lower-trust pose-hint visual feature associations.
+    pub pose_hint_visual_feature_noise_variance: f64,
+    /// Huber threshold for pose-hint visual residuals in whitened residual units.
+    pub pose_hint_visual_huber_threshold: f64,
 }
 
 impl Default for Localization3dParameters {
     fn default() -> Self {
         Self {
             visual_feature_noise_variance: 100.0,
+            pose_hint_visual_feature_noise_variance:
+                DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE,
+            pose_hint_visual_huber_threshold: DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD,
         }
     }
 }
@@ -54,6 +61,18 @@ impl Localization3dParameters {
             || self.visual_feature_noise_variance <= 0.0
         {
             return Err("visual_feature_noise_variance must be finite and > 0".to_string());
+        }
+        if !self.pose_hint_visual_feature_noise_variance.is_finite()
+            || self.pose_hint_visual_feature_noise_variance <= 0.0
+        {
+            return Err(
+                "pose_hint_visual_feature_noise_variance must be finite and > 0".to_string(),
+            );
+        }
+        if !self.pose_hint_visual_huber_threshold.is_finite()
+            || self.pose_hint_visual_huber_threshold <= 0.0
+        {
+            return Err("pose_hint_visual_huber_threshold must be finite and > 0".to_string());
         }
         Ok(())
     }
@@ -124,14 +143,38 @@ impl From<BackendResidualDiagnostics> for SolveResidualDiagnostics {
 
 const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 const VISUAL_ODOMETER_TOPIC: &str = "visual_odometry/current_left_camera_to_visual_odometer";
+const DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE: f64 = 400.0;
+const DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD: f64 = 2.0;
 
 type VisualOdometerCache = Cache<TimeWrapper<nalgebra::Isometry3<f32>>>;
 
 /// Builds the VINS backend configuration used by the localization node.
 ///
-/// `visual_feature_noise_variance` is the pixel-space variance assigned to fixed
-/// field-feature reprojection factors that were accepted by global localization.
+/// `visual_feature_noise_variance` is the pixel-space variance assigned to globally certified
+/// field-feature reprojection factors. Pose-hint fallback factors use conservative defaults here.
 pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfiguration {
+    backend_configuration_with_pose_hint(
+        visual_feature_noise_variance,
+        DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE,
+        DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD,
+    )
+}
+
+pub fn backend_configuration_from_parameters(
+    parameters: &Localization3dParameters,
+) -> BackendConfiguration {
+    backend_configuration_with_pose_hint(
+        parameters.visual_feature_noise_variance,
+        parameters.pose_hint_visual_feature_noise_variance,
+        parameters.pose_hint_visual_huber_threshold,
+    )
+}
+
+fn backend_configuration_with_pose_hint(
+    visual_feature_noise_variance: f64,
+    pose_hint_visual_feature_noise_variance: f64,
+    pose_hint_visual_huber_threshold: f64,
+) -> BackendConfiguration {
     let process_noise = Matrix3::identity() * 0.01;
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
@@ -141,6 +184,9 @@ pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfi
         roll_pitch_yaw_noise: process_noise,
         accelerometer_process_noise: process_noise,
         visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
+        pose_hint_visual_feature_noise: Matrix2::identity()
+            * pose_hint_visual_feature_noise_variance,
+        pose_hint_visual_huber_threshold,
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-4,
         foot_ground_sigma: 1e-2,
@@ -214,9 +260,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let initial_state = wait_for_initial_state(&camera_matrix_cache).await;
-    let visual_feature_noise_variance = parameters.snapshot().typed().visual_feature_noise_variance;
+    let localization_parameters = parameters.snapshot().typed().clone();
     let (mut frontend, backend) = initialize(
-        backend_configuration(visual_feature_noise_variance),
+        backend_configuration_from_parameters(&localization_parameters),
         initial_state,
     );
     let runtime = tokio::runtime::Handle::current();
@@ -480,6 +526,12 @@ fn ingest_field_mark_associations(
         .map(|association| VisualReprojectionAssociation {
             detection: association.detection,
             field_point: association.field_point,
+            kind: match association.kind {
+                FieldMarkAssociationKind::GlobalUnique => {
+                    VisualReprojectionAssociationKind::GlobalUnique
+                }
+                FieldMarkAssociationKind::PoseHint => VisualReprojectionAssociationKind::PoseHint,
+            },
         });
     frontend.ingest_visual_reprojection_associations(
         field_mark_associations.time.to_wallclock(),

@@ -51,7 +51,7 @@ impl Problem {
     }
 }
 
-fn cached_landmark_map(
+pub(super) fn cached_landmark_map(
     field_dimensions: &FieldDimensions,
     min_map_baseline: f32,
 ) -> Arc<LandmarkMap> {
@@ -107,7 +107,7 @@ fn landmark_map_cache_key(field: &FieldDimensions, min_map_baseline: f32) -> Lan
     }
 }
 
-fn valid_intrinsic(intrinsic: Intrinsic) -> bool {
+pub(super) fn valid_intrinsic(intrinsic: Intrinsic) -> bool {
     intrinsic.focals.x.is_finite()
         && intrinsic.focals.y.is_finite()
         && intrinsic.optical_center.x().is_finite()
@@ -116,7 +116,7 @@ fn valid_intrinsic(intrinsic: Intrinsic) -> bool {
         && intrinsic.focals.y.abs() > 1.0e-6
 }
 
-fn detection_points(
+pub(super) fn detection_points(
     features: &DetectedVisualFeatures,
     map: &LandmarkMap,
     camera_to_ground: &Isometry3<Camera, Ground>,

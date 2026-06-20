@@ -8,6 +8,7 @@ use crate::{
 pub struct IntervalMeasurements {
     pub imu: Vec<ImuMeasurement>,
     pub visual: Vec<Vec<VisualReprojectionMeasurement>>,
+    pub pose_hint_visual: Vec<Vec<VisualReprojectionMeasurement>>,
     pub visual_odometry: Vec<VisualOdometryMeasurement>,
     pub foot_heights: Vec<FootHeightMeasurement>,
 }
@@ -17,6 +18,7 @@ impl IntervalMeasurements {
         Self {
             imu: Vec::new(),
             visual: Vec::new(),
+            pose_hint_visual: Vec::new(),
             visual_odometry: Vec::new(),
             foot_heights: Vec::new(),
         }
@@ -30,6 +32,7 @@ impl IntervalMeasurements {
         match measurement {
             SensorMeasurement::Imu(imu) => self.push_imu(imu),
             SensorMeasurement::Visual(visual) => self.push_visual(visual),
+            SensorMeasurement::PoseHintVisual(visual) => self.push_pose_hint_visual(visual),
             SensorMeasurement::VisualOdometry(visual_odometry) => {
                 self.push_visual_odometry(visual_odometry)
             }
@@ -38,12 +41,11 @@ impl IntervalMeasurements {
     }
 
     pub fn push_visual(&mut self, visual: Vec<VisualReprojectionMeasurement>) {
-        insert_sorted(&mut self.visual, visual, |visual| {
-            visual
-                .first()
-                .expect("visual frames must contain at least one measurement")
-                .time
-        });
+        insert_visual_frame(&mut self.visual, visual);
+    }
+
+    pub fn push_pose_hint_visual(&mut self, visual: Vec<VisualReprojectionMeasurement>) {
+        insert_visual_frame(&mut self.pose_hint_visual, visual);
     }
 
     pub fn push_visual_odometry(&mut self, visual_odometry: VisualOdometryMeasurement) {
@@ -57,6 +59,18 @@ impl IntervalMeasurements {
             measurement.time
         });
     }
+}
+
+fn insert_visual_frame(
+    frames: &mut Vec<Vec<VisualReprojectionMeasurement>>,
+    visual: Vec<VisualReprojectionMeasurement>,
+) {
+    insert_sorted(frames, visual, |visual| {
+        visual
+            .first()
+            .expect("visual frames must contain at least one measurement")
+            .time
+    });
 }
 
 fn insert_sorted<T, K: Ord>(vec: &mut Vec<T>, item: T, key: impl Fn(&T) -> K) {

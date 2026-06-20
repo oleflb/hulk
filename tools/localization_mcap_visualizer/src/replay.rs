@@ -11,7 +11,7 @@ use color_eyre::Result;
 use coordinate_systems::{Field, Robot};
 use field_mark_association::{
     FieldMarkAssociationParameters, GlobalLocalizationDebugStatus, GlobalLocalizerParameters,
-    find_detected_visual_features, localize_global_visual_features,
+    PoseHintAssociationParameters, associate_visual_features, find_detected_visual_features,
 };
 use linear_algebra::IntoTransform;
 use localization_3d::{
@@ -19,7 +19,7 @@ use localization_3d::{
 };
 use localization_factrs::{
     BackendConfiguration, VinsBackend, VinsFrontend, VisualReprojectionAssociation,
-    backend::BackendSolveDiagnostics, initialize,
+    VisualReprojectionAssociationKind, backend::BackendSolveDiagnostics, initialize,
 };
 use nalgebra::SMatrix;
 use projection::camera_matrix::CameraMatrix;
@@ -45,6 +45,7 @@ pub struct ReplayParameters {
     pub include_imu: bool,
     pub include_foot_heights: bool,
     pub global_localizer: GlobalLocalizerParameters,
+    pub pose_hint: PoseHintAssociationParameters,
 }
 
 impl Default for ReplayParameters {
@@ -62,6 +63,7 @@ impl Default for ReplayParameters {
             include_imu: true,
             include_foot_heights: true,
             global_localizer: association_parameters.global_localizer,
+            pose_hint: association_parameters.pose_hint,
         }
     }
 }
@@ -343,7 +345,7 @@ fn ingest_global_features(
 ) -> Result<()> {
     stats.global_frames += 1;
     let visual_features = find_detected_visual_features(objects);
-    if visual_features.supported_feature_count() < parameters.global_localizer.min_inliers.max(3) {
+    if visual_features.supported_feature_count() == 0 {
         return Ok(());
     }
     stats.global_candidates += 1;
@@ -366,12 +368,16 @@ fn ingest_global_features(
             .cast::<f32>()
             .framed_transform::<Robot, Field>()
     });
-    let localization = localize_global_visual_features(
+    let association_parameters = FieldMarkAssociationParameters {
+        global_localizer: parameters.global_localizer,
+        pose_hint: parameters.pose_hint,
+    };
+    let localization = associate_visual_features(
         &visual_features,
         &camera_matrix.matrix.inner,
         &FieldDimensions::SPL_2025,
         pose_hint,
-        &parameters.global_localizer,
+        &association_parameters,
     );
     match localization.debug.as_ref().map(|debug| debug.status) {
         None => stats.global_none += 1,
@@ -383,7 +389,8 @@ fn ingest_global_features(
         }
     }
 
-    if let Some(associations) = localization.unique_associations {
+    let associations = localization.associations;
+    if !associations.is_empty() {
         stats.global_frames_ingested += 1;
         stats.global_associations_ingested += associations.len();
         let associations =
@@ -392,6 +399,14 @@ fn ingest_global_features(
                 .map(|association| VisualReprojectionAssociation {
                     detection: association.detection,
                     field_point: association.field_point,
+                    kind: match association.kind {
+                        field_mark_association::FieldMarkAssociationKind::GlobalUnique => {
+                            VisualReprojectionAssociationKind::GlobalUnique
+                        }
+                        field_mark_association::FieldMarkAssociationKind::PoseHint => {
+                            VisualReprojectionAssociationKind::PoseHint
+                        }
+                    },
                 });
         frontend.ingest_visual_reprojection_associations(
             event.publish_time,

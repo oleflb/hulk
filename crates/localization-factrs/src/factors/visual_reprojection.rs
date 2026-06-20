@@ -24,6 +24,11 @@ pub struct VisualReprojectionFactor {
     duration: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PoseHintVisualReprojectionFactor {
+    inner: VisualReprojectionFactor,
+}
+
 #[factrs::mark]
 impl Residual for VisualReprojectionFactor {
     type Input = (SE23, SE23, CameraIntrinsics);
@@ -115,6 +120,38 @@ impl VisualReprojectionFactor {
         }
 
         residuals
+    }
+}
+
+#[factrs::mark]
+impl Residual for PoseHintVisualReprojectionFactor {
+    type Input = (SE23, SE23, CameraIntrinsics);
+    type Differ = ForwardProp;
+
+    fn dim_out(&self) -> usize {
+        self.inner.dim_out()
+    }
+
+    fn residual<T: Numeric>(&self, input: (SE23<T>, SE23<T>, CameraIntrinsics<T>)) -> VectorX<T> {
+        self.inner.residual(input)
+    }
+}
+
+impl PoseHintVisualReprojectionFactor {
+    pub fn new(
+        start_time: SystemTime,
+        end_time: SystemTime,
+        measurement: VisualReprojectionMeasurement,
+        visual_feature_noise: Matrix2<f64>,
+    ) -> Self {
+        Self {
+            inner: VisualReprojectionFactor::new(
+                start_time,
+                end_time,
+                vec![vec![measurement]],
+                visual_feature_noise,
+            ),
+        }
     }
 }
 

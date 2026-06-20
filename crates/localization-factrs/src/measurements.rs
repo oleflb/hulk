@@ -14,6 +14,7 @@ use crate::factors::{
 pub enum SensorMeasurement {
     Imu(ImuMeasurement),
     Visual(Vec<VisualReprojectionMeasurement>),
+    PoseHintVisual(Vec<VisualReprojectionMeasurement>),
     VisualOdometry(VisualOdometryMeasurement),
     FootHeights(FootHeightMeasurement),
 }
@@ -22,7 +23,7 @@ impl SensorMeasurement {
     pub fn time(&self) -> SystemTime {
         match self {
             SensorMeasurement::Imu(imu) => imu.time,
-            SensorMeasurement::Visual(visual) => {
+            SensorMeasurement::Visual(visual) | SensorMeasurement::PoseHintVisual(visual) => {
                 visual
                     .first()
                     .expect("visual frames must contain at least one measurement")
@@ -47,6 +48,16 @@ pub struct VisualReprojectionAssociation {
     pub detection: FramedPoint2<Pixel>,
     /// Associated field feature in field coordinates.
     pub field_point: FramedPoint3<Field>,
+    /// Association source, used to select backend weighting and robustification.
+    pub kind: VisualReprojectionAssociationKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VisualReprojectionAssociationKind {
+    /// Globally certified, unique association.
+    GlobalUnique,
+    /// Association selected from a trusted current pose hint.
+    PoseHint,
 }
 
 #[derive(Debug, Clone)]

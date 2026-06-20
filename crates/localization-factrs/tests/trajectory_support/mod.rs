@@ -11,7 +11,8 @@ use factrs::{core::SO3, variables::SE23};
 use indicatif::ProgressIterator;
 use linear_algebra::{IntoFramed, Point2 as FramedPoint2, Point3 as FramedPoint3};
 use localization_factrs::{
-    BackendConfiguration, CameraIntrinsics, InitialState, VisualReprojectionAssociation, initialize,
+    BackendConfiguration, CameraIntrinsics, InitialState, VisualReprojectionAssociation,
+    VisualReprojectionAssociationKind, initialize,
 };
 use nalgebra::{Matrix2, Matrix3, Point2, Point3, SMatrix, Vector3, vector};
 use rand::{Rng, SeedableRng};
@@ -188,6 +189,8 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             roll_pitch_yaw_noise: Matrix3::identity()
                 * solver_variance(config.roll_pitch_yaw_noise_std),
             visual_feature_noise: Matrix2::identity() * solver_variance(config.detection_noise_std),
+            pose_hint_visual_feature_noise: Matrix2::identity() * 100.0,
+            pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
         },
@@ -537,6 +540,7 @@ fn associate_visual_detections(
         associations.push(VisualReprojectionAssociation {
             detection: FramedPoint2::<Pixel>::wrap(detections[detection].cast()),
             field_point: FramedPoint3::<Field>::wrap(landmark.cast()),
+            kind: VisualReprojectionAssociationKind::GlobalUnique,
         });
     }
 

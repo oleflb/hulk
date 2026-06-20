@@ -5,7 +5,7 @@ use std::{
 
 use factrs::{
     containers::FactorBuilder,
-    core::{GaussNewton, Graph, PriorResidual, SE3, SO3, Values, Vector3},
+    core::{GaussNewton, Graph, Huber, PriorResidual, SE3, SO3, Values, Vector3},
     linalg::{Matrix3, VectorX},
     noise::GaussianNoise,
     optimizers::{BaseOptParams, OptError, OptStatus},
@@ -29,7 +29,7 @@ use crate::{
             AdjacentVisualOdometryFactor, VisualOdometryDelta, VisualOdometryFactor,
             VisualOdometryMeasurement,
         },
-        visual_reprojection::VisualReprojectionFactor,
+        visual_reprojection::{PoseHintVisualReprojectionFactor, VisualReprojectionFactor},
     },
     initial_state::InitialState,
     interval_measurement::IntervalMeasurements,
@@ -69,6 +69,8 @@ pub struct BackendConfiguration {
 
     pub roll_pitch_yaw_noise: Matrix3<f64>,
     pub visual_feature_noise: Matrix2<f64>,
+    pub pose_hint_visual_feature_noise: Matrix2<f64>,
+    pub pose_hint_visual_huber_threshold: f64,
     pub visual_odometry_noise: SMatrix<f64, 6, 6>,
     pub foot_ground_sigma: f64,
 }
@@ -509,6 +511,44 @@ impl VinsBackend {
         }
     }
 
+    fn ingest_pose_hint_visual(&mut self, mut visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
+        visuals.retain(|visual| !visual.is_empty());
+        let Some(last) = visuals.last() else {
+            return;
+        };
+
+        let last_time = visual_frame_time(last);
+        self.update_last_knot_time(last_time);
+
+        let interval_groups = self.interval_groups(visuals, |visual| visual_frame_time(visual));
+
+        for group in interval_groups {
+            if !self.prepare_interval_for_measurements(group.start_index, "pose-hint visual") {
+                continue;
+            }
+
+            let keys = (
+                State(group.start_index),
+                State(group.start_index + 1),
+                CameraIntrinsics(0),
+            );
+            let graph = self.optimizer.graph_mut();
+            for measurement in group.measurements.into_iter().flatten() {
+                let residual = PoseHintVisualReprojectionFactor::new(
+                    group.start_time,
+                    group.end_time,
+                    measurement,
+                    self.config.pose_hint_visual_feature_noise,
+                );
+                let factor = FactorBuilder::new(residual, keys)
+                    .robust(Huber::new(self.config.pose_hint_visual_huber_threshold))
+                    .build();
+
+                graph.add_factor(factor);
+            }
+        }
+    }
+
     fn ingest_visual_odometry(&mut self, visual_odometry: Vec<VisualOdometryMeasurement>) {
         let Some(last) = visual_odometry.last() else {
             return;
@@ -934,6 +974,7 @@ impl VinsBackend {
     ) -> Result<(), VinsBackendError> {
         self.ingest_imu(new_measurements.imu);
         self.ingest_visual(new_measurements.visual);
+        self.ingest_pose_hint_visual(new_measurements.pose_hint_visual);
         self.ingest_visual_odometry(new_measurements.visual_odometry);
         self.ingest_foot_heights(new_measurements.foot_heights);
 
@@ -1010,6 +1051,8 @@ impl VinsBackend {
         let graph = self.optimizer.graph();
         let mut visual_odometry = self.residual_diagnostics::<VisualOdometryFactor>();
         visual_odometry.extend(self.residual_diagnostics::<AdjacentVisualOdometryFactor>());
+        let mut visual_reprojection = self.residual_diagnostics::<VisualReprojectionFactor>();
+        visual_reprojection.extend(self.residual_diagnostics::<PoseHintVisualReprojectionFactor>());
 
         BackendSolveDiagnostics {
             optimizer_status,
@@ -1017,9 +1060,7 @@ impl VinsBackend {
             factor_count: graph.len(),
             total_error: graph.error(&self.values),
             visual_odometry: visual_odometry.finish(),
-            visual_reprojection: self
-                .residual_diagnostics::<VisualReprojectionFactor>()
-                .finish(),
+            visual_reprojection: visual_reprojection.finish(),
             gaussian_process_prior: self
                 .residual_diagnostics::<GaussianProcessPriorFactor>()
                 .finish(),
@@ -1289,6 +1330,8 @@ mod tests {
             accelerometer_process_noise: Matrix3::identity() * 0.01,
             roll_pitch_yaw_noise: Matrix3::identity() * 0.01,
             visual_feature_noise: Matrix2::identity() * 5.0,
+            pose_hint_visual_feature_noise: Matrix2::identity() * 100.0,
+            pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
         }
@@ -1335,11 +1378,35 @@ mod tests {
         }])
     }
 
+    fn pose_hint_visual_reprojection(time: SystemTime) -> SensorMeasurement {
+        SensorMeasurement::PoseHintVisual(vec![VisualReprojectionMeasurement {
+            time,
+            detection: nalgebra::point![0.0, 0.0],
+            field_point: nalgebra::point![0.0, 0.0, 2.0],
+            robot_to_camera: SE3::identity(),
+        }])
+    }
+
     fn visual_reprojection_factor_count(backend: &mut VinsBackend, state: State) -> usize {
         backend
             .optimizer
             .graph_mut()
             .factors_for_residual::<VisualReprojectionFactor, _>((
+                state,
+                State(state.0 + 1),
+                CameraIntrinsics(0),
+            ))
+            .count()
+    }
+
+    fn pose_hint_visual_reprojection_factor_count(
+        backend: &mut VinsBackend,
+        state: State,
+    ) -> usize {
+        backend
+            .optimizer
+            .graph_mut()
+            .factors_for_residual::<PoseHintVisualReprojectionFactor, _>((
                 state,
                 State(state.0 + 1),
                 CameraIntrinsics(0),
@@ -1470,6 +1537,31 @@ mod tests {
         assert!(backend.values().get_raw(State(0)).is_some());
         assert!(backend.values().get_raw(State(1)).is_some());
         assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 1);
+    }
+
+    #[test]
+    fn pose_hint_visual_reprojection_measurements_create_separate_factor() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        measurement_sender
+            .send(pose_hint_visual_reprojection(start))
+            .expect("pose-hint visual reprojection should send");
+
+        let _ = backend.solve_once().expect("solve should succeed");
+
+        assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 0);
+        assert_eq!(
+            pose_hint_visual_reprojection_factor_count(&mut backend, State(0)),
+            1
+        );
     }
 
     #[test]

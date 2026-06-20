@@ -12,4 +12,11 @@
     score_ratio: 1.05,
     residual_weight: 0.1,
   },
+  pose_hint: {
+    enabled: true,
+    max_pose_age: { nanos: 250000000, secs: 0 },
+    association_gate: 0.35,
+    second_best_margin: 0.25,
+    max_reprojection_error_px: 80.0,
+  },
 }

@@ -16,7 +16,7 @@ use localization_3d::{
     Localization3dParameters, backend_configuration, initial_state_from_camera_matrix,
 };
 use localization_factrs::{
-    OptimizationResult, VisualReprojectionAssociation,
+    OptimizationResult, VisualReprojectionAssociation, VisualReprojectionAssociationKind,
     backend::OptimizationResult as BackendResult, initialize,
 };
 use projection::camera_matrix::CameraMatrix;
@@ -202,13 +202,15 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                 if relaxed_debug_localization.debug.is_some() {
                     relaxed_global_localization_debug_frame_count += 1;
                 }
-                if let Some(associations) = localization.unique_associations {
+                let associations = localization.associations;
+                if !associations.is_empty() {
                     let associations =
                         associations
                             .into_iter()
                             .map(|association| VisualReprojectionAssociation {
                                 detection: association.detection,
                                 field_point: association.field_point,
+                                kind: VisualReprojectionAssociationKind::GlobalUnique,
                             });
                     frontend.ingest_visual_reprojection_associations(
                         source_time.to_wallclock(),
