@@ -14,6 +14,8 @@ use crate::{
     utils::{interval_dt, tau},
 };
 
+const MIN_REPROJECTION_DEPTH: f64 = 0.01;
+
 #[derive(Debug, Clone)]
 pub struct VisualReprojectionFactor {
     measurements: Vec<VisualReprojectionMeasurement>,
@@ -110,8 +112,12 @@ impl VisualReprojectionFactor {
             let field_point = measurement.field_point.coords.cast::<T>();
             let point_robot = field_to_robot.apply(field_point.as_view());
             let point_camera = robot_to_camera.apply(point_robot.as_view());
-            let reprojection = intrinsics.project(point_camera.as_view())
-                - measurement.detection.coords.cast::<T>();
+            let Some(projected) =
+                intrinsics.project_checked(point_camera.as_view(), T::from(MIN_REPROJECTION_DEPTH))
+            else {
+                continue;
+            };
+            let reprojection = projected - measurement.detection.coords.cast::<T>();
             let whitened = pixel_information_root * reprojection;
 
             residuals
@@ -218,6 +224,39 @@ mod tests {
         ));
 
         assert!(residual.norm() > 1.0);
+    }
+
+    #[test]
+    fn invalid_depth_reprojection_is_ignored() {
+        let time = SystemTime::UNIX_EPOCH;
+        let factor = VisualReprojectionFactor::new(
+            time,
+            time + Duration::from_secs(1),
+            vec![vec![
+                VisualReprojectionMeasurement {
+                    time,
+                    detection: Point2::new(10.0, 20.0),
+                    field_point: Point3::new(0.0, 0.0, -1.0),
+                    robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
+                },
+                VisualReprojectionMeasurement {
+                    time,
+                    detection: Point2::new(10.0, 20.0),
+                    field_point: Point3::new(0.0, 0.0, 1.0e-4),
+                    robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
+                },
+            ]],
+            Matrix2::identity(),
+        );
+        let intrinsics = CameraIntrinsics::new(vector![100.0, 100.0], vector![0.0, 0.0]);
+        let pose = state(Vector3::zeros());
+
+        let linearized = factor.residual_jacobian((pose.clone(), pose, intrinsics));
+
+        assert!(linearized.value.iter().all(|value| value.is_finite()));
+        assert!(linearized.diff.iter().all(|value| value.is_finite()));
+        assert!(linearized.value.norm() < 1.0e-12);
+        assert!(linearized.diff.norm() < 1.0e-12);
     }
 
     #[test]

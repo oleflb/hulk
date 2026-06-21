@@ -33,6 +33,18 @@ impl<T: Numeric> CameraIntrinsics<T> {
         let z_inv = S::one() / point_camera.z;
         focals.component_mul(&point_camera.xy()).scale(z_inv) + optical_center
     }
+
+    pub fn project_checked<S: Numeric + SupersetOf<T>>(
+        &self,
+        point_camera: VectorView3<S>,
+        min_depth: S,
+    ) -> Option<Vector2<S>> {
+        if !(point_camera.z > min_depth) {
+            return None;
+        }
+
+        Some(self.project(point_camera))
+    }
 }
 
 impl<T: Numeric> Display for CameraIntrinsics<T> {

@@ -31,7 +31,7 @@ use types::{
     object_detection::{Object, RobocupObjectLabel},
     stereo_image_pair::StereoImagePair,
     time_wrapper::TimeWrapper,
-    visual_odometry::VisualOdometryDelta,
+    visual_odometry::{VisualOdometer, VisualOdometryDelta},
 };
 
 type ChannelId = u16;
@@ -156,7 +156,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         "localization",
     )
     .await?;
-    spawn_topic::<TimeWrapper<nalgebra::Isometry3<f32>>>(
+    spawn_topic::<VisualOdometer>(
         &node,
         &mut recorders,
         sample_sender.clone(),

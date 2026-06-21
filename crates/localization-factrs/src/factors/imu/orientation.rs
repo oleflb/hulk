@@ -1,9 +1,10 @@
 use std::time::SystemTime;
 
 use factrs::{
-    core::{SO3, Vector3},
+    core::{SO3, Vector2, Vector3},
     linalg::{Matrix3, Numeric},
     traits::Variable,
+    variables::MatrixLieGroup,
 };
 use nalgebra::{Matrix2, UnitQuaternion};
 
@@ -60,11 +61,35 @@ pub(super) fn orientation_from_measurement(measurement: &ImuMeasurement) -> SO3 
     so3_from_euler_angles(rpy.x, rpy.y, rpy.z)
 }
 
+pub(super) fn local_up_xy_from_so3<T: Numeric>(rotation: &SO3<T>) -> Vector2<T> {
+    let field_up = Vector3::new(T::zero(), T::zero(), T::one());
+    let local_up = rotation.inverse().apply(field_up.as_view());
+    local_up.fixed_rows::<2>(0).into_owned()
+}
+
+pub(super) fn relative_orientation<T: Numeric>(start: &SO3<T>, end: &SO3<T>) -> SO3<T> {
+    start.inverse().compose(end)
+}
+
+pub(super) fn relative_yaw_error<T: Numeric>(
+    predicted_start: &SO3<T>,
+    predicted_end: &SO3<T>,
+    measured_relative: &SO3,
+) -> T {
+    let predicted_relative = relative_orientation(predicted_start, predicted_end);
+    let measured_relative = measured_relative.cast::<T>();
+    measured_relative
+        .inverse()
+        .compose(&predicted_relative)
+        .log()[2]
+}
+
 fn geodesic_interpolate(start: SO3, end: SO3, alpha: f64) -> SO3 {
     let phi = start.inverse().compose(&end).log();
     start.oplus_right((phi * alpha).as_view())
 }
 
+#[cfg(test)]
 pub(super) fn roll_pitch_yaw_from_so3<T: Numeric>(rotation: &SO3<T>) -> Vector3<T> {
     let one = T::from(1.0);
     let two = T::from(2.0);
@@ -79,11 +104,6 @@ pub(super) fn roll_pitch_yaw_from_so3<T: Numeric>(rotation: &SO3<T>) -> Vector3<
     let yaw = (two * (w * z + x * y)).atan2(one - two * (y * y + z * z));
 
     Vector3::new(roll, pitch, yaw)
-}
-
-pub(super) fn angle_difference<T: Numeric>(left: T, right: T) -> T {
-    let difference = left - right;
-    difference.sin().atan2(difference.cos())
 }
 
 pub(super) fn so3_from_euler_angles(roll: f64, pitch: f64, yaw: f64) -> SO3 {

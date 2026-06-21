@@ -113,6 +113,13 @@ impl VisualOdometryPipeline {
         self.current_left_camera_to_visual_odometer
     }
 
+    pub fn reset_tracking(&mut self) {
+        self.previous_features = PreviousFeatureState::new();
+        self.previous_frame = None;
+        self.current_points.clear();
+        self.current_left_camera_to_visual_odometer = na::Isometry3::identity();
+    }
+
     /// Return the stereo points triangulated from the most recently processed frame.
     ///
     /// Points are expressed in the current left-camera frame.

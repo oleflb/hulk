@@ -30,6 +30,7 @@ use types::{
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
     time_wrapper::TimeWrapper,
+    visual_odometry::VisualOdometer,
 };
 
 use crate::{
@@ -167,7 +168,7 @@ async fn run(arguments: Arguments, state: SharedState, egui_context: EguiContext
 struct DebugSubscriptions {
     field_dimensions: SubscriptionHandle<FieldDimensions>,
     localization: SubscriptionHandle<Option<Isometry3<Field, Robot>>>,
-    visual_odometer: SubscriptionHandle<TimeWrapper<nalgebra::Isometry3<f32>>>,
+    visual_odometer: SubscriptionHandle<VisualOdometer>,
     robot_kinematics: WindowedDebugStream<RobotKinematics>,
     camera_matrix: WindowedDebugStream<CameraMatrix>,
     calibrated_intrinsics: SubscriptionHandle<Intrinsic>,
@@ -199,8 +200,8 @@ impl DebugSubscriptions {
                 .build()
                 .await?,
             visual_odometer: manager
-                .subscribe_typed::<TimeWrapper<nalgebra::Isometry3<f32>>>(VISUAL_ODOMETER_TOPIC)
-                .with_stamp(time_wrapper_stamp::<nalgebra::Isometry3<f32>>)
+                .subscribe_typed::<VisualOdometer>(VISUAL_ODOMETER_TOPIC)
+                .with_stamp(|message| message.time)
                 .build()
                 .await?,
             robot_kinematics: WindowedDebugStream::new(
@@ -322,7 +323,7 @@ fn refresh_debug_streams(state: &mut ViewerState, subscriptions: &mut DebugSubsc
     );
 
     if let Some(record) = subscriptions.visual_odometer.latest() {
-        state.visual_odometer = Some(record.value.inner.clone());
+        state.visual_odometer = Some(record.value.current_left_camera_to_visual_odometer);
     }
     update_debug_status(
         &mut state.visual_odometer_status,

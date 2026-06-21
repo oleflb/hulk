@@ -15,15 +15,15 @@ use crate::{
 };
 
 use super::orientation::{
-    angle_difference, orientation_from_measurement, relative_yaw_information_root,
-    roll_pitch_information_root, roll_pitch_yaw_from_so3,
+    local_up_xy_from_so3, orientation_from_measurement, relative_orientation, relative_yaw_error,
+    relative_yaw_information_root, roll_pitch_information_root,
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct CurrentSplineOrientationFactor {
     measurement_tau: f64,
-    measured_roll_pitch: Vector2<f64>,
-    measured_yaw_delta_from_start: f64,
+    measured_local_up_xy: Vector2<f64>,
+    measured_relative_orientation: SO3,
     roll_pitch_information_root: Matrix2<f64>,
     yaw_information_root: f64,
     duration: f64,
@@ -39,23 +39,17 @@ impl Residual for CurrentSplineOrientationFactor {
     }
 
     fn residual<T: Numeric>(&self, (start, end): (SE23<T>, SE23<T>)) -> VectorX<T> {
-        let start_rpy = roll_pitch_yaw_from_so3(start.rot());
-        let spline = SE23Spline::new(start, end, T::from(self.duration));
+        let spline = SE23Spline::new(start.clone(), end, T::from(self.duration));
         let current_pose = spline.evaluate(T::from(self.measurement_tau));
 
-        let current_rpy = roll_pitch_yaw_from_so3(current_pose.rot());
-        let measured_roll_pitch = self.measured_roll_pitch.cast::<T>();
-
-        let roll_pitch_error = Vector2::new(
-            angle_difference(current_rpy.x, measured_roll_pitch.x),
-            angle_difference(current_rpy.y, measured_roll_pitch.y),
-        );
+        let roll_pitch_error =
+            local_up_xy_from_so3(current_pose.rot()) - self.measured_local_up_xy.cast::<T>();
         let whitened_roll_pitch = self.roll_pitch_information_root.cast::<T>() * roll_pitch_error;
 
-        let predicted_yaw_delta_from_start = angle_difference(current_rpy.z, start_rpy.z);
-        let yaw_error = angle_difference(
-            predicted_yaw_delta_from_start,
-            T::from(self.measured_yaw_delta_from_start),
+        let yaw_error = relative_yaw_error(
+            start.rot(),
+            current_pose.rot(),
+            &self.measured_relative_orientation,
         );
 
         let mut residual = VectorX::<T>::zeros(3);
@@ -76,15 +70,13 @@ impl CurrentSplineOrientationFactor {
         end_time: SystemTime,
     ) -> Self {
         let measured_current_orientation = orientation_from_measurement(current_measurement);
-        let measured_current_rpy = roll_pitch_yaw_from_so3(&measured_current_orientation);
-        let measured_start_yaw = roll_pitch_yaw_from_so3(&measured_start_orientation).z;
 
         Self {
             measurement_tau: tau::<f64>(start_time, end_time, current_measurement.time),
-            measured_roll_pitch: measured_current_rpy.fixed_rows::<2>(0).into_owned(),
-            measured_yaw_delta_from_start: angle_difference(
-                measured_current_rpy.z,
-                measured_start_yaw,
+            measured_local_up_xy: local_up_xy_from_so3(&measured_current_orientation),
+            measured_relative_orientation: relative_orientation(
+                &measured_start_orientation,
+                &measured_current_orientation,
             ),
             roll_pitch_information_root: roll_pitch_information_root(roll_pitch_yaw_noise),
             yaw_information_root: relative_yaw_information_root(roll_pitch_yaw_noise),

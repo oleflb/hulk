@@ -23,8 +23,10 @@ use nalgebra as na;
 use ros_z::prelude::*;
 use ros_z::qos::QosDurability;
 use types::{
-    stereo_camera_info::StereoCameraInfo, stereo_image_pair::StereoImagePair,
-    time_wrapper::TimeWrapper, visual_odometry::VisualOdometryDelta,
+    stereo_camera_info::StereoCameraInfo,
+    stereo_image_pair::StereoImagePair,
+    time_wrapper::TimeWrapper,
+    visual_odometry::{VisualOdometer, VisualOdometryDelta},
 };
 
 use crate::parameters::StereoVisualOdometryParameters;
@@ -74,9 +76,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let odometer_pub = node
-        .publisher::<TimeWrapper<na::Isometry3<f32>>>(
-            "visual_odometry/current_left_camera_to_visual_odometer",
-        )?
+        .publisher::<VisualOdometer>("visual_odometry/current_left_camera_to_visual_odometer")?
         .build()
         .await?;
 
@@ -91,6 +91,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     let mut pipeline =
         VisualOdometryPipeline::new(&parameters.typed().neural_network, stereo_camera_info)?;
     let mut previous_image_time: Option<ros_z::time::Time> = None;
+    let mut odometer_epoch = 0;
 
     loop {
         parameters_receiver
@@ -104,13 +105,43 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let parameters = parameters.typed();
 
         let start_time = Instant::now();
+        let had_previous_image = previous_image_time.is_some();
+        let mut process_failed = false;
         let odometry =
-            pipeline.process(&stereo_image_pair, &parameters.pose_estimation_parameters)?;
+            match pipeline.process(&stereo_image_pair, &parameters.pose_estimation_parameters) {
+                Ok(odometry) => odometry,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "visual odometry frame processing failed; resetting tracking"
+                    );
+                    process_failed = true;
+                    None
+                }
+            };
         let duration = start_time.elapsed();
 
         debug_odometry_pub
             .publish_if_subscribed(|| ready(odometry.clone()))
             .await?;
+        if process_failed || (had_previous_image && odometry.is_none()) {
+            tracing::debug!("visual odometry estimate failed; resetting odometer epoch");
+            odometer_epoch += 1;
+            previous_image_time = None;
+            pipeline.reset_tracking();
+            odometer_pub
+                .publish(&VisualOdometer {
+                    time: current_image_time,
+                    epoch: odometer_epoch,
+                    current_left_camera_to_visual_odometer: pipeline
+                        .current_left_camera_to_visual_odometer(),
+                })
+                .await?;
+            feature_duration_pub
+                .publish_if_subscribed(|| ready(duration))
+                .await?;
+            continue;
+        }
         if let (Some(previous_time), Some(previous_left_camera_to_current_left_camera)) =
             (previous_image_time, odometry.as_ref())
         {
@@ -125,9 +156,11 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         }
         previous_image_time = Some(current_image_time);
         odometer_pub
-            .publish(&TimeWrapper {
+            .publish(&VisualOdometer {
                 time: current_image_time,
-                inner: pipeline.current_left_camera_to_visual_odometer(),
+                epoch: odometer_epoch,
+                current_left_camera_to_visual_odometer: pipeline
+                    .current_left_camera_to_visual_odometer(),
             })
             .await?;
         if triangulated_features_pub.has_subscribers() {
