@@ -1,0 +1,71 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/root/.cargo/bin:$PATH
+ENV SYSROOT=/opt/x5-rootfs
+ENV X5_SDK_INCLUDE=/opt/x5-rootfs/usr/include
+ENV X5_SDK_LIB_DIR=/opt/x5-rootfs/usr/hobot/lib
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV RUSTFLAGS="-C link-arg=--sysroot=/opt/x5-rootfs -C link-arg=-Wl,-rpath-link,/opt/x5-rootfs/usr/hobot/lib -C link-arg=-Wl,-rpath-link,/opt/x5-rootfs/usr/lib/aarch64-linux-gnu -C link-arg=-Wl,-rpath-link,/opt/x5-rootfs/lib/aarch64-linux-gnu"
+ARG X5_RDK_GEN_COMMIT=89f88fec8df211edc64d794df2a5c52150edf43e
+ARG X5_RDK_GEN_CONFIG=build_params/ubuntu-22.04_server_rdk-x5_release.conf
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        clang \
+        curl \
+        file \
+        gcc-aarch64-linux-gnu \
+        g++-aarch64-linux-gnu \
+        git \
+        libclang-dev \
+        pkg-config \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable \
+    && rustup target add aarch64-unknown-linux-gnu \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    git init /opt/x5-rdk-gen; \
+    cd /opt/x5-rdk-gen; \
+    git remote add origin https://github.com/D-Robotics/x5-rdk-gen; \
+    git fetch --depth 1 origin "${X5_RDK_GEN_COMMIT}"; \
+    git checkout --detach FETCH_HEAD; \
+    ./download_samplefs.sh -c "${X5_RDK_GEN_CONFIG}"; \
+    ./download_deb_pkgs.sh -c "${X5_RDK_GEN_CONFIG}"; \
+    mkdir -p "${SYSROOT}"; \
+    tar --same-owner --numeric-owner -xzpf rootfs_server/samplefs*.tar.gz -C "${SYSROOT}"; \
+    find deb_packages -maxdepth 1 -type f -name '*.deb' -print | sort | \
+        while IFS= read -r deb; do dpkg-deb -x "${deb}" "${SYSROOT}"; done; \
+    rm -rf /opt/x5-rdk-gen
+
+RUN set -eux; \
+    test -d /opt/x5-rootfs/usr/include; \
+    test -f /opt/x5-rootfs/usr/include/hb_media_codec.h; \
+    test -f /opt/x5-rootfs/usr/include/hbn_api.h; \
+    test -d /opt/x5-rootfs/usr/hobot/lib; \
+    if [ ! -e /opt/x5-rootfs/lib ]; then ln -s usr/lib /opt/x5-rootfs/lib; fi; \
+    if [ -e /opt/x5-rootfs/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 ] \
+        && [ ! -e /opt/x5-rootfs/usr/lib/ld-linux-aarch64.so.1 ]; then \
+        ln -s aarch64-linux-gnu/ld-linux-aarch64.so.1 /opt/x5-rootfs/usr/lib/ld-linux-aarch64.so.1; \
+    fi; \
+    ensure_link() { \
+        soname="$1"; pattern="$2"; \
+        target="$(find /opt/x5-rootfs/usr/hobot/lib -maxdepth 1 -type f -name "$pattern" | sort -V | tail -n 1)"; \
+        if [ -z "$target" ]; then \
+            echo "missing SDK library matching $pattern" >&2; \
+            exit 1; \
+        fi; \
+        if [ ! -e "/opt/x5-rootfs/usr/hobot/lib/$soname" ]; then \
+            ln -s "$(basename "$target")" "/opt/x5-rootfs/usr/hobot/lib/$soname"; \
+        fi; \
+    }; \
+    ensure_link libcam.so 'libcam.so.*'; \
+    ensure_link libvpf.so 'libvpf.so.*'; \
+    ensure_link libhbmem.so 'libhbmem.so.*'; \
+    ensure_link libgdcbin.so 'libgdcbin.so.*'; \
+    ensure_link libmultimedia.so 'libmultimedia.so.*'
+
+WORKDIR /work
