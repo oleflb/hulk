@@ -292,7 +292,7 @@ struct HbMemModule;
 impl HbMemModule {
     /// Opens the hbmem module before any hbmem-backed SDK allocations.
     fn open() -> Result<Self, String> {
-        let ret = unsafe { crate::ffi::hb_mem_module_open() };
+        let ret = unsafe { super::ffi::hb_mem_module_open() };
         if ret != 0 {
             return Err(format!("hb_mem_module_open failed ret={ret}"));
         }
@@ -304,7 +304,7 @@ impl Drop for HbMemModule {
     /// Closes the hbmem module when all dependent resources are gone.
     fn drop(&mut self) {
         unsafe {
-            crate::ffi::hb_mem_module_close();
+            super::ffi::hb_mem_module_close();
         }
     }
 }

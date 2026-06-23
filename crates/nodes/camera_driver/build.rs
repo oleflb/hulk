@@ -1,14 +1,23 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(x5cam_x5_target)");
     println!("cargo:rerun-if-env-changed=X5_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=X5_SDK_INCLUDE");
     println!("cargo:rerun-if-env-changed=X5_SDK_LIB_DIR");
     println!("cargo:rerun-if-env-changed=X5CAM_FORCE_X5_TARGET");
-    println!("cargo:rerun-if-changed=src/ffi/wrapper.h");
+    println!("cargo:rerun-if-changed=src/driver/ffi/wrapper.h");
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let x5_target =
+        env::var_os("X5CAM_FORCE_X5_TARGET").is_some() || (arch == "aarch64" && os == "linux");
+
+    if !x5_target {
+        return;
+    }
+
+    println!("cargo:rustc-cfg=x5cam_x5_target");
 
     let x5_source =
         env::var("X5_SOURCE_DIR").unwrap_or_else(|_| "/home/ole/hulk-stuff/x5/source".to_string());
@@ -17,7 +26,7 @@ fn main() {
         .unwrap_or_else(|_| PathBuf::from(&x5_source).join("hobot-multimedia-dev/usr/include"));
 
     let bindings = bindgen::Builder::default()
-        .header("src/ffi/wrapper.h")
+        .header("src/driver/ffi/wrapper.h")
         .clang_arg(format!("-I{}", sdk_include.display()))
         .default_enum_style(bindgen::EnumVariation::Consts)
         .derive_default(true)

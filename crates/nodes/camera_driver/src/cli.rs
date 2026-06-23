@@ -4,8 +4,8 @@ use clap::Parser;
 pub struct Args {
     /// Router to connect to
     #[arg(long)]
-    router: String,
+    pub router: String,
     /// ros-z namespace
     #[arg(long)]
-    namespace: String,
+    pub namespace: String,
 }

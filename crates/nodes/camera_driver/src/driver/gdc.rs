@@ -1,4 +1,4 @@
-use crate::eeprom::{CameraCalibration, StereoCalibration};
+use super::eeprom::{CameraCalibration, StereoCalibration};
 
 /// Fixed-size 3x3 matrix used for rectification math.
 type Matrix3 = [[f64; 3]; 3];
@@ -132,7 +132,7 @@ fn generate_camera_map(
     raw_height: u32,
     out_width: u32,
     out_height: u32,
-) -> Vec<crate::ffi::point_t> {
+) -> Vec<super::ffi::point_t> {
     let mut points = Vec::with_capacity(out_width as usize * out_height as usize);
     for y in 0..out_height {
         for x in 0..out_width {
@@ -148,7 +148,7 @@ fn generate_camera_map(
             let portrait_x = landscape_y.clamp(0.0, raw_width.saturating_sub(1) as f64);
             let portrait_y = (raw_height.saturating_sub(1) as f64 - landscape_x)
                 .clamp(0.0, raw_height.saturating_sub(1) as f64);
-            points.push(crate::ffi::point_t {
+            points.push(super::ffi::point_t {
                 x: portrait_x,
                 y: portrait_y,
             });
@@ -245,7 +245,7 @@ fn normalize(v: [f64; 3]) -> Result<[f64; 3], String> {
 #[cfg(x5cam_x5_target)]
 pub struct GdcBin {
     /// Common hbmem buffer containing the generated GDC binary.
-    pub buf: crate::ffi::hb_mem_common_buf_t,
+    pub buf: super::ffi::hb_mem_common_buf_t,
 }
 
 impl Drop for GdcBin {
@@ -253,7 +253,7 @@ impl Drop for GdcBin {
     fn drop(&mut self) {
         if self.buf.fd >= 0 {
             unsafe {
-                crate::ffi::hb_mem_free_buf(self.buf.fd);
+                super::ffi::hb_mem_free_buf(self.buf.fd);
             }
             self.buf.fd = -1;
         }
@@ -262,7 +262,7 @@ impl Drop for GdcBin {
 
 /// Calls the SDK GDC generator and copies the result into hbmem.
 fn generate_gdc_bin(
-    points: &mut [crate::ffi::point_t],
+    points: &mut [super::ffi::point_t],
     raw_width: u32,
     raw_height: u32,
     out_width: u32,
@@ -279,8 +279,8 @@ fn generate_gdc_bin(
     }
 
     unsafe {
-        let mut param: crate::ffi::param_t = mem::zeroed();
-        param.format = crate::ffi::frame_format_FMT_SEMIPLANAR_420;
+        let mut param: super::ffi::param_t = mem::zeroed();
+        param.format = super::ffi::frame_format_FMT_SEMIPLANAR_420;
         param.in_.w = raw_width;
         param.in_.h = raw_height;
         param.out.w = out_width;
@@ -288,12 +288,12 @@ fn generate_gdc_bin(
         param.diameter = raw_height as i32;
         param.fov = 180.0;
 
-        let mut window: crate::ffi::window_t = mem::zeroed();
+        let mut window: super::ffi::window_t = mem::zeroed();
         window.out_r.x = 0;
         window.out_r.y = 0;
         window.out_r.w = out_width as i32;
         window.out_r.h = out_height as i32;
-        window.transform = crate::ffi::gdc_transformation_CUSTOM;
+        window.transform = super::ffi::gdc_transformation_CUSTOM;
         window.input_roi_r.x = 0;
         window.input_roi_r.y = 0;
         window.input_roi_r.w = raw_width as i32;
@@ -317,28 +317,28 @@ fn generate_gdc_bin(
 
         let mut raw_buf: *mut u32 = ptr::null_mut();
         let mut raw_size = 0u64;
-        let ret = crate::ffi::hbn_gen_gdc_bin(&param, &window, 1, &mut raw_buf, &mut raw_size);
+        let ret = super::ffi::hbn_gen_gdc_bin(&param, &window, 1, &mut raw_buf, &mut raw_size);
         if ret != 0 || raw_buf.is_null() || raw_size == 0 {
             return Err(format!("hbn_gen_gdc_bin failed ret={ret} size={raw_size}"));
         }
 
-        let mut bin_buf: crate::ffi::hb_mem_common_buf_t = mem::zeroed();
-        let flags = crate::ffi::mem_usage_t_HB_MEM_USAGE_MAP_INITIALIZED
-            | crate::ffi::mem_usage_t_HB_MEM_USAGE_PRIV_HEAP_2_RESERVED
-            | crate::ffi::mem_usage_t_HB_MEM_USAGE_CPU_READ_OFTEN
-            | crate::ffi::mem_usage_t_HB_MEM_USAGE_CPU_WRITE_OFTEN
-            | crate::ffi::mem_usage_t_HB_MEM_USAGE_CACHED;
-        let ret = crate::ffi::hb_mem_alloc_com_buf(raw_size, flags as i64, &mut bin_buf);
+        let mut bin_buf: super::ffi::hb_mem_common_buf_t = mem::zeroed();
+        let flags = super::ffi::mem_usage_t_HB_MEM_USAGE_MAP_INITIALIZED
+            | super::ffi::mem_usage_t_HB_MEM_USAGE_PRIV_HEAP_2_RESERVED
+            | super::ffi::mem_usage_t_HB_MEM_USAGE_CPU_READ_OFTEN
+            | super::ffi::mem_usage_t_HB_MEM_USAGE_CPU_WRITE_OFTEN
+            | super::ffi::mem_usage_t_HB_MEM_USAGE_CACHED;
+        let ret = super::ffi::hb_mem_alloc_com_buf(raw_size, flags as i64, &mut bin_buf);
         if ret != 0 || bin_buf.virt_addr.is_null() {
-            crate::ffi::hbn_free_gdc_bin(raw_buf);
+            super::ffi::hbn_free_gdc_bin(raw_buf);
             return Err(format!("hb_mem_alloc_com_buf for GDC bin failed ret={ret}"));
         }
 
         ptr::copy_nonoverlapping(raw_buf.cast::<u8>(), bin_buf.virt_addr, raw_size as usize);
-        crate::ffi::hbn_free_gdc_bin(raw_buf);
-        let ret = crate::ffi::hb_mem_flush_buf(bin_buf.fd, 0, raw_size);
+        super::ffi::hbn_free_gdc_bin(raw_buf);
+        let ret = super::ffi::hb_mem_flush_buf(bin_buf.fd, 0, raw_size);
         if ret != 0 {
-            crate::ffi::hb_mem_free_buf(bin_buf.fd);
+            super::ffi::hb_mem_free_buf(bin_buf.fd);
             return Err(format!("hb_mem_flush_buf for GDC bin failed ret={ret}"));
         }
 

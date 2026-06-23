@@ -1,7 +1,7 @@
 use std::fmt;
 
 #[cfg(x5cam_x5_target)]
-pub use crate::codec::EncodedFrameData;
+pub use super::codec::EncodedFrameData;
 
 #[cfg(not(x5cam_x5_target))]
 /// Placeholder payload type for non-X5 builds that cannot open the camera.

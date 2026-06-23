@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
-use crate::events::{CameraInfo, Channel, EncodedFrame};
+use super::config::Config;
+use super::events::{CameraInfo, Channel, EncodedFrame};
 
 /// Per-channel counters used for status and startup validation.
 #[derive(Clone, Debug)]

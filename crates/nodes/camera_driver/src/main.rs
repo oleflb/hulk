@@ -1,16 +1,41 @@
 use clap::Parser;
-use color_eyre::Result;
+use color_eyre::{
+    Result,
+    eyre::{WrapErr, bail, eyre},
+};
 use std::time::{Duration, Instant};
+use tracing_subscriber::EnvFilter;
+
+use ros_z::{
+    node::Node,
+    prelude::{Context, ContextBuilder},
+    pubsub::Publisher,
+};
 
 mod cli;
 mod driver;
 
-use driver::{Config, X5Camera};
+use driver::{CalibrationInfo as Calibration, CameraInfo, Config, EncodedFrame, X5Camera};
 
-fn main() -> Result<()> {
+use crate::{
+    cli::Args,
+    driver::{Event, Stats},
+};
+
+type PendingPublisher<T> = Publisher<T, ros_z::dynamic::DynamicCdrCodec>;
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = cli::Args::parse();
+    color_eyre::install()?;
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
     let config = Config::default();
+    let context = build_context(args).await?;
+    let node = context.create_node("camera_driver").build().await?;
+    let publishers = Publishers::create(&node).wrap_err("failed to create publishers")?;
 
     println!("camera-driver");
     println!("  backend      : {}", X5Camera::backend_name());
@@ -29,7 +54,9 @@ fn main() -> Result<()> {
         config.left_host, config.right_host
     );
 
-    let mut camera = X5Camera::open(&config).wrap_err("failed to open camera")?;
+    let mut camera = X5Camera::open(&config)
+        .map_err(|err| eyre!(err))
+        .wrap_err("failed to open camera")?;
 
     let mut stats = Stats::new();
     let mut last_print = Instant::now();
@@ -72,31 +99,35 @@ fn main() -> Result<()> {
                     stats.note_encoded(frame);
                 }
                 Event::Error(err) => {
-                    eprintln!("camera error: {}", err.message);
+                    tracing::warn!("camera error: {}", err.message);
                     stats.note_error(err.channel);
                 }
             },
             Ok(None) => {}
             Err(err) => {
-                eprintln!("fatal: backend error: {err}");
-                return ExitCode::from(1);
+                bail!("fatal: backend error: {err}");
             }
-        }
-
-        if !validated && Instant::now() >= startup_deadline {
-            if let Err(err) = stats.validate_startup(&config) {
-                eprintln!("fatal: startup validation failed: {err}");
-                return ExitCode::from(1);
-            }
-            validated = true;
-            println!("startup validation passed");
-        }
-
-        if last_print.elapsed() >= Duration::from_secs(1) {
-            stats.print_tick();
-            last_print = Instant::now();
         }
     }
 }
 
-pub fn configure_rosz() {}
+pub async fn build_context(args: Args) -> Result<Context> {
+    Ok(ContextBuilder::default()
+        .with_namespace(args.namespace)
+        .with_mode("client")
+        .with_router_endpoint(args.router)?
+        .build()
+        .await?)
+}
+
+struct Publishers {
+    frames: PendingPublisher<EncodedFrame>,
+    calibration: PendingPublisher<Calibration>,
+    camera_info: PendingPublisher<CameraInfo>,
+}
+
+impl Publishers {
+    pub fn create(node: &Node) -> Result<Self> {
+        todo!()
+    }
+}

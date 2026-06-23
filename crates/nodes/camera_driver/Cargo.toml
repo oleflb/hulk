@@ -10,6 +10,9 @@ libc = { workspace = true }
 ros-z = { workspace = true }
 color-eyre = { workspace = true }
 clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
 
 [build-dependencies]
 bindgen = { workspace = true }
