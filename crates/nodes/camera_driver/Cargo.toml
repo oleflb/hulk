@@ -1,0 +1,15 @@
+[package]
+name = "camera_driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+ros-z = { workspace = true }
+color-eyre = { workspace = true }
+clap = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }

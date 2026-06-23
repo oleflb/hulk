@@ -2361,6 +2361,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera_driver"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "clap",
+ "color-eyre",
+ "libc",
+ "ros-z",
+]
+
+[[package]]
 name = "camera_matrix_calculator"
 version = "0.1.0"
 dependencies = [

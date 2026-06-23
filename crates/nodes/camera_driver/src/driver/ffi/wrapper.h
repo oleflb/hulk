@@ -1,0 +1,10 @@
+#include <gdc_bin_cfg.h>
+#include <gdc_cfg.h>
+#include <hb_camera_interface.h>
+#include <hb_media_codec.h>
+#include <hb_media_error.h>
+#include <hb_mem_mgr.h>
+#include <hbn_api.h>
+#include <isp_cfg.h>
+#include <vin_cfg.h>
+#include <vse_cfg.h>

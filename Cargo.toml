@@ -43,6 +43,7 @@ members = [
   "crates/nodes/booster_sdk_interface",
   "crates/nodes/button_event_bridge",
   "crates/nodes/button_event_handler",
+  "crates/nodes/camera_driver",
   "crates/nodes/camera_matrix_calculator",
   "crates/nodes/detection",
   "crates/nodes/fake_odometry",
