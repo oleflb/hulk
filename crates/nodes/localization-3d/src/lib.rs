@@ -199,6 +199,7 @@ fn backend_configuration_with_pose_hint(
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-4,
         foot_ground_sigma: 1e-2,
+        gravity: Vector3::new(0.0, 0.0, 9.81),
     }
 }
 

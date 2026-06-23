@@ -70,7 +70,8 @@ pub struct BackendConfiguration {
     pub use_accelerometer_measurements: bool,
     pub gyroscope_process_noise: Matrix3<f64>,
     pub accelerometer_process_noise: Matrix3<f64>,
-
+    pub gravity: Vector3<f64>,
+    
     pub roll_pitch_yaw_noise: Matrix3<f64>,
     pub visual_feature_noise: Matrix2<f64>,
     pub pose_hint_visual_feature_noise: Matrix2<f64>,
