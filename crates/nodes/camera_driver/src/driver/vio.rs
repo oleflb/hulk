@@ -16,11 +16,10 @@ use crate::config::Config;
 use crate::gdc::GdcBin;
 use crate::sensor::SensorHost;
 
-/// Single-channel VIO pipelines use channel id 0 throughout.
+/// Primary channel id used by the offline VIN -> ISP path.
 const CHN_ID: ChannelId = ChannelId::PRIMARY;
 /// VIN IPI channel used by the X5 sample pipeline setup.
 const VIN_IPI_CHANNEL: ChannelId = ChannelId(1);
-
 /// RAII wrapper for one X5 camera-to-VSE hardware pipeline.
 pub struct VioPipeline {
     /// Vflow handle binding all vnodes.
@@ -193,7 +192,7 @@ fn create_vin(config: &Config, sensor: &SensorHost) -> Result<sys::VinNode> {
 fn create_isp(config: &Config) -> Result<sys::IspNode> {
     let mut isp =
         sys::IspNode::open_isp(HardwareId(0), AllocationId::Auto).wrap_err("open ISP vnode")?;
-    let input_mode = InputMode::Mcm;
+    let input_mode = InputMode::Ddr;
     let sensor_mode = IspSensorMode::Normal;
     println!(
         "isp attr: input_mode={:?}({}) sensor_mode={:?}({}) crop=x{} y{} w{} h{}",
@@ -356,7 +355,7 @@ fn vin_attr(config: &Config, mipi_rx: HardwareId) -> VinAttr {
         mipi_rx,
         vc_index: CHN_ID,
         ipi_channel: VIN_IPI_CHANNEL,
-        isp_flyby: true,
+        isp_flyby: false,
         frame_id: FrameIdConfig {
             enable: true,
             set_initial: true,
