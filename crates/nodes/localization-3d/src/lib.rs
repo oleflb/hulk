@@ -10,7 +10,7 @@ use color_eyre::{
     Result,
     eyre::{Context as _, bail},
 };
-use coordinate_systems::{Camera, Field, Robot};
+use coordinate_systems::{Camera, Field, Ground, Robot};
 use field_mark_association::{FieldMarkAssociationKind, FieldMarkAssociations};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, point};
@@ -188,9 +188,9 @@ fn backend_configuration_with_pose_hint(
             5.0_f64.powi(2),   // y sigma = 5 m/s^2
             100.0_f64.powi(2), // z disabled
         ]),
-        use_accelerometer_measurements: true,
+        use_accelerometer_measurements: false,
         gyroscope_process_noise: process_noise,
-        roll_pitch_yaw_noise: process_noise,
+        roll_pitch_yaw_noise: Matrix3::from_diagonal(&Vector3::new(0.01, 0.01, 0.00001)),
         accelerometer_process_noise: process_noise,
         visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
         pose_hint_visual_feature_noise: Matrix2::identity()
@@ -355,7 +355,21 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     live_localization.reset(result, &visual_odometer_cache, &camera_matrix_cache);
                     live_localization
                         .field_to_robot_latest(&visual_odometer_cache, &camera_matrix_cache)
-                        .unwrap_or_else(|| localization_transform_from_backend_pose(&result.transform))
+                        .unwrap_or_else(|| {
+                            let backend_localization =
+                                localization_transform_from_backend_pose(&result.transform);
+                            if let Some(camera_matrix) = fresh_camera_matrix(
+                                &camera_matrix_cache,
+                                Time::from_wallclock(result.time),
+                            ) {
+                                constrain_localization_to_ground(
+                                    backend_localization,
+                                    &camera_matrix.inner.ground_to_robot,
+                                )
+                            } else {
+                                backend_localization
+                            }
+                        })
                 });
 
                 localization_publisher.publish(&transform).await?;
@@ -435,8 +449,11 @@ impl LiveVisualOdometryLocalization {
         }
         let anchor = self.anchor.as_ref()?;
         if current_odometer.time <= anchor.time {
-            return Some(localization_transform_from_backend_pose(
+            let current_camera_matrix =
+                fresh_camera_matrix(camera_matrix_cache, current_odometer.time)?;
+            return Some(localization_transform_constrained_to_ground(
                 &anchor.robot_to_field,
+                &current_camera_matrix.inner.ground_to_robot,
             ));
         }
 
@@ -450,8 +467,9 @@ impl LiveVisualOdometryLocalization {
             * current_robot_to_camera;
         let current_robot_to_field = anchor.robot_to_field * current_robot_to_anchor_robot.cast();
 
-        Some(localization_transform_from_backend_pose(
+        Some(localization_transform_constrained_to_ground(
             &current_robot_to_field,
+            &current_camera_matrix.inner.ground_to_robot,
         ))
     }
 }
@@ -527,6 +545,31 @@ fn localization_transform_from_backend_pose(
     robot_to_field: &nalgebra::Isometry3<f64>,
 ) -> Isometry3<Field, Robot> {
     robot_to_field.inverse().cast::<f32>().framed_transform()
+}
+
+fn localization_transform_constrained_to_ground(
+    robot_to_field: &nalgebra::Isometry3<f64>,
+    ground_to_robot: &Isometry3<Ground, Robot>,
+) -> Isometry3<Field, Robot> {
+    let localization = localization_transform_from_backend_pose(robot_to_field);
+    constrain_localization_to_ground(localization, ground_to_robot)
+}
+
+fn constrain_localization_to_ground(
+    localization: Isometry3<Field, Robot>,
+    ground_to_robot: &Isometry3<Ground, Robot>,
+) -> Isometry3<Field, Robot> {
+    let (_, _, yaw) = localization.inner.rotation.euler_angles();
+    let (roll, pitch, _) = ground_to_robot.inner.rotation.euler_angles();
+
+    let mut translation = localization.inner.translation;
+    translation.vector.z = ground_to_robot.inner.translation.vector.z;
+
+    nalgebra::Isometry3::from_parts(
+        translation,
+        nalgebra::UnitQuaternion::from_euler_angles(roll, pitch, yaw),
+    )
+    .framed_transform()
 }
 
 fn camera_matrix_is_fresh(camera_matrix: &TimeWrapper<CameraMatrix>, time: Time) -> bool {
@@ -765,6 +808,30 @@ mod tests {
                 .angle_to(&robot_to_field.rotation)
                 < 1.0e-6
         );
+    }
+
+    #[test]
+    fn constrained_localization_preserves_yaw_and_xy_but_uses_ground_tilt_and_height() {
+        let localization: Isometry3<Field, Robot> = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(1.5, -2.0, -1.7),
+            nalgebra::UnitQuaternion::from_euler_angles(3.0, 0.2, 0.7),
+        )
+        .framed_transform();
+        let ground_to_robot: Isometry3<Ground, Robot> = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(0.01, -0.02, -0.523),
+            nalgebra::UnitQuaternion::from_euler_angles(-0.045, -0.047, 0.1),
+        )
+        .framed_transform();
+
+        let constrained = constrain_localization_to_ground(localization, &ground_to_robot);
+        let (roll, pitch, yaw) = constrained.inner.rotation.euler_angles();
+
+        assert!((constrained.inner.translation.vector.x - 1.5).abs() < 1.0e-6);
+        assert!((constrained.inner.translation.vector.y + 2.0).abs() < 1.0e-6);
+        assert!((constrained.inner.translation.vector.z + 0.523).abs() < 1.0e-6);
+        assert!((roll + 0.045).abs() < 1.0e-6);
+        assert!((pitch + 0.047).abs() < 1.0e-6);
+        assert!((yaw - 0.7).abs() < 1.0e-6);
     }
 
     #[test]
