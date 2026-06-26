@@ -44,12 +44,12 @@ unsafe impl Send for VioPipeline {}
 impl VioPipeline {
     /// Creates and attaches the camera, VIN, ISP, GDC, VSE, and vflow nodes.
     pub fn create(config: &Config, sensor: &SensorHost, gdc_bin: GdcBin) -> Result<Self> {
+        let mut camera = sys::Camera::create(camera_config(config, sensor)?)?;
         let vin = create_vin(config, sensor)?;
         let isp = create_isp(config)?;
         let gdc = create_gdc(config, &gdc_bin)?;
         let vse = create_vse(config)?;
         let vflow = create_vflow(&vin, &isp, &gdc, &vse)?;
-        let mut camera = sys::Camera::create(camera_config(config, sensor)?)?;
         camera.attach_to_vin(&vin)?;
 
         Ok(Self {
@@ -186,7 +186,7 @@ fn create_isp(config: &Config) -> Result<sys::IspNode> {
     let mut isp =
         sys::IspNode::open_isp(HardwareId(0), AllocationId::Auto).wrap_err("open ISP vnode")?;
     isp.set_isp_attr(IspAttr {
-        input_mode: InputMode::Ddr,
+        input_mode: InputMode::Mcm,
         sensor_mode: IspSensorMode::Normal,
         crop: Rect {
             x: 0,

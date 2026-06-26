@@ -146,6 +146,7 @@ pub enum PixelFormat {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMode {
+    Mcm,
     Ddr,
 }
 
@@ -2105,6 +2106,7 @@ impl PixelFormat {
 impl InputMode {
     fn raw(self) -> raw::enum_input_mode_e {
         match self {
+            Self::Mcm => raw::enum_input_mode_e_MCM_MODE,
             Self::Ddr => raw::enum_input_mode_e_DDR_MODE,
         }
     }
