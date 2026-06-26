@@ -32,6 +32,18 @@ impl EnumIter for Class {
 }
 
 impl Class {
+    pub fn supports_boxes(self) -> bool {
+        !self.requires_point()
+    }
+
+    pub fn supports_points(self) -> bool {
+        self.requires_point() || self == Class::GoalPost
+    }
+
+    pub fn requires_point(self) -> bool {
+        matches!(self, Class::LSpot | Class::TSpot | Class::XSpot)
+    }
+
     pub fn from_key(key: Key) -> Option<Class> {
         let keybindings = &CONFIG.get().unwrap().keybindings;
         match key {

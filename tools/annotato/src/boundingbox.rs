@@ -1,22 +1,46 @@
-use crate::{annotation::AnnotationFormat, classes::Class};
 use eframe::egui::{Pos2, Rect, Vec2};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundingBox {
     pub rect: Rect,
-    pub class: Class,
 }
 
 impl BoundingBox {
-    pub fn new(corner: Pos2, opposing_corner: Pos2, class: Class) -> Self {
+    pub fn new(corner: Pos2, opposing_corner: Pos2) -> Self {
         BoundingBox {
             rect: Rect::from_two_pos(corner, opposing_corner),
-            class,
         }
     }
 
-    pub fn from_rect(rect: Rect, class: Class) -> Self {
-        BoundingBox { rect, class }
+    pub fn from_rect(rect: Rect) -> Self {
+        BoundingBox { rect }
+    }
+
+    pub fn from_points(points: [[f32; 2]; 2], image_size: [f32; 2]) -> Self {
+        let [[minimum_x, minimum_y], [maximum_x, maximum_y]] = points;
+        let width = image_size[0];
+        let height = image_size[1];
+
+        Self::new(
+            Pos2::new(minimum_x * width, minimum_y * height),
+            Pos2::new(maximum_x * width, maximum_y * height),
+        )
+    }
+
+    pub fn to_points(&self, image_size: [f32; 2]) -> [[f32; 2]; 2] {
+        let width = image_size[0];
+        let height = image_size[1];
+
+        [
+            [
+                clamp_normalized(self.rect.left() / width),
+                clamp_normalized(self.rect.top() / height),
+            ],
+            [
+                clamp_normalized(self.rect.right() / width),
+                clamp_normalized(self.rect.bottom() / height),
+            ],
+        ]
     }
 
     pub fn set_corner(&mut self, corner: Corner, position: Pos2) {
@@ -101,36 +125,6 @@ impl BoundingBox {
             })
             .unwrap_or(Corner::BottomRight)
     }
-
-    pub fn to_annotation(&self, image_size: [f32; 2]) -> AnnotationFormat {
-        let width = image_size[0];
-        let height = image_size[1];
-
-        AnnotationFormat {
-            points: [
-                [
-                    clamp_normalized(self.rect.left() / width),
-                    clamp_normalized(self.rect.top() / height),
-                ],
-                [
-                    clamp_normalized(self.rect.right() / width),
-                    clamp_normalized(self.rect.bottom() / height),
-                ],
-            ],
-            class: self.class,
-        }
-    }
-
-    pub fn from_annotation(annotation: AnnotationFormat, image_size: [f32; 2]) -> Self {
-        let [[minimum_x, minimum_y], [maximum_x, maximum_y]] = annotation.points;
-        let width = image_size[0];
-        let height = image_size[1];
-
-        let corner = Pos2::new(minimum_x * width, minimum_y * height);
-        let opposing_corner = Pos2::new(maximum_x * width, maximum_y * height);
-
-        Self::new(corner, opposing_corner, annotation.class)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +153,7 @@ impl Corner {
     }
 }
 
-fn clamp_normalized(value: f32) -> f32 {
+pub(crate) fn clamp_normalized(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
@@ -168,29 +162,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn annotations_roundtrip_through_image_size() {
-        let annotation = AnnotationFormat {
-            points: [[0.25, 0.2], [0.75, 0.8]],
-            class: Class::Ball,
-        };
+    fn points_roundtrip_through_image_size() {
+        let points = [[0.25, 0.2], [0.75, 0.8]];
 
-        let bounding_box = BoundingBox::from_annotation(annotation.clone(), [800.0, 400.0]);
-        let serialized = bounding_box.to_annotation([800.0, 400.0]);
+        let bounding_box = BoundingBox::from_points(points, [800.0, 400.0]);
+        let serialized = bounding_box.to_points([800.0, 400.0]);
 
-        assert_eq!(serialized.class, annotation.class);
-        assert_eq!(serialized.points, annotation.points);
+        assert_eq!(serialized, points);
     }
 
     #[test]
     fn annotations_are_normalized_for_different_image_sizes() {
-        let bounding_box = BoundingBox::new(
-            Pos2::new(100.0, 50.0),
-            Pos2::new(300.0, 250.0),
-            Class::Robot,
-        );
+        let bounding_box = BoundingBox::new(Pos2::new(100.0, 50.0), Pos2::new(300.0, 250.0));
 
         assert_eq!(
-            bounding_box.to_annotation([400.0, 500.0]).points,
+            bounding_box.to_points([400.0, 500.0]),
             [[0.25, 0.1], [0.75, 0.5]]
         );
     }

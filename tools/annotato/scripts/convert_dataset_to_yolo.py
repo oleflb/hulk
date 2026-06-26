@@ -33,10 +33,17 @@ def convert_annotations(json_path: str, filename: str) -> list[str]:
     for ann in annotations:
         class_name = ann.get("class")
         points = ann.get("points")
+        point = ann.get("point")
 
         if class_name not in CLASS_MAP:
             print(f"Skipping unknown class '{class_name}' in {filename}")
             continue
+
+        if point is not None:
+            raise ValueError(
+                "YOLO box export does not support point annotations yet: "
+                f"class '{class_name}' in {filename}"
+            )
 
         if not points or len(points) != 2:
             print(f"Invalid points in {filename}")

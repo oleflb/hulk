@@ -5,6 +5,7 @@ use eframe::egui::{
 use eframe::epaint::TextureHandle;
 
 use crate::{
+    annotation::Annotation,
     boundingbox::{BoundingBox, Corner},
     classes::Class,
     user_toml::CONFIG,
@@ -12,10 +13,40 @@ use crate::{
 
 const HANDLE_RADIUS: f32 = 5.0;
 const HANDLE_HIT_RADIUS: f32 = 10.0;
+const POINT_RADIUS: f32 = 5.0;
+const POINT_HIT_RADIUS: f32 = 12.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationShape {
+    Box,
+    Point,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationShape {
+    Box,
+    Point,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    index: usize,
+    shape: AnnotationShape,
+}
+
+impl Selection {
+    pub fn index(self) -> usize {
+        self.index
+    }
+
+    pub fn shape(self) -> AnnotationShape {
+        self.shape
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct CanvasState {
-    selected_box: Option<usize>,
+    selected: Option<Selection>,
     draft_box: Option<BoundingBox>,
     interaction: Interaction,
     keyboard_mode: KeyboardMode,
@@ -24,19 +55,61 @@ pub struct CanvasState {
 }
 
 impl CanvasState {
-    pub fn selected_box(&self) -> Option<usize> {
-        self.selected_box
+    pub fn selected(&self) -> Option<Selection> {
+        self.selected
     }
 
-    pub fn apply_class(&mut self, bounding_boxes: &mut [BoundingBox], class: Class) {
-        if let Some(draft_box) = &mut self.draft_box {
-            draft_box.class = class;
+    pub fn apply_class(&mut self, annotations: &mut Vec<Annotation>, class: Class) {
+        if let Some(draft_box) = self.draft_box.take() {
+            if class.requires_point() {
+                annotations.push(Annotation::point(class, draft_box.rect.center()));
+                self.selected = Some(Selection {
+                    index: annotations.len() - 1,
+                    shape: AnnotationShape::Point,
+                });
+            } else {
+                self.draft_box = Some(draft_box);
+            }
         }
-        if let Some(index) = self.selected_box
-            && let Some(bounding_box) = bounding_boxes.get_mut(index)
+
+        let Some(selection) = self.selected else {
+            return;
+        };
+        let Some(annotation) = annotations.get_mut(selection.index) else {
+            self.selected = None;
+            return;
+        };
+
+        if class.requires_point() && annotation.point.is_none() {
+            let previous_class = annotation.class;
+            annotation.point = annotation
+                .bounding_box
+                .as_ref()
+                .map(|bounding_box| bounding_box.rect.center());
+            if !previous_class.requires_point() {
+                annotation.bounding_box = None;
+            }
+            self.selected = Some(Selection {
+                index: selection.index,
+                shape: AnnotationShape::Point,
+            });
+        } else if !class.supports_points()
+            && selection.shape == AnnotationShape::Point
+            && let Some(point) = annotation.point.take()
         {
-            bounding_box.class = class;
+            if annotation.bounding_box.is_none() {
+                annotation.bounding_box = Some(BoundingBox::new(
+                    point - Vec2::splat(8.0),
+                    point + Vec2::splat(8.0),
+                ));
+            }
+            self.selected = Some(Selection {
+                index: selection.index,
+                shape: AnnotationShape::Box,
+            });
         }
+
+        annotation.class = class;
     }
 }
 
@@ -44,16 +117,19 @@ impl CanvasState {
 enum Interaction {
     #[default]
     None,
-    Drawing {
+    DrawingBox {
         start: Pos2,
     },
-    Moving {
+    MovingBox {
         index: usize,
         last_position: Pos2,
     },
-    Resizing {
+    ResizingBox {
         index: usize,
         corner: Corner,
+    },
+    MovingPoint {
+        index: usize,
     },
 }
 
@@ -74,7 +150,8 @@ pub struct BoundingBoxAnnotator<'a> {
     texture_handle: TextureHandle,
     image_size: [f32; 2],
     selected_class: &'a mut Class,
-    bounding_boxes: &'a mut Vec<BoundingBox>,
+    creation_shape: CreationShape,
+    annotations: &'a mut Vec<Annotation>,
     state: &'a mut CanvasState,
 }
 
@@ -82,29 +159,31 @@ impl<'a> BoundingBoxAnnotator<'a> {
     pub fn new(
         image: TextureHandle,
         image_size: [f32; 2],
-        bounding_boxes: &'a mut Vec<BoundingBox>,
+        annotations: &'a mut Vec<Annotation>,
         state: &'a mut CanvasState,
         selected_class: &'a mut Class,
+        creation_shape: CreationShape,
     ) -> Self {
         Self {
             texture_handle: image,
             image_size,
-            bounding_boxes,
+            annotations,
             state,
             selected_class,
+            creation_shape,
         }
     }
 
     fn handle_input(&mut self, ui: &Ui, response: &Response, transform: ImageTransform) {
         self.handle_view_input(ui, response);
         self.handle_class_input(ui);
-        self.handle_keyboard_box_input(ui, response, transform);
+        self.handle_keyboard_input(ui, response, transform);
         self.handle_pointer_input(ui, response, transform);
 
-        if let Some(selected_box) = self.state.selected_box
-            && selected_box >= self.bounding_boxes.len()
+        if let Some(selection) = self.state.selected
+            && selection.index >= self.annotations.len()
         {
-            self.state.selected_box = None;
+            self.state.selected = None;
             self.state.keyboard_mode = KeyboardMode::None;
         }
     }
@@ -181,33 +260,18 @@ impl<'a> BoundingBoxAnnotator<'a> {
         };
 
         *self.selected_class = requested_class;
-        if let Some(draft_box) = &mut self.state.draft_box {
-            draft_box.class = requested_class;
-        }
-        if let Some(index) = self.state.selected_box
-            && let Some(bounding_box) = self.bounding_boxes.get_mut(index)
-        {
-            bounding_box.class = requested_class;
-        }
+        self.state.apply_class(self.annotations, requested_class);
     }
 
     fn current_class(&self) -> Class {
-        if let Some(draft_box) = &self.state.draft_box {
-            return draft_box.class;
-        }
         self.state
-            .selected_box
-            .and_then(|index| self.bounding_boxes.get(index))
-            .map(|bounding_box| bounding_box.class)
+            .selected
+            .and_then(|selection| self.annotations.get(selection.index))
+            .map(|annotation| annotation.class)
             .unwrap_or(*self.selected_class)
     }
 
-    fn handle_keyboard_box_input(
-        &mut self,
-        ui: &Ui,
-        response: &Response,
-        transform: ImageTransform,
-    ) {
+    fn handle_keyboard_input(&mut self, ui: &Ui, response: &Response, transform: ImageTransform) {
         let config = &CONFIG.get().unwrap().keybindings;
 
         if ui.input(|input| config.abort.is_pressed(input)) {
@@ -216,19 +280,21 @@ impl<'a> BoundingBoxAnnotator<'a> {
             } else if self.state.keyboard_mode != KeyboardMode::None {
                 self.state.keyboard_mode = KeyboardMode::None;
             } else {
-                self.state.selected_box = None;
+                self.state.selected = None;
             }
             return;
         }
 
         if ui.input(|input| config.delete.is_pressed(input) || input.key_pressed(Key::Backspace)) {
-            self.delete_selected_box();
+            self.delete_selected();
             return;
         }
 
         if ui.input(|input| config.draw.is_pressed(input)) {
             if self.state.draft_box.is_some() {
                 self.commit_draft_box();
+            } else if self.creation_shape == CreationShape::Point {
+                self.create_point_at_pointer_or_center(response, transform);
             } else {
                 self.start_keyboard_draft(response, transform);
             }
@@ -243,8 +309,10 @@ impl<'a> BoundingBoxAnnotator<'a> {
         }
 
         if ui.input(|input| config.edit.is_pressed(input))
-            && let Some(index) = self.state.selected_box
-            && let Some(bounding_box) = self.bounding_boxes.get(index)
+            && let Some(selection) = self.state.selected
+            && selection.shape == AnnotationShape::Box
+            && let Some(annotation) = self.annotations.get(selection.index)
+            && let Some(bounding_box) = &annotation.bounding_box
         {
             let pointer = response
                 .hover_pos()
@@ -255,8 +323,7 @@ impl<'a> BoundingBoxAnnotator<'a> {
             };
         }
 
-        if ui.input(|input| config.move_box.is_pressed(input)) && self.state.selected_box.is_some()
-        {
+        if ui.input(|input| config.move_box.is_pressed(input)) && self.state.selected.is_some() {
             self.state.keyboard_mode = KeyboardMode::MoveSelected;
         }
 
@@ -291,21 +358,30 @@ impl<'a> BoundingBoxAnnotator<'a> {
         let Some(direction) = tab_direction else {
             return;
         };
-        if self.bounding_boxes.is_empty() {
-            self.state.selected_box = None;
+        let selectable = selectable_shapes(self.annotations);
+        if selectable.is_empty() {
+            self.state.selected = None;
             return;
         }
 
-        let current = self.state.selected_box.unwrap_or(0);
-        let len = self.bounding_boxes.len();
-        self.state.selected_box = Some(if direction > 0 {
-            (current + 1) % len
+        let current = self
+            .state
+            .selected
+            .and_then(|selection| {
+                selectable
+                    .iter()
+                    .position(|candidate| *candidate == selection)
+            })
+            .unwrap_or(0);
+        let len = selectable.len();
+        self.state.selected = Some(if direction > 0 {
+            selectable[(current + 1) % len]
         } else {
-            (current + len - 1) % len
+            selectable[(current + len - 1) % len]
         });
         self.state.keyboard_mode = KeyboardMode::None;
-        if let Some(index) = self.state.selected_box {
-            *self.selected_class = self.bounding_boxes[index].class;
+        if let Some(selection) = self.state.selected {
+            *self.selected_class = self.annotations[selection.index].class;
         }
     }
 
@@ -319,8 +395,12 @@ impl<'a> BoundingBoxAnnotator<'a> {
                 }
             }
             KeyboardMode::ResizeSelected { corner } => {
-                if let Some(index) = self.state.selected_box
-                    && let Some(bounding_box) = self.bounding_boxes.get_mut(index)
+                if let Some(selection) = self.state.selected
+                    && selection.shape == AnnotationShape::Box
+                    && let Some(bounding_box) = self
+                        .annotations
+                        .get_mut(selection.index)
+                        .and_then(|annotation| annotation.bounding_box.as_mut())
                 {
                     let position = bounding_box.corner(corner) + delta;
                     bounding_box.set_corner(corner, position);
@@ -328,36 +408,85 @@ impl<'a> BoundingBoxAnnotator<'a> {
                 }
             }
             KeyboardMode::MoveSelected | KeyboardMode::None => {
-                if let Some(index) = self.state.selected_box
-                    && let Some(bounding_box) = self.bounding_boxes.get_mut(index)
-                {
-                    bounding_box.translate(delta, self.image_size);
+                if let Some(selection) = self.state.selected {
+                    match selection.shape {
+                        AnnotationShape::Box => {
+                            if let Some(bounding_box) = self
+                                .annotations
+                                .get_mut(selection.index)
+                                .and_then(|annotation| annotation.bounding_box.as_mut())
+                            {
+                                bounding_box.translate(delta, self.image_size);
+                            }
+                        }
+                        AnnotationShape::Point => {
+                            if let Some(point) = self
+                                .annotations
+                                .get_mut(selection.index)
+                                .and_then(|annotation| annotation.point.as_mut())
+                            {
+                                *point = clamp_point(*point + delta, self.image_size);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     fn start_keyboard_draft(&mut self, response: &Response, transform: ImageTransform) {
+        if !self.selected_class.supports_boxes() {
+            self.create_point_at_pointer_or_center(response, transform);
+            return;
+        }
+
         let center = response
             .hover_pos()
             .map(|position| transform.screen_to_image_clamped(position, self.image_size))
             .unwrap_or_else(|| Pos2::new(self.image_size[0] * 0.5, self.image_size[1] * 0.5));
         let half_size = Vec2::splat(16.0);
-        let mut draft_box =
-            BoundingBox::new(center - half_size, center + half_size, *self.selected_class);
+        let mut draft_box = BoundingBox::new(center - half_size, center + half_size);
         draft_box.clip_to_image(self.image_size);
         self.state.draft_box = Some(draft_box);
-        self.state.selected_box = None;
+        self.state.selected = None;
         self.state.keyboard_mode = KeyboardMode::DraftResize {
             corner: Corner::BottomRight,
         };
+    }
+
+    fn create_point_at_pointer_or_center(
+        &mut self,
+        response: &Response,
+        transform: ImageTransform,
+    ) {
+        let point = response
+            .hover_pos()
+            .map(|position| transform.screen_to_image_clamped(position, self.image_size))
+            .unwrap_or_else(|| Pos2::new(self.image_size[0] * 0.5, self.image_size[1] * 0.5));
+        self.add_point(point);
+    }
+
+    fn add_point(&mut self, point: Pos2) {
+        if !self.selected_class.supports_points() {
+            return;
+        }
+
+        self.annotations.push(Annotation::point(
+            *self.selected_class,
+            clamp_point(point, self.image_size),
+        ));
+        self.state.selected = Some(Selection {
+            index: self.annotations.len() - 1,
+            shape: AnnotationShape::Point,
+        });
+        self.state.keyboard_mode = KeyboardMode::MoveSelected;
     }
 
     fn handle_pointer_input(&mut self, ui: &Ui, response: &Response, transform: ImageTransform) {
         let pointer_position = ui.input(|input| input.pointer.interact_pos());
 
         if response.clicked_by(PointerButton::Secondary) {
-            self.delete_box_at(pointer_position, transform);
+            self.delete_at(pointer_position, transform);
             return;
         }
 
@@ -374,14 +503,17 @@ impl<'a> BoundingBoxAnnotator<'a> {
         } else {
             self.finish_pointer_interaction();
         }
+
+        if response.clicked_by(PointerButton::Primary)
+            && let Some(position) = pointer_position
+        {
+            self.click_pointer(position, transform);
+        }
     }
 
-    fn start_pointer_interaction(&mut self, position: Pos2, transform: ImageTransform) {
-        if let Some((index, corner)) = self.hit_test_handle(position, transform) {
-            self.state.selected_box = Some(index);
-            self.state.keyboard_mode = KeyboardMode::None;
-            self.state.interaction = Interaction::Resizing { index, corner };
-            *self.selected_class = self.bounding_boxes[index].class;
+    fn click_pointer(&mut self, position: Pos2, transform: ImageTransform) {
+        if let Some(selection) = self.hit_test_point(position, transform) {
+            self.select(selection);
             return;
         }
 
@@ -389,88 +521,146 @@ impl<'a> BoundingBoxAnnotator<'a> {
             return;
         };
 
-        if let Some(index) = topmost_box_at(self.bounding_boxes, image_position) {
-            self.state.selected_box = Some(index);
-            self.state.keyboard_mode = KeyboardMode::None;
-            self.state.interaction = Interaction::Moving {
-                index,
-                last_position: image_position,
-            };
-            *self.selected_class = self.bounding_boxes[index].class;
+        if let Some(selection) = self.hit_test_box(image_position) {
+            self.select(selection);
             return;
         }
 
-        self.state.selected_box = None;
-        self.state.keyboard_mode = KeyboardMode::None;
-        self.state.draft_box = Some(BoundingBox::new(
-            image_position,
-            image_position,
-            *self.selected_class,
-        ));
-        self.state.interaction = Interaction::Drawing {
-            start: image_position,
+        if self.creation_shape == CreationShape::Point {
+            self.add_point(image_position);
+        }
+    }
+
+    fn start_pointer_interaction(&mut self, position: Pos2, transform: ImageTransform) {
+        if let Some(selection) = self.hit_test_point(position, transform) {
+            self.select(selection);
+            self.state.interaction = Interaction::MovingPoint {
+                index: selection.index,
+            };
+            return;
+        }
+
+        if let Some((index, corner)) = self.hit_test_handle(position, transform) {
+            self.select(Selection {
+                index,
+                shape: AnnotationShape::Box,
+            });
+            self.state.interaction = Interaction::ResizingBox { index, corner };
+            return;
+        }
+
+        let Some(image_position) = transform.screen_to_image(position) else {
+            return;
         };
+
+        if let Some(selection) = self.hit_test_box(image_position) {
+            self.select(selection);
+            self.state.interaction = Interaction::MovingBox {
+                index: selection.index,
+                last_position: image_position,
+            };
+            return;
+        }
+
+        if self.creation_shape == CreationShape::Box && self.selected_class.supports_boxes() {
+            self.state.selected = None;
+            self.state.keyboard_mode = KeyboardMode::None;
+            self.state.draft_box = Some(BoundingBox::new(image_position, image_position));
+            self.state.interaction = Interaction::DrawingBox {
+                start: image_position,
+            };
+        }
     }
 
     fn update_pointer_interaction(&mut self, position: Pos2, transform: ImageTransform) {
         let image_position = transform.screen_to_image_clamped(position, self.image_size);
         match self.state.interaction {
             Interaction::None => {}
-            Interaction::Drawing { start } => {
-                self.state.draft_box = Some(BoundingBox::new(
-                    start,
-                    image_position,
-                    *self.selected_class,
-                ));
+            Interaction::DrawingBox { start } => {
+                self.state.draft_box = Some(BoundingBox::new(start, image_position));
             }
-            Interaction::Moving {
+            Interaction::MovingBox {
                 index,
                 last_position,
             } => {
-                if let Some(bounding_box) = self.bounding_boxes.get_mut(index) {
+                if let Some(bounding_box) = self
+                    .annotations
+                    .get_mut(index)
+                    .and_then(|annotation| annotation.bounding_box.as_mut())
+                {
                     bounding_box.translate(image_position - last_position, self.image_size);
-                    self.state.interaction = Interaction::Moving {
+                    self.state.interaction = Interaction::MovingBox {
                         index,
                         last_position: image_position,
                     };
                 }
             }
-            Interaction::Resizing { index, corner } => {
-                if let Some(bounding_box) = self.bounding_boxes.get_mut(index) {
+            Interaction::ResizingBox { index, corner } => {
+                if let Some(bounding_box) = self
+                    .annotations
+                    .get_mut(index)
+                    .and_then(|annotation| annotation.bounding_box.as_mut())
+                {
                     bounding_box.set_corner(corner, image_position);
                     bounding_box.clip_to_image(self.image_size);
+                }
+            }
+            Interaction::MovingPoint { index } => {
+                if let Some(point) = self
+                    .annotations
+                    .get_mut(index)
+                    .and_then(|annotation| annotation.point.as_mut())
+                {
+                    *point = image_position;
                 }
             }
         }
     }
 
     fn finish_pointer_interaction(&mut self) {
-        if matches!(self.state.interaction, Interaction::Drawing { .. }) {
+        if matches!(self.state.interaction, Interaction::DrawingBox { .. }) {
             self.commit_draft_box();
         }
         self.state.interaction = Interaction::None;
     }
 
-    fn delete_box_at(&mut self, pointer_position: Option<Pos2>, transform: ImageTransform) {
-        if let Some(position) = pointer_position
-            && let Some(image_position) = transform.screen_to_image(position)
-            && let Some(index) = topmost_box_at(self.bounding_boxes, image_position)
-        {
-            self.bounding_boxes.remove(index);
-            self.state.selected_box = None;
-            self.state.keyboard_mode = KeyboardMode::None;
-            return;
+    fn delete_at(&mut self, pointer_position: Option<Pos2>, transform: ImageTransform) {
+        if let Some(position) = pointer_position {
+            if let Some(selection) = self.hit_test_point(position, transform) {
+                self.delete_selection(selection);
+                return;
+            }
+
+            if let Some(image_position) = transform.screen_to_image(position)
+                && let Some(selection) = self.hit_test_box(image_position)
+            {
+                self.delete_selection(selection);
+                return;
+            }
         }
 
-        self.delete_selected_box();
+        self.delete_selected();
     }
 
-    fn delete_selected_box(&mut self) {
-        if let Some(index) = self.state.selected_box.take()
-            && index < self.bounding_boxes.len()
-        {
-            self.bounding_boxes.remove(index);
+    fn delete_selected(&mut self) {
+        if let Some(selection) = self.state.selected.take() {
+            self.delete_selection(selection);
         }
+        self.state.keyboard_mode = KeyboardMode::None;
+    }
+
+    fn delete_selection(&mut self, selection: Selection) {
+        let Some(annotation) = self.annotations.get_mut(selection.index) else {
+            return;
+        };
+        match selection.shape {
+            AnnotationShape::Box => annotation.bounding_box = None,
+            AnnotationShape::Point => annotation.point = None,
+        }
+        if annotation.is_empty() {
+            self.annotations.remove(selection.index);
+        }
+        self.state.selected = None;
         self.state.keyboard_mode = KeyboardMode::None;
     }
 
@@ -478,12 +668,48 @@ impl<'a> BoundingBoxAnnotator<'a> {
         let Some(mut draft_box) = self.state.draft_box.take() else {
             return;
         };
+        if !self.selected_class.supports_boxes() {
+            self.add_point(draft_box.rect.center());
+            return;
+        }
         draft_box.clip_to_image(self.image_size);
         if draft_box.is_valid() {
-            self.bounding_boxes.push(draft_box);
-            self.state.selected_box = Some(self.bounding_boxes.len() - 1);
+            self.annotations
+                .push(Annotation::bounding_box(*self.selected_class, draft_box));
+            self.state.selected = Some(Selection {
+                index: self.annotations.len() - 1,
+                shape: AnnotationShape::Box,
+            });
         }
         self.state.keyboard_mode = KeyboardMode::None;
+    }
+
+    fn select(&mut self, selection: Selection) {
+        self.state.selected = Some(selection);
+        self.state.keyboard_mode = KeyboardMode::None;
+        if let Some(annotation) = self.annotations.get(selection.index) {
+            *self.selected_class = annotation.class;
+        }
+    }
+
+    fn hit_test_point(
+        &self,
+        screen_position: Pos2,
+        transform: ImageTransform,
+    ) -> Option<Selection> {
+        self.annotations
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, annotation)| {
+                annotation.point.and_then(|point| {
+                    (transform.image_to_screen(point).distance(screen_position) <= POINT_HIT_RADIUS)
+                        .then_some(Selection {
+                            index,
+                            shape: AnnotationShape::Point,
+                        })
+                })
+            })
     }
 
     fn hit_test_handle(
@@ -491,16 +717,38 @@ impl<'a> BoundingBoxAnnotator<'a> {
         screen_position: Pos2,
         transform: ImageTransform,
     ) -> Option<(usize, Corner)> {
-        self.bounding_boxes
+        self.annotations
             .iter()
             .enumerate()
             .rev()
-            .find_map(|(index, bounding_box)| {
-                Corner::ALL.into_iter().find_map(|corner| {
-                    let corner_screen = transform.image_to_screen(bounding_box.corner(corner));
-                    (corner_screen.distance(screen_position) <= HANDLE_HIT_RADIUS)
-                        .then_some((index, corner))
+            .filter(|(_, annotation)| annotation.class.supports_boxes())
+            .find_map(|(index, annotation)| {
+                annotation.bounding_box.as_ref().and_then(|bounding_box| {
+                    Corner::ALL.into_iter().find_map(|corner| {
+                        let corner_screen = transform.image_to_screen(bounding_box.corner(corner));
+                        (corner_screen.distance(screen_position) <= HANDLE_HIT_RADIUS)
+                            .then_some((index, corner))
+                    })
                 })
+            })
+    }
+
+    fn hit_test_box(&self, image_position: Pos2) -> Option<Selection> {
+        self.annotations
+            .iter()
+            .enumerate()
+            .filter(|(_, annotation)| annotation.class.supports_boxes())
+            .filter_map(|(index, annotation)| {
+                annotation
+                    .bounding_box
+                    .as_ref()
+                    .filter(|bounding_box| bounding_box.contains(image_position))
+                    .map(|bounding_box| (index, bounding_box))
+            })
+            .min_by(|(_, left), (_, right)| left.rect.area().total_cmp(&right.rect.area()))
+            .map(|(index, _)| Selection {
+                index,
+                shape: AnnotationShape::Box,
             })
     }
 
@@ -515,18 +763,41 @@ impl<'a> BoundingBoxAnnotator<'a> {
             Color32::WHITE,
         );
 
-        for (index, bounding_box) in self.bounding_boxes.iter().enumerate() {
-            self.draw_box(
-                ui,
-                transform,
-                bounding_box,
-                self.state.selected_box == Some(index),
-                false,
-            );
+        for (index, annotation) in self.annotations.iter().enumerate() {
+            if let Some(bounding_box) = &annotation.bounding_box {
+                self.draw_box(
+                    ui,
+                    transform,
+                    annotation.class,
+                    bounding_box,
+                    self.state.selected
+                        == Some(Selection {
+                            index,
+                            shape: AnnotationShape::Box,
+                        }),
+                    false,
+                );
+            }
         }
 
         if let Some(draft_box) = &self.state.draft_box {
-            self.draw_box(ui, transform, draft_box, true, true);
+            self.draw_box(ui, transform, *self.selected_class, draft_box, true, true);
+        }
+
+        for (index, annotation) in self.annotations.iter().enumerate() {
+            if let Some(point) = annotation.point {
+                self.draw_point(
+                    ui,
+                    transform,
+                    annotation,
+                    point,
+                    self.state.selected
+                        == Some(Selection {
+                            index,
+                            shape: AnnotationShape::Point,
+                        }),
+                );
+            }
         }
     }
 
@@ -534,6 +805,7 @@ impl<'a> BoundingBoxAnnotator<'a> {
         &self,
         ui: &Ui,
         transform: ImageTransform,
+        class: Class,
         bounding_box: &BoundingBox,
         selected: bool,
         draft: bool,
@@ -544,7 +816,12 @@ impl<'a> BoundingBoxAnnotator<'a> {
 
         let painter = ui.painter();
         let rect = transform.image_rect_to_screen(bounding_box.rect);
-        let color = bounding_box.class.color();
+        let editable = class.supports_boxes() || draft;
+        let color = if editable {
+            class.color()
+        } else {
+            class.color().gamma_multiply(0.55)
+        };
         let stroke_width = if selected { 2.5 } else { 1.5 };
         painter.rect_filled(
             rect,
@@ -559,20 +836,21 @@ impl<'a> BoundingBoxAnnotator<'a> {
         );
 
         let label = if draft {
-            format!("new {}", bounding_box.class.as_str())
+            format!("new {}", class.as_str())
+        } else if editable {
+            class.as_str().to_string()
         } else {
-            bounding_box.class.as_str().to_string()
+            format!("legacy {} box", class.as_str())
         };
-        let label_position = rect.left_top() + Vec2::new(4.0, 4.0);
         painter.text(
-            label_position,
+            rect.left_top() + Vec2::new(4.0, 4.0),
             Align2::LEFT_TOP,
             label,
             FontId::proportional(13.0),
             Color32::from_rgb(205, 214, 244),
         );
 
-        if selected || draft {
+        if editable && (selected || draft) {
             for corner in Corner::ALL {
                 let corner_screen = transform.image_to_screen(bounding_box.corner(corner));
                 painter.circle_filled(corner_screen, HANDLE_RADIUS, color);
@@ -583,6 +861,52 @@ impl<'a> BoundingBoxAnnotator<'a> {
                 );
             }
         }
+    }
+
+    fn draw_point(
+        &self,
+        ui: &Ui,
+        transform: ImageTransform,
+        annotation: &Annotation,
+        point: Pos2,
+        selected: bool,
+    ) {
+        let painter = ui.painter();
+        let position = transform.image_to_screen(point);
+        let color = annotation.class.color();
+        let radius = if selected {
+            POINT_RADIUS + 2.0
+        } else {
+            POINT_RADIUS
+        };
+
+        painter.circle_filled(position, radius, color);
+        painter.circle_stroke(
+            position,
+            radius + 2.0,
+            Stroke::new(1.5, Color32::from_rgb(205, 214, 244)),
+        );
+        painter.line_segment(
+            [
+                position - Vec2::new(9.0, 0.0),
+                position + Vec2::new(9.0, 0.0),
+            ],
+            Stroke::new(1.5, color),
+        );
+        painter.line_segment(
+            [
+                position - Vec2::new(0.0, 9.0),
+                position + Vec2::new(0.0, 9.0),
+            ],
+            Stroke::new(1.5, color),
+        );
+        painter.text(
+            position + Vec2::new(8.0, -8.0),
+            Align2::LEFT_BOTTOM,
+            annotation.class.as_str(),
+            FontId::proportional(13.0),
+            Color32::from_rgb(205, 214, 244),
+        );
     }
 }
 
@@ -661,13 +985,31 @@ impl ImageTransform {
     }
 }
 
-fn topmost_box_at(bounding_boxes: &[BoundingBox], image_position: Pos2) -> Option<usize> {
-    bounding_boxes
+fn selectable_shapes(annotations: &[Annotation]) -> Vec<Selection> {
+    annotations
         .iter()
         .enumerate()
-        .filter(|(_, bounding_box)| bounding_box.contains(image_position))
-        .min_by(|(_, left), (_, right)| left.rect.area().total_cmp(&right.rect.area()))
-        .map(|(index, _)| index)
+        .flat_map(|(index, annotation)| {
+            let point = annotation.point.map(|_| Selection {
+                index,
+                shape: AnnotationShape::Point,
+            });
+            let bounding_box = (annotation.bounding_box.is_some()
+                && annotation.class.supports_boxes())
+            .then_some(Selection {
+                index,
+                shape: AnnotationShape::Box,
+            });
+            [point, bounding_box].into_iter().flatten()
+        })
+        .collect()
+}
+
+fn clamp_point(point: Pos2, image_size: [f32; 2]) -> Pos2 {
+    Pos2::new(
+        point.x.clamp(0.0, image_size[0]),
+        point.y.clamp(0.0, image_size[1]),
+    )
 }
 
 fn keyboard_delta(ui: &Ui) -> Option<Vec2> {
@@ -695,4 +1037,63 @@ fn keyboard_delta(ui: &Ui) -> Option<Vec2> {
 
         (delta != Vec2::ZERO).then_some(delta)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn affected_classes_do_not_offer_bbox_selection() {
+        let annotations = vec![Annotation::bounding_box(
+            Class::LSpot,
+            BoundingBox::new(Pos2::ZERO, Pos2::new(10.0, 10.0)),
+        )];
+
+        assert!(selectable_shapes(&annotations).is_empty());
+    }
+
+    #[test]
+    fn reclassifying_regular_box_to_point_class_removes_box() {
+        let mut annotations = vec![Annotation::bounding_box(
+            Class::Robot,
+            BoundingBox::new(Pos2::ZERO, Pos2::new(10.0, 10.0)),
+        )];
+        let mut state = CanvasState {
+            selected: Some(Selection {
+                index: 0,
+                shape: AnnotationShape::Box,
+            }),
+            ..Default::default()
+        };
+
+        state.apply_class(&mut annotations, Class::LSpot);
+
+        assert_eq!(annotations[0].class, Class::LSpot);
+        assert_eq!(annotations[0].point, Some(Pos2::new(5.0, 5.0)));
+        assert!(annotations[0].bounding_box.is_none());
+        assert_eq!(state.selected.unwrap().shape, AnnotationShape::Point);
+    }
+
+    #[test]
+    fn reclassifying_legacy_point_class_box_preserves_box() {
+        let mut annotations = vec![Annotation::bounding_box(
+            Class::LSpot,
+            BoundingBox::new(Pos2::ZERO, Pos2::new(10.0, 10.0)),
+        )];
+        let mut state = CanvasState {
+            selected: Some(Selection {
+                index: 0,
+                shape: AnnotationShape::Box,
+            }),
+            ..Default::default()
+        };
+
+        state.apply_class(&mut annotations, Class::TSpot);
+
+        assert_eq!(annotations[0].class, Class::TSpot);
+        assert_eq!(annotations[0].point, Some(Pos2::new(5.0, 5.0)));
+        assert!(annotations[0].bounding_box.is_some());
+        assert_eq!(state.selected.unwrap().shape, AnnotationShape::Point);
+    }
 }

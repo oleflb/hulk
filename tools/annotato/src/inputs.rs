@@ -119,4 +119,10 @@ mod tests {
 
         fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    fn webp_images_are_supported() {
+        assert!(is_image_path(Path::new("frame.webp")));
+        assert!(is_image_path(Path::new("frame.WEBP")));
+    }
 }
