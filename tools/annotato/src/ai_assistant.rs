@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::annotation::AnnotationFormat;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ModelAnnotations {
     #[serde(flatten)]
     images: HashMap<String, Vec<AnnotationFormat>>,
@@ -22,7 +22,7 @@ impl ModelAnnotations {
         })
     }
 
-    pub fn for_image(&self, image_name: &String) -> Option<Vec<AnnotationFormat>> {
+    pub fn for_image(&self, image_name: &str) -> Option<Vec<AnnotationFormat>> {
         self.images.get(image_name).cloned()
     }
 }

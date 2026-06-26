@@ -1,5 +1,4 @@
 use eframe::egui::{ComboBox, Id, Response, Ui, Widget};
-use std::hash::Hash;
 
 use crate::classes::Class;
 pub trait EnumIter {
@@ -14,9 +13,9 @@ pub struct ClassSelector<'a> {
 }
 
 impl<'a> ClassSelector<'a> {
-    pub fn new(id_source: impl Hash, currently_selected: &'a mut Class) -> Self {
+    pub fn new(id_source: impl Into<Id>, currently_selected: &'a mut Class) -> Self {
         Self {
-            id: Id::new(id_source),
+            id: id_source.into(),
             currently_selected,
         }
     }
@@ -24,16 +23,11 @@ impl<'a> ClassSelector<'a> {
 
 impl Widget for ClassSelector<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        if let Some(class) = ui.input(|i| i.keys_down.iter().find_map(|key| Class::from_key(*key)))
-        {
-            *self.currently_selected = class;
-        }
-
         ComboBox::from_id_salt(self.id)
-            .selected_text(format!("{:?}", self.currently_selected))
+            .selected_text(self.currently_selected.as_str())
             .show_ui(ui, |ui| {
                 Class::list().into_iter().for_each(|class| {
-                    ui.selectable_value(self.currently_selected, class, format!("{class:?}"));
+                    ui.selectable_value(self.currently_selected, class, class.as_str());
                 });
             })
             .response

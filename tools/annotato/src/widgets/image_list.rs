@@ -1,17 +1,15 @@
-use std::collections::VecDeque;
-
 use eframe::egui::{ProgressBar, ScrollArea, Widget};
 
 use crate::{annotator_app::AnnotationPhase, paths::Paths};
 
 use super::path_row::Row;
 pub struct ImageList<'a> {
-    paths: &'a VecDeque<Paths>,
+    paths: &'a [Paths],
     phase: &'a mut AnnotationPhase,
 }
 
 impl<'a> ImageList<'a> {
-    pub fn new(paths: &'a VecDeque<Paths>, phase: &'a mut AnnotationPhase) -> Self {
+    pub fn new(paths: &'a [Paths], phase: &'a mut AnnotationPhase) -> Self {
         Self { paths, phase }
     }
 }
@@ -19,14 +17,14 @@ impl<'a> ImageList<'a> {
 impl Widget for ImageList<'_> {
     fn ui(self, ui: &mut eframe::egui::Ui) -> eframe::egui::Response {
         ui.vertical(|ui| {
-            ui.label("Image List");
+            ui.label("Images");
             let images_done = self
                 .paths
                 .iter()
                 .filter(|paths| paths.label_present)
                 .count();
             ui.add(
-                ProgressBar::new(images_done as f32 / self.paths.len() as f32)
+                ProgressBar::new(images_done as f32 / self.paths.len().max(1) as f32)
                     .show_percentage()
                     .text(format!("{}/{}", images_done, self.paths.len())),
             );
@@ -36,10 +34,11 @@ impl Widget for ImageList<'_> {
                 .auto_shrink([false, false])
                 .max_height(0.8 * ui.available_height())
                 .show_rows(ui, 12.0, self.paths.len(), |ui, range| {
-                    for (paths, index) in self.paths.range(range.clone()).zip(range) {
+                    for index in range {
+                        let paths = &self.paths[index];
                         let row = ui.add(Row::new(paths).highlight(match self.phase {
                             AnnotationPhase::Labelling { current_index } => *current_index == index,
-                            _ => false,
+                            AnnotationPhase::Finished => false,
                         }));
 
                         if let AnnotationPhase::Labelling { current_index } = self.phase

@@ -3,63 +3,47 @@ pub mod annotation;
 pub mod annotator_app;
 pub mod boundingbox;
 pub mod classes;
+pub mod inputs;
 pub mod label_widget;
-pub mod leaderboard;
 pub mod paths;
-pub mod remotedata;
-pub mod rsync;
 pub mod theme;
 pub mod user_toml;
 pub mod utils;
 pub mod widgets;
 
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use annotator_app::AnnotatorApp;
-use clap::{Parser, Subcommand};
-use color_eyre::eyre::{Report, Result, bail};
+use clap::Parser;
+use color_eyre::eyre::{Report, Result};
 use eframe::{NativeOptions, egui::ViewportBuilder, run_native};
-use remotedata::DataCommand;
 use theme::{MOCHA, apply_theme};
 
-use crate::user_toml::CONFIG;
+use crate::{inputs::collect_image_paths, user_toml::CONFIG};
 
 #[derive(Parser, Debug)]
-#[clap(name = "annotato")]
+#[command(name = "annotato")]
 pub struct Args {
-    #[command(subcommand)]
-    command: Command,
-}
+    /// Image files, folders, or glob patterns to annotate
+    #[arg(required = true, value_name = "INPUT")]
+    inputs: Vec<String>,
 
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    /// Download and upload datasets
-    Data {
-        #[command(subcommand)]
-        subcommand: DataCommand,
-    },
-    /// Start labelling data, also downloads and uploads datasets automagically
-    Label {
-        /// The dataset name to be labelled
-        #[arg(required = true)]
-        dataset_name: String,
-        /// Skips the introduction dialog
-        #[arg(short, long, default_value = "false")]
-        skip_introduction: bool,
-        /// Skips downloading and uploading datasets, command will fail if dataset is not present
-        #[arg(short, long, default_value = "false")]
-        offline: bool,
-    },
+    /// Optional predictions JSON keyed by image file name
+    #[arg(long)]
+    predictions: Option<PathBuf>,
+
+    /// Override config path. Defaults to $XDG_CONFIG_HOME/annotato/config.toml
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 fn start_labelling_ui(
-    image_folder: PathBuf,
-    annotation_json: PathBuf,
-    skip_introduction: bool,
+    image_paths: Vec<PathBuf>,
+    predictions: Option<PathBuf>,
 ) -> eframe::Result<()> {
     let native_options = NativeOptions {
         viewport: ViewportBuilder {
-            title: Some("annotato-rs".to_string()),
+            title: Some("annotato".to_string()),
             maximized: Some(true),
             ..Default::default()
         },
@@ -67,7 +51,7 @@ fn start_labelling_ui(
     };
 
     run_native(
-        "annotato-rs",
+        "annotato",
         native_options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -75,7 +59,7 @@ fn start_labelling_ui(
             let context = &cc.egui_ctx;
             apply_theme(context, MOCHA);
 
-            let app = AnnotatorApp::try_new(cc, image_folder, annotation_json, skip_introduction)?;
+            let app = AnnotatorApp::try_new(cc, image_paths, predictions)?;
 
             Ok(Box::new(app))
         }),
@@ -83,39 +67,16 @@ fn start_labelling_ui(
 }
 
 fn main() -> Result<()> {
+    color_eyre::install()?;
     let arguments = Args::parse();
 
     CONFIG
-        .set(toml::from_str(&fs::read_to_string("annotato.toml")?)?)
+        .set(user_toml::load_config(arguments.config.as_deref())?)
         .expect("once_cell::set failed");
 
-    match arguments.command {
-        Command::Data { subcommand } => remotedata::handle(&subcommand),
-        Command::Label {
-            dataset_name,
-            skip_introduction,
-            offline,
-        } => {
-            let image_folder = PathBuf::from_iter(["current", &dataset_name, "images"].iter());
-            let annotation_json = PathBuf::from_iter(["current", &dataset_name, "data.json"]);
-            if !image_folder.exists() {
-                if offline {
-                    bail!("dataset {dataset_name} not present, but offline flag was set")
-                }
-                println!("dataset {dataset_name} not present, downloading...");
-                rsync::rsync_to_local("current", &dataset_name)?;
-            }
-            start_labelling_ui(image_folder, annotation_json, skip_introduction)
-                .map_err(|err| Report::msg(err.to_string()))?;
-
-            if !offline {
-                println!("Uploading {dataset_name}...");
-                rsync::rsync_to_host("current", &dataset_name)?;
-            }
-
-            Ok(())
-        }
-    }?;
+    let image_paths = collect_image_paths(&arguments.inputs)?;
+    start_labelling_ui(image_paths, arguments.predictions)
+        .map_err(|err| Report::msg(err.to_string()))?;
 
     Ok(())
 }

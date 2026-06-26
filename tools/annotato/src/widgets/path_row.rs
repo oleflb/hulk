@@ -26,14 +26,20 @@ impl<'a> Row<'a> {
 
 impl Widget for Row<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let filename = self.paths.image_path.display().to_string();
+        let filename = self
+            .paths
+            .image_path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .unwrap_or("<invalid file name>")
+            .to_string();
         let is_labelled = self.paths.label_present;
 
         let text: WidgetText = RichText::new(filename).monospace().into();
         let check_mark: WidgetText = if is_labelled {
-            RichText::new("✔").color(Color32::GREEN)
+            RichText::new("done").color(Color32::GREEN)
         } else {
-            RichText::new("❌").color(Color32::RED)
+            RichText::new("todo").color(Color32::RED)
         }
         .into();
         let text = text.into_galley(

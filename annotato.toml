@@ -1,18 +1,19 @@
-[remote]
-rsync_path = "rsync://10.1.24.185/labelparty/output"
-
-[leaderboard]
-enable = true
-host = "10.1.24.185:3000"
-githubname = ""
+# Optional annotato config.
+# Copy to $XDG_CONFIG_HOME/annotato/config.toml or ~/.config/annotato/config.toml.
 
 [keybindings]
 next = { primary = "Space" }
 previous = { primary = "Space", modifiers = ["shift"] }
-edit = { primary = "Q" }
-zoom = { primary = "E" }
+save = { primary = "S" }
+edit = { primary = "E" }
 draw = { primary = "B" }
+move_box = { primary = "M" }
+cycle_corner = { primary = "C" }
+confirm = { primary = "Enter" }
 abort = { primary = "Escape" }
+delete = { primary = "Delete" }
+next_class = { primary = "CloseBracket" }
+previous_class = { primary = "OpenBracket" }
 
 select_ball = "Num1"
 select_robot = "Num2"
