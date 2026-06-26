@@ -10,13 +10,14 @@ use std::{
     time::Duration,
 };
 
-use booster::ImuState;
+use booster::{ImuState, MotorState};
 use color_eyre::{
     Result,
     eyre::{WrapErr, eyre},
 };
-use coordinate_systems::{Field, Robot};
+use coordinate_systems::{Field, Ground, Robot};
 use field_mark_association::{FieldMarkAssociations, GlobalLocalizationDebug};
+use kinematics::joints::{Joints, head::HeadJoints};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
 use localization_3d::SolveDiagnostics;
@@ -25,11 +26,12 @@ use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{Message, attachment::Attachment, prelude::*, time::Time};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinSet};
-use tokio_util::sync::CancellationToken;
 use types::{
     field_dimensions::FieldDimensions,
+    motion_command::MotionCommand,
     object_detection::{Object, RobocupObjectLabel},
     stereo_image_pair::StereoImagePair,
+    support_foot::Side,
     time_wrapper::TimeWrapper,
     visual_odometry::{VisualOdometer, VisualOdometryDelta},
 };
@@ -103,8 +105,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     })?;
     let writer = McapWriter::new(BufWriter::new(file))?;
     let (sample_sender, sample_receiver) = mpsc::unbounded_channel();
-    let token = CancellationToken::new();
-    let writer_task = tokio::spawn(write_mcap(sample_receiver, writer, token.clone()));
+    let writer_task = tokio::spawn(write_mcap(sample_receiver, writer));
 
     let mut recorders = JoinSet::new();
     spawn_topic::<ImuState>(
@@ -126,6 +127,20 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         &mut recorders,
         sample_sender.clone(),
         "robot_kinematics",
+    )
+    .await?;
+    spawn_topic::<TimeWrapper<Option<Side>>>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "support_foot",
+    )
+    .await?;
+    spawn_topic::<TimeWrapper<Option<Isometry3<Ground, Robot>>>>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "ground_to_robot",
     )
     .await?;
     spawn_topic::<TimeWrapper<CameraMatrix>>(
@@ -198,6 +213,42 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         "debug/solve_diagnostics",
     )
     .await?;
+    spawn_topic::<Joints<MotorState>>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "inputs/serial_motor_states",
+    )
+    .await?;
+    spawn_topic::<MotionCommand>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "behavior/motion_command",
+    )
+    .await?;
+    spawn_topic::<MotionCommand>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "motion_command",
+    )
+    .await?;
+    spawn_topic::<HeadJoints<f32>>(&node, &mut recorders, sample_sender.clone(), "look_at").await?;
+    spawn_topic::<HeadJoints<f32>>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "look_around_target_joints",
+    )
+    .await?;
+    spawn_topic::<HeadJoints<f32>>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "head_joints_command",
+    )
+    .await?;
 
     if parameters.include_raw_images {
         spawn_topic::<TimeWrapper<StereoImagePair>>(
@@ -216,24 +267,28 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     );
 
     drop(sample_sender);
-    if let Some(max_duration) = parameters.max_duration {
+    let recorder_result = if let Some(max_duration) = parameters.max_duration {
         tokio::select! {
             _ = tokio::time::sleep(max_duration) => {
-                recorders.abort_all();
+                Ok(())
             }
             result = recorders.join_next() => {
-                handle_recorder_result(result)?;
-                recorders.abort_all();
+                handle_recorder_result(result)
             }
         }
     } else {
-        while let Some(result) = recorders.join_next().await {
-            result.wrap_err("localization recorder task panicked")??;
+        let mut recorder_result = Ok(());
+        while let Some(join_result) = recorders.join_next().await {
+            if let Err(error) = handle_recorder_result(Some(join_result)) {
+                recorder_result = Err(error);
+                break;
+            }
         }
-    }
+        recorder_result
+    };
 
-    token.cancel();
-    drop(recorders);
+    recorders.abort_all();
+    drain_aborted_recorders(recorders).await;
     let samples_written = writer_task
         .await
         .wrap_err("localization recorder writer task panicked")??;
@@ -242,6 +297,8 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         samples_written,
         "localization recording finished"
     );
+
+    recorder_result?;
 
     Ok(())
 }
@@ -307,15 +364,24 @@ fn handle_recorder_result(
 async fn write_mcap(
     mut sample_receiver: mpsc::UnboundedReceiver<RecordedSample>,
     mut writer: McapWriter<BufWriter<File>>,
-    token: CancellationToken,
 ) -> Result<usize> {
     let mut samples_written = 0;
-    while let Some(Some(sample)) = token.run_until_cancelled(sample_receiver.recv()).await {
+    while let Some(sample) = sample_receiver.recv().await {
         writer.write(sample)?;
         samples_written += 1;
     }
     writer.finish()?;
     Ok(samples_written)
+}
+
+async fn drain_aborted_recorders(mut recorders: JoinSet<Result<()>>) {
+    while let Some(result) = recorders.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            tracing::debug!(?error, "localization recorder task failed while stopping");
+        }
+    }
 }
 
 #[derive(Clone)]

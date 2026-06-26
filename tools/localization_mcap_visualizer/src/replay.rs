@@ -383,7 +383,7 @@ fn ingest_global_features(
         None => stats.global_none += 1,
         Some(GlobalLocalizationDebugStatus::Ambiguous) => stats.global_ambiguous += 1,
         #[allow(deprecated)]
-        Some(GlobalLocalizationDebugStatus::Unique) => stats.global_ambiguous += 1,
+        Some(GlobalLocalizationDebugStatus::Unique) => stats.global_unique_modulo_symmetry += 1,
         Some(GlobalLocalizationDebugStatus::UniqueModuloSymmetry) => {
             stats.global_unique_modulo_symmetry += 1;
         }
