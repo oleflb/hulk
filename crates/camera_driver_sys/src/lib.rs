@@ -123,6 +123,20 @@ pub enum SensorMode {
     Mono,
 }
 
+impl SensorMode {
+    pub fn sdk_value(self) -> u32 {
+        match self {
+            Self::Normal => 1,
+            Self::Dol2 => 2,
+            Self::Dol3 => 3,
+            Self::Dol4 => 4,
+            Self::Pwl => 5,
+            Self::Slave => 6,
+            Self::Mono => 7,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SensorCalibration {
     Disabled,
@@ -150,9 +164,26 @@ pub enum InputMode {
     Ddr,
 }
 
+impl InputMode {
+    pub fn sdk_value(self) -> u32 {
+        match self {
+            Self::Mcm => 1,
+            Self::Ddr => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IspSensorMode {
     Normal,
+}
+
+impl IspSensorMode {
+    pub fn sdk_value(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

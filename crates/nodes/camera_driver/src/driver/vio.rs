@@ -44,7 +44,15 @@ unsafe impl Send for VioPipeline {}
 impl VioPipeline {
     /// Creates and attaches the camera, VIN, ISP, GDC, VSE, and vflow nodes.
     pub fn create(config: &Config, sensor: &SensorHost, gdc_bin: GdcBin) -> Result<Self> {
-        let mut camera = sys::Camera::create(camera_config(config, sensor)?)?;
+        let camera_config = camera_config(config, sensor)?;
+        println!(
+            "camera config: host={} i2c=0x{:02x} sensor_mode={:?}({})",
+            sensor.host,
+            sensor.i2c_addr,
+            camera_config.sensor_mode,
+            camera_config.sensor_mode.sdk_value(),
+        );
+        let mut camera = sys::Camera::create(camera_config)?;
         let vin = create_vin(config, sensor)?;
         let isp = create_isp(config)?;
         let gdc = create_gdc(config, &gdc_bin)?;
@@ -185,9 +193,22 @@ fn create_vin(config: &Config, sensor: &SensorHost) -> Result<sys::VinNode> {
 fn create_isp(config: &Config) -> Result<sys::IspNode> {
     let mut isp =
         sys::IspNode::open_isp(HardwareId(0), AllocationId::Auto).wrap_err("open ISP vnode")?;
+    let input_mode = InputMode::Mcm;
+    let sensor_mode = IspSensorMode::Normal;
+    println!(
+        "isp attr: input_mode={:?}({}) sensor_mode={:?}({}) crop=x{} y{} w{} h{}",
+        input_mode,
+        input_mode.sdk_value(),
+        sensor_mode,
+        sensor_mode.sdk_value(),
+        0,
+        0,
+        config.raw_width,
+        config.raw_height,
+    );
     isp.set_isp_attr(IspAttr {
-        input_mode: InputMode::Mcm,
-        sensor_mode: IspSensorMode::Normal,
+        input_mode,
+        sensor_mode,
         crop: Rect {
             x: 0,
             y: 0,
