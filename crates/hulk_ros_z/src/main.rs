@@ -2,6 +2,7 @@ use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use color_eyre::{Result, eyre::Context as _};
+use encoded_frame_decoder_node::DecoderNodeConfig;
 use ros_z::prelude::*;
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
@@ -21,6 +22,10 @@ struct Args {
     parameter_root: PathBuf,
     #[arg(long)]
     router: Option<String>,
+    #[arg(long, help = "FFmpeg executable path for HEVC camera decoding.")]
+    ffmpeg_path: Option<PathBuf>,
+    #[arg(long, help = "SHM pool size for decoded NV12 frame payloads.")]
+    decoded_shm_pool_size: Option<usize>,
 }
 
 struct RunningStack {
@@ -54,6 +59,7 @@ async fn run() -> Result<()> {
     let namespace = derive_namespace(&args.robot);
     let parameter_layers =
         derive_parameter_layers(&args.parameter_root, &args.location, &args.robot);
+    let decoder_config = decoder_config_from_args(&args);
 
     let mut builder = ContextBuilder::default()
         .with_namespace(&namespace)
@@ -69,7 +75,7 @@ async fn run() -> Result<()> {
     };
 
     let ctx = Arc::new(builder.build().await?);
-    let mut running = spawn_all(ctx.clone()).await?;
+    let mut running = spawn_all(ctx.clone(), decoder_config).await?;
 
     let result = tokio::select! {
         result = monitor(&mut running.join_set) => result,
@@ -83,6 +89,17 @@ async fn run() -> Result<()> {
         ctx.shutdown()?;
     }
     result
+}
+
+fn decoder_config_from_args(args: &Args) -> DecoderNodeConfig {
+    let mut config = DecoderNodeConfig::default();
+    if let Some(ffmpeg_path) = &args.ffmpeg_path {
+        config.ffmpeg_path = ffmpeg_path.clone();
+    }
+    if let Some(decoded_shm_pool_size) = args.decoded_shm_pool_size {
+        config.decoded_shm_pool_size = decoded_shm_pool_size;
+    }
+    config
 }
 
 fn derive_parameter_layers(
@@ -105,7 +122,10 @@ fn derive_namespace(robot: &str) -> String {
     }
 }
 
-async fn spawn_all(ctx: Arc<Context>) -> Result<RunningStack> {
+async fn spawn_all(
+    ctx: Arc<Context>,
+    #[cfg_attr(feature = "orin-vision", allow(unused_variables))] decoder_config: DecoderNodeConfig,
+) -> Result<RunningStack> {
     let mut join_set = JoinSet::new();
 
     join_set.spawn(active_vision::run_boxed(ctx.clone()));
@@ -116,7 +136,13 @@ async fn spawn_all(ctx: Arc<Context>) -> Result<RunningStack> {
     join_set.spawn(button_event_bridge::run_boxed(ctx.clone()));
     join_set.spawn(button_event_handler::run_boxed(ctx.clone()));
     join_set.spawn(camera_matrix_calculator::run_boxed(ctx.clone()));
-    join_set.spawn(detection::run_boxed(ctx.clone()));
+    #[cfg(not(feature = "orin-vision"))]
+    {
+        join_set.spawn(detection::run_boxed(ctx.clone()));
+        join_set.spawn(encoded_frame_decoder_node::run(ctx.clone(), decoder_config));
+    }
+    #[cfg(feature = "orin-vision")]
+    join_set.spawn(orin_vision_node::run_boxed(ctx.clone()));
     join_set.spawn(fake_odometry::run_boxed(ctx.clone()));
     join_set.spawn(fall_down_state_receiver::run_boxed(ctx.clone()));
     join_set.spawn(field_border_detection::run_boxed(ctx.clone()));

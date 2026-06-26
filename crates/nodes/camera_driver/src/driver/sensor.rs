@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use color_eyre::eyre::{Result, WrapErr, bail, ensure};
+
 /// SC132GS chip-id register address.
 const SC132GS_CHIP_ID_REG: u16 = 0x3107;
 /// Expected SC132GS chip-id value.
@@ -75,26 +77,23 @@ struct VconProperties {
 }
 
 /// Prepares one SC132GS host and verifies the sensor chip id.
-pub fn prepare_sc132gs_host(host: i32) -> Result<SensorHost, String> {
+pub fn prepare_sc132gs_host(host: i32) -> Result<SensorHost> {
     let host_index = usize::try_from(host)
         .ok()
         .filter(|index| *index < MIPI_HOST_SUFFIXES.len())
-        .ok_or_else(|| format!("invalid MIPI host {host}; expected 0..3"))?;
+        .ok_or_else(|| color_eyre::eyre::eyre!("invalid MIPI host {host}; expected 0..3"))?;
 
     ensure_mipi_host_free(host)?;
     let mclk_configured = mipi_mclk_is_configured(host_index)?;
     let vcon = read_vcon(host)?;
     if !dt_status_is_ok(&vcon.status) {
-        return Err(format!(
-            "vcon@{host} status is {:?}, expected okay",
-            vcon.status
-        ));
+        bail!("vcon@{host} status is {:?}, expected okay", vcon.status);
     }
     if vcon.rx_phy.len() < 2 {
-        return Err(format!(
+        bail!(
             "vcon@{host} rx_phy has {} entries, expected at least 2",
             vcon.rx_phy.len()
-        ));
+        );
     }
 
     if mclk_configured {
@@ -121,24 +120,22 @@ pub fn prepare_sc132gs_host(host: i32) -> Result<SensorHost, String> {
 }
 
 /// Rejects hosts that are already configured by another VIO pipeline.
-fn ensure_mipi_host_free(host: i32) -> Result<(), String> {
+fn ensure_mipi_host_free(host: i32) -> Result<()> {
     let path = format!("/sys/class/vps/mipi_host{host}/status/cfg");
-    let cfg = fs::read_to_string(&path).map_err(|err| format!("read {path}: {err}"))?;
+    let cfg = fs::read_to_string(&path).wrap_err_with(|| format!("read {path}"))?;
     let first_line = cfg.lines().next().unwrap_or("").trim();
     if first_line != "not inited" {
-        return Err(format!(
-            "mipi_host{host} is already configured: status/cfg first line is {first_line:?}"
-        ));
+        bail!("mipi_host{host} is already configured: status/cfg first line is {first_line:?}");
     }
     Ok(())
 }
 
 /// Checks whether the host has pinctrl-backed MCLK configuration.
-fn mipi_mclk_is_configured(host_index: usize) -> Result<bool, String> {
+fn mipi_mclk_is_configured(host_index: usize) -> Result<bool> {
     let suffix = MIPI_HOST_SUFFIXES[host_index];
     let path = PathBuf::from(format!("/proc/device-tree/soc/cam/mipi_host@{suffix}"));
     if !path.is_dir() {
-        return Err(format!("missing device-tree node {}", path.display()));
+        bail!("missing device-tree node {}", path.display());
     }
     let pinctrl_names = read_dt_string_optional(&path.join("pinctrl-names"))?;
     Ok(pinctrl_names
@@ -147,17 +144,15 @@ fn mipi_mclk_is_configured(host_index: usize) -> Result<bool, String> {
 }
 
 /// Reads vcon properties for one MIPI host from device tree.
-fn read_vcon(host: i32) -> Result<VconProperties, String> {
+fn read_vcon(host: i32) -> Result<VconProperties> {
     let path = PathBuf::from(format!("/proc/device-tree/soc/cam/vcon@{host}"));
     if !path.is_dir() {
-        return Err(format!("missing device-tree node {}", path.display()));
+        bail!("missing device-tree node {}", path.display());
     }
 
     let status = read_dt_string(&path.join("status"))?;
     let bus = read_be_i32_scalar(&path.join("bus"))?;
-    if bus < 0 {
-        return Err(format!("vcon@{host} bus is negative: {bus}"));
-    }
+    ensure!(bus >= 0, "vcon@{host} bus is negative: {bus}");
     let rx_phy = read_be_i32_array(&path.join("rx_phy"))?;
     let gpio_oth = read_be_i32_array_optional(&path.join("gpio_oth"))?;
 
@@ -175,58 +170,58 @@ fn dt_status_is_ok(status: &str) -> bool {
 }
 
 /// Reads a required NUL-terminated device-tree string.
-fn read_dt_string(path: &Path) -> Result<String, String> {
-    read_dt_string_optional(path)?.ok_or_else(|| format!("missing {}", path.display()))
+fn read_dt_string(path: &Path) -> Result<String> {
+    read_dt_string_optional(path)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing {}", path.display()))
 }
 
 /// Reads an optional NUL-terminated device-tree string.
-fn read_dt_string_optional(path: &Path) -> Result<Option<String>, String> {
+fn read_dt_string_optional(path: &Path) -> Result<Option<String>> {
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("read {}: {err}", path.display())),
+        Err(err) => return Err(err).wrap_err_with(|| format!("read {}", path.display())),
     };
     let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
     let value = std::str::from_utf8(&raw[..end])
-        .map_err(|err| format!("{} is not UTF-8: {err}", path.display()))?
+        .wrap_err_with(|| format!("{} is not UTF-8", path.display()))?
         .trim()
         .to_string();
     Ok(Some(value))
 }
 
 /// Reads the first big-endian `i32` from a device-tree property.
-fn read_be_i32_scalar(path: &Path) -> Result<i32, String> {
+fn read_be_i32_scalar(path: &Path) -> Result<i32> {
     read_be_i32_array(path)?
         .into_iter()
         .next()
-        .ok_or_else(|| format!("{} is empty", path.display()))
+        .ok_or_else(|| color_eyre::eyre::eyre!("{} is empty", path.display()))
 }
 
 /// Reads all big-endian `i32` values from a required property.
-fn read_be_i32_array(path: &Path) -> Result<Vec<i32>, String> {
-    let raw = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+fn read_be_i32_array(path: &Path) -> Result<Vec<i32>> {
+    let raw = fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?;
     parse_be_i32_array(path, &raw)
 }
 
 /// Reads all big-endian `i32` values from an optional property.
-fn read_be_i32_array_optional(path: &Path) -> Result<Vec<i32>, String> {
+fn read_be_i32_array_optional(path: &Path) -> Result<Vec<i32>> {
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(format!("read {}: {err}", path.display())),
+        Err(err) => return Err(err).wrap_err_with(|| format!("read {}", path.display())),
     };
     parse_be_i32_array(path, &raw)
 }
 
 /// Parses a big-endian `i32` array from raw device-tree bytes.
-fn parse_be_i32_array(path: &Path, raw: &[u8]) -> Result<Vec<i32>, String> {
-    if !raw.len().is_multiple_of(4) {
-        return Err(format!(
-            "{} length {} is not a multiple of 4",
-            path.display(),
-            raw.len()
-        ));
-    }
+fn parse_be_i32_array(path: &Path, raw: &[u8]) -> Result<Vec<i32>> {
+    ensure!(
+        raw.len().is_multiple_of(4),
+        "{} length {} is not a multiple of 4",
+        path.display(),
+        raw.len()
+    );
     Ok(raw
         .chunks_exact(4)
         .map(|chunk| i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -234,29 +229,29 @@ fn parse_be_i32_array(path: &Path, raw: &[u8]) -> Result<Vec<i32>, String> {
 }
 
 /// Writes a sysfs value with path context on error.
-fn write_sysfs(path: &str, value: &str) -> Result<(), String> {
-    fs::write(path, value).map_err(|err| format!("write {path}: {err}"))
+fn write_sysfs(path: &str, value: &str) -> Result<()> {
+    fs::write(path, value).wrap_err_with(|| format!("write {path}"))
 }
 
 /// Pulses configured SC132GS GPIOs for reset/power sequencing.
-fn pulse_sc132gs_gpios(host: i32, gpio_oth: &[i32]) -> Result<(), String> {
+fn pulse_sc132gs_gpios(host: i32, gpio_oth: &[i32]) -> Result<()> {
     let active = 1 - SC132GS_GPIO_LEVEL_BIT as i32;
     for (index, gpio) in gpio_oth.iter().copied().enumerate().take(8) {
         if gpio == 0 || (SC132GS_GPIO_ENABLE_BIT & (1 << index)) == 0 {
             continue;
         }
         pulse_gpio(gpio, active)
-            .map_err(|err| format!("vcon@{host} gpio_oth[{index}]={gpio}: {err}"))?;
+            .wrap_err_with(|| format!("vcon@{host} gpio_oth[{index}]={gpio}"))?;
     }
     Ok(())
 }
 
 /// Exports and pulses one GPIO, then unexports it if this function exported it.
-fn pulse_gpio(gpio: i32, active: i32) -> Result<(), String> {
+fn pulse_gpio(gpio: i32, active: i32) -> Result<()> {
     let gpio_dir = PathBuf::from(format!("/sys/class/gpio/gpio{gpio}"));
     let exported_here = export_gpio(gpio, &gpio_dir)?;
     wait_for_gpio_path(&gpio_dir.join("direction"))?;
-    fs::write(gpio_dir.join("direction"), "out").map_err(|err| format!("set direction: {err}"))?;
+    fs::write(gpio_dir.join("direction"), "out").wrap_err("set direction")?;
 
     set_gpio_value(&gpio_dir, active)?;
     thread::sleep(Duration::from_millis(30));
@@ -266,39 +261,38 @@ fn pulse_gpio(gpio: i32, active: i32) -> Result<(), String> {
     thread::sleep(Duration::from_millis(30));
 
     if exported_here {
-        fs::write("/sys/class/gpio/unexport", gpio.to_string())
-            .map_err(|err| format!("unexport gpio: {err}"))?;
+        fs::write("/sys/class/gpio/unexport", gpio.to_string()).wrap_err("unexport gpio")?;
     }
     Ok(())
 }
 
 /// Exports a GPIO unless it is already exported.
-fn export_gpio(gpio: i32, gpio_dir: &Path) -> Result<bool, String> {
+fn export_gpio(gpio: i32, gpio_dir: &Path) -> Result<bool> {
     if gpio_dir.is_dir() {
         return Ok(false);
     }
     match fs::write("/sys/class/gpio/export", gpio.to_string()) {
         Ok(()) => Ok(true),
         Err(_) if gpio_dir.is_dir() => Ok(false),
-        Err(err) => Err(format!("export gpio: {err}")),
+        Err(err) => Err(err).wrap_err("export gpio"),
     }
 }
 
 /// Waits briefly for a sysfs GPIO path to appear.
-fn wait_for_gpio_path(path: &Path) -> Result<(), String> {
+fn wait_for_gpio_path(path: &Path) -> Result<()> {
     for _ in 0..100 {
         if path.exists() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(1));
     }
-    Err(format!("{} did not appear within 100ms", path.display()))
+    bail!("{} did not appear within 100ms", path.display())
 }
 
 /// Sets one exported GPIO value.
-fn set_gpio_value(gpio_dir: &Path, value: i32) -> Result<(), String> {
+fn set_gpio_value(gpio_dir: &Path, value: i32) -> Result<()> {
     fs::write(gpio_dir.join("value"), value.to_string())
-        .map_err(|err| format!("set value {value}: {err}"))
+        .wrap_err_with(|| format!("set value {value}"))
 }
 
 /// Result of probing one SC132GS sensor address.
@@ -309,7 +303,7 @@ struct SensorProbe {
 }
 
 /// Finds an SC132GS sensor on the selected camera I2C bus.
-fn probe_sc132gs(bus: u32) -> Result<SensorProbe, String> {
+fn probe_sc132gs(bus: u32) -> Result<SensorProbe> {
     let mut errors = Vec::new();
     for addr in SC132GS_I2C_ADDRS {
         match i2c_read_reg16_data16(bus, addr, SC132GS_CHIP_ID_REG) {
@@ -317,23 +311,23 @@ fn probe_sc132gs(bus: u32) -> Result<SensorProbe, String> {
             Ok(chip_id) => errors.push(format!(
                 "addr=0x{addr:02x} chip_id=0x{chip_id:04x}, expected 0x{SC132GS_CHIP_ID:04x}"
             )),
-            Err(err) => errors.push(format!("addr=0x{addr:02x}: {err}")),
+            Err(err) => errors.push(format!("addr=0x{addr:02x}: {err:#}")),
         }
     }
-    Err(format!(
+    bail!(
         "SC132GS not found on i2c-{bus} reg=0x{SC132GS_CHIP_ID_REG:04x}: {}",
         errors.join("; ")
-    ))
+    )
 }
 
 /// Reads a 16-bit big-endian register value via Linux `I2C_RDWR`.
-fn i2c_read_reg16_data16(bus: u32, addr: u16, reg: u16) -> Result<u16, String> {
+fn i2c_read_reg16_data16(bus: u32, addr: u16, reg: u16) -> Result<u16> {
     let path = format!("/dev/i2c-{bus}");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
-        .map_err(|err| format!("open {path}: {err}"))?;
+        .wrap_err_with(|| format!("open {path}"))?;
 
     let mut reg_buf = [(reg >> 8) as u8, (reg & 0xff) as u8];
     let mut read_buf = [0u8; 2];
@@ -358,10 +352,7 @@ fn i2c_read_reg16_data16(bus: u32, addr: u16, reg: u16) -> Result<u16, String> {
 
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), I2C_RDWR, &mut data) };
     if rc < 0 {
-        return Err(format!(
-            "read reg 0x{reg:04x}: {}",
-            io::Error::last_os_error()
-        ));
+        bail!("read reg 0x{reg:04x}: {}", io::Error::last_os_error());
     }
     Ok(u16::from_be_bytes(read_buf))
 }

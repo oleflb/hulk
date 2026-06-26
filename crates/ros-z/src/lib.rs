@@ -101,7 +101,7 @@ pub mod utils;
 pub use attachment::{ENDPOINT_GLOBAL_ID_SIZE, EndpointGlobalId};
 pub use entity::{SchemaHash, TypeInfo};
 pub use error::{Error, Result};
-pub use message::{Message, SerdeCdrCodec, Service};
+pub use message::{Message, SerdeCdrCodec, Service, WireZBufDecoder};
 pub use ros_z_derive::Message;
 pub use schema::{
     EnumSchemaBuilder, MessageSchema, SchemaBuilder, StructSchemaBuilder, TupleVariantSchemaBuilder,

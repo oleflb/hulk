@@ -9,16 +9,15 @@ use ort::{
     value::TensorRef,
 };
 use ros_z_streams::CreateAnnouncingPublisher;
-use ros2::sensor_msgs::image::Image;
 
 use ros_z::prelude::*;
 use tokio::time::Instant;
 use types::{
     bounding_box::BoundingBox,
+    nv12_image::Nv12Image,
     object_detection::{NUMBER_OF_VALUES_PER_OBJECT, Object, RobocupObjectLabel, YOLOObjectLabel},
     parameters::DetectionParameters,
     pose_detection::{NUMBER_OF_VALUES_PER_POSE, Pose},
-    time_wrapper::TimeWrapper,
 };
 
 pub const NUMBER_OF_DETECTIONS: usize = 300;
@@ -51,6 +50,19 @@ struct ModelOutputs<'a> {
     poses: ArrayView2<'a, f32>,
 }
 
+#[derive(Debug)]
+pub struct YoloDetections {
+    pub objects: Vec<Object<RobocupObjectLabel>>,
+    pub poses: Vec<Pose<YOLOObjectLabel>>,
+}
+
+#[derive(Debug)]
+pub struct TimedYoloDetections {
+    pub detections: YoloDetections,
+    pub post_processing_duration: Duration,
+    pub non_maximum_suppression_duration: Duration,
+}
+
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(run(ctx))
 }
@@ -61,7 +73,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     let node_parameters = node.bind_parameter_as::<DetectionParameters>("detection")?;
 
     let image_sub = node
-        .subscriber::<TimeWrapper<Image>>("inputs/left_image")
+        .subscriber::<Nv12Image>("inputs/left_nv12_image")
         .build()
         .await?;
     let inference_duration_pub = node
@@ -86,23 +98,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     let initial_parameters_snapshot = node_parameters.snapshot();
     let parameters = initial_parameters_snapshot.typed();
 
-    let model_path = parameters
-        .neural_networks_folder
-        .join(&parameters.model_name);
-
-    let tensor_rt = TensorRTExecutionProvider::default()
-        .with_device_id(0)
-        .with_fp16(true)
-        .with_engine_cache(true)
-        .with_engine_cache_path(parameters.neural_networks_folder.display())
-        .build();
-    let cuda = CUDAExecutionProvider::default().build();
-
-    let mut session = Session::builder()?
-        .with_execution_providers([tensor_rt, cuda])?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_intra_threads(2)?
-        .commit_from_file(model_path)?;
+    let mut session = create_yolo_session(parameters)?;
 
     loop {
         let parameters_snapshot = node_parameters.snapshot();
@@ -111,71 +107,143 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             continue;
         }
 
-        let timed_image = image_sub.recv().await?;
-        let image_time = timed_image.time;
+        let image = image_sub.recv().await?;
+        let image_time = image.time;
 
         let detected_objects_pending = detected_objects_pub.announce(image_time).await?;
         let detected_poses_pending = detected_poses_pub.announce(image_time).await?;
 
-        let image = timed_image.inner;
         check_image(&image)?;
 
         let inference_start = Instant::now();
 
+        let image_data = image.data.contiguous();
         let nv12_data = ArrayView3::from_shape(
             [image.height as usize / 2, image.width as usize / 2, 6],
-            &image.data,
+            image_data.as_ref(),
         )?;
         let outputs: SessionOutputs =
             session.run(inputs!["raw_bytes_input" => TensorRef::from_array_view(nv12_data)?])?;
 
         let inference_duration = inference_start.elapsed();
 
-        let post_processing_start = Instant::now();
-
-        let outputs = extract_outputs(&outputs)?;
-        let candidate_detections = extract_candidate_object_detections(
-            &outputs,
-            parameters.object_detection_parameters.confidence_threshold,
-        )?;
-        let candidate_human_poses = extract_candidate_pose_detections(
-            &outputs,
-            parameters.pose_detection_parameters.confidence_threshold,
-        )?;
-        let post_processing_duration = post_processing_start.elapsed();
-        let non_maximum_suppression_start = Instant::now();
-        let detected_objects = non_maximum_suppression(
-            candidate_detections,
-            parameters
-                .object_detection_parameters
-                .maximum_intersection_over_union,
-        );
-        let detected_poses = non_maximum_suppression(
-            candidate_human_poses,
-            parameters
-                .pose_detection_parameters
-                .maximum_intersection_over_union,
-        );
-        let non_maximum_suppression_duration = non_maximum_suppression_start.elapsed();
+        let detections = postprocess_yolo_outputs_with_timing(&outputs, parameters)?;
 
         inference_duration_pub.publish(&inference_duration).await?;
         post_processing_duration_pub
-            .publish(&post_processing_duration)
+            .publish(&detections.post_processing_duration)
             .await?;
         non_maximum_suppression_duration_pub
-            .publish(&non_maximum_suppression_duration)
+            .publish(&detections.non_maximum_suppression_duration)
             .await?;
 
-        detected_objects_pending.publish(&detected_objects).await?;
-        detected_poses_pending.publish(&detected_poses).await?;
+        detected_objects_pending
+            .publish(&detections.detections.objects)
+            .await?;
+        detected_poses_pending
+            .publish(&detections.detections.poses)
+            .await?;
     }
 }
 
-fn check_image(image: &Image) -> Result<()> {
-    if image.encoding != "nv12" {
-        bail!("unsupported image encoding: {}", image.encoding);
-    }
+pub fn create_yolo_session(parameters: &DetectionParameters) -> Result<Session> {
+    create_yolo_session_inner(parameters, None)
+}
 
+/// Creates a YOLO session whose CUDA/TensorRT execution providers use `compute_stream`.
+///
+/// # Safety
+///
+/// `compute_stream` must be a valid CUDA stream for device 0 and must outlive the
+/// returned `Session`. ONNX Runtime stores the raw stream pointer in the CUDA and
+/// TensorRT execution provider options.
+pub unsafe fn create_yolo_session_with_compute_stream(
+    parameters: &DetectionParameters,
+    compute_stream: *mut (),
+) -> Result<Session> {
+    create_yolo_session_inner(parameters, Some(compute_stream))
+}
+
+fn create_yolo_session_inner(
+    parameters: &DetectionParameters,
+    compute_stream: Option<*mut ()>,
+) -> Result<Session> {
+    let model_path = parameters
+        .neural_networks_folder
+        .join(&parameters.model_name);
+
+    let tensor_rt = TensorRTExecutionProvider::default()
+        .with_device_id(0)
+        .with_fp16(true)
+        .with_engine_cache(true)
+        .with_engine_cache_path(parameters.neural_networks_folder.display());
+    let cuda = CUDAExecutionProvider::default();
+
+    let (tensor_rt, cuda) = if let Some(compute_stream) = compute_stream {
+        // Safety is delegated to `create_yolo_session_with_compute_stream`.
+        unsafe {
+            (
+                tensor_rt.with_compute_stream(compute_stream).build(),
+                cuda.with_compute_stream(compute_stream).build(),
+            )
+        }
+    } else {
+        (tensor_rt.build(), cuda.build())
+    };
+
+    Ok(Session::builder()?
+        .with_execution_providers([tensor_rt, cuda])?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_intra_threads(2)?
+        .commit_from_file(model_path)?)
+}
+
+pub fn postprocess_yolo_outputs(
+    outputs: &SessionOutputs<'_>,
+    parameters: &DetectionParameters,
+) -> Result<YoloDetections> {
+    Ok(postprocess_yolo_outputs_with_timing(outputs, parameters)?.detections)
+}
+
+pub fn postprocess_yolo_outputs_with_timing(
+    outputs: &SessionOutputs<'_>,
+    parameters: &DetectionParameters,
+) -> Result<TimedYoloDetections> {
+    let post_processing_start = Instant::now();
+    let outputs = extract_outputs(outputs)?;
+    let candidate_detections = extract_candidate_object_detections(
+        &outputs,
+        parameters.object_detection_parameters.confidence_threshold,
+    )?;
+    let candidate_human_poses = extract_candidate_pose_detections(
+        &outputs,
+        parameters.pose_detection_parameters.confidence_threshold,
+    )?;
+    let post_processing_duration = post_processing_start.elapsed();
+
+    let non_maximum_suppression_start = Instant::now();
+    let objects = non_maximum_suppression(
+        candidate_detections,
+        parameters
+            .object_detection_parameters
+            .maximum_intersection_over_union,
+    );
+    let poses = non_maximum_suppression(
+        candidate_human_poses,
+        parameters
+            .pose_detection_parameters
+            .maximum_intersection_over_union,
+    );
+    let non_maximum_suppression_duration = non_maximum_suppression_start.elapsed();
+
+    Ok(TimedYoloDetections {
+        detections: YoloDetections { objects, poses },
+        post_processing_duration,
+        non_maximum_suppression_duration,
+    })
+}
+
+fn check_image(image: &Nv12Image) -> Result<()> {
     if !image.width.is_multiple_of(32) || !image.height.is_multiple_of(32) {
         bail!(
             "image dimensions must be multiples of 32 (got {}x{})",
@@ -183,6 +251,8 @@ fn check_image(image: &Image) -> Result<()> {
             image.height
         );
     }
+
+    image.expected_data_len()?;
 
     Ok(())
 }

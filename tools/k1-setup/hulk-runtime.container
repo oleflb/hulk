@@ -5,6 +5,7 @@ Description=HULK Runtime Environment
 ContainerName=hulk
 Image=hulk-runtime:latest
 Network=host
+ShmSize=512m
 AddDevice=nvidia.com/gpu=all
 AddDevice=/dev/snd
 RunInit=true

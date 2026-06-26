@@ -8,6 +8,10 @@ homepage.workspace = true
 [package.metadata.pepsi]
 cross-compile = true
 
+[features]
+default = []
+orin-vision = ["dep:orin_vision_node", "orin_vision_node/orin-gst-cuda"]
+
 [dependencies]
 active_vision = { workspace = true }
 ball_filter = { workspace = true }
@@ -20,6 +24,7 @@ camera_matrix_calculator = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
 detection = { workspace = true, features = ["ort-dynamic"] }
+encoded_frame_decoder_node = { workspace = true }
 fake_odometry = { workspace = true }
 fall_down_state_receiver = { workspace = true }
 field_border_detection = { workspace = true }
@@ -45,6 +50,7 @@ microphone_recorder = { workspace = true }
 motor_commands_collector = { workspace = true }
 obstacle_filter = { workspace = true }
 odometer_bridge = { workspace = true }
+orin_vision_node = { workspace = true, optional = true }
 player_state_receiver = { workspace = true }
 primary_state_filter = { workspace = true }
 robot_mode_handler = { workspace = true }

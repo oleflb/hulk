@@ -1,19 +1,24 @@
+use camera_driver_sys as sys;
+use color_eyre::eyre::{Result, bail, ensure};
+
 use super::eeprom::{CameraCalibration, StereoCalibration};
+
+pub type GdcBin = sys::GdcBin;
 
 /// Fixed-size 3x3 matrix used for rectification math.
 type Matrix3 = [[f64; 3]; 3];
 
 /// Shared rectified camera intrinsics used by both output views.
 #[derive(Copy, Clone, Debug)]
-struct RectifiedIntrinsics {
+pub struct RectifiedIntrinsics {
     /// Horizontal focal length in pixels.
-    fx: f64,
+    pub fx: f64,
     /// Vertical focal length in pixels.
-    fy: f64,
+    pub fy: f64,
     /// Horizontal principal point in pixels.
-    cx: f64,
+    pub cx: f64,
     /// Vertical principal point in pixels.
-    cy: f64,
+    pub cy: f64,
 }
 
 /// Generates left and right hardware GDC bins from EEPROM stereo calibration.
@@ -23,32 +28,14 @@ pub fn generate_rectified_gdc_bins(
     raw_height: u32,
     out_width: u32,
     out_height: u32,
-) -> Result<(GdcBin, GdcBin), String> {
-    if calib.cal_rotation_deg != 90 {
-        return Err(format!(
-            "only SC132GS 90 degree calibration rotation is supported, got {}",
-            calib.cal_rotation_deg
-        ));
-    }
+) -> Result<(GdcBin, GdcBin)> {
+    let rect_k = rectified_intrinsics(calib, raw_width, raw_height, out_width, out_height)?;
     let landscape_width = raw_height;
     let landscape_height = raw_width;
-    if out_width != landscape_width || out_height != landscape_height {
-        return Err(format!(
-            "strict GDC map currently requires full rotated output {}x{}, got {}x{}",
-            landscape_width, landscape_height, out_width, out_height
-        ));
-    }
-
     let sx = landscape_width as f64 / calib.width as f64;
     let sy = landscape_height as f64 / calib.height as f64;
     let left_k = scale_camera(&calib.left, sx, sy);
     let right_k = scale_camera(&calib.right, sx, sy);
-    let rect_k = RectifiedIntrinsics {
-        fx: (left_k.fx + right_k.fx) * 0.5,
-        fy: (left_k.fy + right_k.fy) * 0.5,
-        cx: (left_k.cx + right_k.cx) * 0.5,
-        cy: (left_k.cy + right_k.cy) * 0.5,
-    };
 
     let (left_from_rect, right_from_rect) = rectification_rotations(calib)?;
     let mut left_points = generate_camera_map(
@@ -89,6 +76,44 @@ pub fn generate_rectified_gdc_bins(
     Ok((left, right))
 }
 
+/// Computes the shared rectified intrinsics used by the generated GDC maps.
+pub fn rectified_intrinsics(
+    calib: &StereoCalibration,
+    raw_width: u32,
+    raw_height: u32,
+    out_width: u32,
+    out_height: u32,
+) -> Result<RectifiedIntrinsics> {
+    if calib.cal_rotation_deg != 90 {
+        bail!(
+            "only SC132GS 90 degree calibration rotation is supported, got {}",
+            calib.cal_rotation_deg
+        );
+    }
+    let landscape_width = raw_height;
+    let landscape_height = raw_width;
+    if out_width != landscape_width || out_height != landscape_height {
+        bail!(
+            "strict GDC map currently requires full rotated output {}x{}, got {}x{}",
+            landscape_width,
+            landscape_height,
+            out_width,
+            out_height
+        );
+    }
+
+    let sx = landscape_width as f64 / calib.width as f64;
+    let sy = landscape_height as f64 / calib.height as f64;
+    let left_k = scale_camera(&calib.left, sx, sy);
+    let right_k = scale_camera(&calib.right, sx, sy);
+    Ok(RectifiedIntrinsics {
+        fx: (left_k.fx + right_k.fx) * 0.5,
+        fy: (left_k.fy + right_k.fy) * 0.5,
+        cx: (left_k.cx + right_k.cx) * 0.5,
+        cy: (left_k.cy + right_k.cy) * 0.5,
+    })
+}
+
 /// Scales camera intrinsics from calibration size to target landscape size.
 fn scale_camera(cam: &CameraCalibration, sx: f64, sy: f64) -> CameraCalibration {
     CameraCalibration {
@@ -101,7 +126,7 @@ fn scale_camera(cam: &CameraCalibration, sx: f64, sy: f64) -> CameraCalibration 
 }
 
 /// Computes camera-from-rectified rotations for left and right cameras.
-fn rectification_rotations(calib: &StereoCalibration) -> Result<(Matrix3, Matrix3), String> {
+fn rectification_rotations(calib: &StereoCalibration) -> Result<(Matrix3, Matrix3)> {
     let r = mat_from_row_major(calib.rotation);
     let t = calib.translation;
     let x_axis = normalize([-t[0], -t[1], -t[2]])?;
@@ -132,7 +157,7 @@ fn generate_camera_map(
     raw_height: u32,
     out_width: u32,
     out_height: u32,
-) -> Vec<super::ffi::point_t> {
+) -> Vec<sys::Point> {
     let mut points = Vec::with_capacity(out_width as usize * out_height as usize);
     for y in 0..out_height {
         for x in 0..out_width {
@@ -148,7 +173,7 @@ fn generate_camera_map(
             let portrait_x = landscape_y.clamp(0.0, raw_width.saturating_sub(1) as f64);
             let portrait_y = (raw_height.saturating_sub(1) as f64 - landscape_x)
                 .clamp(0.0, raw_height.saturating_sub(1) as f64);
-            points.push(super::ffi::point_t {
+            points.push(sys::Point {
                 x: portrait_x,
                 y: portrait_y,
             });
@@ -233,115 +258,47 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
 }
 
 /// Normalizes a finite nonzero 3D vector.
-fn normalize(v: [f64; 3]) -> Result<[f64; 3], String> {
+fn normalize(v: [f64; 3]) -> Result<[f64; 3]> {
     let n = dot(v, v).sqrt();
-    if n <= f64::EPSILON || !n.is_finite() {
-        return Err(format!("cannot normalize vector {v:?}"));
-    }
+    ensure!(
+        n > f64::EPSILON && n.is_finite(),
+        "cannot normalize vector {v:?}"
+    );
     Ok([v[0] / n, v[1] / n, v[2] / n])
-}
-
-/// hbmem-backed GDC binary buffer passed to the hardware GDC node.
-#[cfg(x5cam_x5_target)]
-pub struct GdcBin {
-    /// Common hbmem buffer containing the generated GDC binary.
-    pub buf: super::ffi::hb_mem_common_buf_t,
-}
-
-impl Drop for GdcBin {
-    /// Frees the hbmem buffer allocated for the GDC binary.
-    fn drop(&mut self) {
-        if self.buf.fd >= 0 {
-            unsafe {
-                super::ffi::hb_mem_free_buf(self.buf.fd);
-            }
-            self.buf.fd = -1;
-        }
-    }
 }
 
 /// Calls the SDK GDC generator and copies the result into hbmem.
 fn generate_gdc_bin(
-    points: &mut [super::ffi::point_t],
+    points: &mut [sys::Point],
     raw_width: u32,
     raw_height: u32,
     out_width: u32,
     out_height: u32,
-) -> Result<GdcBin, String> {
-    use std::{mem, ptr};
+) -> Result<GdcBin> {
+    ensure!(
+        points.len() == out_width as usize * out_height as usize,
+        "GDC point count mismatch: got {}, expected {}",
+        points.len(),
+        out_width as usize * out_height as usize
+    );
 
-    if points.len() != out_width as usize * out_height as usize {
-        return Err(format!(
-            "GDC point count mismatch: got {}, expected {}",
-            points.len(),
-            out_width as usize * out_height as usize
-        ));
-    }
-
-    unsafe {
-        let mut param: super::ffi::param_t = mem::zeroed();
-        param.format = super::ffi::frame_format_FMT_SEMIPLANAR_420;
-        param.in_.w = raw_width;
-        param.in_.h = raw_height;
-        param.out.w = out_width;
-        param.out.h = out_height;
-        param.diameter = raw_height as i32;
-        param.fov = 180.0;
-
-        let mut window: super::ffi::window_t = mem::zeroed();
-        window.out_r.x = 0;
-        window.out_r.y = 0;
-        window.out_r.w = out_width as i32;
-        window.out_r.h = out_height as i32;
-        window.transform = super::ffi::gdc_transformation_CUSTOM;
-        window.input_roi_r.x = 0;
-        window.input_roi_r.y = 0;
-        window.input_roi_r.w = raw_width as i32;
-        window.input_roi_r.h = raw_height as i32;
-        window.strength = 1.0;
-        window.strengthY = 1.0;
-        window.zoom = 1.0;
-        window.keep_ratio = 1;
-        window.FOV_h = 90.0;
-        window.FOV_w = 90.0;
-        window.trapezoid_left_angle = 90.0;
-        window.trapezoid_right_angle = 90.0;
-        window.custom.full_tile_calc = 1;
-        window.custom.tile_incr_x = 50;
-        window.custom.tile_incr_y = 50;
-        window.custom.w = out_width as i32 - 1;
-        window.custom.h = out_height as i32 - 1;
-        window.custom.centerx = out_width as f64 / 2.0 - 1.0;
-        window.custom.centery = out_height as f64 / 2.0 - 1.0;
-        window.custom.points = points.as_mut_ptr();
-
-        let mut raw_buf: *mut u32 = ptr::null_mut();
-        let mut raw_size = 0u64;
-        let ret = super::ffi::hbn_gen_gdc_bin(&param, &window, 1, &mut raw_buf, &mut raw_size);
-        if ret != 0 || raw_buf.is_null() || raw_size == 0 {
-            return Err(format!("hbn_gen_gdc_bin failed ret={ret} size={raw_size}"));
-        }
-
-        let mut bin_buf: super::ffi::hb_mem_common_buf_t = mem::zeroed();
-        let flags = super::ffi::mem_usage_t_HB_MEM_USAGE_MAP_INITIALIZED
-            | super::ffi::mem_usage_t_HB_MEM_USAGE_PRIV_HEAP_2_RESERVED
-            | super::ffi::mem_usage_t_HB_MEM_USAGE_CPU_READ_OFTEN
-            | super::ffi::mem_usage_t_HB_MEM_USAGE_CPU_WRITE_OFTEN
-            | super::ffi::mem_usage_t_HB_MEM_USAGE_CACHED;
-        let ret = super::ffi::hb_mem_alloc_com_buf(raw_size, flags as i64, &mut bin_buf);
-        if ret != 0 || bin_buf.virt_addr.is_null() {
-            super::ffi::hbn_free_gdc_bin(raw_buf);
-            return Err(format!("hb_mem_alloc_com_buf for GDC bin failed ret={ret}"));
-        }
-
-        ptr::copy_nonoverlapping(raw_buf.cast::<u8>(), bin_buf.virt_addr, raw_size as usize);
-        super::ffi::hbn_free_gdc_bin(raw_buf);
-        let ret = super::ffi::hb_mem_flush_buf(bin_buf.fd, 0, raw_size);
-        if ret != 0 {
-            super::ffi::hb_mem_free_buf(bin_buf.fd);
-            return Err(format!("hb_mem_flush_buf for GDC bin failed ret={ret}"));
-        }
-
-        Ok(GdcBin { buf: bin_buf })
-    }
+    let config = sys::GdcGenerationConfig {
+        frame_format: sys::GdcFrameFormat::Semiplanar420,
+        input_size: sys::ImageSize::new(raw_width, raw_height),
+        output_size: sys::ImageSize::new(out_width, out_height),
+        diameter: raw_height as i32,
+        field_of_view: 180.0,
+        transformation: sys::GdcTransformation::Custom,
+        strength: 1.0,
+        strength_y: 1.0,
+        zoom: 1.0,
+        keep_ratio: true,
+        horizontal_field_of_view: 90.0,
+        vertical_field_of_view: 90.0,
+        trapezoid_left_angle: 90.0,
+        trapezoid_right_angle: 90.0,
+        tile_increment_x: 50,
+        tile_increment_y: 50,
+    };
+    Ok(sys::GdcBin::generate_custom(points, config)?)
 }

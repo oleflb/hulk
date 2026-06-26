@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 
+use color_eyre::eyre::{Result, WrapErr, bail, ensure};
+
 /// Fixed SC132GS EEPROM I2C address.
 const EEPROM_I2C_ADDR: u16 = 0x50;
 /// Offset of the SC132GS calibration validity flag.
@@ -81,7 +83,7 @@ impl StereoCalibration {
 }
 
 /// Reads SC132GS stereo calibration from the selected camera I2C buses.
-pub fn read_sc132gs_calibration<I>(buses: I) -> Result<StereoCalibration, String>
+pub fn read_sc132gs_calibration<I>(buses: I) -> Result<StereoCalibration>
 where
     I: IntoIterator<Item = u32>,
 {
@@ -89,22 +91,22 @@ where
     for bus in buses {
         match read_sc132gs_calibration_on_bus(bus) {
             Ok(calib) => return Ok(calib),
-            Err(err) => errors.push(format!("i2c-{bus}: {err}")),
+            Err(err) => errors.push(format!("i2c-{bus}: {err:#}")),
         }
     }
-    Err(format!(
+    bail!(
         "SC132GS calibration EEPROM not found at 0x50 on selected camera buses ({})",
         errors.join("; ")
-    ))
+    )
 }
 
 /// Reads and parses SC132GS calibration from one I2C bus.
-fn read_sc132gs_calibration_on_bus(bus: u32) -> Result<StereoCalibration, String> {
+fn read_sc132gs_calibration_on_bus(bus: u32) -> Result<StereoCalibration> {
     let eeprom = Eeprom::open(bus)?;
     let mut flag = [0u8; 8];
     eeprom.read_at(SC132GS_FLAG_OFFSET, &mut flag)?;
     if flag[0] != 0x01 || !flag[1..].starts_with(b"SC") {
-        return Err(format!("unexpected EEPROM flag {:?}", flag));
+        bail!("unexpected EEPROM flag {:?}", flag);
     }
 
     let mut raw = [0u8; SC132GS_CALIB_SIZE];
@@ -113,7 +115,7 @@ fn read_sc132gs_calibration_on_bus(bus: u32) -> Result<StereoCalibration, String
 }
 
 /// Parses and normalizes the packed SC132GS EEPROM calibration block.
-fn parse_sc132gs_calibration(raw: &[u8; SC132GS_CALIB_SIZE]) -> Result<StereoCalibration, String> {
+fn parse_sc132gs_calibration(raw: &[u8; SC132GS_CALIB_SIZE]) -> Result<StereoCalibration> {
     let mut rd = F64Reader { raw, offset: 0 };
 
     let fxl = rd.next();
@@ -168,7 +170,7 @@ fn parse_sc132gs_calibration(raw: &[u8; SC132GS_CALIB_SIZE]) -> Result<StereoCal
     };
 
     if !(100.0..=5000.0).contains(&fxl) || !(100.0..=5000.0).contains(&fxr) {
-        return Err(format!("invalid focal lengths fxl={fxl:.3} fxr={fxr:.3}"));
+        bail!("invalid focal lengths fxl={fxl:.3} fxr={fxr:.3}");
     }
 
     let mut left = CameraCalibration {
@@ -201,9 +203,10 @@ fn parse_sc132gs_calibration(raw: &[u8; SC132GS_CALIB_SIZE]) -> Result<StereoCal
         [tx, ty, tz]
     };
 
-    if !translation.iter().all(|v| v.is_finite()) || translation[0] == 0.0 {
-        return Err(format!("invalid translation vector {translation:?}"));
-    }
+    ensure!(
+        translation.iter().all(|v| v.is_finite()) && translation[0] != 0.0,
+        "invalid translation vector {translation:?}"
+    );
 
     Ok(StereoCalibration {
         width,
@@ -245,21 +248,23 @@ struct Eeprom {
 
 impl Eeprom {
     /// Opens `/dev/i2c-{bus}` for combined offset-write/read transfers.
-    fn open(bus: u32) -> Result<Self, String> {
+    fn open(bus: u32) -> Result<Self> {
         let path = format!("/dev/i2c-{bus}");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|err| format!("open {path}: {err}"))?;
+            .wrap_err_with(|| format!("open {path}"))?;
         Ok(Self { bus, file })
     }
 
     /// Reads bytes from a 16-bit EEPROM offset without programming the EEPROM.
-    fn read_at(&self, offset: u16, out: &mut [u8]) -> Result<(), String> {
-        if out.len() > u16::MAX as usize {
-            return Err(format!("read too large: {} bytes", out.len()));
-        }
+    fn read_at(&self, offset: u16, out: &mut [u8]) -> Result<()> {
+        ensure!(
+            out.len() <= u16::MAX as usize,
+            "read too large: {} bytes",
+            out.len()
+        );
 
         let mut addr_buf = [(offset >> 8) as u8, (offset & 0xff) as u8];
         let mut msgs = [
@@ -283,12 +288,12 @@ impl Eeprom {
 
         let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), I2C_RDWR, &mut data) };
         if rc < 0 {
-            return Err(format!(
+            bail!(
                 "read EEPROM bus={} offset=0x{offset:04x} len={}: {}",
                 self.bus,
                 out.len(),
                 io::Error::last_os_error()
-            ));
+            );
         }
         Ok(())
     }

@@ -2,5 +2,5 @@ FROM docker.io/dustynv/onnxruntime:1.22-r36.4.0-cu128-24.04
 
 
 RUN apt-get update && \
-    apt-get install -y curl clang libssl-dev pkg-config libasound2-dev && \
+    apt-get install -y curl clang ffmpeg gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-tools libssl-dev pkg-config libasound2-dev && \
     rm -rf /var/lib/apt/lists/*

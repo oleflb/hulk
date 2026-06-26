@@ -26,9 +26,13 @@ RUN dpkg --add-architecture arm64 && \
         gcc \
         gcc-aarch64-linux-gnu \
         git \
+        gnupg \
         libc6-dev-arm64-cross \
         libasound2-dev:arm64 \
         libclang-dev \
+        libglib2.0-dev:arm64 \
+        libgstreamer1.0-dev:arm64 \
+        libgstreamer-plugins-base1.0-dev:arm64 \
         libssl-dev \
         libssl-dev:arm64 \
         libstdc++-11-dev-arm64-cross \
@@ -43,6 +47,22 @@ RUN dpkg --add-architecture arm64 && \
         /usr/share/lintian/* \
         /usr/share/locale/* \
         /usr/share/man/*
+
+ARG JETSON_L4T_RELEASE=r36.4
+RUN curl -fsSL https://repo.download.nvidia.com/jetson/jetson-ota-public.asc \
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-jetson.gpg && \
+    { \
+        echo "deb [arch=arm64 signed-by=/usr/share/keyrings/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/common ${JETSON_L4T_RELEASE} main"; \
+        echo "deb [arch=arm64 signed-by=/usr/share/keyrings/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/t234 ${JETSON_L4T_RELEASE} main"; \
+    } > /etc/apt/sources.list.d/nvidia-jetson.list && \
+    apt-get update && \
+    mkdir -p /tmp/jetson-l4t && \
+    cd /tmp/jetson-l4t && \
+    apt-get download \
+        nvidia-l4t-jetson-multimedia-api:arm64 \
+        nvidia-l4t-multimedia:arm64 && \
+    for package in *.deb; do dpkg-deb -x "${package}" /; done && \
+    rm -rf /tmp/jetson-l4t /var/lib/apt/lists/*
 
 ENV PKG_CONFIG=/usr/bin/pkg-config
 ENV PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu="/"
@@ -73,6 +93,7 @@ ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="\
     --sysroot=/ \
     -I/usr/include \
     -I/usr/include/aarch64-linux-gnu \
+    -I/usr/src/jetson_multimedia_api/include \
     -I/usr/aarch64-linux-gnu/include"
 
 ENV MOLD_VERSION=2.40.4

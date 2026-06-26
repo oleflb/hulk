@@ -1,0 +1,13 @@
+[package]
+name = "camera_driver_sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }

@@ -21,9 +21,12 @@ num-traits = { workspace = true }
 ordered-float = { workspace = true }
 path_serde = { workspace = true }
 ros-z = { workspace = true }
+ros-z-cdr = { workspace = true }
 ros2 = { workspace = true }
 serde = { workspace = true }
 splines = { workspace = true }
+zenoh = { workspace = true }
+zenoh-buffers = { workspace = true }
 
 [dev-dependencies]
 ros-z-schema = { workspace = true }

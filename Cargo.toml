@@ -9,10 +9,12 @@ members = [
   "crates/booster",
   "crates/buffered_watch",
   "crates/calibration",
+  "crates/camera_driver_sys",
   "crates/code_generation",
   "crates/communication",
   "crates/context_attribute",
   "crates/coordinate_systems",
+  "crates/encoded_frame_decoder",
   "crates/egui_bevy",
   "crates/energy_optimization",
   "crates/filtering",
@@ -46,6 +48,7 @@ members = [
   "crates/nodes/camera_driver",
   "crates/nodes/camera_matrix_calculator",
   "crates/nodes/detection",
+  "crates/nodes/encoded_frame_decoder",
   "crates/nodes/fake_odometry",
   "crates/nodes/fall_down_state_receiver",
   "crates/nodes/field_border_detection",
@@ -71,6 +74,7 @@ members = [
   "crates/nodes/motor_commands_collector",
   "crates/nodes/obstacle_filter",
   "crates/nodes/odometer_bridge",
+  "crates/nodes/orin_vision",
   "crates/nodes/player_state_receiver",
   "crates/nodes/primary_state_filter",
   "crates/nodes/robot_mode_handler",
@@ -177,6 +181,7 @@ byteorder = "1.5.0"
 bytes = { version = "1.11.0", features = ["serde"] }
 calibration = { path = "crates/calibration" }
 camera_matrix_calculator = { path = "crates/nodes/camera_matrix_calculator" }
+camera_driver_sys = { path = "crates/camera_driver_sys" }
 cdr = "0.2.4"
 chrono = "0.4.39"
 clap = { version = "4.5.29", features = ["derive", "env"] }
@@ -188,6 +193,12 @@ context_attribute = { path = "crates/context_attribute" }
 convert_case = "0.7.1"
 coordinate_systems = { path = "crates/coordinate_systems" }
 ctrlc = { version = "3.4.5", features = ["termination"] }
+cudarc = { version = "0.19.8", default-features = false, features = [
+  "cuda-12080",
+  "driver",
+  "dynamic-loading",
+  "std",
+] }
 derive_more = { version = "2.0.1", features = [
   "add",
   "add_assign",
@@ -205,6 +216,8 @@ egui_plot = "0.34.0"
 energy_optimization = { path = "crates/energy_optimization" }
 enum-iterator = "2.1.0"
 enum_dispatch = "0.3.13"
+encoded_frame_decoder = { path = "crates/encoded_frame_decoder" }
+encoded_frame_decoder_node = { path = "crates/nodes/encoded_frame_decoder" }
 env_logger = "0.11.8"
 event-listener = "5"
 fake_odometry = { path = "crates/nodes/fake_odometry" }
@@ -222,6 +235,10 @@ gilrs = "0.11.0"
 glob = "0.3.2"
 global_parameter_provider = { path = "crates/nodes/global_parameter_provider" }
 ground_provider = { path = "crates/nodes/ground_provider" }
+gstreamer = "0.25.2"
+gstreamer-allocators = "0.25.2"
+gstreamer-app = "0.25.2"
+gstreamer-video = "0.25.2"
 hardware = { path = "crates/hardware" }
 head_motion = { path = "crates/nodes/head_motion" }
 hex = "0.4"
@@ -248,6 +265,7 @@ lazy_static = "1.5.0"
 led_handler = { path = "crates/nodes/led_handler" }
 levenberg-marquardt = "0.15.0"
 libc = "0.2.169"
+libloading = "0.9.0"
 line_detection = { path = "crates/nodes/line_detection" }
 linear_algebra = { path = "crates/linear_algebra" }
 localization = { path = "crates/nodes/localization" }
@@ -283,6 +301,7 @@ openvino = { version = "0.8.0", features = ["runtime-linking"] }
 opn = { path = "crates/opn" }
 optimization_engine = "0.9.1"
 ordered-float = "4.6.0"
+orin_vision_node = { path = "crates/nodes/orin_vision" }
 ort = "=2.0.0-rc.10"
 parameters = { path = "crates/parameters" }
 parking_lot = "0.12.3"

@@ -1,0 +1,27 @@
+[package]
+name = "orin_vision_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+color-eyre = { workspace = true }
+cudarc = { workspace = true, optional = true }
+detection = { workspace = true, optional = true }
+encoded_frame_decoder = { workspace = true }
+ort = { workspace = true, optional = true, features = ["cuda", "tensorrt"] }
+ros-z = { workspace = true }
+ros-z-streams = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+types = { workspace = true }
+
+[features]
+default = []
+orin-gst-cuda = [
+    "dep:cudarc",
+    "dep:detection",
+    "dep:ort",
+    "dep:ros-z-streams",
+    "encoded_frame_decoder/orin-gst-cuda",
+]

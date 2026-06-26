@@ -1,28 +1,36 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use camera_driver_sys as sys;
+use camera_driver_sys::{
+    CodecId, EncoderConfig, FrameRate, GopPreset, HevcCbrConfig, ImageSize, Mirror, PixelFormat,
+    PresentationTimestampUs, Rotation, SensorMode, SensorModule,
+};
+use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 
 use super::{
-    codec,
     config::Config,
-    eeprom,
-    events::{CalibrationInfo, CameraError, CameraInfo, Channel, EncodedFrame, Event},
+    eeprom::{self, StereoCalibration},
+    events::{CalibrationInfo, CameraError, CameraSetup, Channel, EncodedFrame, Event},
     gdc, sensor, vio,
 };
 
-/// X5 camera backend with two VIO pipelines and encoders.
+const EVENT_QUEUE_CAPACITY: usize = 4;
+const ENCODER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// X5 camera backend with two VIO pipelines and HEVC encoders.
 pub struct X5Camera {
     /// Receiver for setup, payload, and error events.
-    rx: mpsc::Receiver<Event>,
+    rx: Option<mpsc::Receiver<Event>>,
     /// Shared stop flag observed by both worker threads.
     running: Arc<AtomicBool>,
     /// Worker thread join handles.
     workers: Vec<Worker>,
-    /// GDC config buffers kept alive while the pipelines run.
-    _gdc_bins: [gdc::GdcBin; 2],
     /// Global hbmem module handle kept open for SDK allocations.
-    _hbmem: HbMemModule,
+    _hbmem: sys::MemoryModule,
 }
 
 impl X5Camera {
@@ -31,49 +39,52 @@ impl X5Camera {
         "x5-real"
     }
 
-    /// Opens sensors, calibration, GDC, VIO, and H.265 encoder resources.
-    pub fn open(config: &Config) -> Result<Self, String> {
-        let left_sensor = sensor::prepare_sc132gs_host(config.left_host)?;
-        let right_sensor = sensor::prepare_sc132gs_host(config.right_host)?;
-        let hbmem = HbMemModule::open()?;
+    /// Opens sensors, calibration, GDC, VIO, and HEVC encoder resources.
+    pub fn open(config: &Config) -> Result<Self> {
+        config.validate()?;
+
+        let left_sensor =
+            sensor::prepare_sc132gs_host(config.left_host).wrap_err("prepare left SC132GS host")?;
+        let right_sensor = sensor::prepare_sc132gs_host(config.right_host)
+            .wrap_err("prepare right SC132GS host")?;
+        let hbmem = sys::MemoryModule::open()?;
         let calibration =
-            eeprom::read_sc132gs_calibration([left_sensor.i2c_bus, right_sensor.i2c_bus])?;
+            eeprom::read_sc132gs_calibration([left_sensor.i2c_bus, right_sensor.i2c_bus])
+                .wrap_err("read SC132GS stereo calibration")?;
         let (gdc_left, gdc_right) = gdc::generate_rectified_gdc_bins(
             &calibration,
             config.raw_width,
             config.raw_height,
             config.out_width,
             config.out_height,
-        )?;
-        let pipe_left = vio::VioPipeline::create(config, &left_sensor, &gdc_left)?;
-        let pipe_right = vio::VioPipeline::create(config, &right_sensor, &gdc_right)?;
-        let encoder_left = codec::H265Encoder::create(config)?;
-        let encoder_right = codec::H265Encoder::create(config)?;
+        )
+        .wrap_err("generate rectified GDC maps")?;
+        let mut pipe_left = vio::VioPipeline::create(config, &left_sensor, gdc_left)
+            .wrap_err("create left VIO pipeline")?;
+        let mut pipe_right = vio::VioPipeline::create(config, &right_sensor, gdc_right)
+            .wrap_err("create right VIO pipeline")?;
+        let encoder_left = create_hevc_encoder(config).wrap_err("create left HEVC encoder")?;
+        let encoder_right = create_hevc_encoder(config).wrap_err("create right HEVC encoder")?;
+        pipe_left.start().wrap_err("start left VIO pipeline")?;
+        pipe_right.start().wrap_err("start right VIO pipeline")?;
 
-        let (tx, rx) = mpsc::channel();
-        tx.send(Event::Calibration(CalibrationInfo {
-            raw_width: config.raw_width,
-            raw_height: config.raw_height,
-            rect_width: config.out_width,
-            rect_height: config.out_height,
-            distortion_model: calibration.distortion_model.to_string(),
-            baseline_m: calibration.baseline_m(),
-        }))
-        .map_err(|err| format!("queue calibration event: {err}"))?;
-        tx.send(Event::CameraInfo(camera_info(
+        let (tx, rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        tx.send(Event::Calibration(calibration_info(config, &calibration)?))
+            .map_err(|err| eyre!("queue calibration event: {err}"))?;
+        tx.send(Event::CameraSetup(camera_setup(
             Channel::Left,
             &left_sensor,
             config,
-            encoder_left.external_input(),
+            encoder_left.external_frame_input(),
         )))
-        .map_err(|err| format!("queue left camera event: {err}"))?;
-        tx.send(Event::CameraInfo(camera_info(
+        .map_err(|err| eyre!("queue left camera setup event: {err}"))?;
+        tx.send(Event::CameraSetup(camera_setup(
             Channel::Right,
             &right_sensor,
             config,
-            encoder_right.external_input(),
+            encoder_right.external_frame_input(),
         )))
-        .map_err(|err| format!("queue right camera event: {err}"))?;
+        .map_err(|err| eyre!("queue right camera setup event: {err}"))?;
 
         let running = Arc::new(AtomicBool::new(true));
         let workers = vec![
@@ -96,21 +107,24 @@ impl X5Camera {
         ];
 
         Ok(Self {
-            rx,
+            rx: Some(rx),
             running,
             workers,
-            _gdc_bins: [gdc_left, gdc_right],
             _hbmem: hbmem,
         })
     }
 
     /// Receives the next backend event within `timeout`.
-    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>, String> {
-        match self.rx.recv_timeout(timeout) {
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        let rx = self
+            .rx
+            .as_ref()
+            .ok_or_else(|| eyre!("camera event receiver is stopped"))?;
+        match rx.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("camera workers stopped and event channel disconnected".to_string())
+                bail!("camera workers stopped and event channel disconnected")
             }
         }
     }
@@ -118,6 +132,7 @@ impl X5Camera {
     /// Requests worker shutdown and joins both worker threads.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        drop(self.rx.take());
         for worker in &mut self.workers {
             if let Some(handle) = worker.handle.take() {
                 let _ = handle.join();
@@ -139,120 +154,194 @@ struct Worker {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+struct PendingFrameMetadata {
+    frame_id: u32,
+    timestamp_ns: u64,
+    trigger_timestamp_ns: Option<u64>,
+    pts_us: u64,
+}
+
 /// Starts one capture/encode worker for a stereo channel.
 fn spawn_worker(
     channel: Channel,
     config: Config,
     pipe: vio::VioPipeline,
-    encoder: codec::H265Encoder,
-    tx: mpsc::Sender<Event>,
+    encoder: sys::MediaEncoder,
+    tx: mpsc::SyncSender<Event>,
     running: Arc<AtomicBool>,
 ) -> Worker {
     let handle = thread::spawn(move || {
         let mut pipe = pipe;
         let mut encoder = encoder;
-        let (output_releaser, output_releases) = codec::encoded_output_release_channel();
-        let mut outstanding_outputs = 0usize;
-
-        if let Err(err) = pipe.start() {
-            send_error(&tx, channel, format!("start VIO pipeline: {err}"));
-            return;
-        }
 
         let mut pts_index = 0u64;
+        let mut pending_metadata = VecDeque::new();
         while running.load(Ordering::SeqCst) {
-            if let Err(err) =
-                release_pending_outputs(&mut encoder, &output_releases, &mut outstanding_outputs)
-            {
-                send_error(&tx, channel, format!("release H.265 output: {err}"));
+            if let Err(err) = encoder.release_pending_outputs() {
+                send_error(&tx, channel, format!("release HEVC output: {err:#}"));
                 break;
             }
+            encoder.release_pending_inputs();
 
             let lease = match pipe.get_frame(1_000) {
                 Ok(lease) => lease,
                 Err(err) => {
                     if running.load(Ordering::SeqCst) {
-                        send_error(&tx, channel, format!("get VSE frame: {err}"));
+                        send_error(&tx, channel, format!("get VSE frame: {err:#}"));
                     }
                     break;
                 }
             };
 
             let frame_id = lease.frame_id();
-            let timestamp_ns = lease.timestamp_ns();
+            let trigger_timestamp_ns = lease.trigger_timestamp_ns();
+            let timestamp_ns = trigger_timestamp_ns.unwrap_or_else(|| lease.timestamp_ns());
             let pts_us = (pts_index * 1_000_000) / config.fps.max(1) as u64;
             pts_index = pts_index.wrapping_add(1);
+            let metadata = PendingFrameMetadata {
+                frame_id,
+                timestamp_ns,
+                trigger_timestamp_ns,
+                pts_us,
+            };
 
-            if let Err(err) = encoder.queue_external_frame(Box::new(lease), pts_us) {
-                send_error(&tx, channel, format!("queue H.265 input: {err}"));
+            if let Err(err) = encoder.queue_external_frame(lease, PresentationTimestampUs(pts_us)) {
+                send_error(&tx, channel, format!("queue HEVC input: {err:#}"));
                 break;
             }
+            pending_metadata.push_back(metadata);
 
-            match encoder.dequeue_output(2_000, output_releaser.clone()) {
+            match encoder.dequeue_output(2_000) {
                 Ok(Some(output)) => {
-                    outstanding_outputs += 1;
-                    let _ = tx.send(Event::EncodedFrame(EncodedFrame {
+                    let metadata = match take_pending_metadata(&mut pending_metadata, output.pts_us)
+                    {
+                        Ok(metadata) => metadata,
+                        Err(err) => {
+                            send_error(
+                                &tx,
+                                channel,
+                                format!("match HEVC output metadata: {err:#}"),
+                            );
+                            break;
+                        }
+                    };
+                    let event = Event::EncodedFrame(EncodedFrame {
                         channel,
-                        frame_id,
-                        timestamp_ns,
-                        data: output.data,
+                        frame_id: metadata.frame_id,
+                        timestamp_ns: metadata.timestamp_ns,
+                        trigger_timestamp_ns: metadata.trigger_timestamp_ns,
+                        width: config.out_width,
+                        height: config.out_height,
                         pts_us: output.pts_us,
-                    }));
-                    if let Err(err) = release_pending_outputs(
-                        &mut encoder,
-                        &output_releases,
-                        &mut outstanding_outputs,
-                    ) {
-                        send_error(&tx, channel, format!("release H.265 output: {err}"));
+                        data: output.data,
+                    });
+                    match tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                    if let Err(err) = encoder.release_pending_outputs() {
+                        send_error(&tx, channel, format!("release HEVC output: {err:#}"));
                         break;
                     }
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    send_error(&tx, channel, format!("dequeue H.265 output: {err}"));
+                    send_error(&tx, channel, format!("dequeue HEVC output: {err:#}"));
                     break;
                 }
             }
         }
 
-        wait_for_output_releases(
-            &tx,
-            channel,
-            &mut encoder,
-            &output_releases,
-            &mut outstanding_outputs,
-        );
+        wait_for_input_releases(&tx, channel, &mut encoder);
+        wait_for_output_releases(&tx, channel, &mut encoder);
+        if let Err(err) = encoder.shutdown(ENCODER_DRAIN_TIMEOUT) {
+            send_error(&tx, channel, format!("shutdown HEVC encoder: {err:#}"));
+        }
+        if let Err(err) = pipe.shutdown() {
+            send_error(&tx, channel, format!("shutdown VIO pipeline: {err:#}"));
+        }
     });
     Worker {
         handle: Some(handle),
     }
 }
 
-/// Releases dropped encoded-output leases without blocking the worker.
-fn release_pending_outputs(
-    encoder: &mut codec::H265Encoder,
-    releases: &codec::EncodedOutputReleases,
-    outstanding: &mut usize,
-) -> Result<(), String> {
-    let released = encoder.release_pending_outputs(releases)?;
-    *outstanding = outstanding.saturating_sub(released);
-    Ok(())
+fn take_pending_metadata(
+    pending: &mut VecDeque<PendingFrameMetadata>,
+    pts_us: u64,
+) -> Result<PendingFrameMetadata> {
+    let index = pending
+        .iter()
+        .position(|metadata| metadata.pts_us == pts_us)
+        .ok_or_else(|| eyre!("encoder output PTS {pts_us} has no queued frame metadata"))?;
+    if index > 0 {
+        pending.drain(..index);
+    }
+    pending
+        .pop_front()
+        .ok_or_else(|| eyre!("encoder output PTS {pts_us} metadata queue was empty"))
 }
 
 /// Waits for outstanding zero-copy payload leases before encoder teardown.
 fn wait_for_output_releases(
-    tx: &mpsc::Sender<Event>,
+    tx: &mpsc::SyncSender<Event>,
     channel: Channel,
-    encoder: &mut codec::H265Encoder,
-    releases: &codec::EncodedOutputReleases,
-    outstanding: &mut usize,
+    encoder: &mut sys::MediaEncoder,
 ) {
-    while *outstanding > 0 {
-        match encoder.wait_release_output(releases, Duration::from_millis(100)) {
-            Ok(true) => *outstanding -= 1,
+    let deadline = Instant::now() + ENCODER_DRAIN_TIMEOUT;
+    while encoder.pending_output_count() > 0 {
+        if Instant::now() >= deadline {
+            send_error(
+                tx,
+                channel,
+                format!(
+                    "timed out waiting for {} HEVC output release(s)",
+                    encoder.pending_output_count()
+                ),
+            );
+            break;
+        }
+        match encoder.wait_release_output(Duration::from_millis(100)) {
+            Ok(true) => {}
             Ok(false) => {}
             Err(err) => {
-                send_error(tx, channel, format!("wait for H.265 output release: {err}"));
+                send_error(
+                    tx,
+                    channel,
+                    format!("wait for HEVC output release: {err:#}"),
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Waits for queued VSE input leases to be consumed before VIO teardown.
+fn wait_for_input_releases(
+    tx: &mpsc::SyncSender<Event>,
+    channel: Channel,
+    encoder: &mut sys::MediaEncoder,
+) {
+    encoder.release_pending_inputs();
+    let deadline = Instant::now() + ENCODER_DRAIN_TIMEOUT;
+    while encoder.pending_input_count() > 0 {
+        if Instant::now() >= deadline {
+            send_error(
+                tx,
+                channel,
+                format!(
+                    "timed out waiting for {} HEVC input release(s)",
+                    encoder.pending_input_count()
+                ),
+            );
+            break;
+        }
+        match encoder.wait_input_consumed(Duration::from_millis(100)) {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(err) => {
+                send_error(tx, channel, format!("wait for HEVC input release: {err:#}"));
                 break;
             }
         }
@@ -260,51 +349,103 @@ fn wait_for_output_releases(
 }
 
 /// Builds a camera setup event for one prepared sensor.
-fn camera_info(
+fn camera_setup(
     channel: Channel,
     sensor: &sensor::SensorHost,
     config: &Config,
-    external_input: bool,
-) -> CameraInfo {
-    CameraInfo {
+    external_encoder_input: bool,
+) -> CameraSetup {
+    CameraSetup {
         channel,
         host: sensor.host,
-        sensor_name: "sc132gs-1280p".to_string(),
+        sensor: SensorModule::Sc132gs,
+        sensor_mode: SensorMode::Slave,
+        lpwm_enabled: true,
         raw_width: config.raw_width,
         raw_height: config.raw_height,
         out_width: config.out_width,
         out_height: config.out_height,
         fps: config.fps,
         gdc_enabled: true,
-        h265_enabled: true,
-        external_input,
+        hevc_enabled: true,
+        external_encoder_input,
     }
 }
 
-/// Best-effort error event sender used from worker threads.
-fn send_error(tx: &mpsc::Sender<Event>, channel: Channel, message: String) {
+/// Builds ROS-compatible camera-info messages from EEPROM calibration.
+fn calibration_info(config: &Config, calibration: &StereoCalibration) -> Result<CalibrationInfo> {
+    let rectified = gdc::rectified_intrinsics(
+        calibration,
+        config.raw_width,
+        config.raw_height,
+        config.out_width,
+        config.out_height,
+    )?;
+    Ok(CalibrationInfo {
+        raw_width: calibration.width,
+        raw_height: calibration.height,
+        rect_width: config.out_width,
+        rect_height: config.out_height,
+        distortion_model: calibration.distortion_model.to_string(),
+        raw_left_intrinsics: [
+            calibration.left.fx,
+            calibration.left.fy,
+            calibration.left.cx,
+            calibration.left.cy,
+        ],
+        raw_left_distortion: calibration.left.distortion,
+        baseline_m: calibration.baseline_m(),
+        rect_fx: rectified.fx,
+        rect_fy: rectified.fy,
+        rect_cx: rectified.cx,
+        rect_cy: rectified.cy,
+    })
+}
+
+fn create_hevc_encoder(config: &Config) -> Result<sys::MediaEncoder> {
+    let size = ImageSize::new(config.out_width, config.out_height);
+    let frame_rate = FrameRate::new(config.fps)?;
+    let encoder_config = EncoderConfig {
+        codec: CodecId::Hevc,
+        size,
+        pixel_format: PixelFormat::Nv12,
+        external_frame_input: true,
+        frame_buffer_count: 5,
+        bitstream_buffer_count: 8,
+        bitstream_buffer_size: align_up((2 * 1024 * 1024).max(size.width * size.height * 3), 1024),
+        gop_preset: GopPreset::SingleReferenceIppp,
+        rotation: Rotation::None,
+        mirror: Mirror::None,
+        enable_user_pts: true,
+        rate_control: HevcCbrConfig {
+            intra_period: 60,
+            intra_qp: 30,
+            bit_rate_kbps: config.bitrate_kbps,
+            frame_rate,
+            initial_rc_qp: 30,
+            vbv_buffer_size: 3000,
+            ctu_level_rc_enable: true,
+            min_qp_i: 8,
+            max_qp_i: 50,
+            min_qp_p: 8,
+            max_qp_p: 50,
+            min_qp_b: 8,
+            max_qp_b: 50,
+            hvs_qp_enable: true,
+            hvs_qp_scale: 2,
+            max_delta_qp: 10,
+            qp_map_enable: false,
+        },
+    };
+    Ok(sys::MediaEncoder::create(encoder_config)?)
+}
+
+fn align_up(value: u32, align: u32) -> u32 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
+}
+
+/// Error event sender used from worker threads.
+fn send_error(tx: &mpsc::SyncSender<Event>, channel: Channel, message: String) {
     let _ = tx.send(Event::Error(CameraError { channel, message }));
-}
-
-/// Process-wide hbmem module guard.
-struct HbMemModule;
-
-impl HbMemModule {
-    /// Opens the hbmem module before any hbmem-backed SDK allocations.
-    fn open() -> Result<Self, String> {
-        let ret = unsafe { super::ffi::hb_mem_module_open() };
-        if ret != 0 {
-            return Err(format!("hb_mem_module_open failed ret={ret}"));
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for HbMemModule {
-    /// Closes the hbmem module when all dependent resources are gone.
-    fn drop(&mut self) {
-        unsafe {
-            super::ffi::hb_mem_module_close();
-        }
-    }
 }

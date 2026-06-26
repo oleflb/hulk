@@ -436,7 +436,7 @@ version = "0.38.0+1.3.281"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -642,6 +642,12 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 dependencies = [
  "portable-atomic",
 ]
+
+[[package]]
+name = "atomic_refcell"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
 
 [[package]]
 name = "atomicow"
@@ -2364,14 +2370,25 @@ dependencies = [
 name = "camera_driver"
 version = "0.1.0"
 dependencies = [
- "bindgen",
+ "camera_driver_sys",
  "clap",
  "color-eyre",
  "libc",
  "ros-z",
+ "ros2",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "types",
+]
+
+[[package]]
+name = "camera_driver_sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2464,6 +2481,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfg-expr"
+version = "0.20.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb693542bcafa528e198be0ebd9d3632ca5b7c93dbe7237460e199910835997c"
+dependencies = [
+ "smallvec 1.15.2",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cfg-if"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2539,7 +2566,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -3083,6 +3110,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+dependencies = [
+ "libloading 0.9.0",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3440,7 +3476,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -3720,6 +3756,39 @@ name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
+
+[[package]]
+name = "encoded_frame_decoder"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "color-eyre",
+ "cudarc",
+ "gstreamer",
+ "gstreamer-allocators",
+ "gstreamer-app",
+ "gstreamer-video",
+ "libloading 0.9.0",
+ "ros-z",
+ "thiserror 2.0.18",
+ "types",
+ "zenoh",
+]
+
+[[package]]
+name = "encoded_frame_decoder_node"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "encoded_frame_decoder",
+ "ros-z",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "types",
+ "zenoh",
+]
 
 [[package]]
 name = "encoding_rs"
@@ -4531,6 +4600,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "gio-sys"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64729ba2772c080448f9f966dba8f4456beeb100d8c28a865ef8a0f2ef4987e1"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "libc",
+ "system-deps",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "git-version"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4690,6 +4772,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "glib"
+version = "0.22.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c207e04e51605dcf7b2924c41591b3a10e1438eaac5bcf448fb91f325381104a"
+dependencies = [
+ "bitflags 2.13.0",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-task",
+ "futures-util",
+ "gio-sys",
+ "glib-macros",
+ "glib-sys",
+ "gobject-sys",
+ "libc",
+ "memchr",
+ "smallvec 1.15.2",
+]
+
+[[package]]
+name = "glib-macros"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "506d23499707c7142898429757e8d9a3871d965239a2cb66dfa05052be6d6f19"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "glib-sys"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f7fbac234ed5bc2a28359b7bde8e1b9cdf1441cc2d7f068e4824672d7db9445"
+dependencies = [
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4780,7 +4905,7 @@ dependencies = [
  "glutin_egl_sys",
  "glutin_glx_sys",
  "glutin_wgl_sys",
- "libloading",
+ "libloading 0.8.9",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -4831,6 +4956,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
 dependencies = [
  "gl_generator",
+]
+
+[[package]]
+name = "gobject-sys"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22a861859b887a79cf461359c192c97a57d8fb0229dd291232e57aa11f6fa72c"
+dependencies = [
+ "glib-sys",
+ "libc",
+ "system-deps",
 ]
 
 [[package]]
@@ -4912,6 +5048,154 @@ dependencies = [
  "support_foot_estimator",
  "tokio",
  "types",
+]
+
+[[package]]
+name = "gstreamer"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28ca0c594cac4e86f5444aaa767c7bb810340c0710667a6467d3ead248e35e84"
+dependencies = [
+ "cfg-if 1.0.4",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "glib",
+ "gstreamer-sys",
+ "itertools 0.14.0",
+ "kstring",
+ "libc",
+ "muldiv",
+ "num-integer",
+ "num-rational",
+ "option-operations",
+ "pastey",
+ "pin-project-lite",
+ "smallvec 1.15.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gstreamer-allocators"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d8b56a6b63b166823b6a718e2f22fb71d35b3e92748e244c4d9dc3be9993f20"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-allocators-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-allocators-sys"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea44ee4a86b39bcdcfd260179b7dbfdd5f81955d6fee35f11264934caf65230c"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gstreamer-app"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97f8ae9238c2352398dcc084de28df3f7099af216ac6c160b52318d23f25c010"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "glib",
+ "gstreamer",
+ "gstreamer-app-sys",
+ "gstreamer-base",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-app-sys"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a74a8211e5d7df2f45b612c284ddf56b92bdf4e879e8ed72e7c46dd0842e158"
+dependencies = [
+ "glib-sys",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gstreamer-base"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c279df2918be97fb9570e589a32ade33598f643b0c4f0c92c17f06be6940574e"
+dependencies = [
+ "atomic_refcell",
+ "cfg-if 1.0.4",
+ "glib",
+ "gstreamer",
+ "gstreamer-base-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-base-sys"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6569606feeb89cfcf95a6476a64a0f0aec83fadcef0e91c24e576f7851ceac3a"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gstreamer-sys"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "533fa8d28fc830eafccbcfcfddb390563ea5d3a351af2c3aab99e197e5f5b1ba"
+dependencies = [
+ "cfg-if 1.0.4",
+ "glib-sys",
+ "gobject-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gstreamer-video"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf728cb21499561ea0d6ce584e550bf2b98b279cc7741067ee42f41f98b486e"
+dependencies = [
+ "cfg-if 1.0.4",
+ "futures-channel",
+ "glib",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-video-sys",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gstreamer-video-sys"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "109c2c997a90a5806a8d7fcb416755e3047d6bab8f580d2ededc9ab7ad553caf"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps",
 ]
 
 [[package]]
@@ -5456,6 +5740,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "detection",
+ "encoded_frame_decoder_node",
  "fake_odometry",
  "fall_down_state_receiver",
  "field_border_detection",
@@ -5481,6 +5766,7 @@ dependencies = [
  "motor_commands_collector",
  "obstacle_filter",
  "odometer_bridge",
+ "orin_vision_node",
  "player_state_receiver",
  "primary_state_filter",
  "robot_mode_handler",
@@ -6180,7 +6466,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
 dependencies = [
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "pkg-config",
 ]
 
@@ -6239,6 +6525,15 @@ name = "konst_macro_rules"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
+
+[[package]]
+name = "kstring"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "558bf9508a558512042d3095138b1f7b8fe90c5467d94f9f1da28b3731c5dbd1"
+dependencies = [
+ "static_assertions",
+]
 
 [[package]]
 name = "ktx2"
@@ -6304,6 +6599,16 @@ name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if 1.0.4",
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if 1.0.4",
  "windows-link 0.2.1",
@@ -6906,6 +7211,12 @@ dependencies = [
  "tokio-util",
  "uuid",
 ]
+
+[[package]]
+name = "muldiv"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
 
 [[package]]
 name = "naga"
@@ -7787,6 +8098,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "option-operations"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aca39cf52b03268400c16eeb9b56382ea3c3353409309b63f5c8f0b1faf42754"
+dependencies = [
+ "pastey",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7834,12 +8154,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "orin_vision_node"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "cudarc",
+ "detection",
+ "encoded_frame_decoder",
+ "ort",
+ "ros-z",
+ "ros-z-streams",
+ "tokio",
+ "types",
+]
+
+[[package]]
 name = "ort"
 version = "2.0.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa7e49bd669d32d7bc2a15ec540a527e7764aec722a45467814005725bcd721"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
  "ndarray",
  "ort-sys",
  "smallvec 2.0.0-alpha.10",
@@ -7984,6 +8319,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "path_abs"
@@ -10874,6 +11215,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-deps"
+version = "7.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396a35feb67335377e0251fcbc1092fc85c484bd4e3a7a54319399da127796e7"
+dependencies = [
+ "cfg-expr",
+ "heck",
+ "pkg-config",
+ "toml 1.1.2+spec-1.1.0",
+ "version-compare",
+]
+
+[[package]]
 name = "systemd"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11765,10 +12119,13 @@ dependencies = [
  "ordered-float 4.6.0",
  "path_serde",
  "ros-z",
+ "ros-z-cdr",
  "ros-z-schema",
  "ros2",
  "serde",
  "splines",
+ "zenoh",
+ "zenoh-buffers",
 ]
 
 [[package]]
@@ -12040,6 +12397,12 @@ name = "vec_map"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
+
+[[package]]
+name = "version-compare"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
 
 [[package]]
 name = "version_check"
@@ -12534,7 +12897,7 @@ dependencies = [
  "js-sys",
  "khronos-egl",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "log",
  "metal",
  "naga",
@@ -13526,7 +13889,7 @@ dependencies = [
  "as-raw-xcb-connection",
  "gethostname",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "once_cell",
  "rustix 1.1.4",
  "x11rb-protocol",
@@ -14165,7 +14528,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e235815d14b22448aa1db948560328761530932fa7a2f9a3c14853b3f0267941"
 dependencies = [
  "git-version",
- "libloading",
+ "libloading 0.8.9",
  "serde",
  "stabby",
  "tracing",
@@ -14339,7 +14702,7 @@ dependencies = [
  "humantime",
  "lazy_static",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "pnet_datalink",
  "schemars 1.2.1",
  "serde",

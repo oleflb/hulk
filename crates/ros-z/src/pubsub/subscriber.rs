@@ -12,7 +12,7 @@ use crate::dynamic::{DynamicCdrCodec, DynamicPayload, Schema};
 use crate::endpoint_builder::{EndpointBuilderContext, MessageEndpointType};
 use crate::entity::{EndpointEntity, EndpointKind};
 use crate::graph::Graph;
-use crate::message::WireDecoder;
+use crate::message::{WireDecoder, WireZBufDecoder};
 use crate::pubsub::metadata::Received;
 use crate::pubsub::raw::{self, RawSubscriberBuilder};
 use crate::pubsub::replay::{self, TransientLocalReplayCoordinator};
@@ -520,7 +520,7 @@ where
 impl<T, C> Subscriber<T, C>
 where
     T: Send + Sync + 'static,
-    C: for<'a> WireDecoder<Input<'a> = &'a [u8]>,
+    C: WireZBufDecoder,
 {
     /// Return the number of matched publishers currently visible in the graph.
     pub fn publisher_count(&self) -> usize {
@@ -539,8 +539,8 @@ where
     /// Receive and deserialize the next message together with metadata.
     pub async fn recv_with_metadata(&self) -> Result<Received<C::Output>> {
         let sample = self.queue.recv_async().await;
-        let payload = sample.payload().to_bytes();
-        let message = C::deserialize(&payload)
+        let payload = zenoh_buffers::ZBuf::from(sample.payload().clone());
+        let message = C::deserialize_zbuf(&payload)
             .map_err(|source| crate::Error::decode(std::any::type_name::<C::Output>(), source))?;
         Received::try_from_sample(&sample, message)
     }

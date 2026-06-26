@@ -324,7 +324,11 @@ impl Error {
         }
     }
 
-    pub(crate) fn encode<E>(type_name: impl Into<String>, source: E) -> Self
+    /// Wrap a custom message codec failure as a ROS-Z wire encoding error.
+    ///
+    /// `type_name` should identify the message type being encoded, typically
+    /// `std::any::type_name::<T>()` or the corresponding advertised type name.
+    pub fn encode<E>(type_name: impl Into<String>, source: E) -> Self
     where
         E: StdError + Send + Sync + 'static,
     {

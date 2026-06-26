@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use zenoh::shm::{PosixShmProviderBackend, ShmProvider};
 use zenoh_buffers::ZBuf;
+use zenoh_buffers::buffer::{Buffer, SplitBuffer};
 
 use crate::attachment::{ENDPOINT_GLOBAL_ID_SIZE, EndpointGlobalId};
 use crate::entity::TypeInfo;
@@ -179,7 +180,8 @@ pub trait WireEncoder {
 pub trait Message: MessageSchema + Send + Sync + 'static {
     /// Codec used to encode and decode this message type.
     type Codec: for<'a> WireEncoder<Input<'a> = &'a Self>
-        + for<'a> WireDecoder<Input<'a> = &'a [u8], Output = Self>;
+        + for<'a> WireDecoder<Input<'a> = &'a [u8], Output = Self>
+        + WireZBufDecoder<Output = Self>;
 
     /// Stable fully qualified type name advertised in graph metadata.
     fn type_name() -> String;
@@ -652,6 +654,44 @@ impl MessageSchema for PathBuf {
 /// Serde-backed CDR codec for message types deriving `Serialize` and `Deserialize`.
 pub struct SerdeCdrCodec<T>(PhantomData<T>);
 
+#[derive(Default)]
+struct CountingCdrBuffer {
+    len: usize,
+}
+
+impl CdrBuffer for CountingCdrBuffer {
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        self.len = self
+            .len
+            .checked_add(data.len())
+            .expect("CDR serialized size overflow");
+    }
+
+    fn push(&mut self, _byte: u8) {
+        self.len = self
+            .len
+            .checked_add(1)
+            .expect("CDR serialized size overflow");
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn reserve(&mut self, _additional: usize) {}
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn append_zbuf(&mut self, zbuf: &ZBuf) {
+        self.len = self
+            .len
+            .checked_add(zbuf.len())
+            .expect("CDR serialized size overflow");
+    }
+}
+
 /// Codec-side decoder used by subscribers and service handlers.
 pub trait WireDecoder {
     /// Input accepted by the decoder, usually bytes or a Zenoh buffer.
@@ -662,6 +702,12 @@ pub trait WireDecoder {
     type Error: std::error::Error + Send + Sync + 'static;
     /// Decode one value from `input`.
     fn deserialize(input: Self::Input<'_>) -> Result<Self::Output, Self::Error>;
+}
+
+/// Decoder extension for codecs that can decode from Zenoh's segmented payload buffer.
+pub trait WireZBufDecoder: WireDecoder {
+    /// Decode one value from a `ZBuf`, preserving payload slices when supported.
+    fn deserialize_zbuf(input: &ZBuf) -> Result<Self::Output, Self::Error>;
 }
 
 // ── Serde-backed CDR serialization for typed messages ─────────────────────────────────────
@@ -697,16 +743,21 @@ where
 
     fn serialize_to_shm(
         input: &T,
-        estimated_size: usize,
+        _estimated_size: usize,
         provider: &ShmProvider<PosixShmProviderBackend>,
     ) -> crate::Result<(ZBuf, usize)> {
-        let mut writer = ShmWriter::new(provider, estimated_size)?;
+        // Generic serde size hints are conservative guesses and can miss large
+        // heap-backed fields. Count the exact CDR size before allocating SHM so
+        // the writer never overflows an undersized SHM segment.
+        let actual_size = Self::count_serialized_size(input)
+            .map_err(|source| crate::Error::encode(std::any::type_name::<T>(), source))?;
+        let mut writer = ShmWriter::new(provider, actual_size)?;
         writer.extend_from_slice(&CDR_HEADER_LE);
         let mut serializer = SerdeCdrSerializer::<LittleEndian, ShmWriter>::new(&mut writer);
         input.serialize(&mut serializer).map_err(|source| {
             crate::Error::encode(std::any::type_name::<T>(), CdrEncodeError::from(source))
         })?;
-        let actual_size = writer.position();
+        debug_assert_eq!(writer.position(), actual_size);
         let zbuf = writer.into_zbuf()?;
         Ok((zbuf, actual_size))
     }
@@ -717,6 +768,20 @@ where
         let mut fast_ser = SerdeCdrSerializer::<LittleEndian>::new(buffer);
         input.serialize(&mut fast_ser)?;
         Ok(())
+    }
+}
+
+impl<T> SerdeCdrCodec<T>
+where
+    T: Serialize,
+{
+    fn count_serialized_size(input: &T) -> Result<usize, CdrEncodeError> {
+        let mut counter = CountingCdrBuffer::default();
+        counter.extend_from_slice(&CDR_HEADER_LE);
+        let mut serializer =
+            SerdeCdrSerializer::<LittleEndian, CountingCdrBuffer>::new(&mut counter);
+        input.serialize(&mut serializer)?;
+        Ok(counter.len())
     }
 }
 
@@ -744,6 +809,37 @@ where
         let x =
             ros_z_cdr::from_bytes::<T, byteorder::LittleEndian>(payload).map_err(CdrError::from)?;
         Ok(x.0)
+    }
+}
+
+impl<T> WireZBufDecoder for SerdeCdrCodec<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize_zbuf(input: &ZBuf) -> Result<Self::Output, Self::Error> {
+        let bytes = input.contiguous();
+        if bytes.len() < 4 {
+            return Err(CdrError::message("CDR data too short for header"));
+        }
+        let representation_identifier = &bytes[0..2];
+        if representation_identifier != [0x00, 0x01] {
+            return Err(CdrError::message(format!(
+                "Expected CDR_LE encapsulation ({:?}), found {:?}",
+                [0x00, 0x01],
+                representation_identifier
+            )));
+        }
+        let payload = &bytes[4..];
+
+        ros_z_cdr::ZBUF_DESER_SOURCE.with(|cell| {
+            *cell.borrow_mut() = Some(input.clone());
+        });
+        let result =
+            ros_z_cdr::from_bytes::<T, byteorder::LittleEndian>(payload).map_err(CdrError::from);
+        ros_z_cdr::ZBUF_DESER_SOURCE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        result.map(|(message, _)| message)
     }
 }
 

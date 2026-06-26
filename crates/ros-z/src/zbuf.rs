@@ -6,10 +6,12 @@
 //! The wrapper uses `serialize_bytes()` instead of `serialize_seq()` for better performance
 //! with large byte arrays, which is critical for messages like sensor images.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
+use std::borrow::Cow;
 use std::fmt;
+use std::ops::Range;
 use zenoh_buffers::ZBuf as ZenohZBuf;
-use zenoh_buffers::buffer::SplitBuffer;
+use zenoh_buffers::buffer::{Buffer, SplitBuffer};
 
 /// ros-z wrapper around Zenoh's ZBuf with optimized serde.
 ///
@@ -48,6 +50,61 @@ impl ZBuf {
     #[inline]
     pub fn from_zenoh(zbuf: ZenohZBuf) -> Self {
         Self(zbuf)
+    }
+
+    /// Returns the total byte length.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns a contiguous view, copying only if the buffer is segmented.
+    pub fn contiguous(&self) -> Cow<'_, [u8]> {
+        self.0.contiguous()
+    }
+
+    /// Returns the number of backing slices.
+    pub fn slice_count(&self) -> usize {
+        self.0.zslices().count()
+    }
+
+    /// Creates a `ZBuf` view over a byte range without copying the underlying slices.
+    pub fn subslice(&self, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > self.0.len() {
+            return None;
+        }
+
+        let mut output = ZenohZBuf::empty();
+        let mut skip = range.start;
+        let mut remaining = range.end - range.start;
+        if remaining == 0 {
+            return Some(Self(output));
+        }
+
+        for zslice in self.0.zslices() {
+            let slice_len = zslice.len();
+            if skip >= slice_len {
+                skip -= slice_len;
+                continue;
+            }
+
+            let offset = skip;
+            let take = remaining.min(slice_len - offset);
+            let subslice = zslice.subslice(offset..offset + take)?;
+            output.push_zslice(subslice);
+            remaining -= take;
+            skip = 0;
+
+            if remaining == 0 {
+                return Some(Self(output));
+            }
+        }
+
+        None
     }
 }
 
@@ -110,9 +167,18 @@ impl Serialize for ZBuf {
     where
         S: Serializer,
     {
-        // Use contiguous() for zero-copy access and serialize as bytes.
-        let bytes = self.0.contiguous();
-        serializer.serialize_bytes(bytes.as_ref())
+        if self.slice_count() <= 1 {
+            let bytes = self.0.contiguous();
+            return serializer.serialize_bytes(bytes.as_ref());
+        }
+
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for zslice in self.0.zslices() {
+            for byte in zslice.as_slice() {
+                sequence.serialize_element(byte)?;
+            }
+        }
+        sequence.end()
     }
 }
 
@@ -187,7 +253,6 @@ impl<'de> Deserialize<'de> for ZBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zenoh_buffers::buffer::Buffer;
 
     #[test]
     fn test_zbuf_creation() {

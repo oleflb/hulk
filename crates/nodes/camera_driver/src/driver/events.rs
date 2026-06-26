@@ -1,20 +1,15 @@
 use std::fmt;
 
+use camera_driver_sys::{SensorMode, SensorModule};
+
+#[cfg(not(x5cam_x5_target))]
+use std::sync::Arc;
+
 #[cfg(x5cam_x5_target)]
-pub use super::codec::EncodedFrameData;
+type EncodedFrameData = camera_driver_sys::EncodedFrameData;
 
 #[cfg(not(x5cam_x5_target))]
-/// Placeholder payload type for non-X5 builds that cannot open the camera.
-#[derive(Debug)]
-pub struct EncodedFrameData;
-
-#[cfg(not(x5cam_x5_target))]
-impl EncodedFrameData {
-    /// Returns the placeholder payload length in bytes.
-    pub fn len(&self) -> usize {
-        0
-    }
-}
+type EncodedFrameData = Arc<[u8]>;
 
 /// Camera side for stereo-specific events and counters.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -33,6 +28,14 @@ impl Channel {
             Self::Right => 1,
         }
     }
+
+    /// Returns the optical frame id used in ROS image headers.
+    pub fn frame_id(self) -> &'static str {
+        match self {
+            Self::Left => "x5_left_optical_frame",
+            Self::Right => "x5_right_optical_frame",
+        }
+    }
 }
 
 impl fmt::Display for Channel {
@@ -44,34 +47,38 @@ impl fmt::Display for Channel {
     }
 }
 
-/// Static camera configuration emitted after successful setup.
+/// Static camera setup emitted after successful SDK initialization.
 #[derive(Clone, Debug)]
-pub struct CameraInfo {
+pub struct CameraSetup {
     /// Stereo channel described by this camera.
     pub channel: Channel,
     /// X5 MIPI host index used by the camera.
     pub host: i32,
-    /// Sensor mode name used by the SDK.
-    pub sensor_name: String,
+    /// Sensor module used by the SDK.
+    pub sensor: SensorModule,
+    /// Sensor mode used for capture.
+    pub sensor_mode: SensorMode,
+    /// Whether VIN LPWM trigger generation is enabled.
+    pub lpwm_enabled: bool,
     /// Raw sensor frame width before rotation/rectification.
     pub raw_width: u32,
     /// Raw sensor frame height before rotation/rectification.
     pub raw_height: u32,
-    /// Rectified encoder input width.
+    /// Rectified output width.
     pub out_width: u32,
-    /// Rectified encoder input height.
+    /// Rectified output height.
     pub out_height: u32,
     /// Required per-camera frame rate.
     pub fps: u32,
     /// Whether hardware GDC rectification is enabled.
     pub gdc_enabled: bool,
-    /// Whether H.265 encoding is enabled.
-    pub h265_enabled: bool,
-    /// Whether MediaCodec consumes external VSE frame buffers.
-    pub external_input: bool,
+    /// Whether HEVC encoding is enabled for this camera.
+    pub hevc_enabled: bool,
+    /// Whether MediaCodec consumes external VSE frame buffers directly.
+    pub external_encoder_input: bool,
 }
 
-/// Stereo calibration summary emitted from the EEPROM data.
+/// Stereo calibration emitted from EEPROM as ROS-compatible camera info messages.
 #[derive(Clone, Debug)]
 pub struct CalibrationInfo {
     /// EEPROM calibration image width.
@@ -84,23 +91,53 @@ pub struct CalibrationInfo {
     pub rect_height: u32,
     /// Distortion model used by the EEPROM coefficients.
     pub distortion_model: String,
+    /// Raw left-camera focal lengths and principal point `[fx, fy, cx, cy]`.
+    pub raw_left_intrinsics: [f64; 4],
+    /// Raw left-camera distortion coefficients.
+    pub raw_left_distortion: [f64; 8],
     /// Absolute stereo baseline in meters.
     pub baseline_m: f64,
+    /// Rectified horizontal focal length in pixels.
+    pub rect_fx: f64,
+    /// Rectified vertical focal length in pixels.
+    pub rect_fy: f64,
+    /// Rectified horizontal principal point in pixels.
+    pub rect_cx: f64,
+    /// Rectified vertical principal point in pixels.
+    pub rect_cy: f64,
 }
 
-/// Zero-copy H.265 access-unit payload and its source metadata.
+/// Encoded HEVC access unit produced by one camera.
 #[derive(Debug)]
 pub struct EncodedFrame {
     /// Stereo channel that produced the frame.
     pub channel: Channel,
-    /// VSE frame identifier associated with the encoder input.
+    /// VSE frame identifier.
     pub frame_id: u32,
-    /// VSE source timestamp in nanoseconds.
+    /// VIN trigger timestamp in nanoseconds when available, otherwise VSE timestamp.
     pub timestamp_ns: u64,
-    /// Leased H.265 bytes from the MediaCodec output buffer.
-    pub data: EncodedFrameData,
+    /// VIN trigger timestamp in nanoseconds, when reported by the SDK.
+    pub trigger_timestamp_ns: Option<u64>,
+    /// Encoded image width in pixels.
+    pub width: u32,
+    /// Encoded image height in pixels.
+    pub height: u32,
     /// Encoder presentation timestamp in microseconds.
     pub pts_us: u64,
+    /// Leased encoded bytes. On X5 this borrows the SDK output buffer until dropped.
+    pub data: EncodedFrameData,
+}
+
+impl EncodedFrame {
+    /// Borrows the encoded HEVC bytes without copying.
+    pub fn data(&self) -> &[u8] {
+        self.data.as_ref()
+    }
+
+    /// Returns the encoded payload length in bytes.
+    pub fn data_len(&self) -> usize {
+        self.data().len()
+    }
 }
 
 /// Recoverable camera-side worker error.
@@ -117,10 +154,10 @@ pub struct CameraError {
 #[cfg_attr(not(x5cam_x5_target), allow(dead_code))]
 pub enum Event {
     /// Camera setup information.
-    CameraInfo(CameraInfo),
+    CameraSetup(CameraSetup),
     /// EEPROM calibration information.
     Calibration(CalibrationInfo),
-    /// Encoded H.265 payload from one camera.
+    /// Encoded HEVC frame from one camera.
     EncodedFrame(EncodedFrame),
     /// Worker or SDK error from one camera.
     Error(CameraError),

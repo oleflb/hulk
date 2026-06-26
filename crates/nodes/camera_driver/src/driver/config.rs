@@ -1,3 +1,5 @@
+use color_eyre::eyre::{Result, bail, ensure};
+
 /// Runtime configuration for the strict SC132GS stereo pipeline.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -5,13 +7,13 @@ pub struct Config {
     pub raw_width: u32,
     /// Raw sensor frame height before rotation/rectification.
     pub raw_height: u32,
-    /// Rectified encoder input width.
+    /// Rectified NV12/VSE output width.
     pub out_width: u32,
-    /// Rectified encoder input height.
+    /// Rectified NV12/VSE output height.
     pub out_height: u32,
     /// Required per-camera frame rate.
     pub fps: u32,
-    /// Target H.265 bitrate per camera in kilobits per second.
+    /// Target HEVC bitrate per camera in kilobits per second.
     pub bitrate_kbps: u32,
     /// MIPI host index for the left camera.
     pub left_host: i32,
@@ -40,31 +42,35 @@ impl Default for Config {
 
 impl Config {
     /// Rejects unsupported sensor modes and invalid runtime values.
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<()> {
         if self.raw_width != 1088 || self.raw_height != 1280 || self.fps != 60 {
-            return Err(format!(
+            bail!(
                 "only strict SC132GS 1088x1280@60 is accepted, got {}x{}@{}",
-                self.raw_width, self.raw_height, self.fps
-            ));
+                self.raw_width,
+                self.raw_height,
+                self.fps
+            );
         }
-        if self.out_width == 0 || self.out_height == 0 {
-            return Err("output dimensions must be nonzero".to_string());
-        }
+        ensure!(
+            self.out_width != 0 && self.out_height != 0,
+            "output dimensions must be nonzero"
+        );
         if self.out_width != 1280 || self.out_height != 1088 {
-            return Err(format!(
+            bail!(
                 "only strict rectified output 1280x1088 is accepted, got {}x{}",
-                self.out_width, self.out_height
-            ));
+                self.out_width,
+                self.out_height
+            );
         }
-        if self.bitrate_kbps == 0 {
-            return Err("bitrate must be nonzero".to_string());
-        }
-        if self.left_host == self.right_host {
-            return Err("left-host and right-host must differ".to_string());
-        }
-        if self.startup_timeout_s == 0 {
-            return Err("startup-timeout-s must be nonzero".to_string());
-        }
+        ensure!(
+            self.left_host != self.right_host,
+            "left-host and right-host must differ"
+        );
+        ensure!(self.bitrate_kbps != 0, "bitrate must be nonzero");
+        ensure!(
+            self.startup_timeout_s != 0,
+            "startup-timeout-s must be nonzero"
+        );
         Ok(())
     }
 }

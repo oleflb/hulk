@@ -1,0 +1,34 @@
+[package]
+name = "encoded_frame_decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["ffmpeg-process"]
+ffmpeg-process = []
+orin-gst-cuda = [
+    "dep:cudarc",
+    "dep:gstreamer",
+    "dep:gstreamer-allocators",
+    "dep:gstreamer-app",
+    "dep:gstreamer-video",
+    "dep:libloading",
+]
+
+[dependencies]
+color-eyre = { workspace = true }
+cudarc = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-allocators = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
+ros-z = { workspace = true }
+thiserror = { workspace = true }
+types = { workspace = true }
+zenoh = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }
