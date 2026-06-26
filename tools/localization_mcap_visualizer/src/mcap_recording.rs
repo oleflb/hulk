@@ -9,10 +9,11 @@ use std::{
 use booster::ImuState;
 use color_eyre::{Result, eyre::Context as _};
 use coordinate_systems::{Field, Pixel, Robot};
+use enumset::enum_set;
 use image::RgbImage;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, vector};
-use mcap::{Message, MessageStream};
+use mcap::{Message, MessageStream, read::Options};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::time::Time;
 use ros_z_cdr::{LittleEndian, from_bytes};
@@ -33,6 +34,7 @@ pub const TOPIC_STEREO_IMAGE_PAIR: &str = "inputs/stereo_image_pair";
 pub const TOPIC_ROBOT_KINEMATICS: &str = "robot_kinematics";
 pub const TOPIC_CAMERA_MATRIX: &str = "camera_matrix";
 pub const TOPIC_DETECTED_OBJECTS: &str = "detected_objects";
+pub const TOPIC_DETECTED_OBJECTS_ANNOUNCE: &str = "detected_objects/announce";
 pub const TOPIC_FIELD_DIMENSIONS: &str = "field_dimensions";
 pub const TOPIC_LOCALIZATION: &str = "localization";
 pub const TOPIC_VISUAL_ODOMETRY: &str =
@@ -43,6 +45,7 @@ pub struct Recording {
     events: Vec<RecordedEvent>,
     images: Vec<StereoImageIndex>,
     images_by_embedded_time: Vec<usize>,
+    detected_objects_by_image: Vec<Option<usize>>,
     snapshot_index: SnapshotIndex,
     pub first_camera_matrix: CameraMatrix,
     pub field_dimensions: Option<FieldDimensions>,
@@ -59,18 +62,31 @@ impl Recording {
         let mut first_camera_matrix = None;
         let mut field_dimensions = None;
         let mut topic_counts = BTreeMap::new();
+        let mut detected_objects_announcements = BTreeMap::new();
 
-        for (order, message) in MessageStream::new(&bytes)
-            .wrap_err("failed to open MCAP message stream")?
-            .enumerate()
+        for (order, message) in
+            MessageStream::new_with_options(&bytes, enum_set!(Options::IgnoreEndMagic))
+                .wrap_err("failed to open MCAP message stream")?
+                .enumerate()
         {
-            let message = message.wrap_err("failed to read MCAP message")?;
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        recovered_messages = order,
+                        "stopped reading MCAP after damaged or incomplete record"
+                    );
+                    break;
+                }
+            };
             *topic_counts
                 .entry(message.channel.topic.clone())
                 .or_default() += 1;
 
             let log_time = system_time_from_nanos(message.log_time);
             let publish_time = system_time_from_nanos(message.publish_time);
+            let sequence = i64::from(message.sequence);
             let kind = match message.channel.topic.as_str() {
                 TOPIC_IMU_STATE => Some(EventKind::Imu(decode_recorded_message(&message)?)),
                 TOPIC_VISUAL_ODOMETRY => Some(EventKind::VisualOdometry(
@@ -89,6 +105,12 @@ impl Recording {
                 TOPIC_DETECTED_OBJECTS => Some(EventKind::DetectedObjects(
                     decode_recorded_message(&message)?,
                 )),
+                TOPIC_DETECTED_OBJECTS_ANNOUNCE => {
+                    let announcement: WireAnnouncement = decode_recorded_message(&message)?;
+                    detected_objects_announcements
+                        .insert(announcement.sequence_number, announcement.time);
+                    None
+                }
                 TOPIC_FIELD_DIMENSIONS => {
                     let dimensions = decode_recorded_message(&message)?;
                     field_dimensions = Some(dimensions);
@@ -123,6 +145,7 @@ impl Recording {
             if let Some(kind) = kind {
                 events.push(RecordedEvent {
                     order,
+                    sequence,
                     log_time,
                     publish_time,
                     kind,
@@ -136,11 +159,18 @@ impl Recording {
         let mut images_by_embedded_time = (0..images.len()).collect::<Vec<_>>();
         images_by_embedded_time
             .sort_by_key(|&index| (images[index].embedded_time.as_nanos(), images[index].order));
+        let detected_objects_by_image = index_detected_objects_by_image(
+            &events,
+            &images,
+            &images_by_embedded_time,
+            &detected_objects_announcements,
+        );
 
         Ok(Self {
             events,
             images,
             images_by_embedded_time,
+            detected_objects_by_image,
             snapshot_index,
             first_camera_matrix: first_camera_matrix
                 .ok_or_else(|| color_eyre::eyre::eyre!("recording has no camera_matrix topic"))?,
@@ -278,13 +308,19 @@ impl Recording {
         {
             snapshot.camera_matrix = Some(camera_matrix.clone());
         }
-        if let Some(event) = self
-            .snapshot_index
-            .nearest_detected_objects(&self.events, snapshot_time)
-            && let EventKind::DetectedObjects(objects) = &event.kind
-        {
+        let detected_objects = if let Some(image_id) = image_id {
+            self.detected_objects_for_image(image_id)
+        } else {
+            self.snapshot_index
+                .nearest_detected_objects(&self.events, snapshot_time)
+                .and_then(|event| match &event.kind {
+                    EventKind::DetectedObjects(objects) => Some((objects, event.log_time)),
+                    _ => None,
+                })
+        };
+        if let Some((objects, time)) = detected_objects {
             snapshot.detected_objects = objects.clone();
-            snapshot.detected_objects_time = Some(event.log_time);
+            snapshot.detected_objects_time = Some(time);
         }
         if let Some(EventKind::RecordedLocalization(localization)) = self
             .snapshot_index
@@ -362,11 +398,101 @@ impl Recording {
         )
         .map(StereoImageId)
     }
+
+    fn detected_objects_for_image(
+        &self,
+        image_id: StereoImageId,
+    ) -> Option<(&Vec<Object<RobocupObjectLabel>>, SystemTime)> {
+        let image = self.images.get(image_id.index())?;
+        let event_index = self
+            .detected_objects_by_image
+            .get(image_id.index())
+            .copied()
+            .flatten()?;
+        let event = self.events.get(event_index)?;
+        match &event.kind {
+            EventKind::DetectedObjects(objects) => Some((objects, image.log_time)),
+            _ => None,
+        }
+    }
+}
+
+fn index_detected_objects_by_image(
+    events: &[RecordedEvent],
+    images: &[StereoImageIndex],
+    images_by_embedded_time: &[usize],
+    announcements: &BTreeMap<i64, Time>,
+) -> Vec<Option<usize>> {
+    let mut by_image = vec![None; images.len()];
+    let mut fallback_image_index = 0;
+
+    for (event_index, event) in events.iter().enumerate() {
+        if !matches!(event.kind, EventKind::DetectedObjects(_)) {
+            continue;
+        }
+
+        let image_index = announcements
+            .get(&event.sequence)
+            .and_then(|time| {
+                nearest_image_index_by_embedded_time(images, images_by_embedded_time, *time)
+            })
+            .or_else(|| {
+                let image_index = fallback_image_index;
+                fallback_image_index += 1;
+                (image_index < images.len()).then_some(image_index)
+            });
+
+        if let Some(image_index) = image_index
+            && let Some(slot) = by_image.get_mut(image_index)
+        {
+            *slot = Some(event_index);
+        }
+    }
+
+    by_image
+}
+
+fn nearest_image_index_by_embedded_time(
+    images: &[StereoImageIndex],
+    images_by_embedded_time: &[usize],
+    time: Time,
+) -> Option<usize> {
+    let target_nanos = time.as_nanos();
+    let next = images_by_embedded_time
+        .partition_point(|&index| images[index].embedded_time.as_nanos() <= target_nanos);
+    nearest_by_distance(
+        next.checked_sub(1)
+            .and_then(|index| images_by_embedded_time.get(index))
+            .copied()
+            .map(|index| {
+                (
+                    index,
+                    u128::from(
+                        images[index]
+                            .embedded_time
+                            .as_nanos()
+                            .abs_diff(target_nanos),
+                    ),
+                )
+            }),
+        images_by_embedded_time.get(next).copied().map(|index| {
+            (
+                index,
+                u128::from(
+                    images[index]
+                        .embedded_time
+                        .as_nanos()
+                        .abs_diff(target_nanos),
+                ),
+            )
+        }),
+    )
 }
 
 #[derive(Clone)]
 pub struct RecordedEvent {
     pub order: usize,
+    pub sequence: i64,
     pub log_time: SystemTime,
     pub publish_time: SystemTime,
     pub kind: EventKind,
@@ -617,6 +743,14 @@ struct WireVisualOdometryDelta {
 }
 
 #[derive(Deserialize)]
+struct WireAnnouncement {
+    time: Time,
+    #[allow(dead_code)]
+    source_global_id: ros_z::EndpointGlobalId,
+    sequence_number: i64,
+}
+
+#[derive(Deserialize)]
 struct WireIsometry3 {
     rotation: [f32; 4],
     translation: [f32; 3],
@@ -734,7 +868,7 @@ pub fn seconds_since(time: SystemTime, start: SystemTime) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
     use super::*;
 
@@ -758,5 +892,62 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn detection_index_uses_announced_image_time() {
+        let images = vec![test_image(0, 10), test_image(1, 20), test_image(2, 30)];
+        let images_by_embedded_time = vec![0, 1, 2];
+        let events = vec![test_detected_objects_event(7)];
+        let announcements = BTreeMap::from([(7, Time::from_nanos(20))]);
+
+        let index = index_detected_objects_by_image(
+            &events,
+            &images,
+            &images_by_embedded_time,
+            &announcements,
+        );
+
+        assert_eq!(index, vec![None, Some(0), None]);
+    }
+
+    #[test]
+    fn detection_index_falls_back_to_stream_order() {
+        let images = vec![test_image(0, 10), test_image(1, 20)];
+        let images_by_embedded_time = vec![0, 1];
+        let events = vec![
+            test_detected_objects_event(0),
+            test_detected_objects_event(1),
+        ];
+
+        let index = index_detected_objects_by_image(
+            &events,
+            &images,
+            &images_by_embedded_time,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(index, vec![Some(0), Some(1)]);
+    }
+
+    fn test_image(order: usize, embedded_nanos: i64) -> StereoImageIndex {
+        let time = system_time_from_nanos(embedded_nanos as u64);
+        StereoImageIndex {
+            order,
+            log_time: time,
+            publish_time: time,
+            embedded_time: Time::from_nanos(embedded_nanos),
+            data: Arc::from([]),
+        }
+    }
+
+    fn test_detected_objects_event(sequence: i64) -> RecordedEvent {
+        RecordedEvent {
+            order: sequence as usize,
+            sequence,
+            log_time: system_time_from_nanos(sequence as u64),
+            publish_time: system_time_from_nanos(sequence as u64),
+            kind: EventKind::DetectedObjects(Vec::new()),
+        }
     }
 }

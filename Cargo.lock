@@ -7088,6 +7088,7 @@ dependencies = [
  "eframe",
  "egui_bevy",
  "egui_plot",
+ "enumset",
  "field_mark_association",
  "image",
  "itertools 0.14.0",
@@ -7103,6 +7104,7 @@ dependencies = [
  "ros2",
  "serde",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "types",
 ]
@@ -7122,6 +7124,7 @@ dependencies = [
  "nalgebra 0.34.2",
  "projection",
  "ros-z",
+ "ros-z-streams",
  "serde",
  "serde_json",
  "tokio",

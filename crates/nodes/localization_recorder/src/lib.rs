@@ -24,6 +24,7 @@ use localization_3d::SolveDiagnostics;
 use mcap::{Writer, records::MessageHeader};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
 use ros_z::{Message, attachment::Attachment, prelude::*, time::Time};
+use ros_z_streams::Announcement;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinSet};
 use types::{
@@ -155,6 +156,13 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         &mut recorders,
         sample_sender.clone(),
         "detected_objects",
+    )
+    .await?;
+    spawn_topic::<Announcement>(
+        &node,
+        &mut recorders,
+        sample_sender.clone(),
+        "detected_objects/announce",
     )
     .await?;
     spawn_topic::<FieldDimensions>(

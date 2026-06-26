@@ -210,6 +210,7 @@ egui_extras = { version = "0.33.3", features = ["image"] }
 egui_plot = "0.34.0"
 energy_optimization = { path = "crates/energy_optimization" }
 enum-iterator = "2.1.0"
+enumset = "1.1.10"
 enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
 event-listener = "5"
