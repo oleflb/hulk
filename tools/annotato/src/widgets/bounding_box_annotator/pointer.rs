@@ -58,8 +58,9 @@ impl BoundingBoxAnnotator<'_> {
 
         if response.drag_started_by(PointerButton::Primary)
             && let Some(position) = pointer_position
+            && let Some(drag) = response.total_drag_delta()
         {
-            self.start_pointer_interaction(position, transform);
+            self.start_pointer_interaction(position - drag, transform);
         }
 
         if ui.input(|input| input.pointer.button_down(PointerButton::Primary)) {
