@@ -71,6 +71,23 @@ impl BoundingBoxAnnotator<'_> {
                 );
             }
         }
+
+        if let Some(cursor) = response.hover_pos() {
+            painter.line_segment(
+                [
+                    Pos2::new(response.rect.left(), cursor.y),
+                    Pos2::new(response.rect.right(), cursor.y),
+                ],
+                Stroke::new(1.5, Color32::GRAY),
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(cursor.x, response.rect.top()),
+                    Pos2::new(cursor.x, response.rect.bottom()),
+                ],
+                Stroke::new(1.5, Color32::GRAY),
+            );
+        }
     }
 
     fn draw_box(
