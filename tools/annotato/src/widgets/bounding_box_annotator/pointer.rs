@@ -403,10 +403,10 @@ mod tests {
     #[test]
     fn affected_classes_do_not_offer_bbox_selection() {
         let annotations = vec![Annotation::bounding_box(
-            Class::LSpot,
+            Class::PenaltySpot,
             BoundingBox::new(Pos2::ZERO, Pos2::new(10.0, 10.0)),
         )];
 
-        assert!(selectable_shapes(&annotations, Class::LSpot).is_empty());
+        assert!(selectable_shapes(&annotations, Class::PenaltySpot).is_empty());
     }
 }

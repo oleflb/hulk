@@ -22,7 +22,6 @@ pub struct LabelWidget {
     selected_class: Class,
     class_popup_open: bool,
     class_popup_index: usize,
-    goalpost_creation_shape: CreationShape,
     canvas_state: CanvasState,
     texture_load_error: Option<String>,
 }
@@ -39,7 +38,6 @@ impl Default for LabelWidget {
                 .iter()
                 .position(|class| *class == Class::Robot)
                 .unwrap_or(0),
-            goalpost_creation_shape: CreationShape::Box,
             canvas_state: CanvasState::default(),
             texture_load_error: None,
         }
@@ -196,17 +194,6 @@ impl LabelWidget {
                 self.open_class_popup();
             }
 
-            if self.selected_class == Class::GoalPost {
-                ui.separator();
-                ui.label("Goal post");
-                ui.selectable_value(&mut self.goalpost_creation_shape, CreationShape::Box, "box");
-                ui.selectable_value(
-                    &mut self.goalpost_creation_shape,
-                    CreationShape::Point,
-                    "point",
-                );
-            }
-
             ui.separator();
             ui.label(format!("{} labels", self.document.annotations().len()));
             if let Some(selection) = self.canvas_state.selected() {
@@ -222,8 +209,6 @@ impl LabelWidget {
     fn creation_shape(&self) -> CreationShape {
         if self.selected_class.requires_point() {
             CreationShape::Point
-        } else if self.selected_class == Class::GoalPost {
-            self.goalpost_creation_shape
         } else {
             CreationShape::Box
         }

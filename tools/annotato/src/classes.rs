@@ -30,11 +30,14 @@ impl Class {
     }
 
     pub fn supports_points(self) -> bool {
-        self.requires_point() || self == Class::GoalPost
+        self.requires_point()
     }
 
     pub fn requires_point(self) -> bool {
-        matches!(self, Class::LSpot | Class::TSpot | Class::XSpot)
+        matches!(
+            self,
+            Class::LSpot | Class::TSpot | Class::XSpot | Class::PenaltySpot | Class::GoalPost
+        )
     }
 
     pub fn as_str(self) -> &'static str {

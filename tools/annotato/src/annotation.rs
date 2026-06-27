@@ -275,11 +275,11 @@ mod tests {
 
     #[test]
     fn point_only_labels_serialize_without_bbox() {
-        let annotation = Annotation::point(Class::TSpot, Pos2::new(20.0, 50.0));
+        let annotation = Annotation::point(Class::PenaltySpot, Pos2::new(20.0, 50.0));
 
         let format = annotation.to_format([100.0, 200.0]);
 
-        assert_eq!(format.class, Class::TSpot);
+        assert_eq!(format.class, Class::PenaltySpot);
         assert_eq!(format.points, None);
         assert_eq!(format.point, Some([0.2, 0.25]));
     }
@@ -318,13 +318,15 @@ mod tests {
     }
 
     #[test]
-    fn non_migration_labels_cannot_mix_box_and_point() {
-        let error = serde_json::from_str::<AnnotationFormat>(
+    fn goal_post_legacy_boxes_can_be_migrated_to_points() {
+        let format: AnnotationFormat = serde_json::from_str(
             r#"{"class":"GoalPost","points":[[0.1,0.2],[0.3,0.4]],"point":[0.2,0.3]}"#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("cannot combine"));
+        assert_eq!(format.class, Class::GoalPost);
+        assert_eq!(format.points, Some([[0.1, 0.2], [0.3, 0.4]]));
+        assert_eq!(format.point, Some([0.2, 0.3]));
     }
 
     #[test]
