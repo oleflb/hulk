@@ -37,6 +37,7 @@ site/
 
 deploy.toml
 logs
+/current/
 
 notes*
 .worktrees/

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use color_eyre::Result;
 use eframe::{
@@ -15,7 +15,7 @@ pub fn load_image_from_path(path: impl AsRef<Path>) -> Result<ColorImage, ImageE
     Ok(ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()))
 }
 
-pub fn load_image(ui: &Ui, image_path: &PathBuf) -> Result<TextureHandle> {
+pub fn load_image(ui: &Ui, image_path: &Path) -> Result<TextureHandle> {
     let image = load_image_from_path(image_path)?;
     let handle = ui
         .ctx()

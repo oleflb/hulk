@@ -7,21 +7,16 @@ import json
 import os
 import shutil
 from hashlib import sha256
+from pathlib import Path
 
 import click
 
-# Class mapping
-CLASS_MAP = {
-    "Ball": 0,
-    "GoalPost": 1,
-    "LSpot": 2,
-    "PenaltySpot": 3,
-    "Robot": 4,
-    "TSpot": 5,
-    "XSpot": 6,
-    "Person": 7,
-}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+from annotato_common import (
+    CLASS_MAP,
+    LabelSchemaError,
+    supported_image_paths,
+    validate_annotation,
+)
 
 
 def convert_annotations(json_path: str, filename: str) -> list[str]:
@@ -35,20 +30,18 @@ def convert_annotations(json_path: str, filename: str) -> list[str]:
         points = ann.get("points")
         point = ann.get("point")
 
-        if class_name not in CLASS_MAP:
-            print(f"Skipping unknown class '{class_name}' in {filename}")
-            continue
+        try:
+            validate_annotation(ann, filename)
+        except LabelSchemaError as error:
+            raise click.ClickException(str(error)) from error
 
         if point is not None:
-            raise ValueError(
+            raise click.ClickException(
                 "YOLO box export does not support point annotations yet: "
                 f"class '{class_name}' in {filename}"
             )
 
-        if not points or len(points) != 2:
-            print(f"Invalid points in {filename}")
-            continue
-
+        assert points is not None
         (x1, y1), (x2, y2) = points
 
         # Ensure correct ordering
@@ -75,14 +68,10 @@ def convert_annotations(json_path: str, filename: str) -> list[str]:
 def find_images_by_stem(input_dir: str) -> dict[str, str]:
     images_by_stem: dict[str, str] = {}
 
-    for filename in os.listdir(input_dir):
-        path = os.path.join(input_dir, filename)
-        if not os.path.isfile(path):
-            continue
-
-        stem, ext = os.path.splitext(filename)
-        if ext.lower() not in IMAGE_EXTENSIONS:
-            continue
+    for image_path in supported_image_paths(Path(input_dir)):
+        filename = image_path.name
+        stem = image_path.stem
+        path = str(image_path)
 
         if stem in images_by_stem:
             current_name = os.path.basename(images_by_stem[stem])
@@ -201,8 +190,10 @@ def main(
 
                 shutil.copy2(image_path, out_img_path)
                 processed += 1
-            except Exception as e:
-                print(f"Error processing {filename}: {e}. Skipping...")
+            except click.ClickException:
+                raise
+            except Exception as error:
+                print(f"Error processing {filename}: {error}. Skipping...")
 
     print(
         "Done generating YOLO dataset with split: "

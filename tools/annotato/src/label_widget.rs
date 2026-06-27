@@ -1,3 +1,5 @@
+mod class_popup;
+
 use std::{
     fs::{self, File},
     io::Write,
@@ -7,15 +9,13 @@ use crate::{
     annotation::{Annotation, AnnotationFormat},
     classes::Class,
     paths::Paths,
+    user_toml::CONFIG,
     utils,
-    widgets::{
-        bounding_box_annotator::{BoundingBoxAnnotator, CanvasState, CreationShape},
-        class_selector::ClassSelector,
-    },
+    widgets::bounding_box_annotator::{BoundingBoxAnnotator, CanvasState, CreationShape},
 };
-use color_eyre::eyre::{ContextCompat, Result};
+use color_eyre::eyre::{Context, ContextCompat, Result};
 use eframe::{
-    egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2},
+    egui::{Button, Color32, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2},
     epaint::TextureHandle,
 };
 
@@ -24,10 +24,14 @@ pub struct LabelWidget {
     texture_handle: Option<TextureHandle>,
     image_size: Option<[f32; 2]>,
     selected_class: Class,
+    class_popup_open: bool,
+    class_popup_index: usize,
     goalpost_creation_shape: CreationShape,
+    dirty: bool,
     annotations: Vec<Annotation>,
     canvas_state: CanvasState,
     unresolved_annotations: Vec<AnnotationFormat>,
+    texture_load_error: Option<String>,
 }
 
 impl Default for LabelWidget {
@@ -37,10 +41,17 @@ impl Default for LabelWidget {
             texture_handle: None,
             image_size: None,
             selected_class: Class::Robot,
+            class_popup_open: false,
+            class_popup_index: Class::ALL
+                .iter()
+                .position(|class| *class == Class::Robot)
+                .unwrap_or(0),
             goalpost_creation_shape: CreationShape::Box,
+            dirty: false,
             annotations: Vec::new(),
             canvas_state: CanvasState::default(),
             unresolved_annotations: Vec::new(),
+            texture_load_error: None,
         }
     }
 }
@@ -53,8 +64,17 @@ impl LabelWidget {
             .unwrap_or(false)
     }
 
-    pub fn ui(&mut self, ui: &mut eframe::egui::Ui) {
-        self.ensure_texture_loaded(ui);
+    pub fn captures_keyboard(&self) -> bool {
+        self.class_popup_open
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn ui(&mut self, ui: &mut eframe::egui::Ui) -> Result<()> {
+        self.ensure_texture_loaded(ui)?;
+        self.handle_class_popup_shortcut(ui);
 
         ui.vertical(|ui| {
             self.toolbar_ui(ui);
@@ -64,8 +84,10 @@ impl LabelWidget {
                 return;
             }
 
-            if let (Some(texture_handle), Some(image_size)) =
-                (self.texture_handle.clone(), self.image_size)
+            if let Some(error) = &self.texture_load_error {
+                ui.colored_label(Color32::from_rgb(243, 139, 168), error);
+            } else if let (Some(texture_handle), Some(image_size)) =
+                (self.texture_handle.as_ref(), self.image_size)
             {
                 let creation_shape = self.creation_shape();
                 ui.add(BoundingBoxAnnotator::new(
@@ -75,20 +97,36 @@ impl LabelWidget {
                     &mut self.canvas_state,
                     &mut self.selected_class,
                     creation_shape,
+                    !self.class_popup_open,
                 ));
+                if self.canvas_state.take_annotations_changed() {
+                    self.dirty = true;
+                }
             }
             ui.add_space(6.0);
             self.help_ui(ui);
         });
+        self.class_popup_ui(ui);
+
+        Ok(())
     }
 
-    fn ensure_texture_loaded(&mut self, ui: &eframe::egui::Ui) {
-        if self.texture_handle.is_some() {
-            return;
+    fn ensure_texture_loaded(&mut self, ui: &eframe::egui::Ui) -> Result<()> {
+        if self.texture_handle.is_some() || self.texture_load_error.is_some() {
+            return Ok(());
         }
 
         let paths = self.current_paths.as_ref().expect("No image loaded");
-        let handle = utils::load_image(ui, &paths.image_path).expect("failed to load image");
+        let handle = match utils::load_image(ui, &paths.image_path) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.texture_load_error = Some(format!(
+                    "failed to load image {}: {error:#}",
+                    paths.image_path.display()
+                ));
+                return Ok(());
+            }
+        };
         let size = [handle.size()[0] as f32, handle.size()[1] as f32];
         self.image_size = Some(size);
         self.texture_handle = Some(handle);
@@ -98,6 +136,8 @@ impl LabelWidget {
             .drain(..)
             .map(|annotation| Annotation::from_format(annotation, size))
             .collect();
+
+        Ok(())
     }
 
     fn toolbar_ui(&mut self, ui: &mut eframe::egui::Ui) {
@@ -109,7 +149,9 @@ impl LabelWidget {
                     .and_then(|file_name| file_name.to_str())
                     .unwrap_or("<invalid file name>");
                 ui.label(RichText::new(filename).strong());
-                if paths.label_present {
+                if self.dirty {
+                    ui.colored_label(Color32::from_rgb(249, 226, 175), "modified");
+                } else if paths.label_present {
                     ui.colored_label(Color32::from_rgb(166, 227, 161), "saved");
                 } else {
                     ui.colored_label(Color32::from_rgb(250, 179, 135), "unsaved");
@@ -118,14 +160,21 @@ impl LabelWidget {
 
             ui.separator();
             ui.label("Class");
-            let previous_class = self.selected_class;
-            ui.add(ClassSelector::new(
-                "class-selector",
-                &mut self.selected_class,
-            ));
-            if self.selected_class != previous_class {
-                self.canvas_state
-                    .apply_class(&mut self.annotations, self.selected_class);
+            let config = &CONFIG.get().unwrap().keybindings;
+            let class_button = Button::new(
+                RichText::new(format!(
+                    "{}  ({})",
+                    self.selected_class.as_str(),
+                    config.class_popup.label()
+                ))
+                .strong()
+                .size(16.0)
+                .color(Color32::from_rgb(245, 245, 245)),
+            )
+            .fill(self.selected_class.color().gamma_multiply(0.35))
+            .stroke(Stroke::new(1.0, self.selected_class.color()));
+            if ui.add(class_button).clicked() {
+                self.open_class_popup();
             }
 
             if self.selected_class == Class::GoalPost {
@@ -162,6 +211,7 @@ impl LabelWidget {
     }
 
     fn help_ui(&self, ui: &mut eframe::egui::Ui) {
+        let config = &CONFIG.get().unwrap().keybindings;
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Mouse:").strong());
             ui.label("click point");
@@ -171,17 +221,17 @@ impl LabelWidget {
             ui.label("right click delete");
             ui.separator();
             ui.label(RichText::new("Keyboard:").strong());
-            ui.label("B new/commit");
+            ui.label(format!("{} new/commit", config.draw.label()));
             ui.label("arrows move/resize");
             ui.label("Shift faster");
             ui.label("Ctrl fine");
-            ui.label("E resize box");
-            ui.label("M move");
-            ui.label("C corner");
+            ui.label(format!("{} resize box", config.edit.label()));
+            ui.label(format!("{} move", config.move_box.label()));
+            ui.label(format!("{} focus", config.temporary_focus.label()));
             ui.label("Tab label");
-            ui.label("1-8 or [] class");
-            ui.label("Enter commit");
-            ui.label("Esc cancel");
+            ui.label(format!("{} class", config.class_popup.label()));
+            ui.label(format!("{} commit", config.confirm.label()));
+            ui.label(format!("{} cancel", config.abort.label()));
         });
     }
 
@@ -197,8 +247,7 @@ impl LabelWidget {
         };
         let annotation = &self.annotations[annotation_index];
         let bounding_box = annotation
-            .bounding_box
-            .as_ref()
+            .bounding_box_ref()
             .expect("migration annotation has bbox");
         let crop_rect = migration_crop_rect(bounding_box.rect, image_size);
 
@@ -246,7 +295,8 @@ impl LabelWidget {
             && let Some(point) =
                 crop_click_to_image_point(pointer, display_rect, crop_rect, image_size)
         {
-            self.annotations[annotation_index].point = Some(point);
+            self.annotations[annotation_index].set_point(point);
+            self.dirty = true;
         }
 
         true
@@ -269,20 +319,27 @@ impl LabelWidget {
     pub fn load_new_image_with_labels(
         &mut self,
         paths: Paths,
-        model_annotations: Vec<AnnotationFormat>,
+        model_annotations: &[AnnotationFormat],
     ) -> Result<()> {
+        let unresolved_annotations = if paths.label_path.exists() {
+            let existing_annotations =
+                fs::read_to_string(&paths.label_path).wrap_err_with(|| {
+                    format!("failed to read label file {}", paths.label_path.display())
+                })?;
+            serde_json::from_str(&existing_annotations).wrap_err_with(|| {
+                format!("failed to parse label file {}", paths.label_path.display())
+            })?
+        } else {
+            model_annotations.to_vec()
+        };
+
         self.annotations.clear();
-        self.unresolved_annotations.clear();
+        self.unresolved_annotations = unresolved_annotations;
         self.image_size = None;
         self.texture_handle = None;
+        self.texture_load_error = None;
         self.canvas_state = CanvasState::default();
-
-        if paths.label_path.exists() {
-            let existing_annotations = fs::read_to_string(&paths.label_path)?;
-            self.unresolved_annotations = serde_json::from_str(&existing_annotations)?;
-        } else {
-            self.unresolved_annotations = model_annotations;
-        }
+        self.dirty = false;
 
         self.current_paths = Some(paths);
 
@@ -303,14 +360,24 @@ impl LabelWidget {
             .map(|annotation| annotation.to_format(image_size))
             .collect();
 
-        let annotations = serde_json::to_string_pretty(&annotations)?;
+        let annotations = serde_json::to_string_pretty(&annotations).wrap_err_with(|| {
+            format!(
+                "failed to serialize labels for {}",
+                paths.label_path.display()
+            )
+        })?;
 
-        let mut file = File::create(&paths.label_path)?;
-        file.write_all(annotations.as_bytes())?;
+        let mut file = File::create(&paths.label_path).wrap_err_with(|| {
+            format!("failed to create label file {}", paths.label_path.display())
+        })?;
+        file.write_all(annotations.as_bytes()).wrap_err_with(|| {
+            format!("failed to write label file {}", paths.label_path.display())
+        })?;
 
         if let Some(paths) = &mut self.current_paths {
             paths.check_existence();
         }
+        self.dirty = false;
 
         Ok(())
     }

@@ -108,13 +108,6 @@ impl BoundingBox {
         self.rect.area() >= 4.0
     }
 
-    pub fn iou(&self, other: &BoundingBox) -> f32 {
-        let intersection = self.rect.intersect(other.rect).area();
-        let union = self.rect.area() + other.rect.area() - intersection;
-
-        intersection / union
-    }
-
     pub fn closest_corner(&self, position: Pos2) -> Corner {
         Corner::ALL
             .into_iter()

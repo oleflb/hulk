@@ -8,18 +8,8 @@ save = { primary = "S" }
 edit = { primary = "E" }
 draw = { primary = "B" }
 move_box = { primary = "M" }
-cycle_corner = { primary = "C" }
+class_popup = { primary = "C" }
+temporary_focus = { primary = "F" }
 confirm = { primary = "Enter" }
 abort = { primary = "Escape" }
 delete = { primary = "Delete" }
-next_class = { primary = "CloseBracket" }
-previous_class = { primary = "OpenBracket" }
-
-select_ball = "Num1"
-select_robot = "Num2"
-select_goalpost = "Num3"
-select_penaltyspot = "Num4"
-select_xspot = "Num5"
-select_lspot = "Num6"
-select_tspot = "Num7"
-select_person = "Num8"

@@ -15,11 +15,13 @@ use std::path::PathBuf;
 
 use annotator_app::AnnotatorApp;
 use clap::Parser;
-use color_eyre::eyre::{Report, Result};
+use color_eyre::eyre::Result;
 use eframe::{NativeOptions, egui::ViewportBuilder, run_native};
 use theme::{MOCHA, apply_theme};
 
-use crate::{inputs::collect_image_paths, user_toml::CONFIG};
+use crate::{
+    annotator_app::eframe_error_to_report, inputs::collect_image_paths, user_toml::CONFIG,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "annotato")]
@@ -32,7 +34,7 @@ pub struct Args {
     #[arg(long)]
     predictions: Option<PathBuf>,
 
-    /// Override config path. Defaults to $XDG_CONFIG_HOME/annotato/config.toml
+    /// Override config path. Defaults to $XDG_CONFIG_HOME/annotato/config.toml or ~/.config/annotato/config.toml
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -75,8 +77,7 @@ fn main() -> Result<()> {
         .expect("once_cell::set failed");
 
     let image_paths = collect_image_paths(&arguments.inputs)?;
-    start_labelling_ui(image_paths, arguments.predictions)
-        .map_err(|err| Report::msg(err.to_string()))?;
+    start_labelling_ui(image_paths, arguments.predictions).map_err(eframe_error_to_report)?;
 
     Ok(())
 }

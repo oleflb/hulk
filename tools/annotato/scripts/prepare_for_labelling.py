@@ -15,16 +15,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from wonderwords import RandomWord
 
-CLASS_CONVERSION = [
-    "Ball",
-    "GoalPost",
-    "LSpot",
-    "PenaltySpot",
-    "Robot",
-    "TSpot",
-    "XSpot",
-    "Person",
-]
+from annotato_common import CLASS_NAMES, supported_image_paths
 
 
 def generate_random_chunk_name():
@@ -39,7 +30,7 @@ def generate_random_chunk_name():
 
 
 def main(args):
-    image_paths = list(Path(args.image_folder).glob("*.png"))
+    image_paths = supported_image_paths(Path(args.image_folder))
     if len(image_paths) == 0:
         raise RuntimeError("No images found in the image folder")
 
@@ -73,7 +64,7 @@ def main(args):
 
                 chunk_annotations[image_name] = [
                     {
-                        "class": CLASS_CONVERSION[int(box.cls)],
+                        "class": CLASS_NAMES[int(box.cls)],
                         "points": box.xyxyn.reshape(2, 2).tolist(),
                     }
                     for box in detection[0].boxes
@@ -97,6 +88,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--convert-colors",
         help="whether to convert ycbcr to rgb",
+        action="store_true",
         default=False,
     )
 

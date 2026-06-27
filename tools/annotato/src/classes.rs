@@ -1,7 +1,5 @@
-use eframe::{egui::Key, epaint::Color32};
+use eframe::epaint::Color32;
 use serde::{Deserialize, Serialize};
-
-use crate::{user_toml::CONFIG, widgets::class_selector::EnumIter};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum Class {
@@ -15,23 +13,18 @@ pub enum Class {
     Person,
 }
 
-impl EnumIter for Class {
-    fn list() -> Vec<Self> {
-        use Class::*;
-        vec![
-            Ball,
-            Robot,
-            GoalPost,
-            PenaltySpot,
-            LSpot,
-            TSpot,
-            XSpot,
-            Person,
-        ]
-    }
-}
-
 impl Class {
+    pub const ALL: [Self; 8] = [
+        Self::Ball,
+        Self::GoalPost,
+        Self::LSpot,
+        Self::PenaltySpot,
+        Self::Robot,
+        Self::TSpot,
+        Self::XSpot,
+        Self::Person,
+    ];
+
     pub fn supports_boxes(self) -> bool {
         !self.requires_point()
     }
@@ -42,21 +35,6 @@ impl Class {
 
     pub fn requires_point(self) -> bool {
         matches!(self, Class::LSpot | Class::TSpot | Class::XSpot)
-    }
-
-    pub fn from_key(key: Key) -> Option<Class> {
-        let keybindings = &CONFIG.get().unwrap().keybindings;
-        match key {
-            x if x == keybindings.select_ball => Some(Class::Ball),
-            x if x == keybindings.select_robot => Some(Class::Robot),
-            x if x == keybindings.select_goalpost => Some(Class::GoalPost),
-            x if x == keybindings.select_penaltyspot => Some(Class::PenaltySpot),
-            x if x == keybindings.select_lspot => Some(Class::LSpot),
-            x if x == keybindings.select_tspot => Some(Class::TSpot),
-            x if x == keybindings.select_xspot => Some(Class::XSpot),
-            x if x == keybindings.select_person => Some(Class::Person),
-            _ => None,
-        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -73,15 +51,19 @@ impl Class {
     }
 
     pub fn next(self) -> Self {
-        let classes = Self::list();
-        let index = classes.iter().position(|class| *class == self).unwrap_or(0);
-        classes[(index + 1) % classes.len()]
+        let index = Self::ALL
+            .iter()
+            .position(|class| *class == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
     }
 
     pub fn previous(self) -> Self {
-        let classes = Self::list();
-        let index = classes.iter().position(|class| *class == self).unwrap_or(0);
-        classes[(index + classes.len() - 1) % classes.len()]
+        let index = Self::ALL
+            .iter()
+            .position(|class| *class == self)
+            .unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
     pub fn color(&self) -> Color32 {

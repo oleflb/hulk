@@ -1,10 +1,17 @@
-use std::path::{Path, PathBuf};
+use std::{
+    error::Error as StdError,
+    fmt::{self, Display},
+    path::{Path, PathBuf},
+};
 
 use crate::{
     ai_assistant::ModelAnnotations, label_widget::LabelWidget, paths::Paths, user_toml::CONFIG,
     widgets::image_list::ImageList,
 };
-use color_eyre::{Result, eyre::Context as C};
+use color_eyre::{
+    Result,
+    eyre::{Context as C, Report},
+};
 use eframe::{
     App, CreationContext,
     egui::{CentralPanel, Context, Panel, RichText, Ui},
@@ -63,6 +70,10 @@ impl AnnotatorApp {
         }
     }
 
+    fn record_error(&mut self, error: Report) {
+        self.last_error = Some(format!("{error:#}"));
+    }
+
     fn save_current(&mut self) -> Result<()> {
         let Some(current_index) = self.current_index() else {
             return Ok(());
@@ -73,6 +84,13 @@ impl AnnotatorApp {
             .wrap_err("failed to save annotation")?;
         if let Some(paths) = self.paths.get_mut(current_index) {
             paths.check_existence();
+        }
+        Ok(())
+    }
+
+    fn save_current_if_dirty(&mut self) -> Result<()> {
+        if self.label_widget.is_dirty() {
+            self.save_current()?;
         }
         Ok(())
     }
@@ -139,23 +157,26 @@ impl AnnotatorApp {
                 .file_name()
                 .and_then(|file_name| file_name.to_str())
                 .and_then(|file_name| self.model_annotations.for_image(file_name))
-                .unwrap_or_default();
+                .unwrap_or(&[]);
 
             self.label_widget
                 .load_new_image_with_labels(paths.clone(), annotations)?;
+            paths.check_existence();
         }
-
-        self.paths.iter_mut().for_each(Paths::check_existence);
 
         Ok(())
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &Context) {
+        if self.label_widget.captures_keyboard() {
+            return;
+        }
+
         let config = &CONFIG.get().unwrap().keybindings;
         let action = ctx.input(|input| {
-            if config.next.is_pressed(input) || input.key_pressed(eframe::egui::Key::N) {
+            if config.next.is_pressed(input) {
                 Some(GlobalAction::Next)
-            } else if config.previous.is_pressed(input) || input.key_pressed(eframe::egui::Key::P) {
+            } else if config.previous.is_pressed(input) {
                 Some(GlobalAction::Previous)
             } else if config.save.is_pressed(input) {
                 Some(GlobalAction::Save)
@@ -172,11 +193,12 @@ impl AnnotatorApp {
         };
 
         if let Err(error) = result {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
         }
     }
 
     fn show_sidebar(&mut self, ui: &mut Ui) {
+        let config = &CONFIG.get().unwrap().keybindings;
         Panel::left("image-path-list")
             .default_size(280.0)
             .resizable(true)
@@ -188,22 +210,25 @@ impl AnnotatorApp {
                     && let AnnotationPhase::Labelling { current_index } = current_phase
                     && let Err(error) = self.go_to(current_index)
                 {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                 }
 
                 ui.horizontal(|ui| {
                     if ui
                         .button("Previous")
-                        .on_hover_text("Shift+Space or P")
+                        .on_hover_text(config.previous.label())
                         .clicked()
                         && let Err(error) = self.previous()
                     {
-                        self.last_error = Some(error.to_string());
+                        self.record_error(error);
                     }
-                    if ui.button("Next").on_hover_text("Space or N").clicked()
+                    if ui
+                        .button("Next")
+                        .on_hover_text(config.next.label())
+                        .clicked()
                         && let Err(error) = self.next()
                     {
-                        self.last_error = Some(error.to_string());
+                        self.record_error(error);
                     }
                 });
 
@@ -215,7 +240,7 @@ impl AnnotatorApp {
                         .find(|(_, paths)| !paths.label_present)
                     {
                         if let Err(error) = self.go_to(unlabelled_index) {
-                            self.last_error = Some(error.to_string());
+                            self.record_error(error);
                         }
                     } else {
                         self.phase = AnnotationPhase::Finished;
@@ -242,9 +267,10 @@ impl AnnotatorApp {
                     }
                 }
                 ui.separator();
-                ui.label("Space/N next");
-                ui.label("Shift+Space/P previous");
-                ui.label("S save");
+                let config = &CONFIG.get().unwrap().keybindings;
+                ui.label(format!("{} next", config.next.label()));
+                ui.label(format!("{} previous", config.previous.label()));
+                ui.label(format!("{} save", config.save.label()));
 
                 if let Some(error) = &self.last_error {
                     ui.separator();
@@ -257,10 +283,12 @@ impl AnnotatorApp {
     fn show_labelling(&mut self, ui: &mut Ui) {
         CentralPanel::default().show(ui, |ui| {
             if let Err(error) = self.load_image() {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 return;
             }
-            self.label_widget.ui(ui);
+            if let Err(error) = self.label_widget.ui(ui) {
+                self.record_error(error);
+            }
         });
     }
 
@@ -272,7 +300,7 @@ impl AnnotatorApp {
                     if ui.button("Go back to last image").clicked()
                         && let Err(error) = self.previous()
                     {
-                        self.last_error = Some(error.to_string());
+                        self.record_error(error);
                     }
                 });
             });
@@ -293,9 +321,6 @@ impl App for AnnotatorApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        egui_extras::install_image_loaders(&ctx);
-
         self.show_top_bar(ui);
         self.show_sidebar(ui);
 
@@ -303,6 +328,34 @@ impl App for AnnotatorApp {
             AnnotationPhase::Labelling { .. } => self.show_labelling(ui),
             AnnotationPhase::Finished => self.show_finished(ui),
         }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if let Err(error) = self.save_current_if_dirty() {
+            self.record_error(error);
+        }
+    }
+}
+
+pub fn eframe_error_to_report(error: eframe::Error) -> Report {
+    match error {
+        eframe::Error::AppCreation(error) => Report::new(AppCreationError(error)),
+        error => Report::new(error),
+    }
+}
+
+#[derive(Debug)]
+struct AppCreationError(Box<dyn StdError + Send + Sync>);
+
+impl Display for AppCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "app creation error")
+    }
+}
+
+impl StdError for AppCreationError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&*self.0)
     }
 }
 

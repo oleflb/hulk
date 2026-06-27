@@ -10,7 +10,7 @@ use color_eyre::{
 };
 use glob::glob;
 
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp"];
+pub const IMAGE_EXTENSIONS: &str = include_str!("../image_extensions.txt");
 
 pub fn collect_image_paths(inputs: &[String]) -> Result<Vec<PathBuf>> {
     let mut paths = BTreeSet::new();
@@ -42,10 +42,11 @@ fn add_path(path: PathBuf, paths: &mut BTreeSet<PathBuf>) -> Result<()> {
         for entry in
             fs::read_dir(&path).wrap_err_with(|| format!("failed to read {}", path.display()))?
         {
-            let entry = entry?;
+            let entry =
+                entry.wrap_err_with(|| format!("failed to read entry in {}", path.display()))?;
             let entry_path = entry.path();
             if entry_path.is_file() && is_image_path(&entry_path) {
-                paths.insert(entry_path.to_path_buf());
+                paths.insert(entry_path);
             }
         }
     } else if path.is_file() && is_image_path(&path) {
@@ -64,7 +65,8 @@ pub fn is_image_path(path: &Path) -> bool {
         .and_then(|extension| extension.to_str())
         .map(|extension| {
             IMAGE_EXTENSIONS
-                .iter()
+                .lines()
+                .filter(|supported| !supported.is_empty())
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
         .unwrap_or(false)
@@ -124,5 +126,11 @@ mod tests {
     fn webp_images_are_supported() {
         assert!(is_image_path(Path::new("frame.webp")));
         assert!(is_image_path(Path::new("frame.WEBP")));
+    }
+
+    #[test]
+    fn unsupported_decoder_formats_are_rejected() {
+        assert!(!is_image_path(Path::new("frame.bmp")));
+        assert!(!is_image_path(Path::new("frame.tiff")));
     }
 }
