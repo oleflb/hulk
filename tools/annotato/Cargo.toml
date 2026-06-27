@@ -11,7 +11,7 @@ color-eyre = { workspace = true }
 eframe = { version = "0.35.0", features = ["persistence", "wgpu"] }
 egui_extras = { version = "0.35.0", features = ["image"] }
 glob = { workspace = true }
-image = { workspace = true, features = ["webp"] }
+image = { workspace = true, features = ["bmp", "jpeg", "png", "tiff", "webp"] }
 once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

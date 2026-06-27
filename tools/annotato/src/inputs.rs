@@ -123,14 +123,15 @@ mod tests {
     }
 
     #[test]
-    fn webp_images_are_supported() {
+    fn common_still_image_formats_are_supported() {
+        assert!(is_image_path(Path::new("frame.jpg")));
+        assert!(is_image_path(Path::new("frame.jpeg")));
+        assert!(is_image_path(Path::new("frame.png")));
         assert!(is_image_path(Path::new("frame.webp")));
         assert!(is_image_path(Path::new("frame.WEBP")));
-    }
-
-    #[test]
-    fn unsupported_decoder_formats_are_rejected() {
-        assert!(!is_image_path(Path::new("frame.bmp")));
-        assert!(!is_image_path(Path::new("frame.tiff")));
+        assert!(is_image_path(Path::new("frame.bmp")));
+        assert!(is_image_path(Path::new("frame.tif")));
+        assert!(is_image_path(Path::new("frame.tiff")));
+        assert!(is_image_path(Path::new("frame.TIFF")));
     }
 }

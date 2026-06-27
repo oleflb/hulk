@@ -51,11 +51,14 @@ The YOLO conversion script is box-only and fails clearly if a label contains `po
 ## Scripts
 
 ```sh
-uv run --script tools/annotato/scripts/prepare_for_labelling.py --image_folder images --yolo model.pt --chunksize 200
+uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --yolo model.pt --yolo-classes 0-5 --chunk-size 200
+uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --extend --yolo second-model.pt --yolo-classes 6-7
 cargo run -p annotato -- --predictions current/<chunk>/data.json current/<chunk>/images
 uv run --script tools/annotato/scripts/convert_dataset_to_yolo.py labelled-images yolo-output --train-split 0.8
 ```
 
-`prepare_for_labelling.py` writes chunked labelling tasks below `current/`. Each chunk contains `images/` and a `data.json` predictions file for `annotato --predictions`.
+`prepare_for_labelling.py` writes chunked labelling tasks below the selected output folder. Each chunk contains `images/` and a `data.json` predictions file for `annotato --predictions`. Images are copied with their source file format. Supported formats are JPEG, PNG, WebP, BMP, and TIFF.
+
+`--yolo-classes` accepts class IDs, ranges, and names, for example `0-5`, `Robot,Person`, or `0-5,Person`. The output folder also contains `source_images.json`, which maps original source images to generated chunk image names. A later run with `--extend` uses that manifest to update existing `data.json` files instead of creating new image keys.
 
 `convert_dataset_to_yolo.py` expects images and sidecar JSON files with matching stems in one folder. It writes `images/{train,val}` and `labels/{train,val}`.
