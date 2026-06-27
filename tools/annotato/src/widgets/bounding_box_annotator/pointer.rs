@@ -150,9 +150,7 @@ impl BoundingBoxAnnotator<'_> {
             return;
         }
 
-        let Some(image_position) = transform.screen_to_image(position) else {
-            return;
-        };
+        let image_position = transform.screen_to_image_clamped(position, self.image_size);
 
         if let Some(selection) = self.hit_test_box(image_position) {
             self.select(selection);
