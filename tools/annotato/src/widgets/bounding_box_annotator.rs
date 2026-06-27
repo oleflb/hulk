@@ -14,9 +14,9 @@ pub use state::{AnnotationShape, CanvasState, CreationShape, Selection};
 use transform::ImageTransform;
 
 pub(super) const HANDLE_RADIUS: f32 = 5.0;
-pub(super) const HANDLE_HIT_RADIUS: f32 = 10.0;
+pub(super) const HANDLE_HIT_RADIUS: f32 = 20.0;
 pub(super) const POINT_RADIUS: f32 = 5.0;
-pub(super) const POINT_HIT_RADIUS: f32 = 12.0;
+pub(super) const POINT_HIT_RADIUS: f32 = 20.0;
 
 pub struct BoundingBoxAnnotator<'a> {
     texture_handle: &'a TextureHandle,
