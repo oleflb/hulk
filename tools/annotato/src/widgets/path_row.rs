@@ -1,6 +1,6 @@
 use eframe::{
-    egui::{Response, RichText, Sense, TextStyle, TextWrapMode, Ui, Widget, WidgetText},
-    epaint::{Color32, Vec2},
+    egui::{Response, RichText, Sense, TextStyle, TextWrapMode, Ui, Widget, WidgetText, vec2},
+    epaint::Color32,
 };
 
 use crate::paths::Paths;
@@ -37,50 +37,48 @@ impl Widget for Row<'_> {
 
         let text: WidgetText = RichText::new(filename).monospace().into();
         let check_mark: WidgetText = if is_labelled {
-            RichText::new("done").color(Color32::GREEN)
+            RichText::new("✅").color(Color32::GREEN)
         } else {
-            RichText::new("todo").color(Color32::RED)
+            RichText::new("❌").color(Color32::RED)
         }
         .into();
+
+        const CHECKMARK_WIDTH: f32 = 20.0;
+        const MARGIN_V: f32 = 3.0;
+        let text_width = (ui.available_width() - CHECKMARK_WIDTH).max(0.0);
+
         let text = text.into_galley(
             ui,
             Some(TextWrapMode::Truncate),
-            ui.available_width(),
+            text_width,
             TextStyle::Button,
         );
         let check_mark = check_mark.into_galley(
             ui,
             Some(TextWrapMode::Extend),
-            ui.available_width(),
+            CHECKMARK_WIDTH,
             TextStyle::Button,
         );
-
-        let desired_size = Vec2::new(
-            text.size().x + 40.0 + check_mark.size().x + 20.0,
-            text.size().y + 2.0 * 4.0,
+        let response = ui.allocate_response(
+            vec2(ui.available_width(), text.size().y + MARGIN_V),
+            Sense::click(),
         );
 
-        let (rect, response) = ui.allocate_at_least(desired_size, Sense::click());
-        if ui.is_rect_visible(rect) {
-            let visuals = ui.style().interact(&response);
-            let text_height = Vec2::new(0., text.size().y);
-            let check_mark_offset = Vec2::new(text.size().x + 40.0, 0.0);
-
-            if response.hovered() || self.highlight {
-                ui.painter().rect_filled(rect, 2.0, visuals.bg_fill);
-            }
-
-            ui.painter().galley(
-                rect.left_center() - 0.5 * text_height,
-                text,
-                visuals.text_color(),
-            );
-            ui.painter().galley(
-                rect.left_center() - 0.5 * text_height + check_mark_offset,
-                check_mark,
-                visuals.text_color(),
-            );
+        let painter = ui.painter_at(response.rect);
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || self.highlight {
+            painter.rect_filled(response.rect, 2.0, visuals.bg_fill);
         }
+        painter.galley(
+            response.rect.left_top() + vec2(0.0, MARGIN_V / 2.),
+            text,
+            visuals.text_color(),
+        );
+        painter.galley(
+            response.rect.left_top() + vec2(text_width, MARGIN_V / 2.),
+            check_mark,
+            visuals.text_color(),
+        );
 
         response
     }

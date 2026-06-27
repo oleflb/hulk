@@ -15,18 +15,10 @@ use color_eyre::{
 
 pub static CONFIG: OnceCell<Config> = OnceCell::new();
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub keybindings: KeyBindings,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            keybindings: KeyBindings::default(),
-        }
-    }
 }
 
 pub fn load_config(explicit_path: Option<&Path>) -> Result<Config> {

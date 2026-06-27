@@ -16,9 +16,9 @@ impl BoundingBoxAnnotator<'_> {
         let config = &CONFIG.get().unwrap().keybindings;
 
         if ui.input(|input| config.abort.is_pressed(input)) {
-            if self.state.draft_box.take().is_some() {
-                self.state.keyboard_mode = KeyboardMode::None;
-            } else if self.state.keyboard_mode != KeyboardMode::None {
+            if self.state.draft_box.take().is_some()
+                || self.state.keyboard_mode != KeyboardMode::None
+            {
                 self.state.keyboard_mode = KeyboardMode::None;
             } else {
                 self.state.selected = None;

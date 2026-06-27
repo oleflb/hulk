@@ -31,16 +31,12 @@ impl Widget for ImageList<'_> {
             ui.separator();
 
             ScrollArea::vertical()
-                .auto_shrink([false, false])
+                .auto_shrink([true, false])
                 .max_height(0.8 * ui.available_height())
                 .show_rows(ui, 12.0, self.paths.len(), |ui, range| {
                     for index in range {
                         let paths = &self.paths[index];
-                        let row = ui.add(Row::new(paths).highlight(match self.phase {
-                            AnnotationPhase::Labelling { current_index } => *current_index == index,
-                            AnnotationPhase::Finished => false,
-                        }));
-
+                        let row = ui.add(Row::new(paths).highlight(matches!(self.phase, AnnotationPhase::Labelling { current_index } if *current_index == index)));
                         if let AnnotationPhase::Labelling { current_index } = self.phase
                             && *current_index == index
                         {
