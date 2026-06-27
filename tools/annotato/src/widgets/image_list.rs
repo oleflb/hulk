@@ -32,7 +32,7 @@ impl Widget for ImageList<'_> {
 
             ScrollArea::vertical()
                 .auto_shrink([true, false])
-                .max_height(0.8 * ui.available_height())
+                .max_height(ui.available_height().max(0.0))
                 .show_rows(ui, 12.0, self.paths.len(), |ui, range| {
                     for index in range {
                         let paths = &self.paths[index];
@@ -51,7 +51,6 @@ impl Widget for ImageList<'_> {
                         ui.separator();
                     }
                 });
-            ui.separator();
         })
         .response
     }

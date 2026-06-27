@@ -12,7 +12,9 @@ cargo run -p annotato -- --predictions predictions.json --config config.toml ima
 
 Without `--config`, annotato reads `$XDG_CONFIG_HOME/annotato/config.toml` or `~/.config/annotato/config.toml` when present. Supported image inputs are listed in `image_extensions.txt`.
 
-Use `C` to open the class popup, arrow keys to choose a class, `Enter` or `Space` to confirm, and `Esc` to close it. Changing the selected class only affects new annotations. Hold `F` for temporary 10x focus around the cursor. Removed class-cycling and corner-cycling keybindings from older configs are ignored during config loading.
+Annotato labels images in chunks of 50. Each chunk is labelled one class at a time in `Class::ALL` order: all 50 images for `Ball`, then the same chunk for `GoalPost`, and so on. `Space` marks the current image as reviewed for the active class, saves, skips images already reviewed for that class, and advances. A reviewed image does not need to contain an annotation for that class.
+
+Hold `F` for temporary 10x focus around the cursor. Removed class-cycling and corner-cycling keybindings from older configs are ignored during config loading.
 
 ## Config
 
@@ -29,17 +31,20 @@ draw = { primary = "B" }
 
 ## Labels
 
-Annotato stores one JSON sidecar next to each image. Coordinates are normalized to the image size.
+Annotato stores one JSON sidecar next to each image. Coordinates are normalized to the image size. `labeled_classes` records which classes have already been reviewed for the image, including reviewed-empty classes.
 
 ```json
-[
-  { "class": "Robot", "points": [[0.10, 0.20], [0.35, 0.80]] },
-  { "class": "LSpot", "point": [0.42, 0.58] },
-  { "class": "TSpot", "points": [[0.30, 0.40], [0.45, 0.55]], "point": [0.38, 0.48] }
-]
+{
+  "labeled_classes": ["Robot", "LSpot", "Person"],
+  "annotations": [
+    { "class": "Robot", "points": [[0.10, 0.20], [0.35, 0.80]] },
+    { "class": "LSpot", "point": [0.42, 0.58] },
+    { "class": "TSpot", "points": [[0.30, 0.40], [0.45, 0.55]], "point": [0.38, 0.48] }
+  ]
+}
 ```
 
-`points` is a bounding box stored as top-left and bottom-right corners. `point` is a single feature location. The schema is strict: each annotation may contain only `class`, `points`, and `point`, and `class` must be one of the built-in class names. `LSpot`, `TSpot`, and `XSpot` use point labels for new annotations; legacy boxes for those classes are preserved and augmented with `point` during migration. `GoalPost` can be annotated as either a box or a point.
+`points` is a bounding box stored as top-left and bottom-right corners. `point` is a single feature location. The schema is strict: each annotation may contain only `class`, `points`, and `point`, and `class` must be one of the built-in class names. `LSpot`, `TSpot`, and `XSpot` use point labels for new annotations; legacy boxes for those classes are preserved and augmented with `point` during migration. `GoalPost` can be annotated as either a box or a point. Legacy sidecar files containing a bare annotation array are still accepted; their `labeled_classes` are inferred from annotation classes when loaded.
 
 The YOLO conversion script is box-only and fails clearly if a label contains `point` annotations.
 

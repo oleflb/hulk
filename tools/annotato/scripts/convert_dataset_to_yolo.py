@@ -3,7 +3,6 @@
 # dependencies = ["click"]
 # ///
 
-import json
 import os
 import shutil
 from hashlib import sha256
@@ -14,14 +13,14 @@ import click
 from annotato_common import (
     CLASS_MAP,
     LabelSchemaError,
+    load_label_file,
     supported_image_paths,
     validate_annotation,
 )
 
 
 def convert_annotations(json_path: str, filename: str) -> list[str]:
-    with open(json_path) as f:
-        annotations = json.load(f)
+    _, annotations = load_label_file(json_path, filename)
 
     yolo_lines = []
 

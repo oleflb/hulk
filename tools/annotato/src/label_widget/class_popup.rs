@@ -7,7 +7,12 @@ use crate::{classes::Class, user_toml::CONFIG};
 use super::LabelWidget;
 
 impl LabelWidget {
-    pub(super) fn handle_class_popup_shortcut(&mut self, ui: &Ui) {
+    pub(super) fn handle_class_popup_shortcut(&mut self, ui: &Ui, class_locked: bool) {
+        if class_locked {
+            self.class_popup_open = false;
+            return;
+        }
+
         let config = &CONFIG.get().unwrap().keybindings;
         if ui.input(|input| config.class_popup.is_pressed(input)) {
             if self.class_popup_open {

@@ -36,6 +36,7 @@ pub struct CanvasState {
     pub(super) draft_box: Option<BoundingBox>,
     pub(super) interaction: Interaction,
     pub(super) keyboard_mode: KeyboardMode,
+    pub(super) focus_anchor: Option<FocusAnchor>,
     pub(super) zoom: f32,
     pub(super) pan: Vec2,
     annotations_changed: bool,
@@ -48,11 +49,18 @@ impl Default for CanvasState {
             draft_box: None,
             interaction: Interaction::None,
             keyboard_mode: KeyboardMode::None,
+            focus_anchor: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
             annotations_changed: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FocusAnchor {
+    pub(super) screen_position: Pos2,
+    pub(super) image_position: Pos2,
 }
 
 impl CanvasState {
@@ -91,12 +99,14 @@ pub(super) enum Interaction {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) enum KeyboardMode {
     #[default]
     None,
     DraftResize {
-        corner: Corner,
+        anchor: Pos2,
+        moving: Pos2,
+        pointer_position: Option<Pos2>,
     },
     MoveSelected,
     ResizeSelected {

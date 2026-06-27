@@ -15,6 +15,16 @@ pub struct AnnotationFormat {
     point: Option<[f32; 2]>,
 }
 
+impl AnnotationFormat {
+    pub fn class(&self) -> Class {
+        self.class
+    }
+
+    pub fn needs_point_migration(&self) -> bool {
+        self.class.requires_point() && self.points.is_some() && self.point.is_none()
+    }
+}
+
 impl<'de> Deserialize<'de> for AnnotationFormat {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -63,6 +73,83 @@ impl<'de> Deserialize<'de> for AnnotationFormat {
             point: raw.point,
         })
     }
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct LabelFileFormat {
+    pub labeled_classes: Vec<Class>,
+    pub annotations: Vec<AnnotationFormat>,
+}
+
+impl LabelFileFormat {
+    pub fn from_unlabeled_annotations(annotations: Vec<AnnotationFormat>) -> Self {
+        Self {
+            labeled_classes: Vec::new(),
+            annotations,
+        }
+    }
+
+    pub fn class_is_labeled(&self, class: Class) -> bool {
+        self.labeled_classes.contains(&class)
+    }
+
+    pub fn has_pending_migration_for_class(&self, class: Class) -> bool {
+        self.annotations
+            .iter()
+            .any(|annotation| annotation.class() == class && annotation.needs_point_migration())
+    }
+}
+
+impl<'de> Deserialize<'de> for LabelFileFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CurrentLabelFileFormat {
+            #[serde(default)]
+            labeled_classes: Vec<Class>,
+            #[serde(default)]
+            annotations: Vec<AnnotationFormat>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum AnyLabelFileFormat {
+            Current(CurrentLabelFileFormat),
+            Legacy(Vec<AnnotationFormat>),
+        }
+
+        match AnyLabelFileFormat::deserialize(deserializer)? {
+            AnyLabelFileFormat::Current(current) => Ok(Self {
+                labeled_classes: normalize_labeled_classes(current.labeled_classes),
+                annotations: current.annotations,
+            }),
+            AnyLabelFileFormat::Legacy(annotations) => Ok(Self {
+                labeled_classes: infer_labeled_classes(&annotations),
+                annotations,
+            }),
+        }
+    }
+}
+
+pub fn normalize_labeled_classes(classes: Vec<Class>) -> Vec<Class> {
+    Class::ALL
+        .into_iter()
+        .filter(|class| classes.contains(class))
+        .collect()
+}
+
+fn infer_labeled_classes(annotations: &[AnnotationFormat]) -> Vec<Class> {
+    Class::ALL
+        .into_iter()
+        .filter(|class| {
+            annotations
+                .iter()
+                .any(|annotation| annotation.class() == *class)
+        })
+        .collect()
 }
 
 fn validate_normalized_point([x, y]: [f32; 2]) -> Result<(), String> {
@@ -310,5 +397,35 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("between 0 and 1"));
+    }
+
+    #[test]
+    fn legacy_label_arrays_infer_labeled_classes() {
+        let json = r#"[{"class":"Robot","points":[[0.1,0.2],[0.3,0.4]]}]"#;
+
+        let label_file: LabelFileFormat = serde_json::from_str(json).unwrap();
+
+        assert_eq!(label_file.labeled_classes, vec![Class::Robot]);
+        assert_eq!(label_file.annotations.len(), 1);
+    }
+
+    #[test]
+    fn label_file_can_mark_empty_class_as_labeled() {
+        let json = r#"{"labeled_classes":["Person"],"annotations":[]}"#;
+
+        let label_file: LabelFileFormat = serde_json::from_str(json).unwrap();
+
+        assert!(label_file.class_is_labeled(Class::Person));
+        assert!(label_file.annotations.is_empty());
+    }
+
+    #[test]
+    fn labeled_class_still_requires_pending_point_migration() {
+        let json = r#"{"labeled_classes":["TSpot"],"annotations":[{"class":"TSpot","points":[[0.1,0.2],[0.3,0.4]]}]}"#;
+
+        let label_file: LabelFileFormat = serde_json::from_str(json).unwrap();
+
+        assert!(label_file.class_is_labeled(Class::TSpot));
+        assert!(label_file.has_pending_migration_for_class(Class::TSpot));
     }
 }

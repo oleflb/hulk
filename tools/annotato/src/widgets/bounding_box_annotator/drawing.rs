@@ -28,6 +28,7 @@ impl BoundingBoxAnnotator<'_> {
                     transform,
                     annotation.class,
                     bounding_box,
+                    annotation.class == *self.selected_class,
                     self.state.selected
                         == Some(Selection {
                             index,
@@ -39,7 +40,15 @@ impl BoundingBoxAnnotator<'_> {
         }
 
         if let Some(draft_box) = &self.state.draft_box {
-            self.draw_box(ui, transform, *self.selected_class, draft_box, true, true);
+            self.draw_box(
+                ui,
+                transform,
+                *self.selected_class,
+                draft_box,
+                true,
+                true,
+                true,
+            );
         }
 
         for (index, annotation) in self.annotations.iter().enumerate() {
@@ -49,6 +58,7 @@ impl BoundingBoxAnnotator<'_> {
                     transform,
                     annotation,
                     point,
+                    annotation.class == *self.selected_class,
                     self.state.selected
                         == Some(Selection {
                             index,
@@ -65,6 +75,7 @@ impl BoundingBoxAnnotator<'_> {
         transform: ImageTransform,
         class: Class,
         bounding_box: &BoundingBox,
+        active: bool,
         selected: bool,
         draft: bool,
     ) {
@@ -74,17 +85,23 @@ impl BoundingBoxAnnotator<'_> {
 
         let painter = ui.painter();
         let rect = transform.image_rect_to_screen(bounding_box.rect);
-        let editable = class.supports_boxes() || draft;
-        let color = if editable {
+        let editable = active && (class.supports_boxes() || draft);
+        let color = if active || draft {
             class.color()
         } else {
-            class.color().gamma_multiply(0.55)
+            class.color().gamma_multiply(0.35)
         };
         let stroke_width = if selected { 2.5 } else { 1.5 };
         painter.rect_filled(
             rect,
             2.0,
-            color.gamma_multiply(if selected { 0.18 } else { 0.10 }),
+            color.gamma_multiply(if selected {
+                0.18
+            } else if active {
+                0.10
+            } else {
+                0.05
+            }),
         );
         painter.rect_stroke(
             rect,
@@ -95,7 +112,7 @@ impl BoundingBoxAnnotator<'_> {
 
         let label: Cow<'_, str> = if draft {
             Cow::Owned(format!("new {}", class.as_str()))
-        } else if editable {
+        } else if editable || !active {
             Cow::Borrowed(class.as_str())
         } else {
             Cow::Owned(format!("legacy {} box", class.as_str()))
@@ -105,10 +122,14 @@ impl BoundingBoxAnnotator<'_> {
             Align2::LEFT_TOP,
             label.as_ref(),
             FontId::proportional(18.0),
-            Color32::from_rgb(205, 214, 244),
+            if active {
+                Color32::from_rgb(205, 214, 244)
+            } else {
+                Color32::from_rgb(127, 132, 156)
+            },
         );
 
-        if editable && (selected || draft) {
+        if editable && active && (selected || draft) {
             for corner in crate::boundingbox::Corner::ALL {
                 let corner_screen = transform.image_to_screen(bounding_box.corner(corner));
                 painter.circle_filled(corner_screen, HANDLE_RADIUS, color);
@@ -127,11 +148,16 @@ impl BoundingBoxAnnotator<'_> {
         transform: ImageTransform,
         annotation: &Annotation,
         point: Pos2,
+        active: bool,
         selected: bool,
     ) {
         let painter = ui.painter();
         let position = transform.image_to_screen(point);
-        let color = annotation.class.color();
+        let color = if active {
+            annotation.class.color()
+        } else {
+            annotation.class.color().gamma_multiply(0.35)
+        };
         let radius = if selected {
             POINT_RADIUS + 2.0
         } else {
@@ -163,7 +189,11 @@ impl BoundingBoxAnnotator<'_> {
             Align2::LEFT_BOTTOM,
             annotation.class.as_str(),
             FontId::proportional(18.0),
-            Color32::from_rgb(205, 214, 244),
+            if active {
+                Color32::from_rgb(205, 214, 244)
+            } else {
+                Color32::from_rgb(127, 132, 156)
+            },
         );
     }
 }

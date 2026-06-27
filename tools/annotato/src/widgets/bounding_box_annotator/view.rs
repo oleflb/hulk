@@ -1,8 +1,8 @@
-use eframe::egui::{Event, PointerButton, Response, Ui, Vec2};
+use eframe::egui::{PointerButton, Response, Ui, Vec2};
 
 use crate::user_toml::CONFIG;
 
-use super::{BoundingBoxAnnotator, transform::ImageTransform};
+use super::{BoundingBoxAnnotator, state::FocusAnchor, transform::ImageTransform};
 
 impl BoundingBoxAnnotator<'_> {
     pub(super) fn handle_view_input(&mut self, ui: &Ui, response: &Response) {
@@ -10,18 +10,9 @@ impl BoundingBoxAnnotator<'_> {
             return;
         }
 
-        let (scroll_delta, ctrl_pressed, middle_drag_delta, pointer_position) = ui.input(|input| {
-            let scroll_delta = input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::MouseWheel { delta, .. } => Some(*delta),
-                    _ => None,
-                })
-                .fold(Vec2::ZERO, |sum, delta| sum + delta);
+        let (scroll_y, middle_drag_delta, pointer_position) = ui.input(|input| {
             (
-                (scroll_delta != Vec2::ZERO).then_some(scroll_delta),
-                input.modifiers.ctrl,
+                input.smooth_scroll_delta.y,
                 if input.pointer.button_down(PointerButton::Middle) {
                     input.pointer.delta()
                 } else {
@@ -35,62 +26,73 @@ impl BoundingBoxAnnotator<'_> {
             self.state.pan += middle_drag_delta;
         }
 
-        let Some(scroll_delta) = scroll_delta else {
-            return;
-        };
-
-        if ctrl_pressed {
-            let zoom_factor = (scroll_delta.y / 240.0).exp();
-            let old_zoom = self.state.zoom.max(1.0);
-            let new_zoom = (old_zoom * zoom_factor).clamp(1.0, 16.0);
-            if let Some(pointer) = pointer_position {
-                let old_transform =
-                    ImageTransform::new(response.rect, self.image_size, old_zoom, self.state.pan);
-                let image_anchor = old_transform.screen_to_image_unclamped(pointer);
-                self.state.pan = ImageTransform::pan_for_anchor(
-                    response.rect,
-                    self.image_size,
-                    new_zoom,
-                    pointer,
-                    image_anchor,
-                );
-            }
-            self.state.zoom = new_zoom;
-            if self.state.zoom <= 1.001 {
-                self.state.pan = Vec2::ZERO;
-            }
+        if scroll_y.abs() <= f32::EPSILON {
             return;
         }
 
-        if self.state.zoom > 1.01 {
-            self.state.pan += scroll_delta;
+        let old_zoom = self.state.zoom.max(1.0);
+        let zoom_factor = 1.01_f32.powf(scroll_y);
+        let new_zoom = (old_zoom * zoom_factor).clamp(1.0, 16.0);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+
+        if let Some(pointer) = pointer_position {
+            let old_transform =
+                ImageTransform::new(response.rect, self.image_size, old_zoom, self.state.pan);
+            let image_anchor = old_transform.screen_to_image_unclamped(pointer);
+            self.state.pan = ImageTransform::pan_for_anchor(
+                response.rect,
+                self.image_size,
+                new_zoom,
+                pointer,
+                image_anchor,
+            );
+        }
+        self.state.zoom = new_zoom;
+        if self.state.zoom <= 1.001 {
+            self.state.pan = Vec2::ZERO;
         }
     }
 
     pub(super) fn effective_transform(
-        &self,
+        &mut self,
         ui: &Ui,
         response: &Response,
         base_transform: ImageTransform,
     ) -> ImageTransform {
         let config = &CONFIG.get().unwrap().keybindings;
         let focus = ui.input(|input| config.temporary_focus.is_down(input));
-        if !focus || !response.hovered() {
+        if !focus {
+            self.state.focus_anchor = None;
             return base_transform;
         }
 
-        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+        if self.state.focus_anchor.is_none() {
+            if !response.hovered() {
+                return base_transform;
+            }
+
+            let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+                return base_transform;
+            };
+
+            self.state.focus_anchor = Some(FocusAnchor {
+                screen_position: pointer,
+                image_position: base_transform.screen_to_image_clamped(pointer, self.image_size),
+            });
+        }
+
+        let Some(anchor) = self.state.focus_anchor else {
             return base_transform;
         };
-
-        let image_anchor = base_transform.screen_to_image_clamped(pointer, self.image_size);
         let focus_zoom = (self.state.zoom * 10.0).clamp(1.0, 160.0);
         let focus_pan = ImageTransform::pan_for_anchor(
             response.rect,
             self.image_size,
             focus_zoom,
-            pointer,
-            image_anchor,
+            anchor.screen_position,
+            anchor.image_position,
         );
         ImageTransform::new(response.rect, self.image_size, focus_zoom, focus_pan)
     }

@@ -1,3 +1,4 @@
+import json
 import math
 from pathlib import Path
 
@@ -36,6 +37,40 @@ def supported_image_paths(folder):
         for path in folder.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
+
+
+def load_label_file(json_path, filename):
+    with open(json_path) as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        annotations = data
+        labeled_classes = [
+            class_name
+            for class_name in CLASS_NAMES
+            if any(annotation.get("class") == class_name for annotation in annotations)
+        ]
+    elif isinstance(data, dict):
+        extra_fields = set(data) - {"labeled_classes", "annotations"}
+        if extra_fields:
+            fields = ", ".join(sorted(extra_fields))
+            raise LabelSchemaError(f"Unexpected label file fields in {filename}: {fields}")
+
+        labeled_classes = data.get("labeled_classes", [])
+        annotations = data.get("annotations", [])
+    else:
+        raise LabelSchemaError(f"Label file {filename} must be an object or annotation array")
+
+    if not isinstance(labeled_classes, list):
+        raise LabelSchemaError(f"labeled_classes in {filename} must be a list")
+    for class_name in labeled_classes:
+        if class_name not in CLASS_MAP:
+            raise LabelSchemaError(f"Unknown labeled class '{class_name}' in {filename}")
+
+    if not isinstance(annotations, list):
+        raise LabelSchemaError(f"annotations in {filename} must be a list")
+
+    return labeled_classes, annotations
 
 
 def validate_annotation(annotation, filename):

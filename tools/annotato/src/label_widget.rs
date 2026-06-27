@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    annotation::{Annotation, AnnotationFormat},
+    annotation::{Annotation, AnnotationFormat, LabelFileFormat, normalize_labeled_classes},
     classes::Class,
     paths::Paths,
     user_toml::CONFIG,
@@ -29,6 +29,7 @@ pub struct LabelWidget {
     goalpost_creation_shape: CreationShape,
     dirty: bool,
     annotations: Vec<Annotation>,
+    labeled_classes: Vec<Class>,
     canvas_state: CanvasState,
     unresolved_annotations: Vec<AnnotationFormat>,
     texture_load_error: Option<String>,
@@ -49,6 +50,7 @@ impl Default for LabelWidget {
             goalpost_creation_shape: CreationShape::Box,
             dirty: false,
             annotations: Vec::new(),
+            labeled_classes: Vec::new(),
             canvas_state: CanvasState::default(),
             unresolved_annotations: Vec::new(),
             texture_load_error: None,
@@ -72,12 +74,52 @@ impl LabelWidget {
         self.dirty
     }
 
-    pub fn ui(&mut self, ui: &mut eframe::egui::Ui) -> Result<()> {
+    pub fn selected_class(&self) -> Class {
+        self.selected_class
+    }
+
+    pub fn set_selected_class(&mut self, class: Class) {
+        if self.selected_class == class {
+            return;
+        }
+        self.selected_class = class;
+        self.class_popup_open = false;
+        self.class_popup_index = Class::ALL
+            .iter()
+            .position(|candidate| *candidate == class)
+            .unwrap_or(0);
+        self.canvas_state = CanvasState::default();
+    }
+
+    pub fn mark_labeled_class(&mut self, class: Class) {
+        if !self.labeled_classes.contains(&class) {
+            self.labeled_classes.push(class);
+            self.labeled_classes =
+                normalize_labeled_classes(std::mem::take(&mut self.labeled_classes));
+            self.dirty = true;
+        }
+    }
+
+    pub fn class_is_labeled(&self, class: Class) -> bool {
+        self.labeled_classes.contains(&class)
+    }
+
+    pub fn has_pending_migration_for_class(&self, class: Class) -> bool {
+        self.annotations
+            .iter()
+            .any(|annotation| annotation.class == class && annotation.needs_point_migration())
+            || self
+                .unresolved_annotations
+                .iter()
+                .any(|annotation| annotation.class() == class && annotation.needs_point_migration())
+    }
+
+    pub fn ui(&mut self, ui: &mut eframe::egui::Ui, class_locked: bool) -> Result<()> {
         self.ensure_texture_loaded(ui)?;
-        self.handle_class_popup_shortcut(ui);
+        self.handle_class_popup_shortcut(ui, class_locked);
 
         ui.vertical(|ui| {
-            self.toolbar_ui(ui);
+            self.toolbar_ui(ui, class_locked);
             ui.add_space(8.0);
 
             if self.migration_ui(ui) {
@@ -106,7 +148,9 @@ impl LabelWidget {
             ui.add_space(6.0);
             self.help_ui(ui);
         });
-        self.class_popup_ui(ui);
+        if !class_locked {
+            self.class_popup_ui(ui);
+        }
 
         Ok(())
     }
@@ -140,7 +184,7 @@ impl LabelWidget {
         Ok(())
     }
 
-    fn toolbar_ui(&mut self, ui: &mut eframe::egui::Ui) {
+    fn toolbar_ui(&mut self, ui: &mut eframe::egui::Ui, class_locked: bool) {
         ui.horizontal_wrapped(|ui| {
             if let Some(paths) = &self.current_paths {
                 let filename = paths
@@ -161,19 +205,24 @@ impl LabelWidget {
             ui.separator();
             ui.label("Class");
             let config = &CONFIG.get().unwrap().keybindings;
-            let class_button = Button::new(
-                RichText::new(format!(
+            let class_label = if class_locked {
+                format!("{}  (chunk)", self.selected_class.as_str())
+            } else {
+                format!(
                     "{}  ({})",
                     self.selected_class.as_str(),
                     config.class_popup.label()
-                ))
-                .strong()
-                .size(16.0)
-                .color(Color32::from_rgb(245, 245, 245)),
+                )
+            };
+            let class_button = Button::new(
+                RichText::new(class_label)
+                    .strong()
+                    .size(16.0)
+                    .color(Color32::from_rgb(245, 245, 245)),
             )
             .fill(self.selected_class.color().gamma_multiply(0.35))
             .stroke(Stroke::new(1.0, self.selected_class.color()));
-            if ui.add(class_button).clicked() {
+            if ui.add_enabled(!class_locked, class_button).clicked() {
                 self.open_class_popup();
             }
 
@@ -222,11 +271,11 @@ impl LabelWidget {
             ui.separator();
             ui.label(RichText::new("Keyboard:").strong());
             ui.label(format!("{} new/commit", config.draw.label()));
-            ui.label("arrows move/resize");
+            ui.label("arrows edit active mode");
             ui.label("Shift faster");
             ui.label("Ctrl fine");
-            ui.label(format!("{} resize box", config.edit.label()));
-            ui.label(format!("{} move", config.move_box.label()));
+            ui.label(format!("{} resize mode", config.edit.label()));
+            ui.label(format!("{} move mode", config.move_box.label()));
             ui.label(format!("{} focus", config.temporary_focus.label()));
             ui.label("Tab label");
             ui.label(format!("{} class", config.class_popup.label()));
@@ -242,7 +291,8 @@ impl LabelWidget {
         let Some(image_size) = self.image_size else {
             return false;
         };
-        let Some((annotation_index, pending_count)) = self.pending_migration() else {
+        let Some((annotation_index, pending_count)) = self.pending_migration(self.selected_class)
+        else {
             return false;
         };
         let annotation = &self.annotations[annotation_index];
@@ -302,12 +352,12 @@ impl LabelWidget {
         true
     }
 
-    fn pending_migration(&self) -> Option<(usize, usize)> {
+    fn pending_migration(&self, class: Class) -> Option<(usize, usize)> {
         let mut first_index = None;
         let mut count = 0;
 
         for (index, annotation) in self.annotations.iter().enumerate() {
-            if annotation.needs_point_migration() {
+            if annotation.class == class && annotation.needs_point_migration() {
                 first_index.get_or_insert(index);
                 count += 1;
             }
@@ -321,7 +371,7 @@ impl LabelWidget {
         paths: Paths,
         model_annotations: &[AnnotationFormat],
     ) -> Result<()> {
-        let unresolved_annotations = if paths.label_path.exists() {
+        let label_file = if paths.label_path.exists() {
             let existing_annotations =
                 fs::read_to_string(&paths.label_path).wrap_err_with(|| {
                     format!("failed to read label file {}", paths.label_path.display())
@@ -330,11 +380,12 @@ impl LabelWidget {
                 format!("failed to parse label file {}", paths.label_path.display())
             })?
         } else {
-            model_annotations.to_vec()
+            LabelFileFormat::from_unlabeled_annotations(model_annotations.to_vec())
         };
 
         self.annotations.clear();
-        self.unresolved_annotations = unresolved_annotations;
+        self.labeled_classes = label_file.labeled_classes;
+        self.unresolved_annotations = label_file.annotations;
         self.image_size = None;
         self.texture_handle = None;
         self.texture_load_error = None;
@@ -351,16 +402,20 @@ impl LabelWidget {
             .current_paths
             .as_ref()
             .wrap_err("no image loaded currently")?;
-        let Some(image_size) = self.image_size else {
-            return Ok(());
+        let annotations: Vec<AnnotationFormat> = if let Some(image_size) = self.image_size {
+            self.annotations
+                .iter()
+                .map(|annotation| annotation.to_format(image_size))
+                .collect()
+        } else {
+            self.unresolved_annotations.clone()
         };
-        let annotations: Vec<AnnotationFormat> = self
-            .annotations
-            .iter()
-            .map(|annotation| annotation.to_format(image_size))
-            .collect();
+        let label_file = LabelFileFormat {
+            labeled_classes: normalize_labeled_classes(self.labeled_classes.clone()),
+            annotations,
+        };
 
-        let annotations = serde_json::to_string_pretty(&annotations).wrap_err_with(|| {
+        let annotations = serde_json::to_string_pretty(&label_file).wrap_err_with(|| {
             format!(
                 "failed to serialize labels for {}",
                 paths.label_path.display()

@@ -1,21 +1,33 @@
 use std::{
     error::Error as StdError,
     fmt::{self, Display},
+    fs,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
 use crate::{
-    ai_assistant::ModelAnnotations, label_widget::LabelWidget, paths::Paths, user_toml::CONFIG,
-    widgets::image_list::ImageList,
+    ai_assistant::ModelAnnotations,
+    annotation::LabelFileFormat,
+    classes::Class,
+    label_widget::LabelWidget,
+    paths::Paths,
+    user_toml::{CONFIG, KeyBind},
+    widgets::{image_list::ImageList, keybind_preview::KeybindPreview},
 };
 use color_eyre::{
     Result,
-    eyre::{Context as C, Report},
+    eyre::{Context as C, Report, bail},
 };
 use eframe::{
     App, CreationContext,
-    egui::{CentralPanel, Context, Panel, RichText, Ui},
+    egui::{
+        CentralPanel, Context, Grid, Key, KeyboardShortcut, Panel, ProgressBar, Response, RichText,
+        Ui,
+    },
 };
+
+const CHUNK_SIZE: usize = 50;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnnotationPhase {
@@ -25,9 +37,11 @@ pub enum AnnotationPhase {
 
 pub struct AnnotatorApp {
     phase: AnnotationPhase,
+    workflow: ChunkWorkflow,
     paths: Vec<Paths>,
     label_widget: LabelWidget,
     model_annotations: ModelAnnotations,
+    class_transition: Option<ClassTransition>,
     last_error: Option<String>,
 }
 
@@ -54,13 +68,17 @@ impl AnnotatorApp {
             })
             .collect::<Vec<_>>();
 
-        Ok(AnnotatorApp {
+        let mut app = AnnotatorApp {
             phase: AnnotationPhase::Labelling { current_index: 0 },
+            workflow: ChunkWorkflow::default(),
             paths,
             label_widget: LabelWidget::default(),
             model_annotations,
+            class_transition: None,
             last_error: None,
-        })
+        };
+        app.move_to_first_pending();
+        Ok(app)
     }
 
     fn current_index(&self) -> Option<usize> {
@@ -95,17 +113,40 @@ impl AnnotatorApp {
         Ok(())
     }
 
+    fn active_class(&self) -> Class {
+        self.workflow.active_class()
+    }
+
+    fn complete_current_for_active_class(&mut self) -> Result<()> {
+        let active_class = self.active_class();
+        self.load_image()?;
+        if self
+            .label_widget
+            .has_pending_migration_for_class(active_class)
+        {
+            bail!(
+                "finish pending {} keypoint migration before advancing",
+                active_class.as_str()
+            );
+        }
+
+        self.label_widget.mark_labeled_class(active_class);
+        self.save_current()
+    }
+
     fn next(&mut self) -> Result<()> {
+        if self.handle_class_transition_command(ClassTransitionDirection::Next) {
+            return Ok(());
+        }
+
         let Some(current_index) = self.current_index() else {
             return Ok(());
         };
-        self.save_current().wrap_err("failed to go to next image")?;
+        self.complete_current_for_active_class()
+            .wrap_err("failed to go to next image")?;
 
-        let new_index = current_index + 1;
-        if new_index < self.paths.len() {
-            self.phase = AnnotationPhase::Labelling {
-                current_index: new_index,
-            };
+        if let Some(position) = self.next_pending_position_after(current_index) {
+            self.apply_position_with_class_transition(position, ClassTransitionDirection::Next);
         } else {
             self.phase = AnnotationPhase::Finished;
         }
@@ -113,29 +154,46 @@ impl AnnotatorApp {
     }
 
     fn previous(&mut self) -> Result<()> {
+        if self.handle_class_transition_command(ClassTransitionDirection::Previous) {
+            return Ok(());
+        }
+
         match self.phase {
             AnnotationPhase::Labelling { current_index } => {
-                self.save_current()
+                self.save_current_if_dirty()
                     .wrap_err("failed to go to previous image")?;
-                self.phase = AnnotationPhase::Labelling {
-                    current_index: current_index.saturating_sub(1),
-                };
+                if let Some(position) = self.previous_position_before(current_index) {
+                    self.apply_position_with_class_transition(
+                        position,
+                        ClassTransitionDirection::Previous,
+                    );
+                }
             }
             AnnotationPhase::Finished => {
-                self.phase = AnnotationPhase::Labelling {
-                    current_index: self.paths.len() - 1,
-                };
+                let class_index = Class::ALL.len() - 1;
+                self.apply_position_with_class_transition(
+                    ChunkPosition {
+                        index: self.paths.len() - 1,
+                        class_index,
+                    },
+                    ClassTransitionDirection::Previous,
+                );
             }
         }
         Ok(())
     }
 
     fn go_to(&mut self, index: usize) -> Result<()> {
+        if self.class_transition.is_some() {
+            return Ok(());
+        }
+
         if Some(index) == self.current_index() {
             return Ok(());
         }
 
-        self.save_current().wrap_err("failed to switch image")?;
+        self.save_current_if_dirty()
+            .wrap_err("failed to switch image")?;
         self.phase = AnnotationPhase::Labelling {
             current_index: index,
         };
@@ -146,6 +204,8 @@ impl AnnotatorApp {
         let Some(index) = self.current_index() else {
             return Ok(());
         };
+        let active_class = self.active_class();
+        self.label_widget.set_selected_class(active_class);
 
         if let Some(paths) = self.paths.get_mut(index) {
             if self.label_widget.has_paths(paths) {
@@ -165,6 +225,182 @@ impl AnnotatorApp {
         }
 
         Ok(())
+    }
+
+    fn move_to_first_pending(&mut self) {
+        if let Some(position) = self.first_pending_position() {
+            self.apply_position(position);
+        } else {
+            self.phase = AnnotationPhase::Finished;
+        }
+    }
+
+    fn apply_position(&mut self, position: ChunkPosition) {
+        self.class_transition = None;
+        self.workflow.class_index = position.class_index;
+        self.label_widget.set_selected_class(self.active_class());
+        self.phase = AnnotationPhase::Labelling {
+            current_index: position.index,
+        };
+    }
+
+    fn apply_position_with_class_transition(
+        &mut self,
+        position: ChunkPosition,
+        direction: ClassTransitionDirection,
+    ) {
+        if position.class_index == self.workflow.class_index {
+            self.apply_position(position);
+        } else {
+            self.class_transition = Some(ClassTransition {
+                position,
+                direction,
+            });
+        }
+    }
+
+    fn handle_class_transition_command(&mut self, direction: ClassTransitionDirection) -> bool {
+        let Some(transition) = self.class_transition else {
+            return false;
+        };
+
+        self.class_transition = None;
+        if transition.direction == direction {
+            self.apply_position(transition.position);
+        }
+
+        true
+    }
+
+    fn first_pending_position(&self) -> Option<ChunkPosition> {
+        let mut chunk_start = 0;
+        while chunk_start < self.paths.len() {
+            let chunk_range = self.chunk_range_from_start(chunk_start);
+            for class_index in 0..Class::ALL.len() {
+                if let Some(index) = self.first_pending_in_range(chunk_range.clone(), class_index) {
+                    return Some(ChunkPosition { index, class_index });
+                }
+            }
+            chunk_start = chunk_range.end;
+        }
+        None
+    }
+
+    fn next_pending_position_after(&self, current_index: usize) -> Option<ChunkPosition> {
+        let class_index = self.workflow.class_index;
+        let chunk_start = chunk_start(current_index);
+        let chunk_range = self.chunk_range_from_start(chunk_start);
+
+        if let Some(index) =
+            self.first_pending_in_range(current_index + 1..chunk_range.end, class_index)
+        {
+            return Some(ChunkPosition { index, class_index });
+        }
+
+        for next_class_index in class_index + 1..Class::ALL.len() {
+            if let Some(index) = self.first_pending_in_range(chunk_range.clone(), next_class_index)
+            {
+                return Some(ChunkPosition {
+                    index,
+                    class_index: next_class_index,
+                });
+            }
+        }
+
+        let mut next_chunk_start = chunk_range.end;
+        while next_chunk_start < self.paths.len() {
+            let next_chunk_range = self.chunk_range_from_start(next_chunk_start);
+            for next_class_index in 0..Class::ALL.len() {
+                if let Some(index) =
+                    self.first_pending_in_range(next_chunk_range.clone(), next_class_index)
+                {
+                    return Some(ChunkPosition {
+                        index,
+                        class_index: next_class_index,
+                    });
+                }
+            }
+            next_chunk_start = next_chunk_range.end;
+        }
+
+        None
+    }
+
+    fn previous_position_before(&self, current_index: usize) -> Option<ChunkPosition> {
+        let chunk_start = chunk_start(current_index);
+        let chunk_range = self.chunk_range_from_start(chunk_start);
+        let class_index = self.workflow.class_index;
+
+        if current_index > chunk_start {
+            return Some(ChunkPosition {
+                index: current_index - 1,
+                class_index,
+            });
+        }
+
+        if class_index > 0 {
+            return Some(ChunkPosition {
+                index: chunk_range.end - 1,
+                class_index: class_index - 1,
+            });
+        }
+
+        if chunk_start > 0 {
+            let previous_chunk_start = chunk_start.saturating_sub(CHUNK_SIZE);
+            let previous_chunk_range = self.chunk_range_from_start(previous_chunk_start);
+            return Some(ChunkPosition {
+                index: previous_chunk_range.end - 1,
+                class_index: Class::ALL.len() - 1,
+            });
+        }
+
+        None
+    }
+
+    fn first_pending_in_range(&self, range: Range<usize>, class_index: usize) -> Option<usize> {
+        let class = Class::ALL[class_index];
+        range
+            .filter(|index| *index < self.paths.len())
+            .find(|index| !self.class_is_complete_for_index(*index, class))
+    }
+
+    fn class_is_complete_for_index(&self, index: usize, class: Class) -> bool {
+        let Some(label_file) = self.label_file_for_index(index) else {
+            return false;
+        };
+        label_file.class_is_labeled(class) && !label_file.has_pending_migration_for_class(class)
+    }
+
+    fn label_file_for_index(&self, index: usize) -> Option<LabelFileFormat> {
+        let label_path = &self.paths.get(index)?.label_path;
+        let label_file = fs::read_to_string(label_path).ok()?;
+        serde_json::from_str(&label_file).ok()
+    }
+
+    fn chunk_range_for_index(&self, index: usize) -> Range<usize> {
+        self.chunk_range_from_start(chunk_start(index))
+    }
+
+    fn chunk_range_from_start(&self, start: usize) -> Range<usize> {
+        start..(start + CHUNK_SIZE).min(self.paths.len())
+    }
+
+    fn chunk_progress(&self) -> Option<ChunkProgress> {
+        let current_index = self.current_index()?;
+        let chunk_range = self.chunk_range_for_index(current_index);
+        let active_class = self.active_class();
+        let completed = chunk_range
+            .clone()
+            .filter(|index| self.class_is_complete_for_index(*index, active_class))
+            .count();
+
+        Some(ChunkProgress {
+            chunk_index: chunk_range.start / CHUNK_SIZE,
+            chunk_count: self.paths.len().div_ceil(CHUNK_SIZE),
+            class: active_class,
+            completed,
+            total: chunk_range.len(),
+        })
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &Context) {
@@ -198,13 +434,18 @@ impl AnnotatorApp {
     }
 
     fn show_sidebar(&mut self, ui: &mut Ui) {
-        let config = &CONFIG.get().unwrap().keybindings;
         Panel::left("image-path-list")
             .default_size(280.0)
             .resizable(true)
             .show(ui, |ui| {
+                Panel::bottom("sidebar-footer").show(ui, |ui| {
+                    self.show_sidebar_footer(ui);
+                });
+
                 let mut current_phase = self.phase.clone();
-                ui.add(ImageList::new(&self.paths, &mut current_phase));
+                CentralPanel::no_frame().show(ui, |ui| {
+                    ui.add(ImageList::new(&self.paths, &mut current_phase));
+                });
 
                 if current_phase != self.phase
                     && let AnnotationPhase::Labelling { current_index } = current_phase
@@ -212,41 +453,110 @@ impl AnnotatorApp {
                 {
                     self.record_error(error);
                 }
+            });
+    }
 
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Previous")
-                        .on_hover_text(config.previous.label())
-                        .clicked()
-                        && let Err(error) = self.previous()
-                    {
-                        self.record_error(error);
-                    }
-                    if ui
-                        .button("Next")
-                        .on_hover_text(config.next.label())
-                        .clicked()
-                        && let Err(error) = self.next()
-                    {
-                        self.record_error(error);
-                    }
-                });
+    fn show_sidebar_footer(&mut self, ui: &mut Ui) -> Response {
+        ui.vertical(|ui| {
+            let config = &CONFIG.get().unwrap().keybindings;
+            if let Some(progress) = self.chunk_progress() {
+                ui.label(RichText::new("Chunk progress").strong());
+                ui.add(
+                    ProgressBar::new(progress.fraction())
+                        .show_percentage()
+                        .text(progress.label()),
+                );
+            }
 
-                if ui.button("First unlabelled").clicked() {
-                    if let Some((unlabelled_index, _)) = self
-                        .paths
-                        .iter()
-                        .enumerate()
-                        .find(|(_, paths)| !paths.label_present)
-                    {
-                        if let Err(error) = self.go_to(unlabelled_index) {
-                            self.record_error(error);
-                        }
-                    } else {
-                        self.phase = AnnotationPhase::Finished;
-                    }
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Previous")
+                    .on_hover_text(config.previous.label())
+                    .clicked()
+                    && let Err(error) = self.previous()
+                {
+                    self.record_error(error);
+                }
+                if ui
+                    .button("Next")
+                    .on_hover_text(config.next.label())
+                    .clicked()
+                    && let Err(error) = self.next()
+                {
+                    self.record_error(error);
                 }
             });
+
+            if ui.button("First incomplete").clicked() && self.class_transition.is_none() {
+                if let Err(error) = self.save_current_if_dirty() {
+                    self.record_error(error);
+                } else if let Some(position) = self.first_pending_position() {
+                    self.apply_position_with_class_transition(
+                        position,
+                        ClassTransitionDirection::Next,
+                    );
+                } else {
+                    self.phase = AnnotationPhase::Finished;
+                }
+            }
+
+            ui.add_space(8.0);
+            Self::show_keybinds(ui);
+        })
+        .response
+    }
+
+    fn show_keybinds(ui: &mut Ui) {
+        let config = &CONFIG.get().unwrap().keybindings;
+        ui.separator();
+        ui.label(RichText::new("Keybinds").strong());
+        let keybinds = [
+            ("Next", &config.next),
+            ("Previous", &config.previous),
+            ("Save", &config.save),
+            ("New/commit", &config.draw),
+            ("Resize mode", &config.edit),
+            ("Move mode", &config.move_box),
+            ("Focus", &config.temporary_focus),
+            ("Class", &config.class_popup),
+            ("Confirm", &config.confirm),
+            ("Cancel", &config.abort),
+            ("Delete", &config.delete),
+        ];
+        Grid::new("annotato-keybinds")
+            .num_columns(4)
+            .show(ui, |ui| {
+                for chunk in keybinds.chunks(2) {
+                    for (label, keybind) in chunk {
+                        Self::show_keybind_entry(ui, label, keybind);
+                    }
+                    if chunk.len() == 1 {
+                        ui.label("");
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn show_keybind_entry(ui: &mut Ui, label: &str, keybind: &KeyBind) {
+        ui.horizontal(|ui| {
+            Self::show_keybind_preview(ui, keybind, keybind.primary);
+            for alternative in &keybind.alternatives {
+                ui.label("/");
+                Self::show_keybind_preview(ui, keybind, *alternative);
+            }
+        });
+        ui.label(label);
+    }
+
+    fn show_keybind_preview(ui: &mut Ui, keybind: &KeyBind, key: Key) {
+        ui.add(KeybindPreview(KeyboardShortcut::new(
+            keybind.modifiers,
+            key,
+        )));
     }
 
     fn show_top_bar(&mut self, ui: &mut Ui) {
@@ -254,28 +564,62 @@ impl AnnotatorApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("annotato").strong());
                 ui.separator();
-                match self.phase {
-                    AnnotationPhase::Labelling { current_index } => {
-                        ui.label(format!(
-                            "Image {} of {}",
-                            current_index + 1,
-                            self.paths.len()
-                        ));
-                    }
-                    AnnotationPhase::Finished => {
-                        ui.label(format!("{} images complete", self.paths.len()));
+                if let Some(transition) = self.class_transition {
+                    let class = Class::ALL[transition.position.class_index];
+                    ui.label(format!(
+                        "{}: {}",
+                        transition.direction.label(),
+                        class.as_str()
+                    ));
+                } else {
+                    match self.phase {
+                        AnnotationPhase::Labelling { current_index } => {
+                            ui.label(format!(
+                                "Image {} of {}",
+                                current_index + 1,
+                                self.paths.len()
+                            ));
+                        }
+                        AnnotationPhase::Finished => {
+                            ui.label(format!("{} images complete", self.paths.len()));
+                        }
                     }
                 }
-                ui.separator();
-                let config = &CONFIG.get().unwrap().keybindings;
-                ui.label(format!("{} next", config.next.label()));
-                ui.label(format!("{} previous", config.previous.label()));
-                ui.label(format!("{} save", config.save.label()));
 
                 if let Some(error) = &self.last_error {
                     ui.separator();
                     ui.colored_label(eframe::egui::Color32::from_rgb(243, 139, 168), error);
                 }
+            });
+        });
+    }
+
+    fn show_class_transition(&mut self, ui: &mut Ui) {
+        let Some(transition) = self.class_transition else {
+            return;
+        };
+        let class = Class::ALL[transition.position.class_index];
+        let config = &CONFIG.get().unwrap().keybindings;
+        let (confirm, cancel) = match transition.direction {
+            ClassTransitionDirection::Next => (config.next.label(), config.previous.label()),
+            ClassTransitionDirection::Previous => (config.previous.label(), config.next.label()),
+        };
+
+        CentralPanel::default().show(ui, |ui| {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(transition.direction.label())
+                            .size(22.0)
+                            .strong(),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(class.as_str()).size(48.0).strong());
+                    ui.add_space(12.0);
+                    ui.label(format!(
+                        "Press {confirm} to continue, or {cancel} to stay here"
+                    ));
+                });
             });
         });
     }
@@ -286,7 +630,7 @@ impl AnnotatorApp {
                 self.record_error(error);
                 return;
             }
-            if let Err(error) = self.label_widget.ui(ui) {
+            if let Err(error) = self.label_widget.ui(ui, true) {
                 self.record_error(error);
             }
         });
@@ -315,6 +659,80 @@ enum GlobalAction {
     Save,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChunkWorkflow {
+    class_index: usize,
+}
+
+impl Default for ChunkWorkflow {
+    fn default() -> Self {
+        Self { class_index: 0 }
+    }
+}
+
+impl ChunkWorkflow {
+    fn active_class(self) -> Class {
+        Class::ALL[self.class_index]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkPosition {
+    index: usize,
+    class_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClassTransition {
+    position: ChunkPosition,
+    direction: ClassTransitionDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassTransitionDirection {
+    Next,
+    Previous,
+}
+
+impl ClassTransitionDirection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Next => "Next class",
+            Self::Previous => "Previous class",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkProgress {
+    chunk_index: usize,
+    chunk_count: usize,
+    class: Class,
+    completed: usize,
+    total: usize,
+}
+
+impl ChunkProgress {
+    fn fraction(self) -> f32 {
+        self.completed as f32 / self.total.max(1) as f32
+    }
+
+    fn label(self) -> String {
+        format!(
+            "Chunk {} of {} · {} {}/{}",
+            self.chunk_index + 1,
+            self.chunk_count,
+            self.class.as_str(),
+            self.completed,
+            self.total
+        )
+    }
+}
+
+fn chunk_start(index: usize) -> usize {
+    index / CHUNK_SIZE * CHUNK_SIZE
+}
+
 impl App for AnnotatorApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.handle_global_shortcuts(ctx);
@@ -324,9 +742,13 @@ impl App for AnnotatorApp {
         self.show_top_bar(ui);
         self.show_sidebar(ui);
 
-        match self.phase {
-            AnnotationPhase::Labelling { .. } => self.show_labelling(ui),
-            AnnotationPhase::Finished => self.show_finished(ui),
+        if self.class_transition.is_some() {
+            self.show_class_transition(ui);
+        } else {
+            match self.phase {
+                AnnotationPhase::Labelling { .. } => self.show_labelling(ui),
+                AnnotationPhase::Finished => self.show_finished(ui),
+            }
         }
     }
 

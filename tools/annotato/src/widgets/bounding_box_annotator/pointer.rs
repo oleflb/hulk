@@ -47,6 +47,10 @@ impl BoundingBoxAnnotator<'_> {
     ) {
         let pointer_position = ui.input(|input| input.pointer.interact_pos());
 
+        if self.update_keyboard_draft_from_pointer(response, transform) {
+            return;
+        }
+
         if response.clicked_by(PointerButton::Secondary) {
             self.delete_at(pointer_position, transform);
             return;
@@ -71,6 +75,45 @@ impl BoundingBoxAnnotator<'_> {
         {
             self.click_pointer(position, transform);
         }
+    }
+
+    fn update_keyboard_draft_from_pointer(
+        &mut self,
+        response: &Response,
+        transform: ImageTransform,
+    ) -> bool {
+        let KeyboardMode::DraftResize {
+            anchor,
+            pointer_position,
+            ..
+        } = self.state.keyboard_mode
+        else {
+            return false;
+        };
+        if self.state.draft_box.is_none() {
+            return false;
+        }
+
+        if let Some(position) = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos())
+        {
+            if pointer_position != Some(position) {
+                let moving = transform.screen_to_image_clamped(position, self.image_size);
+                self.state.draft_box = Some(BoundingBox::new(anchor, moving));
+                self.state.keyboard_mode = KeyboardMode::DraftResize {
+                    anchor,
+                    moving,
+                    pointer_position: Some(position),
+                };
+            }
+        }
+
+        if response.clicked_by(PointerButton::Primary) {
+            self.commit_draft_box();
+        }
+
+        true
     }
 
     fn click_pointer(&mut self, position: Pos2, transform: ImageTransform) {
@@ -265,6 +308,7 @@ impl BoundingBoxAnnotator<'_> {
             .iter()
             .enumerate()
             .rev()
+            .filter(|(_, annotation)| annotation.class == *self.selected_class)
             .find_map(|(index, annotation)| {
                 annotation.point_position().and_then(|point| {
                     (transform.image_to_screen(point).distance(screen_position) <= POINT_HIT_RADIUS)
@@ -285,7 +329,9 @@ impl BoundingBoxAnnotator<'_> {
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, annotation)| annotation.class.supports_boxes())
+            .filter(|(_, annotation)| {
+                annotation.class == *self.selected_class && annotation.class.supports_boxes()
+            })
             .find_map(|(index, annotation)| {
                 annotation.bounding_box_ref().and_then(|bounding_box| {
                     crate::boundingbox::Corner::ALL
@@ -304,7 +350,9 @@ impl BoundingBoxAnnotator<'_> {
         self.annotations
             .iter()
             .enumerate()
-            .filter(|(_, annotation)| annotation.class.supports_boxes())
+            .filter(|(_, annotation)| {
+                annotation.class == *self.selected_class && annotation.class.supports_boxes()
+            })
             .filter_map(|(index, annotation)| {
                 annotation
                     .bounding_box_ref()
@@ -319,14 +367,15 @@ impl BoundingBoxAnnotator<'_> {
     }
 
     pub(super) fn selectable_shapes(&self) -> Vec<Selection> {
-        selectable_shapes(self.annotations)
+        selectable_shapes(self.annotations, *self.selected_class)
     }
 }
 
-fn selectable_shapes(annotations: &[Annotation]) -> Vec<Selection> {
+fn selectable_shapes(annotations: &[Annotation], class: crate::classes::Class) -> Vec<Selection> {
     annotations
         .iter()
         .enumerate()
+        .filter(|(_, annotation)| annotation.class == class)
         .flat_map(|(index, annotation)| {
             let point = annotation.point_position().map(|_| Selection {
                 index,
@@ -357,6 +406,6 @@ mod tests {
             BoundingBox::new(Pos2::ZERO, Pos2::new(10.0, 10.0)),
         )];
 
-        assert!(selectable_shapes(&annotations).is_empty());
+        assert!(selectable_shapes(&annotations, Class::LSpot).is_empty());
     }
 }
