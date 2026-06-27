@@ -10,7 +10,6 @@ use eframe::epaint::TextureHandle;
 
 use crate::{annotation::Annotation, classes::Class};
 
-use state::KeyboardMode;
 pub use state::{AnnotationShape, CanvasState, CreationShape, Selection};
 use transform::ImageTransform;
 
@@ -58,7 +57,7 @@ impl<'a> BoundingBoxAnnotator<'a> {
             && selection.index >= self.annotations.len()
         {
             self.state.selected = None;
-            self.state.keyboard_mode = KeyboardMode::None;
+            self.state.clear_mode();
         }
     }
 }

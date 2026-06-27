@@ -1,11 +1,11 @@
 use eframe::egui::{PointerButton, Pos2, Response, Ui};
 
-use crate::{annotation::Annotation, boundingbox::BoundingBox};
+use crate::annotation::Annotation;
 
 use super::{
     AnnotationShape, BoundingBoxAnnotator, CreationShape, HANDLE_HIT_RADIUS, POINT_HIT_RADIUS,
     Selection,
-    state::{Interaction, KeyboardMode},
+    state::CanvasMode,
     transform::{ImageTransform, clamp_point},
 };
 
@@ -35,7 +35,7 @@ impl BoundingBoxAnnotator<'_> {
             index: self.annotations.len() - 1,
             shape: AnnotationShape::Point,
         });
-        self.state.keyboard_mode = KeyboardMode::MoveSelected;
+        self.state.mode = CanvasMode::KeyboardMoveSelected;
         self.state.mark_annotations_changed();
     }
 
@@ -82,31 +82,26 @@ impl BoundingBoxAnnotator<'_> {
         response: &Response,
         transform: ImageTransform,
     ) -> bool {
-        let KeyboardMode::DraftResize {
+        let CanvasMode::KeyboardDraftBox {
             anchor,
             pointer_position,
             ..
-        } = self.state.keyboard_mode
+        } = self.state.mode
         else {
             return false;
         };
-        if self.state.draft_box.is_none() {
-            return false;
-        }
 
         if let Some(position) = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos())
+            && pointer_position != Some(position)
         {
-            if pointer_position != Some(position) {
-                let moving = transform.screen_to_image_clamped(position, self.image_size);
-                self.state.draft_box = Some(BoundingBox::new(anchor, moving));
-                self.state.keyboard_mode = KeyboardMode::DraftResize {
-                    anchor,
-                    moving,
-                    pointer_position: Some(position),
-                };
-            }
+            let moving = transform.screen_to_image_clamped(position, self.image_size);
+            self.state.mode = CanvasMode::KeyboardDraftBox {
+                anchor,
+                moving,
+                pointer_position: Some(position),
+            };
         }
 
         if response.clicked_by(PointerButton::Primary) {
@@ -139,7 +134,7 @@ impl BoundingBoxAnnotator<'_> {
     fn start_pointer_interaction(&mut self, position: Pos2, transform: ImageTransform) {
         if let Some(selection) = self.hit_test_point(position, transform) {
             self.select(selection);
-            self.state.interaction = Interaction::MovingPoint {
+            self.state.mode = CanvasMode::DraggingPoint {
                 index: selection.index,
             };
             return;
@@ -150,7 +145,7 @@ impl BoundingBoxAnnotator<'_> {
                 index,
                 shape: AnnotationShape::Box,
             });
-            self.state.interaction = Interaction::ResizingBox { index, corner };
+            self.state.mode = CanvasMode::ResizingBoxWithPointer { index, corner };
             return;
         }
 
@@ -160,7 +155,7 @@ impl BoundingBoxAnnotator<'_> {
 
         if let Some(selection) = self.hit_test_box(image_position) {
             self.select(selection);
-            self.state.interaction = Interaction::MovingBox {
+            self.state.mode = CanvasMode::DraggingBox {
                 index: selection.index,
                 last_position: image_position,
             };
@@ -169,22 +164,23 @@ impl BoundingBoxAnnotator<'_> {
 
         if self.creation_shape == CreationShape::Box && self.selected_class.supports_boxes() {
             self.state.selected = None;
-            self.state.keyboard_mode = KeyboardMode::None;
-            self.state.draft_box = Some(BoundingBox::new(image_position, image_position));
-            self.state.interaction = Interaction::DrawingBox {
+            self.state.mode = CanvasMode::DrawingBox {
                 start: image_position,
+                moving: image_position,
             };
         }
     }
 
     fn update_pointer_interaction(&mut self, position: Pos2, transform: ImageTransform) {
         let image_position = transform.screen_to_image_clamped(position, self.image_size);
-        match self.state.interaction {
-            Interaction::None => {}
-            Interaction::DrawingBox { start } => {
-                self.state.draft_box = Some(BoundingBox::new(start, image_position));
+        match self.state.mode {
+            CanvasMode::DrawingBox { start, .. } => {
+                self.state.mode = CanvasMode::DrawingBox {
+                    start,
+                    moving: image_position,
+                };
             }
-            Interaction::MovingBox {
+            CanvasMode::DraggingBox {
                 index,
                 last_position,
             } => {
@@ -194,14 +190,14 @@ impl BoundingBoxAnnotator<'_> {
                     .and_then(|annotation| annotation.bounding_box_mut())
                 {
                     bounding_box.translate(image_position - last_position, self.image_size);
-                    self.state.interaction = Interaction::MovingBox {
+                    self.state.mode = CanvasMode::DraggingBox {
                         index,
                         last_position: image_position,
                     };
                     self.state.mark_annotations_changed();
                 }
             }
-            Interaction::ResizingBox { index, corner } => {
+            CanvasMode::ResizingBoxWithPointer { index, corner } => {
                 if let Some(bounding_box) = self
                     .annotations
                     .get_mut(index)
@@ -212,7 +208,7 @@ impl BoundingBoxAnnotator<'_> {
                     self.state.mark_annotations_changed();
                 }
             }
-            Interaction::MovingPoint { index } => {
+            CanvasMode::DraggingPoint { index } => {
                 if let Some(point) = self
                     .annotations
                     .get_mut(index)
@@ -222,14 +218,19 @@ impl BoundingBoxAnnotator<'_> {
                     self.state.mark_annotations_changed();
                 }
             }
+            CanvasMode::Idle
+            | CanvasMode::KeyboardDraftBox { .. }
+            | CanvasMode::KeyboardMoveSelected
+            | CanvasMode::KeyboardResizeSelected { .. } => {}
         }
     }
 
     fn finish_pointer_interaction(&mut self) {
-        if matches!(self.state.interaction, Interaction::DrawingBox { .. }) {
+        if matches!(self.state.mode, CanvasMode::DrawingBox { .. }) {
             self.commit_draft_box();
+        } else if self.state.mode.is_pointer_interaction() {
+            self.state.clear_mode();
         }
-        self.state.interaction = Interaction::None;
     }
 
     fn delete_at(&mut self, pointer_position: Option<Pos2>, transform: ImageTransform) {
@@ -254,7 +255,7 @@ impl BoundingBoxAnnotator<'_> {
         if let Some(selection) = self.state.selected.take() {
             self.delete_selection(selection);
         }
-        self.state.keyboard_mode = KeyboardMode::None;
+        self.state.clear_mode();
     }
 
     fn delete_selection(&mut self, selection: Selection) {
@@ -269,12 +270,12 @@ impl BoundingBoxAnnotator<'_> {
             self.annotations.remove(selection.index);
         }
         self.state.selected = None;
-        self.state.keyboard_mode = KeyboardMode::None;
+        self.state.clear_mode();
         self.state.mark_annotations_changed();
     }
 
     pub(super) fn commit_draft_box(&mut self) {
-        let Some(mut draft_box) = self.state.draft_box.take() else {
+        let Some(mut draft_box) = self.state.take_draft_box() else {
             return;
         };
         if !self.selected_class.supports_boxes() {
@@ -291,12 +292,12 @@ impl BoundingBoxAnnotator<'_> {
             });
             self.state.mark_annotations_changed();
         }
-        self.state.keyboard_mode = KeyboardMode::None;
+        self.state.clear_mode();
     }
 
     fn select(&mut self, selection: Selection) {
         self.state.selected = Some(selection);
-        self.state.keyboard_mode = KeyboardMode::None;
+        self.state.clear_mode();
     }
 
     fn hit_test_point(
@@ -397,7 +398,7 @@ mod tests {
     use eframe::egui::Pos2;
 
     use super::*;
-    use crate::classes::Class;
+    use crate::{boundingbox::BoundingBox, classes::Class};
 
     #[test]
     fn affected_classes_do_not_offer_bbox_selection() {

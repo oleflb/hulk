@@ -28,26 +28,30 @@ impl BoundingBoxAnnotator<'_> {
                     transform,
                     annotation.class,
                     bounding_box,
-                    annotation.class == *self.selected_class,
-                    self.state.selected
-                        == Some(Selection {
-                            index,
-                            shape: AnnotationShape::Box,
-                        }),
-                    false,
+                    BoxDrawOptions {
+                        active: annotation.class == *self.selected_class,
+                        selected: self.state.selected
+                            == Some(Selection {
+                                index,
+                                shape: AnnotationShape::Box,
+                            }),
+                        draft: false,
+                    },
                 );
             }
         }
 
-        if let Some(draft_box) = &self.state.draft_box {
+        if let Some(draft_box) = self.state.draft_box() {
             self.draw_box(
                 ui,
                 transform,
                 *self.selected_class,
-                draft_box,
-                true,
-                true,
-                true,
+                &draft_box,
+                BoxDrawOptions {
+                    active: true,
+                    selected: true,
+                    draft: true,
+                },
             );
         }
 
@@ -75,29 +79,27 @@ impl BoundingBoxAnnotator<'_> {
         transform: ImageTransform,
         class: Class,
         bounding_box: &BoundingBox,
-        active: bool,
-        selected: bool,
-        draft: bool,
+        options: BoxDrawOptions,
     ) {
-        if !bounding_box.is_valid() && !draft {
+        if !bounding_box.is_valid() && !options.draft {
             return;
         }
 
         let painter = ui.painter();
         let rect = transform.image_rect_to_screen(bounding_box.rect);
-        let editable = active && (class.supports_boxes() || draft);
-        let color = if active || draft {
+        let editable = options.active && (class.supports_boxes() || options.draft);
+        let color = if options.active || options.draft {
             class.color()
         } else {
             class.color().gamma_multiply(0.35)
         };
-        let stroke_width = if selected { 2.5 } else { 1.5 };
+        let stroke_width = if options.selected { 2.5 } else { 1.5 };
         painter.rect_filled(
             rect,
             2.0,
-            color.gamma_multiply(if selected {
+            color.gamma_multiply(if options.selected {
                 0.18
-            } else if active {
+            } else if options.active {
                 0.10
             } else {
                 0.05
@@ -110,9 +112,9 @@ impl BoundingBoxAnnotator<'_> {
             StrokeKind::Inside,
         );
 
-        let label: Cow<'_, str> = if draft {
+        let label: Cow<'_, str> = if options.draft {
             Cow::Owned(format!("new {}", class.as_str()))
-        } else if editable || !active {
+        } else if editable || !options.active {
             Cow::Borrowed(class.as_str())
         } else {
             Cow::Owned(format!("legacy {} box", class.as_str()))
@@ -122,14 +124,14 @@ impl BoundingBoxAnnotator<'_> {
             Align2::LEFT_TOP,
             label.as_ref(),
             FontId::proportional(18.0),
-            if active {
+            if options.active {
                 Color32::from_rgb(205, 214, 244)
             } else {
                 Color32::from_rgb(127, 132, 156)
             },
         );
 
-        if editable && active && (selected || draft) {
+        if editable && options.active && (options.selected || options.draft) {
             for corner in crate::boundingbox::Corner::ALL {
                 let corner_screen = transform.image_to_screen(bounding_box.corner(corner));
                 painter.circle_filled(corner_screen, HANDLE_RADIUS, color);
@@ -196,4 +198,11 @@ impl BoundingBoxAnnotator<'_> {
             },
         );
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoxDrawOptions {
+    active: bool,
+    selected: bool,
+    draft: bool,
 }

@@ -1,9 +1,9 @@
 use eframe::egui::{Key, Pos2, Response, Ui, Vec2};
 
-use crate::{boundingbox::BoundingBox, user_toml::CONFIG};
+use crate::user_toml::CONFIG;
 
 use super::{
-    AnnotationShape, BoundingBoxAnnotator, CreationShape, KeyboardMode, Selection,
+    AnnotationShape, BoundingBoxAnnotator, CreationShape, Selection, state::CanvasMode,
     transform::ImageTransform,
 };
 
@@ -17,10 +17,8 @@ impl BoundingBoxAnnotator<'_> {
         let config = &CONFIG.get().unwrap().keybindings;
 
         if ui.input(|input| config.abort.is_pressed(input)) {
-            if self.state.draft_box.take().is_some()
-                || self.state.keyboard_mode != KeyboardMode::None
-            {
-                self.state.keyboard_mode = KeyboardMode::None;
+            if self.state.take_draft_box().is_some() || !self.state.mode.is_idle() {
+                self.state.clear_mode();
             } else {
                 self.state.selected = None;
             }
@@ -33,7 +31,7 @@ impl BoundingBoxAnnotator<'_> {
         }
 
         if ui.input(|input| config.draw.is_pressed(input)) {
-            if self.state.draft_box.is_some() {
+            if self.state.draft_box().is_some() {
                 self.commit_draft_box();
             } else if self.creation_shape == CreationShape::Point {
                 self.create_point_at_pointer_or_center(response, transform);
@@ -43,10 +41,10 @@ impl BoundingBoxAnnotator<'_> {
         }
 
         if ui.input(|input| config.confirm.is_pressed(input)) {
-            if self.state.draft_box.is_some() {
+            if self.state.draft_box().is_some() {
                 self.commit_draft_box();
             } else {
-                self.state.keyboard_mode = KeyboardMode::None;
+                self.state.clear_mode();
             }
         }
 
@@ -61,14 +59,14 @@ impl BoundingBoxAnnotator<'_> {
                 .hover_pos()
                 .map(|position| transform.screen_to_image_clamped(position, self.image_size))
                 .unwrap_or_else(|| bounding_box.rect.center());
-            self.state.keyboard_mode = KeyboardMode::ResizeSelected {
+            self.state.mode = CanvasMode::KeyboardResizeSelected {
                 corner: bounding_box.closest_corner(pointer),
             };
         }
 
         if ui.input(|input| config.move_box.is_pressed(input)) && self.active_selection().is_some()
         {
-            self.state.keyboard_mode = KeyboardMode::MoveSelected;
+            self.state.mode = CanvasMode::KeyboardMoveSelected;
         }
 
         self.handle_tab_selection(ui);
@@ -117,25 +115,24 @@ impl BoundingBoxAnnotator<'_> {
         } else {
             selectable[(current + len - 1) % len]
         });
-        self.state.keyboard_mode = KeyboardMode::None;
+        self.state.clear_mode();
     }
 
     fn apply_keyboard_delta(&mut self, delta: Vec2) {
-        match self.state.keyboard_mode {
-            KeyboardMode::DraftResize {
+        match self.state.mode {
+            CanvasMode::KeyboardDraftBox {
                 anchor,
                 moving,
                 pointer_position,
             } => {
                 let moving = super::transform::clamp_point(moving + delta, self.image_size);
-                self.state.draft_box = Some(BoundingBox::new(anchor, moving));
-                self.state.keyboard_mode = KeyboardMode::DraftResize {
+                self.state.mode = CanvasMode::KeyboardDraftBox {
                     anchor,
                     moving,
                     pointer_position,
                 };
             }
-            KeyboardMode::ResizeSelected { corner } => {
+            CanvasMode::KeyboardResizeSelected { corner } => {
                 if let Some(selection) = self.active_selection()
                     && selection.shape == AnnotationShape::Box
                     && let Some(bounding_box) = self
@@ -148,10 +145,10 @@ impl BoundingBoxAnnotator<'_> {
                     bounding_box.clip_to_image(self.image_size);
                     self.state.mark_annotations_changed();
                 } else {
-                    self.state.keyboard_mode = KeyboardMode::None;
+                    self.state.clear_mode();
                 }
             }
-            KeyboardMode::MoveSelected => {
+            CanvasMode::KeyboardMoveSelected => {
                 if let Some(selection) = self.active_selection() {
                     match selection.shape {
                         AnnotationShape::Box => {
@@ -177,10 +174,14 @@ impl BoundingBoxAnnotator<'_> {
                         }
                     }
                 } else {
-                    self.state.keyboard_mode = KeyboardMode::None;
+                    self.state.clear_mode();
                 }
             }
-            KeyboardMode::None => {}
+            CanvasMode::Idle
+            | CanvasMode::DrawingBox { .. }
+            | CanvasMode::DraggingBox { .. }
+            | CanvasMode::ResizingBoxWithPointer { .. }
+            | CanvasMode::DraggingPoint { .. } => {}
         }
     }
 
@@ -194,9 +195,8 @@ impl BoundingBoxAnnotator<'_> {
         let anchor = pointer_position
             .map(|position| transform.screen_to_image_clamped(position, self.image_size))
             .unwrap_or_else(|| Pos2::new(self.image_size[0] * 0.5, self.image_size[1] * 0.5));
-        self.state.draft_box = Some(BoundingBox::new(anchor, anchor));
         self.state.selected = None;
-        self.state.keyboard_mode = KeyboardMode::DraftResize {
+        self.state.mode = CanvasMode::KeyboardDraftBox {
             anchor,
             moving: anchor,
             pointer_position,

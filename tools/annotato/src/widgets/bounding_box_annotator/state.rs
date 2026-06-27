@@ -33,9 +33,7 @@ impl Selection {
 #[derive(Debug)]
 pub struct CanvasState {
     pub(super) selected: Option<Selection>,
-    pub(super) draft_box: Option<BoundingBox>,
-    pub(super) interaction: Interaction,
-    pub(super) keyboard_mode: KeyboardMode,
+    pub(super) mode: CanvasMode,
     pub(super) focus_anchor: Option<FocusAnchor>,
     pub(super) zoom: f32,
     pub(super) pan: Vec2,
@@ -46,9 +44,7 @@ impl Default for CanvasState {
     fn default() -> Self {
         Self {
             selected: None,
-            draft_box: None,
-            interaction: Interaction::None,
-            keyboard_mode: KeyboardMode::None,
+            mode: CanvasMode::Idle,
             focus_anchor: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -68,6 +64,30 @@ impl CanvasState {
         self.selected
     }
 
+    pub(super) fn clear_mode(&mut self) {
+        self.mode = CanvasMode::Idle;
+    }
+
+    pub(super) fn draft_box(&self) -> Option<BoundingBox> {
+        match self.mode {
+            CanvasMode::DrawingBox { start, moving }
+            | CanvasMode::KeyboardDraftBox {
+                anchor: start,
+                moving,
+                ..
+            } => Some(BoundingBox::new(start, moving)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_draft_box(&mut self) -> Option<BoundingBox> {
+        let draft_box = self.draft_box();
+        if draft_box.is_some() {
+            self.clear_mode();
+        }
+        draft_box
+    }
+
     pub fn mark_annotations_changed(&mut self) {
         self.annotations_changed = true;
     }
@@ -79,37 +99,47 @@ impl CanvasState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) enum Interaction {
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) enum CanvasMode {
     #[default]
-    None,
+    Idle,
     DrawingBox {
         start: Pos2,
+        moving: Pos2,
     },
-    MovingBox {
+    DraggingBox {
         index: usize,
         last_position: Pos2,
     },
-    ResizingBox {
+    ResizingBoxWithPointer {
         index: usize,
         corner: Corner,
     },
-    MovingPoint {
+    DraggingPoint {
         index: usize,
     },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(super) enum KeyboardMode {
-    #[default]
-    None,
-    DraftResize {
+    KeyboardDraftBox {
         anchor: Pos2,
         moving: Pos2,
         pointer_position: Option<Pos2>,
     },
-    MoveSelected,
-    ResizeSelected {
+    KeyboardMoveSelected,
+    KeyboardResizeSelected {
         corner: Corner,
     },
+}
+
+impl CanvasMode {
+    pub(super) fn is_idle(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    pub(super) fn is_pointer_interaction(self) -> bool {
+        matches!(
+            self,
+            Self::DraggingBox { .. }
+                | Self::ResizingBoxWithPointer { .. }
+                | Self::DraggingPoint { .. }
+        )
+    }
 }

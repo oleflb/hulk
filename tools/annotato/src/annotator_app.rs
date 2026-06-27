@@ -2,7 +2,6 @@ use std::{
     error::Error as StdError,
     fmt::{self, Display},
     fs,
-    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -13,7 +12,13 @@ use crate::{
     label_widget::LabelWidget,
     paths::Paths,
     user_toml::{CONFIG, KeyBind},
-    widgets::{image_list::ImageList, keybind_preview::KeybindPreview},
+    widgets::{
+        image_list::{ImageList, ImageListState},
+        keybind_preview::KeybindPreview,
+    },
+    workflow::{
+        ChunkPosition, ChunkProgress, ChunkWorkflow, ClassTransition, ClassTransitionDirection,
+    },
 };
 use color_eyre::{
     Result,
@@ -27,8 +32,6 @@ use eframe::{
     },
 };
 
-const CHUNK_SIZE: usize = 50;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnnotationPhase {
     Labelling { current_index: usize },
@@ -40,6 +43,7 @@ pub struct AnnotatorApp {
     workflow: ChunkWorkflow,
     paths: Vec<Paths>,
     label_widget: LabelWidget,
+    image_list_state: ImageListState,
     model_annotations: ModelAnnotations,
     class_transition: Option<ClassTransition>,
     last_error: Option<String>,
@@ -73,6 +77,7 @@ impl AnnotatorApp {
             workflow: ChunkWorkflow::default(),
             paths,
             label_widget: LabelWidget::default(),
+            image_list_state: ImageListState::default(),
             model_annotations,
             class_transition: None,
             last_error: None,
@@ -172,10 +177,7 @@ impl AnnotatorApp {
             AnnotationPhase::Finished => {
                 let class_index = Class::ALL.len() - 1;
                 self.apply_position_with_class_transition(
-                    ChunkPosition {
-                        index: self.paths.len() - 1,
-                        class_index,
-                    },
+                    ChunkPosition::new(self.paths.len() - 1, class_index),
                     ClassTransitionDirection::Previous,
                 );
             }
@@ -237,7 +239,7 @@ impl AnnotatorApp {
 
     fn apply_position(&mut self, position: ChunkPosition) {
         self.class_transition = None;
-        self.workflow.class_index = position.class_index;
+        self.workflow.apply_position(position);
         self.label_widget.set_selected_class(self.active_class());
         self.phase = AnnotationPhase::Labelling {
             current_index: position.index,
@@ -249,13 +251,10 @@ impl AnnotatorApp {
         position: ChunkPosition,
         direction: ClassTransitionDirection,
     ) {
-        if position.class_index == self.workflow.class_index {
+        if self.workflow.is_active_class(position) {
             self.apply_position(position);
         } else {
-            self.class_transition = Some(ClassTransition {
-                position,
-                direction,
-            });
+            self.class_transition = Some(ClassTransition::new(position, direction));
         }
     }
 
@@ -273,95 +272,22 @@ impl AnnotatorApp {
     }
 
     fn first_pending_position(&self) -> Option<ChunkPosition> {
-        let mut chunk_start = 0;
-        while chunk_start < self.paths.len() {
-            let chunk_range = self.chunk_range_from_start(chunk_start);
-            for class_index in 0..Class::ALL.len() {
-                if let Some(index) = self.first_pending_in_range(chunk_range.clone(), class_index) {
-                    return Some(ChunkPosition { index, class_index });
-                }
-            }
-            chunk_start = chunk_range.end;
-        }
-        None
+        ChunkWorkflow::first_pending_position(self.paths.len(), |index, class| {
+            self.class_is_complete_for_index(index, class)
+        })
     }
 
     fn next_pending_position_after(&self, current_index: usize) -> Option<ChunkPosition> {
-        let class_index = self.workflow.class_index;
-        let chunk_start = chunk_start(current_index);
-        let chunk_range = self.chunk_range_from_start(chunk_start);
-
-        if let Some(index) =
-            self.first_pending_in_range(current_index + 1..chunk_range.end, class_index)
-        {
-            return Some(ChunkPosition { index, class_index });
-        }
-
-        for next_class_index in class_index + 1..Class::ALL.len() {
-            if let Some(index) = self.first_pending_in_range(chunk_range.clone(), next_class_index)
-            {
-                return Some(ChunkPosition {
-                    index,
-                    class_index: next_class_index,
-                });
-            }
-        }
-
-        let mut next_chunk_start = chunk_range.end;
-        while next_chunk_start < self.paths.len() {
-            let next_chunk_range = self.chunk_range_from_start(next_chunk_start);
-            for next_class_index in 0..Class::ALL.len() {
-                if let Some(index) =
-                    self.first_pending_in_range(next_chunk_range.clone(), next_class_index)
-                {
-                    return Some(ChunkPosition {
-                        index,
-                        class_index: next_class_index,
-                    });
-                }
-            }
-            next_chunk_start = next_chunk_range.end;
-        }
-
-        None
+        self.workflow.next_pending_position_after(
+            current_index,
+            self.paths.len(),
+            |index, class| self.class_is_complete_for_index(index, class),
+        )
     }
 
     fn previous_position_before(&self, current_index: usize) -> Option<ChunkPosition> {
-        let chunk_start = chunk_start(current_index);
-        let chunk_range = self.chunk_range_from_start(chunk_start);
-        let class_index = self.workflow.class_index;
-
-        if current_index > chunk_start {
-            return Some(ChunkPosition {
-                index: current_index - 1,
-                class_index,
-            });
-        }
-
-        if class_index > 0 {
-            return Some(ChunkPosition {
-                index: chunk_range.end - 1,
-                class_index: class_index - 1,
-            });
-        }
-
-        if chunk_start > 0 {
-            let previous_chunk_start = chunk_start.saturating_sub(CHUNK_SIZE);
-            let previous_chunk_range = self.chunk_range_from_start(previous_chunk_start);
-            return Some(ChunkPosition {
-                index: previous_chunk_range.end - 1,
-                class_index: Class::ALL.len() - 1,
-            });
-        }
-
-        None
-    }
-
-    fn first_pending_in_range(&self, range: Range<usize>, class_index: usize) -> Option<usize> {
-        let class = Class::ALL[class_index];
-        range
-            .filter(|index| *index < self.paths.len())
-            .find(|index| !self.class_is_complete_for_index(*index, class))
+        self.workflow
+            .previous_position_before(current_index, self.paths.len())
     }
 
     fn class_is_complete_for_index(&self, index: usize, class: Class) -> bool {
@@ -377,30 +303,14 @@ impl AnnotatorApp {
         serde_json::from_str(&label_file).ok()
     }
 
-    fn chunk_range_for_index(&self, index: usize) -> Range<usize> {
-        self.chunk_range_from_start(chunk_start(index))
-    }
-
-    fn chunk_range_from_start(&self, start: usize) -> Range<usize> {
-        start..(start + CHUNK_SIZE).min(self.paths.len())
-    }
-
     fn chunk_progress(&self) -> Option<ChunkProgress> {
         let current_index = self.current_index()?;
-        let chunk_range = self.chunk_range_for_index(current_index);
-        let active_class = self.active_class();
-        let completed = chunk_range
-            .clone()
-            .filter(|index| self.class_is_complete_for_index(*index, active_class))
-            .count();
-
-        Some(ChunkProgress {
-            chunk_index: chunk_range.start / CHUNK_SIZE,
-            chunk_count: self.paths.len().div_ceil(CHUNK_SIZE),
-            class: active_class,
-            completed,
-            total: chunk_range.len(),
-        })
+        Some(
+            self.workflow
+                .chunk_progress(current_index, self.paths.len(), |index, class| {
+                    self.class_is_complete_for_index(index, class)
+                }),
+        )
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &Context) {
@@ -444,7 +354,11 @@ impl AnnotatorApp {
 
                 let mut current_phase = self.phase.clone();
                 CentralPanel::no_frame().show(ui, |ui| {
-                    ui.add(ImageList::new(&self.paths, &mut current_phase));
+                    ui.add(ImageList::new(
+                        &self.paths,
+                        &mut current_phase,
+                        &mut self.image_list_state,
+                    ));
                 });
 
                 if current_phase != self.phase
@@ -565,7 +479,7 @@ impl AnnotatorApp {
                 ui.label(RichText::new("annotato").strong());
                 ui.separator();
                 if let Some(transition) = self.class_transition {
-                    let class = Class::ALL[transition.position.class_index];
+                    let class = transition.position.class();
                     ui.label(format!(
                         "{}: {}",
                         transition.direction.label(),
@@ -598,7 +512,7 @@ impl AnnotatorApp {
         let Some(transition) = self.class_transition else {
             return;
         };
-        let class = Class::ALL[transition.position.class_index];
+        let class = transition.position.class();
         let config = &CONFIG.get().unwrap().keybindings;
         let (confirm, cancel) = match transition.direction {
             ClassTransitionDirection::Next => (config.next.label(), config.previous.label()),
@@ -657,80 +571,6 @@ enum GlobalAction {
     Next,
     Previous,
     Save,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ChunkWorkflow {
-    class_index: usize,
-}
-
-impl Default for ChunkWorkflow {
-    fn default() -> Self {
-        Self { class_index: 0 }
-    }
-}
-
-impl ChunkWorkflow {
-    fn active_class(self) -> Class {
-        Class::ALL[self.class_index]
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ChunkPosition {
-    index: usize,
-    class_index: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ClassTransition {
-    position: ChunkPosition,
-    direction: ClassTransitionDirection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClassTransitionDirection {
-    Next,
-    Previous,
-}
-
-impl ClassTransitionDirection {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Next => "Next class",
-            Self::Previous => "Previous class",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ChunkProgress {
-    chunk_index: usize,
-    chunk_count: usize,
-    class: Class,
-    completed: usize,
-    total: usize,
-}
-
-impl ChunkProgress {
-    fn fraction(self) -> f32 {
-        self.completed as f32 / self.total.max(1) as f32
-    }
-
-    fn label(self) -> String {
-        format!(
-            "Chunk {} of {} · {} {}/{}",
-            self.chunk_index + 1,
-            self.chunk_count,
-            self.class.as_str(),
-            self.completed,
-            self.total
-        )
-    }
-}
-
-fn chunk_start(index: usize) -> usize {
-    index / CHUNK_SIZE * CHUNK_SIZE
 }
 
 impl App for AnnotatorApp {

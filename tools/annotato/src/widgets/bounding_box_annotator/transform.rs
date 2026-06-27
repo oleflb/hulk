@@ -80,6 +80,13 @@ impl ImageTransform {
     }
 }
 
+pub(super) fn clamp_point(point: Pos2, image_size: [f32; 2]) -> Pos2 {
+    Pos2::new(
+        point.x.clamp(0.0, image_size[0]),
+        point.y.clamp(0.0, image_size[1]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,11 +104,4 @@ mod tests {
 
         assert!(zoomed.image_to_screen(image_anchor).distance(pointer) < 0.001);
     }
-}
-
-pub(super) fn clamp_point(point: Pos2, image_size: [f32; 2]) -> Pos2 {
-    Pos2::new(
-        point.x.clamp(0.0, image_size[0]),
-        point.y.clamp(0.0, image_size[1]),
-    )
 }

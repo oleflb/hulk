@@ -4,12 +4,14 @@ pub mod annotator_app;
 pub mod boundingbox;
 pub mod classes;
 pub mod inputs;
+pub mod label_document;
 pub mod label_widget;
 pub mod paths;
 pub mod theme;
 pub mod user_toml;
 pub mod utils;
 pub mod widgets;
+pub mod workflow;
 
 use std::path::PathBuf;
 

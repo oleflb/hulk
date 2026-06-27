@@ -165,31 +165,24 @@ fn validate_normalized_point([x, y]: [f32; 2]) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     pub class: Class,
-    geometry: AnnotationGeometry,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum AnnotationGeometry {
-    BoundingBox(BoundingBox),
-    Point(Pos2),
-    BoundingBoxAndPoint {
-        bounding_box: BoundingBox,
-        point: Pos2,
-    },
+    bounding_box: Option<BoundingBox>,
+    point: Option<Pos2>,
 }
 
 impl Annotation {
     pub fn point(class: Class, point: Pos2) -> Self {
         Self {
             class,
-            geometry: AnnotationGeometry::Point(point),
+            bounding_box: None,
+            point: Some(point),
         }
     }
 
     pub fn bounding_box(class: Class, bounding_box: BoundingBox) -> Self {
         Self {
             class,
-            geometry: AnnotationGeometry::BoundingBox(bounding_box),
+            bounding_box: Some(bounding_box),
+            point: None,
         }
     }
 
@@ -201,17 +194,12 @@ impl Annotation {
         let point = format
             .point
             .map(|[x, y]| Pos2::new(x * image_size[0], y * image_size[1]));
-        let geometry = match (bounding_box, point) {
-            (Some(bounding_box), Some(point)) => AnnotationGeometry::BoundingBoxAndPoint {
-                bounding_box,
-                point,
-            },
-            (Some(bounding_box), None) => AnnotationGeometry::BoundingBox(bounding_box),
-            (None, Some(point)) => AnnotationGeometry::Point(point),
-            (None, None) => unreachable!("AnnotationFormat rejects missing geometry"),
-        };
 
-        Self { class, geometry }
+        Self {
+            class,
+            bounding_box,
+            point,
+        }
     }
 
     pub fn to_format(&self, image_size: [f32; 2]) -> AnnotationFormat {
@@ -236,83 +224,33 @@ impl Annotation {
     }
 
     pub fn bounding_box_ref(&self) -> Option<&BoundingBox> {
-        match &self.geometry {
-            AnnotationGeometry::BoundingBox(bounding_box)
-            | AnnotationGeometry::BoundingBoxAndPoint { bounding_box, .. } => Some(bounding_box),
-            AnnotationGeometry::Point(_) => None,
-        }
+        self.bounding_box.as_ref()
     }
 
     pub fn bounding_box_mut(&mut self) -> Option<&mut BoundingBox> {
-        match &mut self.geometry {
-            AnnotationGeometry::BoundingBox(bounding_box)
-            | AnnotationGeometry::BoundingBoxAndPoint { bounding_box, .. } => Some(bounding_box),
-            AnnotationGeometry::Point(_) => None,
-        }
+        self.bounding_box.as_mut()
     }
 
     pub fn point_position(&self) -> Option<Pos2> {
-        match self.geometry {
-            AnnotationGeometry::Point(point)
-            | AnnotationGeometry::BoundingBoxAndPoint { point, .. } => Some(point),
-            AnnotationGeometry::BoundingBox(_) => None,
-        }
+        self.point
     }
 
     pub fn point_mut(&mut self) -> Option<&mut Pos2> {
-        match &mut self.geometry {
-            AnnotationGeometry::Point(point)
-            | AnnotationGeometry::BoundingBoxAndPoint { point, .. } => Some(point),
-            AnnotationGeometry::BoundingBox(_) => None,
-        }
+        self.point.as_mut()
     }
 
     pub fn set_point(&mut self, point: Pos2) {
-        self.geometry =
-            match std::mem::replace(&mut self.geometry, AnnotationGeometry::Point(point)) {
-                AnnotationGeometry::BoundingBox(bounding_box)
-                | AnnotationGeometry::BoundingBoxAndPoint { bounding_box, .. } => {
-                    AnnotationGeometry::BoundingBoxAndPoint {
-                        bounding_box,
-                        point,
-                    }
-                }
-                AnnotationGeometry::Point(_) => AnnotationGeometry::Point(point),
-            };
+        self.point = Some(point);
     }
 
     pub fn clear_bounding_box(&mut self) -> bool {
-        match std::mem::replace(&mut self.geometry, AnnotationGeometry::Point(Pos2::ZERO)) {
-            AnnotationGeometry::BoundingBox(bounding_box) => {
-                self.geometry = AnnotationGeometry::BoundingBox(bounding_box);
-                true
-            }
-            AnnotationGeometry::BoundingBoxAndPoint { point, .. } => {
-                self.geometry = AnnotationGeometry::Point(point);
-                false
-            }
-            AnnotationGeometry::Point(point) => {
-                self.geometry = AnnotationGeometry::Point(point);
-                false
-            }
-        }
+        self.bounding_box = None;
+        self.point.is_none()
     }
 
     pub fn clear_point(&mut self) -> bool {
-        match std::mem::replace(&mut self.geometry, AnnotationGeometry::Point(Pos2::ZERO)) {
-            AnnotationGeometry::Point(point) => {
-                self.geometry = AnnotationGeometry::Point(point);
-                true
-            }
-            AnnotationGeometry::BoundingBoxAndPoint { bounding_box, .. } => {
-                self.geometry = AnnotationGeometry::BoundingBox(bounding_box);
-                false
-            }
-            AnnotationGeometry::BoundingBox(bounding_box) => {
-                self.geometry = AnnotationGeometry::BoundingBox(bounding_box);
-                false
-            }
-        }
+        self.point = None;
+        self.bounding_box.is_none()
     }
 }
 
