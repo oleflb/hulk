@@ -15,7 +15,8 @@ use color_eyre::{
 use nalgebra as na;
 use ros2::sensor_msgs::{camera_info::CameraInfo, image::Image};
 use stereo_visual_odometry::{
-    parameters::StereoVisualOdometryPoseEstimationParameters, pipeline::VisualOdometryPipeline,
+    OdometryDiagnostics, parameters::StereoVisualOdometryPoseEstimationParameters,
+    pipeline::VisualOdometryPipeline,
 };
 use types::{stereo_camera_info::StereoCameraInfo, stereo_image_pair::StereoImagePair};
 use zip::ZipArchive;
@@ -178,6 +179,7 @@ fn run_sequence(
 
         if frame_index > 0 {
             metrics.transitions += 1;
+            metrics.add_diagnostics(pipeline.latest_odometry_diagnostics());
             match estimated_previous_to_current {
                 Some(estimated) => metrics.add_accuracy(
                     estimated,
@@ -452,6 +454,7 @@ struct SequenceMetrics {
     translation_errors_meters: Vec<f32>,
     translation_relative_errors: Vec<f32>,
     translation_scale_ratios: Vec<f32>,
+    diagnostics: DiagnosticsMetrics,
 }
 
 impl SequenceMetrics {
@@ -466,6 +469,7 @@ impl SequenceMetrics {
             translation_errors_meters: Vec::new(),
             translation_relative_errors: Vec::new(),
             translation_scale_ratios: Vec::new(),
+            diagnostics: DiagnosticsMetrics::default(),
         }
     }
 
@@ -503,6 +507,11 @@ impl SequenceMetrics {
             .append(&mut sequence.translation_relative_errors);
         self.translation_scale_ratios
             .append(&mut sequence.translation_scale_ratios);
+        self.diagnostics.extend(sequence.diagnostics);
+    }
+
+    fn add_diagnostics(&mut self, diagnostics: OdometryDiagnostics) {
+        self.diagnostics.add(diagnostics);
     }
 
     fn print(&self) {
@@ -564,6 +573,171 @@ impl SequenceMetrics {
             scale_ratio.p95,
             scale_ratio.p99,
         );
+        self.diagnostics.print();
+    }
+}
+
+#[derive(Default)]
+struct DiagnosticsMetrics {
+    frames: usize,
+    total_correspondences: usize,
+    total_left_ransac_inliers: usize,
+    total_right_observations: usize,
+    total_trusted_right_observations: usize,
+    outlier_free_pose_frames: usize,
+    refit_used_frames: usize,
+    lm_attempted_frames: usize,
+    lm_success_frames: usize,
+    lm_accepted_frames: usize,
+    lm_delta_translation_m: Vec<f32>,
+    lm_delta_rotation_deg: Vec<f32>,
+    left_rmse_before_lm: Vec<f32>,
+    right_rmse_before_lm: Vec<f32>,
+    stereo_rmse_before_lm: Vec<f32>,
+    weighted_cost_before_lm: Vec<f32>,
+    left_rmse_after_lm: Vec<f32>,
+    right_rmse_after_lm: Vec<f32>,
+    stereo_rmse_after_lm: Vec<f32>,
+    weighted_cost_after_lm: Vec<f32>,
+    right_bad_fraction_before_lm: Vec<f32>,
+    right_bad_fraction_after_lm: Vec<f32>,
+}
+
+impl DiagnosticsMetrics {
+    fn add(&mut self, diagnostics: OdometryDiagnostics) {
+        self.frames += 1;
+        self.total_correspondences += diagnostics.correspondences;
+        self.total_left_ransac_inliers += diagnostics.left_ransac_inliers;
+        self.total_right_observations += diagnostics.right_observations;
+        self.total_trusted_right_observations += diagnostics.trusted_right_observations;
+        self.outlier_free_pose_frames += usize::from(diagnostics.used_outlier_free_pose);
+        self.refit_used_frames += usize::from(diagnostics.refit_used);
+        self.lm_attempted_frames += usize::from(diagnostics.lm_attempted);
+        self.lm_success_frames += usize::from(diagnostics.lm_success);
+        self.lm_accepted_frames += usize::from(diagnostics.lm_accepted);
+        push_some(
+            &mut self.lm_delta_translation_m,
+            diagnostics.lm_delta_translation_m,
+        );
+        push_some(
+            &mut self.lm_delta_rotation_deg,
+            diagnostics.lm_delta_rotation_deg,
+        );
+        push_some(
+            &mut self.left_rmse_before_lm,
+            diagnostics.left_rmse_before_lm,
+        );
+        push_some(
+            &mut self.right_rmse_before_lm,
+            diagnostics.right_rmse_before_lm,
+        );
+        push_some(
+            &mut self.stereo_rmse_before_lm,
+            diagnostics.stereo_rmse_before_lm,
+        );
+        push_some(
+            &mut self.weighted_cost_before_lm,
+            diagnostics.weighted_cost_before_lm,
+        );
+        push_some(&mut self.left_rmse_after_lm, diagnostics.left_rmse_after_lm);
+        push_some(
+            &mut self.right_rmse_after_lm,
+            diagnostics.right_rmse_after_lm,
+        );
+        push_some(
+            &mut self.stereo_rmse_after_lm,
+            diagnostics.stereo_rmse_after_lm,
+        );
+        push_some(
+            &mut self.weighted_cost_after_lm,
+            diagnostics.weighted_cost_after_lm,
+        );
+        push_some(
+            &mut self.right_bad_fraction_before_lm,
+            diagnostics.right_bad_fraction_before_lm,
+        );
+        push_some(
+            &mut self.right_bad_fraction_after_lm,
+            diagnostics.right_bad_fraction_after_lm,
+        );
+    }
+
+    fn extend(&mut self, mut other: Self) {
+        self.frames += other.frames;
+        self.total_correspondences += other.total_correspondences;
+        self.total_left_ransac_inliers += other.total_left_ransac_inliers;
+        self.total_right_observations += other.total_right_observations;
+        self.total_trusted_right_observations += other.total_trusted_right_observations;
+        self.outlier_free_pose_frames += other.outlier_free_pose_frames;
+        self.refit_used_frames += other.refit_used_frames;
+        self.lm_attempted_frames += other.lm_attempted_frames;
+        self.lm_success_frames += other.lm_success_frames;
+        self.lm_accepted_frames += other.lm_accepted_frames;
+        self.lm_delta_translation_m
+            .append(&mut other.lm_delta_translation_m);
+        self.lm_delta_rotation_deg
+            .append(&mut other.lm_delta_rotation_deg);
+        self.left_rmse_before_lm
+            .append(&mut other.left_rmse_before_lm);
+        self.right_rmse_before_lm
+            .append(&mut other.right_rmse_before_lm);
+        self.stereo_rmse_before_lm
+            .append(&mut other.stereo_rmse_before_lm);
+        self.weighted_cost_before_lm
+            .append(&mut other.weighted_cost_before_lm);
+        self.left_rmse_after_lm
+            .append(&mut other.left_rmse_after_lm);
+        self.right_rmse_after_lm
+            .append(&mut other.right_rmse_after_lm);
+        self.stereo_rmse_after_lm
+            .append(&mut other.stereo_rmse_after_lm);
+        self.weighted_cost_after_lm
+            .append(&mut other.weighted_cost_after_lm);
+        self.right_bad_fraction_before_lm
+            .append(&mut other.right_bad_fraction_before_lm);
+        self.right_bad_fraction_after_lm
+            .append(&mut other.right_bad_fraction_after_lm);
+    }
+
+    fn print(&self) {
+        let frames = self.frames.max(1) as f32;
+        let lm_delta_translation = FloatSummary::from(self.lm_delta_translation_m.as_slice());
+        let lm_delta_rotation = FloatSummary::from(self.lm_delta_rotation_deg.as_slice());
+        let left_before = FloatSummary::from(self.left_rmse_before_lm.as_slice());
+        let right_before = FloatSummary::from(self.right_rmse_before_lm.as_slice());
+        let left_after = FloatSummary::from(self.left_rmse_after_lm.as_slice());
+        let right_after = FloatSummary::from(self.right_rmse_after_lm.as_slice());
+        println!(
+            "  stereo_diag avg_corr={:.1} avg_left_inliers={:.1} avg_right_obs={:.1} avg_trusted_right={:.1} outlier_free={} refit_used={}",
+            self.total_correspondences as f32 / frames,
+            self.total_left_ransac_inliers as f32 / frames,
+            self.total_right_observations as f32 / frames,
+            self.total_trusted_right_observations as f32 / frames,
+            self.outlier_free_pose_frames,
+            self.refit_used_frames,
+        );
+        println!(
+            "  stereo_lm attempted={} success={} accepted={} delta_t_m median={:.4} p95={:.4} delta_rot_deg median={:.4} p95={:.4}",
+            self.lm_attempted_frames,
+            self.lm_success_frames,
+            self.lm_accepted_frames,
+            lm_delta_translation.median,
+            lm_delta_translation.p95,
+            lm_delta_rotation.median,
+            lm_delta_rotation.p95,
+        );
+        println!(
+            "  stereo_rmse left_before median={:.3} right_before median={:.3} left_after median={:.3} right_after median={:.3}",
+            left_before.median, right_before.median, left_after.median, right_after.median,
+        );
+    }
+}
+
+fn push_some(values: &mut Vec<f32>, value: Option<f32>) {
+    if let Some(value) = value
+        && value.is_finite()
+    {
+        values.push(value);
     }
 }
 

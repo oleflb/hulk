@@ -5,6 +5,7 @@ pub mod pipeline;
 mod pose_refinement;
 mod triangulator;
 
+pub use odometry::OdometryDiagnostics;
 pub use pipeline::VisualOdometryPipeline;
 
 use std::{
@@ -122,7 +123,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let duration = start_time.elapsed();
 
         debug_odometry_pub
-            .publish_if_subscribed(|| ready(odometry.clone()))
+            .publish_if_subscribed(|| ready(odometry))
             .await?;
         if process_failed || (had_previous_image && odometry.is_none()) {
             tracing::debug!("visual odometry estimate failed; resetting odometer epoch");

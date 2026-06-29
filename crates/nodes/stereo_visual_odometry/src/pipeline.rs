@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{
     feature_extractor::{FeatureExtractor, NUM_KEYPOINTS, PreviousFeatureState},
-    odometry::{OdometryScratch, PreviousFrame, estimate_previous_to_current},
+    odometry::{OdometryDiagnostics, OdometryScratch, PreviousFrame, estimate_previous_to_current},
     parameters::StereoVisualOdometryPoseEstimationParameters,
     triangulator::StereoTriangulator,
 };
@@ -111,6 +111,10 @@ impl VisualOdometryPipeline {
     /// The transform uses the left-camera frame and does not include head-camera extrinsics.
     pub fn current_left_camera_to_visual_odometer(&self) -> na::Isometry3<f32> {
         self.current_left_camera_to_visual_odometer
+    }
+
+    pub fn latest_odometry_diagnostics(&self) -> OdometryDiagnostics {
+        self.odometry_scratch.diagnostics()
     }
 
     pub fn reset_tracking(&mut self) {

@@ -258,10 +258,11 @@ fn correspondence_residuals(
         }),
         correspondence
             .right_image_point
+            .filter(|_| correspondence.right_weight > 0.0)
             .map(|image_point| CorrespondenceResidual {
                 image_point,
                 x_offset: -baseline,
-                weight: correspondence.weight,
+                weight: correspondence.right_weight,
             }),
     ]
 }
