@@ -568,23 +568,15 @@ fn index_detected_objects_by_image(
     images_by_embedded_time: &[usize],
 ) -> Vec<Option<usize>> {
     let mut by_image = vec![None; images.len()];
-    let mut fallback_image_index = 0;
 
     for (event_index, event) in events.iter().enumerate() {
         let EventKind::DetectedObjects(frame) = &event.kind else {
             continue;
         };
 
-        let image_index = match frame.image_time {
-            Some(time) => {
-                nearest_image_index_by_embedded_time(images, images_by_embedded_time, time)
-            }
-            None => {
-                let image_index = fallback_image_index;
-                fallback_image_index += 1;
-                (image_index < images.len()).then_some(image_index)
-            }
-        };
+        let image_index = frame.image_time.and_then(|time| {
+            first_image_index_at_or_after_embedded_time(images, images_by_embedded_time, time)
+        });
 
         if let Some(image_index) = image_index
             && let Some(slot) = by_image.get_mut(image_index)
@@ -596,42 +588,15 @@ fn index_detected_objects_by_image(
     by_image
 }
 
-fn nearest_image_index_by_embedded_time(
+fn first_image_index_at_or_after_embedded_time(
     images: &[StereoImageIndex],
     images_by_embedded_time: &[usize],
     time: Time,
 ) -> Option<usize> {
     let target_nanos = time.as_nanos();
     let next = images_by_embedded_time
-        .partition_point(|&index| images[index].embedded_time.as_nanos() <= target_nanos);
-    nearest_by_distance(
-        next.checked_sub(1)
-            .and_then(|index| images_by_embedded_time.get(index))
-            .copied()
-            .map(|index| {
-                (
-                    index,
-                    u128::from(
-                        images[index]
-                            .embedded_time
-                            .as_nanos()
-                            .abs_diff(target_nanos),
-                    ),
-                )
-            }),
-        images_by_embedded_time.get(next).copied().map(|index| {
-            (
-                index,
-                u128::from(
-                    images[index]
-                        .embedded_time
-                        .as_nanos()
-                        .abs_diff(target_nanos),
-                ),
-            )
-        }),
-    )
-    .filter(|&index| {
+        .partition_point(|&index| images[index].embedded_time.as_nanos() < target_nanos);
+    images_by_embedded_time.get(next).copied().filter(|&index| {
         Duration::from_nanos(
             u128::from(
                 images[index]
@@ -1252,7 +1217,35 @@ mod tests {
     }
 
     #[test]
-    fn detection_index_falls_back_to_stream_order() {
+    fn detection_index_uses_following_image_when_previous_is_closer() {
+        let images = vec![test_image(0, 90_000_000), test_image(1, 120_000_000)];
+        let images_by_embedded_time = vec![0, 1];
+        let events = vec![test_detected_objects_event(
+            7,
+            Some(Time::from_nanos(100_000_000)),
+        )];
+
+        let index = index_detected_objects_by_image(&events, &images, &images_by_embedded_time);
+
+        assert_eq!(index, vec![None, Some(0)]);
+    }
+
+    #[test]
+    fn detection_index_rejects_stale_following_image() {
+        let images = vec![test_image(0, 90_000_000), test_image(1, 250_000_001)];
+        let images_by_embedded_time = vec![0, 1];
+        let events = vec![test_detected_objects_event(
+            7,
+            Some(Time::from_nanos(100_000_000)),
+        )];
+
+        let index = index_detected_objects_by_image(&events, &images, &images_by_embedded_time);
+
+        assert_eq!(index, vec![None, None]);
+    }
+
+    #[test]
+    fn detection_index_rejects_unannounced_detections() {
         let images = vec![test_image(0, 10), test_image(1, 20)];
         let images_by_embedded_time = vec![0, 1];
         let events = vec![
@@ -1262,7 +1255,7 @@ mod tests {
 
         let index = index_detected_objects_by_image(&events, &images, &images_by_embedded_time);
 
-        assert_eq!(index, vec![Some(0), Some(1)]);
+        assert_eq!(index, vec![None, None]);
     }
 
     fn test_image(order: usize, embedded_nanos: i64) -> StereoImageIndex {
