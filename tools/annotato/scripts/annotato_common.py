@@ -15,7 +15,6 @@ CLASS_NAMES = [
     "Robot",
     "TSpot",
     "XSpot",
-    "Person",
 ]
 CLASS_MAP = {name: index for index, name in enumerate(CLASS_NAMES)}
 IMAGE_EXTENSIONS = {

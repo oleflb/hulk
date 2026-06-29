@@ -10,11 +10,10 @@ pub enum Class {
     LSpot,
     TSpot,
     XSpot,
-    Person,
 }
 
 impl Class {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Ball,
         Self::GoalPost,
         Self::LSpot,
@@ -22,7 +21,6 @@ impl Class {
         Self::Robot,
         Self::TSpot,
         Self::XSpot,
-        Self::Person,
     ];
 
     pub fn supports_boxes(self) -> bool {
@@ -49,7 +47,6 @@ impl Class {
             Class::LSpot => "L spot",
             Class::TSpot => "T spot",
             Class::XSpot => "X spot",
-            Class::Person => "Person",
         }
     }
 
@@ -78,7 +75,6 @@ impl Class {
             Class::LSpot => Color32::from_rgb(203, 166, 247),
             Class::TSpot => Color32::from_rgb(166, 227, 161),
             Class::XSpot => Color32::from_rgb(137, 220, 235),
-            Class::Person => Color32::from_rgb(245, 194, 231),
         }
     }
 }

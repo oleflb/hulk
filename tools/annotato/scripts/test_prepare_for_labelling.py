@@ -290,7 +290,7 @@ def test_merge_annotations_replaces_only_selected_classes(monkeypatch):
     existing_annotations = [
         {"class": "Ball", "points": [[0.1, 0.2], [0.3, 0.4]]},
         {"class": "Robot", "points": [[0.5, 0.6], [0.7, 0.8]]},
-        {"class": "Person", "points": [[0.2, 0.3], [0.4, 0.5]]},
+        {"class": "XSpot", "points": [[0.2, 0.3], [0.4, 0.5]]},
     ]
     new_annotations = [
         {"class": "Robot", "points": [[0.11, 0.22], [0.33, 0.44]]},
@@ -304,7 +304,7 @@ def test_merge_annotations_replaces_only_selected_classes(monkeypatch):
 
     assert merged_annotations == [
         {"class": "Ball", "points": [[0.1, 0.2], [0.3, 0.4]]},
-        {"class": "Person", "points": [[0.2, 0.3], [0.4, 0.5]]},
+        {"class": "XSpot", "points": [[0.2, 0.3], [0.4, 0.5]]},
         {"class": "Robot", "points": [[0.11, 0.22], [0.33, 0.44]]},
     ]
 
