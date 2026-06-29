@@ -10,6 +10,8 @@ pub enum Class {
     LSpot,
     TSpot,
     XSpot,
+    #[serde(other)]
+    Unknown,
 }
 
 impl Class {
@@ -47,6 +49,7 @@ impl Class {
             Class::LSpot => "L spot",
             Class::TSpot => "T spot",
             Class::XSpot => "X spot",
+            Class::Unknown => "Unknown",
         }
     }
 
@@ -75,6 +78,7 @@ impl Class {
             Class::LSpot => Color32::from_rgb(203, 166, 247),
             Class::TSpot => Color32::from_rgb(166, 227, 161),
             Class::XSpot => Color32::from_rgb(137, 220, 235),
+            Class::Unknown => Color32::DEBUG_COLOR,
         }
     }
 }
