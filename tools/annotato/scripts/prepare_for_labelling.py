@@ -1,16 +1,25 @@
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["click","tqdm","opencv-python","ultralytics","wonderwords","onnxruntime"]
+# dependencies = [
+#   "click",
+#   "tqdm",
+#   "opencv-python",
+#   "ultralytics",
+#   "wonderwords",
+#   "onnxruntime",
+# ]
 # ///
+
+# ruff: noqa: FBT001, S311, TRY003
 
 import json
 import shutil
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-import click
-
+import click  # ty: ignore[unresolved-import]
 from annotato_common import CLASS_MAP, CLASS_NAMES, supported_image_paths
 
 MANIFEST_FILENAME = "source_images.json"
@@ -18,28 +27,22 @@ MANIFEST_VERSION = 1
 PRELABELED_DATA_FILENAME = "prelabeled-data.json"
 
 
-@dataclass(frozen=True)
-class PredictionSummary:
-    annotations: list
-    class_ids: tuple[int, ...]
-    confidences: tuple[float, ...]
+Annotation = dict[str, Any]
+Manifest = dict[str, Any]
 
 
-@dataclass(frozen=True)
-class SamplingResult:
-    image_paths: list[Path]
-    summaries_by_source: dict[str, PredictionSummary]
-
-
-def source_key(source_path):
+def source_key(source_path: Path) -> str:
     return str(Path(source_path).resolve())
 
 
-def manifest_entry_for_source(manifest, source_path):
+def manifest_entry_for_source(
+    manifest: Manifest,
+    source_path: Path,
+) -> dict[str, str] | None:
     return manifest["images"].get(source_key(source_path))
 
 
-def validate_unique_source_keys(image_paths):
+def validate_unique_source_keys(image_paths: list[Path]) -> None:
     seen_sources = {}
     for image_path in image_paths:
         key = source_key(image_path)
@@ -51,15 +54,15 @@ def validate_unique_source_keys(image_paths):
         seen_sources[key] = image_path
 
 
-def empty_manifest():
+def empty_manifest() -> Manifest:
     return {"version": MANIFEST_VERSION, "images": {}}
 
 
-def manifest_path(output_path):
+def manifest_path(output_path: Path) -> Path:
     return output_path / MANIFEST_FILENAME
 
 
-def load_manifest(output_path):
+def load_manifest(output_path: Path) -> Manifest:
     path = manifest_path(output_path)
     if not path.exists():
         return empty_manifest()
@@ -77,12 +80,12 @@ def load_manifest(output_path):
     return manifest
 
 
-def write_manifest(output_path, manifest):
+def write_manifest(output_path: Path, manifest: Manifest) -> None:
     with open(manifest_path(output_path), "w") as f:
         json.dump(manifest, f)
 
 
-def parse_yolo_classes(class_spec):
+def parse_yolo_classes(class_spec: str | None) -> set[int] | None:
     if class_spec is None:
         return None
 
@@ -102,9 +105,13 @@ def parse_yolo_classes(class_spec):
                 start = int(range_start)
                 end = int(range_end)
             except ValueError as error:
-                raise click.BadParameter(f"invalid class range '{part}'") from error
+                raise click.BadParameter(
+                    f"invalid class range '{part}'"
+                ) from error
             if start > end:
-                raise click.BadParameter(f"invalid descending class range '{part}'")
+                raise click.BadParameter(
+                    f"invalid descending class range '{part}'"
+                )
             for class_id in range(start, end + 1):
                 validate_class_id(class_id)
                 class_ids.add(class_id)
@@ -120,7 +127,11 @@ def parse_yolo_classes(class_spec):
     return class_ids
 
 
-def resolve_sample_size(total_images, sample_count, sample_fraction):
+def resolve_sample_size(
+    total_images: int,
+    sample_count: int | None,
+    sample_fraction: float | None,
+) -> int | None:
     if sample_count is not None and sample_fraction is not None:
         raise click.UsageError(
             "--sample-count and --sample-fraction are mutually exclusive"
@@ -132,12 +143,19 @@ def resolve_sample_size(total_images, sample_count, sample_fraction):
     if sample_fraction is not None:
         import math
 
-        return max(1, min(total_images, math.ceil(total_images * sample_fraction)))
+        return max(
+            1,
+            min(total_images, math.ceil(total_images * sample_fraction)),
+        )
 
     return None
 
 
-def sample_random(image_paths, sample_size, seed):
+def sample_random(
+    image_paths: list[Path],
+    sample_size: int | None,
+    seed: int,
+) -> list[Path]:
     if sample_size is None or sample_size >= len(image_paths):
         return image_paths
 
@@ -148,7 +166,10 @@ def sample_random(image_paths, sample_size, seed):
     return [image_paths[index] for index in selected_indices]
 
 
-def sample_spread(image_paths, sample_size):
+def sample_spread(
+    image_paths: list[Path],
+    sample_size: int | None,
+) -> list[Path]:
     if sample_size is None or sample_size >= len(image_paths):
         return image_paths
     if sample_size == 1:
@@ -162,19 +183,12 @@ def sample_spread(image_paths, sample_size):
     return [image_paths[index] for index in indices]
 
 
-def squared_distance(left, right):
-    return sum(
-        (left_value - right_value) ** 2
-        for left_value, right_value in zip(left, right)
-    )
-
-
 def sample_visual_diversity(
-    image_paths,
-    sample_size,
-    seed,
-    feature_for_image=None,
-):
+    image_paths: list[Path],
+    sample_size: int | None,
+    seed: int,
+    feature_for_image: Callable[[Path], tuple[float, ...]] | None = None,
+) -> list[Path]:
     if sample_size is None or sample_size >= len(image_paths):
         return image_paths
 
@@ -195,8 +209,8 @@ def sample_visual_diversity(
     return [path for path in image_paths if path in selected_paths]
 
 
-def image_fingerprint(image_path):
-    import cv2
+def image_fingerprint(image_path: Path) -> tuple[float, ...]:
+    import cv2  # ty: ignore[unresolved-import]
 
     image = cv2.imread(str(image_path))
     if image is None:
@@ -205,7 +219,13 @@ def image_fingerprint(image_path):
     thumbnail = cv2.resize(image, (16, 16), interpolation=cv2.INTER_AREA)
     fingerprint = []
     for channel in range(3):
-        histogram = cv2.calcHist([thumbnail], [channel], None, [8], [0, 256]).flatten()
+        histogram = cv2.calcHist(
+            [thumbnail],
+            [channel],
+            None,
+            [8],
+            [0, 256],
+        ).flatten()
         total = histogram.sum()
         if total:
             histogram = histogram / total
@@ -214,14 +234,19 @@ def image_fingerprint(image_path):
     return tuple(fingerprint)
 
 
-def validate_class_id(class_id):
+def validate_class_id(class_id: int) -> None:
     if class_id < 0 or class_id >= len(CLASS_NAMES):
         raise click.BadParameter(
-            f"class id {class_id} is outside the supported range 0-{len(CLASS_NAMES) - 1}"
+            f"class id {class_id} is outside the supported range "
+            f"0-{len(CLASS_NAMES) - 1}"
         )
 
 
-def merge_annotations(existing_annotations, new_annotations, replacement_class_ids):
+def merge_annotations(
+    existing_annotations: list[Annotation],
+    new_annotations: list[Annotation],
+    replacement_class_ids: set[int],
+) -> list[Annotation]:
     preserved_annotations = [
         annotation
         for annotation in existing_annotations
@@ -230,7 +255,7 @@ def merge_annotations(existing_annotations, new_annotations, replacement_class_i
     return preserved_annotations + new_annotations
 
 
-def load_data_json(chunk_path):
+def load_data_json(chunk_path: Path) -> dict[str, list[Annotation]]:
     data_path = chunk_path / PRELABELED_DATA_FILENAME
     if not data_path.exists():
         return {}
@@ -239,29 +264,16 @@ def load_data_json(chunk_path):
         return json.load(f)
 
 
-def write_data_json(chunk_path, chunk_annotations):
+def write_data_json(
+    chunk_path: Path,
+    chunk_annotations: dict[str, list[Annotation]],
+) -> None:
     with open(chunk_path / PRELABELED_DATA_FILENAME, "w") as f:
         json.dump(chunk_annotations, f)
 
 
-def update_data_json(
-    chunk_path,
-    image_name,
-    new_annotations,
-    replacement_class_ids,
-):
-    chunk_annotations = load_data_json(chunk_path)
-    existing_annotations = chunk_annotations.get(image_name, [])
-    chunk_annotations[image_name] = merge_annotations(
-        existing_annotations,
-        new_annotations,
-        replacement_class_ids,
-    )
-    write_data_json(chunk_path, chunk_annotations)
-
-
-def generate_random_chunk_name():
-    from wonderwords import RandomWord
+def generate_random_chunk_name() -> str:
+    from wonderwords import RandomWord  # ty: ignore[unresolved-import]
 
     rng = RandomWord()
 
@@ -273,23 +285,23 @@ def generate_random_chunk_name():
     return f"{adjective}-{noun}"
 
 
-def chunked(items, chunk_size):
+def chunked(items: list[Path], chunk_size: int) -> Iterator[list[Path]]:
     for start in range(0, len(items), chunk_size):
         yield items[start : start + chunk_size]
 
 
-def progress(iterable):
-    from tqdm import tqdm
+def progress(iterable: Iterable[Any]) -> Iterable[Any]:
+    from tqdm import tqdm  # ty: ignore[unresolved-import]
 
     return tqdm(iterable)
 
 
-def generated_image_name(source_path):
+def generated_image_name(source_path: Path) -> str:
     return f"{uuid4()}{source_path.suffix.lower()}"
 
 
-def load_image(image_path, convert_colors):
-    import cv2
+def load_image(image_path: Path, convert_colors: bool) -> Any:
+    import cv2  # ty: ignore[unresolved-import]
 
     image = cv2.imread(str(image_path))
     if image is None:
@@ -302,29 +314,34 @@ def load_image(image_path, convert_colors):
     return image
 
 
-def write_image(image_path, output_image_path, image, convert_colors):
+def write_image(
+    image_path: Path,
+    output_image_path: Path,
+    image: Any,
+    convert_colors: bool,
+) -> None:
     if not convert_colors:
         shutil.copy2(image_path, output_image_path)
         return
 
-    import cv2
+    import cv2  # ty: ignore[unresolved-import]
 
     if not cv2.imwrite(str(output_image_path), image):
         raise click.ClickException(f"failed to write image {output_image_path}")
 
 
-def annotations_from_detection(detection, selected_class_ids):
-    return prediction_summary_from_detection(detection, selected_class_ids).annotations
-
-
-def prediction_summary_from_detection(detection, selected_class_ids):
+def annotations_from_detection(
+    detection: Any,
+    selected_class_ids: set[int] | None,
+) -> list[Annotation]:
     annotations = []
-    class_ids = []
-    confidences = []
 
     for box in detection[0].boxes:
         class_id = int(box.cls)
-        if selected_class_ids is not None and class_id not in selected_class_ids:
+        if (
+            selected_class_ids is not None
+            and class_id not in selected_class_ids
+        ):
             continue
         validate_class_id(class_id)
         annotations.append(
@@ -333,192 +350,55 @@ def prediction_summary_from_detection(detection, selected_class_ids):
                 "points": box.xyxyn.reshape(2, 2).tolist(),
             }
         )
-        class_ids.append(class_id)
-        confidences.append(float(getattr(box, "conf", 1.0)))
 
-    return PredictionSummary(
-        annotations=annotations,
-        class_ids=tuple(class_ids),
-        confidences=tuple(confidences),
-    )
-
-
-def model_information_score(summary, class_counts):
-    if not summary.class_ids:
-        return 0.0
-
-    rare_class_score = sum(
-        1.0 / max(1, class_counts.get(class_id, 1)) ** 0.5
-        for class_id in set(summary.class_ids)
-    )
-    class_diversity_score = len(set(summary.class_ids))
-    object_count_score = min(len(summary.class_ids), 5) / 5
-    uncertainty_score = sum(
-        1.0 - min(1.0, abs(confidence - 0.5) * 2.0)
-        for confidence in summary.confidences
-    ) / len(summary.confidences)
-
-    return (
-        rare_class_score
-        + class_diversity_score
-        + object_count_score
-        + uncertainty_score
-    )
-
-
-def infer_prediction_summary(yolo_model, image, selected_class_ids):
-    detection = yolo_model(image, verbose=False, conf=0.1, end2end=False, iou=0.3)
-    return prediction_summary_from_detection(detection, selected_class_ids)
-
-
-def sample_model_aware(image_paths, sample_size, summaries_by_source):
-    if sample_size is None or sample_size >= len(image_paths):
-        return image_paths
-
-    class_counts = {}
-    for summary in summaries_by_source.values():
-        for class_id in set(summary.class_ids):
-            class_counts[class_id] = class_counts.get(class_id, 0) + 1
-
-    ranked_paths = sorted(
-        image_paths,
-        key=lambda path: (
-            model_information_score(summaries_by_source[source_key(path)], class_counts),
-            -image_paths.index(path),
-        ),
-        reverse=True,
-    )
-    selected_paths = set(ranked_paths[:sample_size])
-    return [path for path in image_paths if path in selected_paths]
-
-
-def infer_summaries_for_sampling(
-    image_paths,
-    yolo_model,
-    selected_class_ids,
-    convert_colors,
-):
-    summaries_by_source = {}
-    for image_path in progress(image_paths):
-        image = load_image(image_path, convert_colors)
-        summaries_by_source[source_key(image_path)] = infer_prediction_summary(
-            yolo_model,
-            image,
-            selected_class_ids,
-        )
-
-    return summaries_by_source
-
-
-def sample_hybrid(
-    image_paths,
-    sample_size,
-    seed,
-    yolo_model,
-    selected_class_ids,
-    convert_colors,
-):
-    visual_size = min(len(image_paths), max(sample_size * 4, sample_size + 200))
-    visual_pool = sample_visual_diversity(image_paths, visual_size, seed)
-
-    if yolo_model is None:
-        spread_pool = sample_spread(image_paths, min(len(image_paths), sample_size))
-        combined = list(dict.fromkeys(visual_pool + spread_pool))
-        selected = sample_visual_diversity(combined, sample_size, seed)
-        selected_paths = set(selected)
-        return SamplingResult(
-            image_paths=[path for path in image_paths if path in selected_paths],
-            summaries_by_source={},
-        )
-
-    summaries_by_source = infer_summaries_for_sampling(
-        visual_pool,
-        yolo_model,
-        selected_class_ids,
-        convert_colors,
-    )
-    selected = sample_model_aware(visual_pool, sample_size, summaries_by_source)
-    selected_paths = set(selected)
-    return SamplingResult(
-        image_paths=[path for path in image_paths if path in selected_paths],
-        summaries_by_source=summaries_by_source,
-    )
+    return annotations
 
 
 def sample_images(
-    image_paths,
-    sample_size,
-    method,
-    seed,
-    yolo_model,
-    selected_class_ids,
-    convert_colors,
-):
+    image_paths: list[Path],
+    sample_size: int | None,
+    method: str,
+    seed: int,
+) -> list[Path]:
     method = method.lower()
-    if method == "model-aware" and yolo_model is None:
-        raise click.UsageError("--sample-method model-aware requires --yolo")
 
     if sample_size is None or sample_size >= len(image_paths):
-        return SamplingResult(image_paths=image_paths, summaries_by_source={})
+        return image_paths
 
     if method == "random":
-        return SamplingResult(
-            image_paths=sample_random(image_paths, sample_size, seed),
-            summaries_by_source={},
-        )
+        return sample_random(image_paths, sample_size, seed)
 
     if method == "spread":
-        return SamplingResult(
-            image_paths=sample_spread(image_paths, sample_size),
-            summaries_by_source={},
-        )
+        return sample_spread(image_paths, sample_size)
 
     if method == "visual-diversity":
-        return SamplingResult(
-            image_paths=sample_visual_diversity(image_paths, sample_size, seed),
-            summaries_by_source={},
-        )
-
-    if method == "model-aware":
-        summaries_by_source = infer_summaries_for_sampling(
-            image_paths,
-            yolo_model,
-            selected_class_ids,
-            convert_colors,
-        )
-        return SamplingResult(
-            image_paths=sample_model_aware(
-                image_paths,
-                sample_size,
-                summaries_by_source,
-            ),
-            summaries_by_source=summaries_by_source,
-        )
-
-    if method == "hybrid":
-        return sample_hybrid(
-            image_paths,
-            sample_size,
-            seed,
-            yolo_model,
-            selected_class_ids,
-            convert_colors,
-        )
+        return sample_visual_diversity(image_paths, sample_size, seed)
 
     raise click.UsageError(f"unknown sample method: {method}")
 
 
-def infer_annotations(yolo_model, image, selected_class_ids):
-    return infer_prediction_summary(yolo_model, image, selected_class_ids).annotations
+def infer_annotations(
+    yolo_model: Any,
+    image: Any,
+    selected_class_ids: set[int] | None,
+) -> list[Annotation]:
+    detection = yolo_model(
+        image,
+        verbose=False,
+        conf=0.1,
+        end2end=False,
+        iou=0.3,
+    )
+    return annotations_from_detection(detection, selected_class_ids)
 
 
-def load_yolo_model(yolo_checkpoint):
-    from ultralytics import YOLO
+def load_yolo_model(yolo_checkpoint: Path) -> Any:
+    from ultralytics import YOLO  # ty: ignore[unresolved-import]
 
     return YOLO(str(yolo_checkpoint))
 
 
-def create_chunk_path(output_path):
+def create_chunk_path(output_path: Path) -> tuple[str, Path]:
     for _ in range(100):
         chunk_name = generate_random_chunk_name()
         chunk_path = output_path / chunk_name
@@ -529,16 +409,14 @@ def create_chunk_path(output_path):
 
 
 def create_labelling_chunks(
-    image_paths,
-    output_path,
-    manifest,
-    yolo_model,
-    selected_class_ids,
-    chunk_size,
-    convert_colors,
-    summaries_by_source=None,
-):
-    summaries_by_source = summaries_by_source or {}
+    image_paths: list[Path],
+    output_path: Path,
+    manifest: Manifest,
+    yolo_model: Any,
+    selected_class_ids: set[int] | None,
+    chunk_size: int,
+    convert_colors: bool,
+) -> None:
     duplicate_sources = [
         image_path
         for image_path in image_paths
@@ -546,8 +424,8 @@ def create_labelling_chunks(
     ]
     if duplicate_sources:
         raise click.ClickException(
-            "source image already exists in the manifest; use --extend to add labels: "
-            f"{duplicate_sources[0]}"
+            "source image already exists in the manifest; "
+            f"use --extend to add labels: {duplicate_sources[0]}"
         )
 
     for chunk in progress(list(chunked(image_paths, chunk_size))):
@@ -563,15 +441,11 @@ def create_labelling_chunks(
                 image = load_image(image_path, convert_colors)
 
             if yolo_model is not None:
-                summary = summaries_by_source.get(source_key(image_path))
-                if summary is not None:
-                    chunk_annotations[image_name] = summary.annotations
-                else:
-                    chunk_annotations[image_name] = infer_annotations(
-                        yolo_model,
-                        image,
-                        selected_class_ids,
-                    )
+                chunk_annotations[image_name] = infer_annotations(
+                    yolo_model,
+                    image,
+                    selected_class_ids,
+                )
 
             write_image(image_path, output_image_path, image, convert_colors)
             manifest["images"][source_key(image_path)] = {
@@ -583,31 +457,28 @@ def create_labelling_chunks(
 
 
 def extend_labelling_chunks(
-    image_paths,
-    output_path,
-    manifest,
-    yolo_model,
-    selected_class_ids,
-    replacement_class_ids,
-    convert_colors,
-    summaries_by_source=None,
-):
-    summaries_by_source = summaries_by_source or {}
+    image_paths: list[Path],
+    output_path: Path,
+    manifest: Manifest,
+    yolo_model: Any,
+    selected_class_ids: set[int] | None,
+    replacement_class_ids: set[int],
+    convert_colors: bool,
+) -> None:
     targets = collect_extend_targets(image_paths, output_path, manifest)
     chunk_updates = {}
 
     for image_path, chunk_path, image_name in progress(targets):
-        summary = summaries_by_source.get(source_key(image_path))
-        if summary is not None:
-            new_annotations = summary.annotations
-        else:
-            image = load_image(image_path, convert_colors)
-            new_annotations = infer_annotations(yolo_model, image, selected_class_ids)
-
-        chunk_annotations = chunk_updates.setdefault(
-            chunk_path,
-            load_data_json(chunk_path),
+        image = load_image(image_path, convert_colors)
+        new_annotations = infer_annotations(
+            yolo_model,
+            image,
+            selected_class_ids,
         )
+
+        if chunk_path not in chunk_updates:
+            chunk_updates[chunk_path] = load_data_json(chunk_path)
+        chunk_annotations = chunk_updates[chunk_path]
         existing_annotations = chunk_annotations.get(image_name, [])
         chunk_annotations[image_name] = merge_annotations(
             existing_annotations,
@@ -619,13 +490,18 @@ def extend_labelling_chunks(
         write_data_json(chunk_path, chunk_annotations)
 
 
-def collect_extend_targets(image_paths, output_path, manifest):
+def collect_extend_targets(
+    image_paths: list[Path],
+    output_path: Path,
+    manifest: Manifest,
+) -> list[tuple[Path, Path, str]]:
     targets = []
     for image_path in image_paths:
         entry = manifest_entry_for_source(manifest, image_path)
         if entry is None:
             raise click.ClickException(
-                f"no manifest entry for {image_path}; run without --extend first"
+                f"no manifest entry for {image_path}; "
+                "run without --extend first"
             )
 
         chunk_path = output_path / entry["chunk"]
@@ -669,7 +545,10 @@ def collect_extend_targets(image_paths, output_path, manifest):
 @click.option(
     "--yolo-classes",
     default=None,
-    help="Comma-separated class IDs, ranges, or names to use from the YOLO output.",
+    help=(
+        "Comma-separated class IDs, ranges, or names to use from the YOLO "
+        "output."
+    ),
 )
 @click.option(
     "--chunk-size",
@@ -692,10 +571,10 @@ def collect_extend_targets(image_paths, output_path, manifest):
 @click.option(
     "--sample-method",
     type=click.Choice(
-        ["random", "spread", "visual-diversity", "model-aware", "hybrid"],
+        ["random", "spread", "visual-diversity"],
         case_sensitive=False,
     ),
-    default="hybrid",
+    default="spread",
     help="Sampling strategy used with --sample-count or --sample-fraction.",
 )
 @click.option(
@@ -711,18 +590,18 @@ def collect_extend_targets(image_paths, output_path, manifest):
     help="Whether to convert YCbCr to RGB before inference/output.",
 )
 def main(
-    image_folder,
-    output_path,
-    extend,
-    yolo_checkpoint,
-    yolo_classes,
-    chunk_size,
-    sample_count,
-    sample_fraction,
-    sample_method,
-    sample_seed,
-    convert_colors,
-):
+    image_folder: Path,
+    output_path: Path,
+    extend: bool,
+    yolo_checkpoint: Path | None,
+    yolo_classes: str | None,
+    chunk_size: int,
+    sample_count: int | None,
+    sample_fraction: float | None,
+    sample_method: str,
+    sample_seed: int,
+    convert_colors: bool,
+) -> None:
     selected_class_ids = parse_yolo_classes(yolo_classes)
     if selected_class_ids is not None and yolo_checkpoint is None:
         raise click.UsageError("--yolo-classes requires --yolo")
@@ -740,7 +619,11 @@ def main(
 
     output_path.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(output_path)
-    yolo_model = load_yolo_model(yolo_checkpoint) if yolo_checkpoint is not None else None
+    yolo_model = (
+        load_yolo_model(yolo_checkpoint)
+        if yolo_checkpoint is not None
+        else None
+    )
     replacement_class_ids = selected_class_ids or set(range(len(CLASS_NAMES)))
     sample_size = resolve_sample_size(
         len(image_paths),
@@ -749,19 +632,16 @@ def main(
     )
     if sample_size is not None:
         click.echo(
-            f"Sampling {sample_size} of {len(image_paths)} images with {sample_method.lower()}"
+            "Sampling "
+            f"{sample_size} of {len(image_paths)} images with "
+            f"{sample_method.lower()}"
         )
-    sampling_result = sample_images(
+    image_paths = sample_images(
         image_paths=image_paths,
         sample_size=sample_size,
         method=sample_method,
         seed=sample_seed,
-        yolo_model=yolo_model,
-        selected_class_ids=selected_class_ids,
-        convert_colors=convert_colors,
     )
-    image_paths = sampling_result.image_paths
-    summaries_by_source = sampling_result.summaries_by_source
 
     if extend:
         extend_labelling_chunks(
@@ -772,7 +652,6 @@ def main(
             selected_class_ids,
             replacement_class_ids,
             convert_colors,
-            summaries_by_source,
         )
     else:
         create_labelling_chunks(
@@ -783,7 +662,6 @@ def main(
             selected_class_ids,
             chunk_size,
             convert_colors,
-            summaries_by_source,
         )
 
     write_manifest(output_path, manifest)

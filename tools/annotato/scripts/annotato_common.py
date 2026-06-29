@@ -1,6 +1,11 @@
+# ruff: noqa: TRY003
+
 import json
 import math
 from pathlib import Path
+from typing import Any
+
+Annotation = dict[str, Any]
 
 CLASS_NAMES = [
     "Ball",
@@ -31,7 +36,7 @@ class LabelSchemaError(ValueError):
     pass
 
 
-def supported_image_paths(folder):
+def supported_image_paths(folder: Path) -> list[Path]:
     return sorted(
         path
         for path in folder.iterdir()
@@ -39,7 +44,10 @@ def supported_image_paths(folder):
     )
 
 
-def load_label_file(json_path, filename):
+def load_label_file(
+    json_path: Path,
+    filename: str,
+) -> tuple[list[str], list[Annotation]]:
     with open(json_path) as f:
         data = json.load(f)
 
@@ -48,24 +56,33 @@ def load_label_file(json_path, filename):
         labeled_classes = [
             class_name
             for class_name in CLASS_NAMES
-            if any(annotation.get("class") == class_name for annotation in annotations)
+            if any(
+                annotation.get("class") == class_name
+                for annotation in annotations
+            )
         ]
     elif isinstance(data, dict):
         extra_fields = set(data) - {"labeled_classes", "annotations"}
         if extra_fields:
             fields = ", ".join(sorted(extra_fields))
-            raise LabelSchemaError(f"Unexpected label file fields in {filename}: {fields}")
+            raise LabelSchemaError(
+                f"Unexpected label file fields in {filename}: {fields}"
+            )
 
         labeled_classes = data.get("labeled_classes", [])
         annotations = data.get("annotations", [])
     else:
-        raise LabelSchemaError(f"Label file {filename} must be an object or annotation array")
+        raise LabelSchemaError(
+            f"Label file {filename} must be an object or annotation array"
+        )
 
     if not isinstance(labeled_classes, list):
         raise LabelSchemaError(f"labeled_classes in {filename} must be a list")
     for class_name in labeled_classes:
         if class_name not in CLASS_MAP:
-            raise LabelSchemaError(f"Unknown labeled class '{class_name}' in {filename}")
+            raise LabelSchemaError(
+                f"Unknown labeled class '{class_name}' in {filename}"
+            )
 
     if not isinstance(annotations, list):
         raise LabelSchemaError(f"annotations in {filename} must be a list")
@@ -73,11 +90,13 @@ def load_label_file(json_path, filename):
     return labeled_classes, annotations
 
 
-def validate_annotation(annotation, filename):
+def validate_annotation(annotation: Annotation, filename: str) -> None:
     extra_fields = set(annotation) - {"class", "points", "point"}
     if extra_fields:
         fields = ", ".join(sorted(extra_fields))
-        raise LabelSchemaError(f"Unexpected annotation fields in {filename}: {fields}")
+        raise LabelSchemaError(
+            f"Unexpected annotation fields in {filename}: {fields}"
+        )
 
     class_name = annotation.get("class")
     points = annotation.get("points")
@@ -88,7 +107,8 @@ def validate_annotation(annotation, filename):
 
     if points is None and point is None:
         raise LabelSchemaError(
-            f"Annotation in {filename} must contain 'points' or 'point' geometry"
+            f"Annotation in {filename} must contain 'points' or 'point' "
+            "geometry"
         )
     if points is not None:
         if len(points) != 2:
@@ -99,15 +119,21 @@ def validate_annotation(annotation, filename):
         validate_normalized_point(point, filename)
         if class_name not in POINT_CLASSES:
             raise LabelSchemaError(
-                f"Class '{class_name}' in {filename} does not support point geometry"
+                f"Class '{class_name}' in {filename} does not support point "
+                "geometry"
             )
-    if points is not None and point is not None and class_name not in MIGRATED_POINT_CLASSES:
+    if (
+        points is not None
+        and point is not None
+        and class_name not in MIGRATED_POINT_CLASSES
+    ):
         raise LabelSchemaError(
-            f"Class '{class_name}' in {filename} cannot combine points and point geometry"
+            f"Class '{class_name}' in {filename} cannot combine points and "
+            "point geometry"
         )
 
 
-def validate_normalized_point(point, filename):
+def validate_normalized_point(point: Any, filename: str) -> None:
     if not isinstance(point, (list, tuple)) or len(point) != 2:
         raise LabelSchemaError(f"Invalid normalized point in {filename}")
 
@@ -121,5 +147,6 @@ def validate_normalized_point(point, filename):
         and 0.0 <= y <= 1.0
     ):
         raise LabelSchemaError(
-            f"Normalized coordinates in {filename} must be finite and between 0 and 1"
+            f"Normalized coordinates in {filename} must be finite and between "
+            "0 and 1"
         )
