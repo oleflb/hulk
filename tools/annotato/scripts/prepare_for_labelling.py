@@ -25,6 +25,14 @@ from annotato_common import CLASS_MAP, CLASS_NAMES, supported_image_paths
 MANIFEST_FILENAME = "source_images.json"
 MANIFEST_VERSION = 1
 PRELABELED_DATA_FILENAME = "prelabeled-data.json"
+MODEL_KIND_CUSTOM = "custom"
+MODEL_KIND_YOLO = "yolo"
+MODEL_KINDS = [MODEL_KIND_CUSTOM, MODEL_KIND_YOLO]
+YOLO_CLASS_COUNT = 80
+YOLO_CLASS_TO_LABEL = {
+    0: "Person",
+    32: "Ball",
+}
 
 
 Annotation = dict[str, Any]
@@ -85,7 +93,10 @@ def write_manifest(output_path: Path, manifest: Manifest) -> None:
         json.dump(manifest, f)
 
 
-def parse_yolo_classes(class_spec: str | None) -> set[int] | None:
+def parse_yolo_classes(
+    class_spec: str | None,
+    model_kind: str = MODEL_KIND_CUSTOM,
+) -> set[int] | None:
     if class_spec is None:
         return None
 
@@ -95,8 +106,9 @@ def parse_yolo_classes(class_spec: str | None) -> set[int] | None:
         if not part:
             raise click.BadParameter("class list contains an empty item")
 
-        if part in CLASS_NAMES:
-            class_ids.add(CLASS_NAMES.index(part))
+        class_id = class_id_for_name(part, model_kind)
+        if class_id is not None:
+            class_ids.add(class_id)
             continue
 
         if "-" in part:
@@ -113,7 +125,7 @@ def parse_yolo_classes(class_spec: str | None) -> set[int] | None:
                     f"invalid descending class range '{part}'"
                 )
             for class_id in range(start, end + 1):
-                validate_class_id(class_id)
+                validate_model_class_id(class_id, model_kind)
                 class_ids.add(class_id)
             continue
 
@@ -121,10 +133,20 @@ def parse_yolo_classes(class_spec: str | None) -> set[int] | None:
             class_id = int(part)
         except ValueError as error:
             raise click.BadParameter(f"unknown class '{part}'") from error
-        validate_class_id(class_id)
+        validate_model_class_id(class_id, model_kind)
         class_ids.add(class_id)
 
     return class_ids
+
+
+def class_id_for_name(class_name: str, model_kind: str) -> int | None:
+    if model_kind == MODEL_KIND_CUSTOM and class_name in CLASS_NAMES:
+        return CLASS_NAMES.index(class_name)
+    if model_kind == MODEL_KIND_YOLO:
+        for class_id, label in YOLO_CLASS_TO_LABEL.items():
+            if class_name == label:
+                return class_id
+    return None
 
 
 def resolve_sample_size(
@@ -242,6 +264,44 @@ def validate_class_id(class_id: int) -> None:
         )
 
 
+def validate_model_class_id(class_id: int, model_kind: str) -> None:
+    if model_kind == MODEL_KIND_CUSTOM:
+        validate_class_id(class_id)
+        return
+
+    if class_id < 0 or class_id >= YOLO_CLASS_COUNT:
+        raise click.BadParameter(
+            f"class id {class_id} is outside the supported range "
+            f"0-{YOLO_CLASS_COUNT - 1}"
+        )
+
+
+def annotato_label_for_model_class(
+    class_id: int,
+    model_kind: str,
+) -> str | None:
+    if model_kind == MODEL_KIND_CUSTOM:
+        validate_class_id(class_id)
+        return CLASS_NAMES[class_id]
+
+    return YOLO_CLASS_TO_LABEL.get(class_id)
+
+
+def replacement_class_ids_for_model_kind(
+    model_kind: str,
+    selected_class_ids: set[int] | None,
+) -> set[int]:
+    if model_kind == MODEL_KIND_CUSTOM:
+        return selected_class_ids or set(range(len(CLASS_NAMES)))
+
+    model_class_ids = selected_class_ids or set(YOLO_CLASS_TO_LABEL)
+    return {
+        CLASS_MAP[label]
+        for class_id, label in YOLO_CLASS_TO_LABEL.items()
+        if class_id in model_class_ids
+    }
+
+
 def merge_annotations(
     existing_annotations: list[Annotation],
     new_annotations: list[Annotation],
@@ -333,6 +393,7 @@ def write_image(
 def annotations_from_detection(
     detection: Any,
     selected_class_ids: set[int] | None,
+    model_kind: str = MODEL_KIND_CUSTOM,
 ) -> list[Annotation]:
     annotations = []
 
@@ -343,10 +404,12 @@ def annotations_from_detection(
             and class_id not in selected_class_ids
         ):
             continue
-        validate_class_id(class_id)
+        label = annotato_label_for_model_class(class_id, model_kind)
+        if label is None:
+            continue
         annotations.append(
             {
-                "class": CLASS_NAMES[class_id],
+                "class": label,
                 "points": box.xyxyn.reshape(2, 2).tolist(),
             }
         )
@@ -381,6 +444,7 @@ def infer_annotations(
     yolo_model: Any,
     image: Any,
     selected_class_ids: set[int] | None,
+    model_kind: str,
 ) -> list[Annotation]:
     detection = yolo_model(
         image,
@@ -389,7 +453,7 @@ def infer_annotations(
         end2end=False,
         iou=0.3,
     )
-    return annotations_from_detection(detection, selected_class_ids)
+    return annotations_from_detection(detection, selected_class_ids, model_kind)
 
 
 def load_yolo_model(yolo_checkpoint: Path) -> Any:
@@ -414,6 +478,7 @@ def create_labelling_chunks(
     manifest: Manifest,
     yolo_model: Any,
     selected_class_ids: set[int] | None,
+    model_kind: str,
     chunk_size: int,
     convert_colors: bool,
 ) -> None:
@@ -445,6 +510,7 @@ def create_labelling_chunks(
                     yolo_model,
                     image,
                     selected_class_ids,
+                    model_kind,
                 )
 
             write_image(image_path, output_image_path, image, convert_colors)
@@ -462,6 +528,7 @@ def extend_labelling_chunks(
     manifest: Manifest,
     yolo_model: Any,
     selected_class_ids: set[int] | None,
+    model_kind: str,
     replacement_class_ids: set[int],
     convert_colors: bool,
 ) -> None:
@@ -474,6 +541,7 @@ def extend_labelling_chunks(
             yolo_model,
             image,
             selected_class_ids,
+            model_kind,
         )
 
         if chunk_path not in chunk_updates:
@@ -543,6 +611,12 @@ def collect_extend_targets(
     help="The YOLO checkpoint used for inference.",
 )
 @click.option(
+    "--model-kind",
+    type=click.Choice(MODEL_KINDS, case_sensitive=False),
+    default=MODEL_KIND_CUSTOM,
+    help="The class mapping used for YOLO detections.",
+)
+@click.option(
     "--yolo-classes",
     default=None,
     help=(
@@ -594,6 +668,7 @@ def main(
     output_path: Path,
     extend: bool,
     yolo_checkpoint: Path | None,
+    model_kind: str,
     yolo_classes: str | None,
     chunk_size: int,
     sample_count: int | None,
@@ -602,7 +677,8 @@ def main(
     sample_seed: int,
     convert_colors: bool,
 ) -> None:
-    selected_class_ids = parse_yolo_classes(yolo_classes)
+    model_kind = model_kind.lower()
+    selected_class_ids = parse_yolo_classes(yolo_classes, model_kind)
     if selected_class_ids is not None and yolo_checkpoint is None:
         raise click.UsageError("--yolo-classes requires --yolo")
     if extend and yolo_checkpoint is None:
@@ -624,7 +700,10 @@ def main(
         if yolo_checkpoint is not None
         else None
     )
-    replacement_class_ids = selected_class_ids or set(range(len(CLASS_NAMES)))
+    replacement_class_ids = replacement_class_ids_for_model_kind(
+        model_kind,
+        selected_class_ids,
+    )
     sample_size = resolve_sample_size(
         len(image_paths),
         sample_count,
@@ -650,6 +729,7 @@ def main(
             manifest,
             yolo_model,
             selected_class_ids,
+            model_kind,
             replacement_class_ids,
             convert_colors,
         )
@@ -660,6 +740,7 @@ def main(
             manifest,
             yolo_model,
             selected_class_ids,
+            model_kind,
             chunk_size,
             convert_colors,
         )

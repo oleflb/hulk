@@ -52,6 +52,7 @@ The YOLO conversion script is box-only and fails clearly if a label contains `po
 
 ```sh
 uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --yolo model.pt --yolo-classes 0-5 --chunk-size 200
+uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --yolo yolo11x.pt --model-kind yolo --yolo-classes 0,32
 uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --sample-count 500 --sample-method visual-diversity --sample-seed 123
 uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --extend --yolo second-model.pt --yolo-classes 6-7
 cargo run -p annotato -- current/<chunk>
@@ -60,7 +61,7 @@ uv run --script tools/annotato/scripts/convert_dataset_to_yolo.py labelled-image
 
 `prepare_for_labelling.py` writes chunked labelling tasks below the selected output folder. Each chunk is a normal annotato image folder containing copied images and a `prelabeled-data.json` predictions file. When passed one chunk folder, annotato automatically uses `prelabeled-data.json` for images that do not have sidecar label files yet. Images are copied with their source file format. Supported formats are JPEG, PNG, WebP, BMP, and TIFF.
 
-`--yolo-classes` accepts class IDs, ranges, and names, for example `0-5`, `Robot,Person`, or `0-5,Person`. The output folder also contains `source_images.json`, which maps original source images to generated chunk image names. A later run with `--extend` uses that manifest to update existing `prelabeled-data.json` files instead of creating new image keys.
+`--model-kind` controls how YOLO class IDs are mapped to annotato labels. The default `custom` kind uses annotato's custom class order. The `yolo` kind is for off-the-shelf COCO YOLO models and maps COCO `person` (`0`) to `Person` and `sports ball` (`32`) to `Ball`; all other detections are dropped. `--yolo-classes` accepts class IDs, ranges, and names for the selected model kind, for example `0-5`, `Robot,Person`, or `0-5,Person` with `custom`, and `0,32`, `Person`, or `Ball` with `yolo`. The output folder also contains `source_images.json`, which maps original source images to generated chunk image names. A later run with `--extend` uses that manifest to update existing `prelabeled-data.json` files instead of creating new image keys.
 
 Use `--sample-count` or `--sample-fraction` to prepare only a deterministic subset before creating chunks or extending existing predictions. `--sample-method` accepts `random`, `spread`, and `visual-diversity`; `spread` is the default when sampling is requested. Change `--sample-seed` to get a different deterministic subset for seeded methods.
 
