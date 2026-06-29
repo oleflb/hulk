@@ -53,7 +53,7 @@ The YOLO conversion script is box-only and fails clearly if a label contains `po
 ```sh
 uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --yolo model.pt --yolo-classes 0-5 --chunk-size 200
 uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --yolo yolo11x.pt --model-kind yolo --yolo-classes 0,32
-uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --sample-count 500 --sample-method visual-diversity --sample-seed 123
+uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images-a --image-folder images-b --output current --sample-count 500 --sample-count 100 --sample-method visual-diversity --sample-seed 123
 uv run --script tools/annotato/scripts/prepare_for_labelling.py --image-folder images --output current --extend --yolo second-model.pt --yolo-classes 6-7
 cargo run -p annotato -- current/<chunk>
 uv run --script tools/annotato/scripts/convert_dataset_to_yolo.py labelled-images yolo-output --train-split 0.8
@@ -63,6 +63,6 @@ uv run --script tools/annotato/scripts/convert_dataset_to_yolo.py labelled-image
 
 `--model-kind` controls how YOLO class IDs are mapped to annotato labels. The default `custom` kind uses annotato's custom class order. The `yolo` kind is for off-the-shelf COCO YOLO models and maps COCO `person` (`0`) to `Person` and `sports ball` (`32`) to `Ball`; all other detections are dropped. `--yolo-classes` accepts class IDs, ranges, and names for the selected model kind, for example `0-5`, `Robot,Person`, or `0-5,Person` with `custom`, and `0,32`, `Person`, or `Ball` with `yolo`. The output folder also contains `source_images.json`, which maps original source images to generated chunk image names. A later run with `--extend` uses that manifest to update existing `prelabeled-data.json` files instead of creating new image keys.
 
-Use `--sample-count` or `--sample-fraction` to prepare only a deterministic subset before creating chunks or extending existing predictions. `--sample-method` accepts `random`, `spread`, and `visual-diversity`; `spread` is the default when sampling is requested. Change `--sample-seed` to get a different deterministic subset for seeded methods.
+Use `--image-folder` multiple times to build one prepared dataset from several source folders. Use `--sample-count` or `--sample-fraction` to prepare only a deterministic subset before creating chunks or extending existing predictions. These sampling options can also be supplied multiple times; values apply to source folders by order. If fewer values are supplied than folders, the last value is reused for the remaining folders and the script prints an informational message. During chunk creation, selected images from multiple source folders are distributed proportionally across chunks; only the final chunk is partial unless the total selected image count is smaller than `--chunk-size`. `--sample-method` accepts `random`, `spread`, and `visual-diversity`; `spread` is the default when sampling is requested. Change `--sample-seed` to get a different deterministic subset for seeded methods.
 
 `convert_dataset_to_yolo.py` expects images and sidecar JSON files with matching stems in one folder. It writes `images/{train,val}` and `labels/{train,val}`.

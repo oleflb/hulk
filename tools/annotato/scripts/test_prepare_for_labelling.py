@@ -209,6 +209,38 @@ def test_sample_images_random_dispatches_to_random(monkeypatch):
     ]
 
 
+def test_yolo_model_kind_maps_coco_person_and_sports_ball(monkeypatch):
+    prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
+
+    class FakeTensor:
+        def reshape(self, *shape):
+            return self
+
+        def tolist(self):
+            return [[0.1, 0.2], [0.3, 0.4]]
+
+    detection = [
+        types.SimpleNamespace(
+            boxes=[
+                types.SimpleNamespace(cls=0, xyxyn=FakeTensor()),
+                types.SimpleNamespace(cls=32, xyxyn=FakeTensor()),
+                types.SimpleNamespace(cls=4, xyxyn=FakeTensor()),
+            ]
+        )
+    ]
+
+    annotations = prepare_for_labelling.annotations_from_detection(
+        detection,
+        selected_class_ids=None,
+        model_kind="yolo",
+    )
+
+    assert annotations == [
+        {"class": "Person", "points": [[0.1, 0.2], [0.3, 0.4]]},
+        {"class": "Ball", "points": [[0.1, 0.2], [0.3, 0.4]]},
+    ]
+
+
 def test_merge_annotations_replaces_only_selected_classes(monkeypatch):
     prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
     existing_annotations = [
@@ -548,6 +580,195 @@ def test_main_subsamples_before_creating_chunks(tmp_path, monkeypatch):
     assert set(manifest["images"]) == {
         str((source_dir / "frame-0.jpg").resolve()),
         str((source_dir / "frame-4.jpg").resolve()),
+    }
+
+
+def test_main_samples_each_image_folder_in_order(tmp_path, monkeypatch):
+    prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
+    chunk_names = iter(["first-chunk", "second-chunk"])
+    monkeypatch.setattr(
+        prepare_for_labelling,
+        "generate_random_chunk_name",
+        lambda: next(chunk_names),
+    )
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    third_dir = tmp_path / "third"
+    for source_dir in [first_dir, second_dir, third_dir]:
+        source_dir.mkdir()
+        for index in range(4):
+            (source_dir / f"frame-{index}.jpg").write_bytes(
+                f"{source_dir.name}-{index}".encode()
+            )
+    output_path = tmp_path / "current"
+
+    result = CliRunner().invoke(
+        prepare_for_labelling.main,
+        [
+            "--image-folder",
+            str(first_dir),
+            "--image-folder",
+            str(second_dir),
+            "--image-folder",
+            str(third_dir),
+            "--output",
+            str(output_path),
+            "--chunk-size",
+            "4",
+            "--sample-count",
+            "1",
+            "--sample-count",
+            "2",
+            "--sample-method",
+            "spread",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Using final --sample-count value 2 for 1 remaining image folder"
+        in result.output
+    )
+    manifest = json.loads((output_path / "source_images.json").read_text())
+    assert list(manifest["images"]) == [
+        str((first_dir / "frame-0.jpg").resolve()),
+        str((second_dir / "frame-0.jpg").resolve()),
+        str((second_dir / "frame-3.jpg").resolve()),
+        str((third_dir / "frame-0.jpg").resolve()),
+        str((third_dir / "frame-3.jpg").resolve()),
+    ]
+
+
+def test_main_rejects_more_sample_counts_than_image_folders(
+    tmp_path,
+    monkeypatch,
+):
+    prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "frame.jpg").write_bytes(b"image")
+
+    result = CliRunner().invoke(
+        prepare_for_labelling.main,
+        [
+            "--image-folder",
+            str(source_dir),
+            "--sample-count",
+            "1",
+            "--sample-count",
+            "2",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert (
+        "more --sample-count values than --image-folder values"
+        in result.output
+    )
+
+
+def test_main_samples_each_image_folder_with_fraction(tmp_path, monkeypatch):
+    prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
+    monkeypatch.setattr(
+        prepare_for_labelling,
+        "generate_random_chunk_name",
+        lambda: "gentle-river",
+    )
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    for source_dir in [first_dir, second_dir]:
+        source_dir.mkdir()
+        for index in range(4):
+            (source_dir / f"frame-{index}.jpg").write_bytes(b"image")
+    output_path = tmp_path / "current"
+
+    result = CliRunner().invoke(
+        prepare_for_labelling.main,
+        [
+            "--image-folder",
+            str(first_dir),
+            "--image-folder",
+            str(second_dir),
+            "--output",
+            str(output_path),
+            "--sample-fraction",
+            "0.25",
+            "--sample-fraction",
+            "0.5",
+            "--sample-method",
+            "spread",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = json.loads((output_path / "source_images.json").read_text())
+    assert list(manifest["images"]) == [
+        str((first_dir / "frame-0.jpg").resolve()),
+        str((second_dir / "frame-0.jpg").resolve()),
+        str((second_dir / "frame-3.jpg").resolve()),
+    ]
+
+
+def test_main_chunks_multiple_image_folders_proportionally(
+    tmp_path,
+    monkeypatch,
+):
+    prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
+    chunk_names = iter(["chunk-one", "chunk-two", "chunk-three"])
+    monkeypatch.setattr(
+        prepare_for_labelling,
+        "generate_random_chunk_name",
+        lambda: next(chunk_names),
+    )
+    source_counts = {
+        "first": 5,
+        "second": 3,
+        "third": 1,
+    }
+    source_dirs = {}
+    for source_name, source_count in source_counts.items():
+        source_dir = tmp_path / source_name
+        source_dir.mkdir()
+        source_dirs[source_name] = source_dir
+        for index in range(source_count):
+            (source_dir / f"frame-{index}.jpg").write_bytes(
+                f"{source_name}-{index}".encode()
+            )
+    output_path = tmp_path / "current"
+
+    result = CliRunner().invoke(
+        prepare_for_labelling.main,
+        [
+            "--image-folder",
+            str(source_dirs["first"]),
+            "--image-folder",
+            str(source_dirs["second"]),
+            "--image-folder",
+            str(source_dirs["third"]),
+            "--output",
+            str(output_path),
+            "--chunk-size",
+            "4",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = json.loads((output_path / "source_images.json").read_text())
+    chunk_sources = {
+        "chunk-one": [],
+        "chunk-two": [],
+        "chunk-three": [],
+    }
+    for source_name, source_count in source_counts.items():
+        for index in range(source_count):
+            source_path = source_dirs[source_name] / f"frame-{index}.jpg"
+            entry = manifest["images"][str(source_path.resolve())]
+            chunk_sources[entry["chunk"]].append(source_name)
+
+    assert chunk_sources == {
+        "chunk-one": ["first", "first", "second", "third"],
+        "chunk-two": ["first", "first", "second", "second"],
+        "chunk-three": ["first"],
     }
 
 

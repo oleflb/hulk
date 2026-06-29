@@ -345,11 +345,6 @@ def generate_random_chunk_name() -> str:
     return f"{adjective}-{noun}"
 
 
-def chunked(items: list[Path], chunk_size: int) -> Iterator[list[Path]]:
-    for start in range(0, len(items), chunk_size):
-        yield items[start : start + chunk_size]
-
-
 def progress(iterable: Iterable[Any]) -> Iterable[Any]:
     from tqdm import tqdm  # ty: ignore[unresolved-import]
 
@@ -440,6 +435,160 @@ def sample_images(
     raise click.UsageError(f"unknown sample method: {method}")
 
 
+def expand_sample_values(
+    sample_values: tuple[Any, ...],
+    image_folder_count: int,
+    option_name: str,
+) -> list[Any | None]:
+    if not sample_values:
+        return [None] * image_folder_count
+
+    if len(sample_values) > image_folder_count:
+        raise click.UsageError(
+            f"more {option_name} values than --image-folder values"
+        )
+
+    if len(sample_values) < image_folder_count:
+        remaining_count = image_folder_count - len(sample_values)
+        folder_word = "folder" if remaining_count == 1 else "folders"
+        click.echo(
+            f"Using final {option_name} value {sample_values[-1]} for "
+            f"{remaining_count} remaining image {folder_word}"
+        )
+
+    return list(sample_values) + [sample_values[-1]] * (
+        image_folder_count - len(sample_values)
+    )
+
+
+def flatten_image_groups(image_groups: list[list[Path]]) -> list[Path]:
+    return [image_path for group in image_groups for image_path in group]
+
+
+def image_path_groups_for_folders(
+    image_folders: tuple[Path, ...],
+    sample_counts: tuple[int, ...],
+    sample_fractions: tuple[float, ...],
+    sample_method: str,
+    sample_seed: int,
+) -> list[list[Path]]:
+    if sample_counts and sample_fractions:
+        raise click.UsageError(
+            "--sample-count and --sample-fraction are mutually exclusive"
+        )
+
+    count_values = expand_sample_values(
+        sample_counts,
+        len(image_folders),
+        "--sample-count",
+    )
+    fraction_values = expand_sample_values(
+        sample_fractions,
+        len(image_folders),
+        "--sample-fraction",
+    )
+    selected_groups = []
+
+    for image_folder, sample_count, sample_fraction in zip(
+        image_folders,
+        count_values,
+        fraction_values,
+        strict=True,
+    ):
+        image_paths = supported_image_paths(image_folder)
+        if len(image_paths) == 0:
+            raise click.ClickException(
+                f"No images found in the image folder: {image_folder}"
+            )
+
+        sample_size = resolve_sample_size(
+            len(image_paths),
+            sample_count,
+            sample_fraction,
+        )
+        if sample_size is not None:
+            message = (
+                f"Sampling {sample_size} of {len(image_paths)} images"
+            )
+            if len(image_folders) > 1:
+                message += f" from {image_folder}"
+            click.echo(f"{message} with {sample_method.lower()}")
+        selected_groups.append(
+            sample_images(
+                image_paths=image_paths,
+                sample_size=sample_size,
+                method=sample_method,
+                seed=sample_seed,
+            )
+        )
+
+    selected_paths = flatten_image_groups(selected_groups)
+    validate_unique_source_keys(selected_paths)
+    return selected_groups
+
+
+def image_paths_for_folders(
+    image_folders: tuple[Path, ...],
+    sample_counts: tuple[int, ...],
+    sample_fractions: tuple[float, ...],
+    sample_method: str,
+    sample_seed: int,
+) -> list[Path]:
+    return flatten_image_groups(
+        image_path_groups_for_folders(
+            image_folders,
+            sample_counts,
+            sample_fractions,
+            sample_method,
+            sample_seed,
+        )
+    )
+
+
+def proportional_chunked(
+    image_groups: list[list[Path]],
+    chunk_size: int,
+) -> Iterator[list[Path]]:
+    positions = [0] * len(image_groups)
+    remaining_total = sum(len(group) for group in image_groups)
+
+    while remaining_total > 0:
+        target_size = min(chunk_size, remaining_total)
+        remaining_counts = [
+            len(group) - position
+            for group, position in zip(image_groups, positions, strict=True)
+        ]
+        quotas = [
+            remaining_count * target_size / remaining_total
+            for remaining_count in remaining_counts
+        ]
+        take_counts = [int(quota) for quota in quotas]
+        remaining_slots = target_size - sum(take_counts)
+
+        for index in sorted(
+            range(len(image_groups)),
+            key=lambda candidate: (
+                -(quotas[candidate] - take_counts[candidate]),
+                candidate,
+            ),
+        ):
+            if remaining_slots == 0:
+                break
+            if take_counts[index] < remaining_counts[index]:
+                take_counts[index] += 1
+                remaining_slots -= 1
+
+        chunk = []
+        for index, take_count in enumerate(take_counts):
+            start = positions[index]
+            end = start + take_count
+            chunk.extend(image_groups[index][start:end])
+            positions[index] = end
+
+        remaining_total -= target_size
+        yield chunk
+
+
 def infer_annotations(
     yolo_model: Any,
     image: Any,
@@ -473,7 +622,7 @@ def create_chunk_path(output_path: Path) -> tuple[str, Path]:
 
 
 def create_labelling_chunks(
-    image_paths: list[Path],
+    image_groups: list[list[Path]],
     output_path: Path,
     manifest: Manifest,
     yolo_model: Any,
@@ -482,6 +631,7 @@ def create_labelling_chunks(
     chunk_size: int,
     convert_colors: bool,
 ) -> None:
+    image_paths = flatten_image_groups(image_groups)
     duplicate_sources = [
         image_path
         for image_path in image_paths
@@ -493,7 +643,8 @@ def create_labelling_chunks(
             f"use --extend to add labels: {duplicate_sources[0]}"
         )
 
-    for chunk in progress(list(chunked(image_paths, chunk_size))):
+    chunks = list(proportional_chunked(image_groups, chunk_size))
+    for chunk in progress(chunks):
         chunk_name, chunk_path = create_chunk_path(output_path)
         chunk_path.mkdir(parents=True, exist_ok=False)
         chunk_annotations = {}
@@ -587,9 +738,11 @@ def collect_extend_targets(
 @click.command(context_settings={"show_default": True})
 @click.option(
     "--image-folder",
+    "image_folders",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
+    multiple=True,
     required=True,
-    help="The source image folder.",
+    help="Source image folder. Can be supplied multiple times.",
 )
 @click.option(
     "--output",
@@ -633,14 +786,14 @@ def collect_extend_targets(
 @click.option(
     "--sample-count",
     type=click.IntRange(min=1),
-    default=None,
-    help="Number of images to select before labelling task generation.",
+    multiple=True,
+    help="Number of images to select from each source folder.",
 )
 @click.option(
     "--sample-fraction",
     type=click.FloatRange(min=0.0, max=1.0, min_open=True),
-    default=None,
-    help="Fraction of images to select before labelling task generation.",
+    multiple=True,
+    help="Fraction of images to select from each source folder.",
 )
 @click.option(
     "--sample-method",
@@ -664,15 +817,15 @@ def collect_extend_targets(
     help="Whether to convert YCbCr to RGB before inference/output.",
 )
 def main(
-    image_folder: Path,
+    image_folders: tuple[Path, ...],
     output_path: Path,
     extend: bool,
     yolo_checkpoint: Path | None,
     model_kind: str,
     yolo_classes: str | None,
     chunk_size: int,
-    sample_count: int | None,
-    sample_fraction: float | None,
+    sample_count: tuple[int, ...],
+    sample_fraction: tuple[float, ...],
     sample_method: str,
     sample_seed: int,
     convert_colors: bool,
@@ -688,10 +841,14 @@ def main(
             f"cannot extend without {manifest_path(output_path)}"
         )
 
-    image_paths = supported_image_paths(image_folder)
-    if len(image_paths) == 0:
-        raise click.ClickException("No images found in the image folder")
-    validate_unique_source_keys(image_paths)
+    image_groups = image_path_groups_for_folders(
+        image_folders,
+        sample_count,
+        sample_fraction,
+        sample_method,
+        sample_seed,
+    )
+    image_paths = flatten_image_groups(image_groups)
 
     output_path.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(output_path)
@@ -704,24 +861,6 @@ def main(
         model_kind,
         selected_class_ids,
     )
-    sample_size = resolve_sample_size(
-        len(image_paths),
-        sample_count,
-        sample_fraction,
-    )
-    if sample_size is not None:
-        click.echo(
-            "Sampling "
-            f"{sample_size} of {len(image_paths)} images with "
-            f"{sample_method.lower()}"
-        )
-    image_paths = sample_images(
-        image_paths=image_paths,
-        sample_size=sample_size,
-        method=sample_method,
-        seed=sample_seed,
-    )
-
     if extend:
         extend_labelling_chunks(
             image_paths,
@@ -735,7 +874,7 @@ def main(
         )
     else:
         create_labelling_chunks(
-            image_paths,
+            image_groups,
             output_path,
             manifest,
             yolo_model,
