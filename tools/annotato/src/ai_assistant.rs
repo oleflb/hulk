@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs, path::Path};
 use color_eyre::{Result, eyre::Context};
 use serde::{Deserialize, Serialize};
 
-use crate::annotation::AnnotationFormat;
+use crate::{annotation::AnnotationFormat, classes::Class};
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct ModelAnnotations {
@@ -26,7 +26,15 @@ impl ModelAnnotations {
         })
     }
 
-    pub fn for_image(&self, image_name: &str) -> Option<&[AnnotationFormat]> {
-        self.images.get(image_name).map(Vec::as_slice)
+    pub fn for_image(&self, image_name: &str) -> Option<Vec<AnnotationFormat>> {
+        let suggestions = self.images.get(image_name)?;
+
+        Some(
+            suggestions
+                .iter()
+                .filter(|suggestion| suggestion.class() != Class::Unknown)
+                .cloned()
+                .collect(),
+        )
     }
 }

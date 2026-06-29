@@ -228,10 +228,10 @@ impl AnnotatorApp {
                 .file_name()
                 .and_then(|file_name| file_name.to_str())
                 .and_then(|file_name| self.model_annotations.for_image(file_name))
-                .unwrap_or(&[]);
+                .unwrap_or(Vec::new());
 
             self.label_widget
-                .load_new_image_with_labels(paths.clone(), annotations)?;
+                .load_new_image_with_labels(paths.clone(), &annotations)?;
             paths.check_existence();
         }
 
