@@ -13,6 +13,8 @@ pub struct AnnotationFormat {
     points: Option<[[f32; 2]; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     point: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    migration_skipped: bool,
 }
 
 impl AnnotationFormat {
@@ -21,7 +23,10 @@ impl AnnotationFormat {
     }
 
     pub fn needs_point_migration(&self) -> bool {
-        self.class.requires_point() && self.points.is_some() && self.point.is_none()
+        self.class.requires_point()
+            && self.points.is_some()
+            && self.point.is_none()
+            && !self.migration_skipped
     }
 }
 
@@ -38,6 +43,8 @@ impl<'de> Deserialize<'de> for AnnotationFormat {
             points: Option<[[f32; 2]; 2]>,
             #[serde(default)]
             point: Option<[f32; 2]>,
+            #[serde(default)]
+            migration_skipped: bool,
         }
 
         let raw = RawAnnotationFormat::deserialize(deserializer)?;
@@ -66,11 +73,28 @@ impl<'de> Deserialize<'de> for AnnotationFormat {
                 raw.class.as_str()
             )));
         }
+        if raw.migration_skipped && raw.point.is_some() {
+            return Err(D::Error::custom(
+                "migration_skipped annotations cannot contain `point` geometry",
+            ));
+        }
+        if raw.migration_skipped && !raw.class.requires_point() {
+            return Err(D::Error::custom(format!(
+                "{} does not support point migration skips",
+                raw.class.as_str()
+            )));
+        }
+        if raw.migration_skipped && raw.points.is_none() {
+            return Err(D::Error::custom(
+                "migration_skipped annotations must retain legacy `points` geometry",
+            ));
+        }
 
         Ok(Self {
             class: raw.class,
             points: raw.points,
             point: raw.point,
+            migration_skipped: raw.migration_skipped,
         })
     }
 }
@@ -162,11 +186,16 @@ fn validate_normalized_point([x, y]: [f32; 2]) -> Result<(), String> {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     pub class: Class,
     bounding_box: Option<BoundingBox>,
     point: Option<Pos2>,
+    migration_skipped: bool,
 }
 
 impl Annotation {
@@ -175,6 +204,7 @@ impl Annotation {
             class,
             bounding_box: None,
             point: Some(point),
+            migration_skipped: false,
         }
     }
 
@@ -183,6 +213,7 @@ impl Annotation {
             class,
             bounding_box: Some(bounding_box),
             point: None,
+            migration_skipped: false,
         }
     }
 
@@ -199,6 +230,7 @@ impl Annotation {
             class,
             bounding_box,
             point,
+            migration_skipped: format.migration_skipped,
         }
     }
 
@@ -214,6 +246,7 @@ impl Annotation {
                     clamp_normalized(point.y / image_size[1]),
                 ]
             }),
+            migration_skipped: self.migration_skipped,
         }
     }
 
@@ -221,6 +254,11 @@ impl Annotation {
         self.class.requires_point()
             && self.bounding_box_ref().is_some()
             && self.point_position().is_none()
+            && !self.migration_skipped
+    }
+
+    pub fn migration_skipped(&self) -> bool {
+        self.migration_skipped
     }
 
     pub fn bounding_box_ref(&self) -> Option<&BoundingBox> {
@@ -241,15 +279,23 @@ impl Annotation {
 
     pub fn set_point(&mut self, point: Pos2) {
         self.point = Some(point);
+        self.migration_skipped = false;
+    }
+
+    pub fn skip_point_migration(&mut self) {
+        self.point = None;
+        self.migration_skipped = true;
     }
 
     pub fn clear_bounding_box(&mut self) -> bool {
         self.bounding_box = None;
+        self.migration_skipped = false;
         self.point.is_none()
     }
 
     pub fn clear_point(&mut self) -> bool {
         self.point = None;
+        self.migration_skipped = false;
         self.bounding_box.is_none()
     }
 }
@@ -351,11 +397,11 @@ mod tests {
 
     #[test]
     fn label_file_can_mark_empty_class_as_labeled() {
-        let json = r#"{"labeled_classes":["Person"],"annotations":[]}"#;
+        let json = r#"{"labeled_classes":["Robot"],"annotations":[]}"#;
 
         let label_file: LabelFileFormat = serde_json::from_str(json).unwrap();
 
-        assert!(label_file.class_is_labeled(Class::Person));
+        assert!(label_file.class_is_labeled(Class::Robot));
         assert!(label_file.annotations.is_empty());
     }
 
@@ -367,5 +413,43 @@ mod tests {
 
         assert!(label_file.class_is_labeled(Class::TSpot));
         assert!(label_file.has_pending_migration_for_class(Class::TSpot));
+    }
+
+    #[test]
+    fn skipped_point_migration_is_not_pending() {
+        let json = r#"{"labeled_classes":["TSpot"],"annotations":[{"class":"TSpot","points":[[0.1,0.2],[0.3,0.4]],"migration_skipped":true}]}"#;
+
+        let label_file: LabelFileFormat = serde_json::from_str(json).unwrap();
+        let annotation = Annotation::from_format(label_file.annotations[0].clone(), [100.0, 100.0]);
+
+        assert!(annotation.migration_skipped());
+        assert!(!annotation.needs_point_migration());
+        assert!(!label_file.has_pending_migration_for_class(Class::TSpot));
+        assert!(
+            serde_json::to_value(annotation.to_format([100.0, 100.0]))
+                .unwrap()
+                .get("migration_skipped")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn skipped_point_migration_cannot_also_have_point() {
+        let error = serde_json::from_str::<AnnotationFormat>(
+            r#"{"class":"TSpot","points":[[0.1,0.2],[0.3,0.4]],"point":[0.2,0.3],"migration_skipped":true}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("migration_skipped"));
+    }
+
+    #[test]
+    fn skipped_point_migration_requires_point_class() {
+        let error = serde_json::from_str::<AnnotationFormat>(
+            r#"{"class":"Ball","points":[[0.1,0.2],[0.3,0.4]],"migration_skipped":true}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("migration skips"));
     }
 }

@@ -46,6 +46,8 @@ pub struct AnnotatorApp {
     image_list_state: ImageListState,
     model_annotations: ModelAnnotations,
     class_transition: Option<ClassTransition>,
+    manual_class_edit: bool,
+    manual_class_edit_changed: bool,
     last_error: Option<String>,
 }
 
@@ -80,6 +82,8 @@ impl AnnotatorApp {
             image_list_state: ImageListState::default(),
             model_annotations,
             class_transition: None,
+            manual_class_edit: false,
+            manual_class_edit_changed: false,
             last_error: None,
         };
         app.move_to_first_pending();
@@ -153,6 +157,8 @@ impl AnnotatorApp {
         if let Some(position) = self.next_pending_position_after(current_index) {
             self.apply_position_with_class_transition(position, ClassTransitionDirection::Next);
         } else {
+            self.manual_class_edit = false;
+            self.manual_class_edit_changed = false;
             self.phase = AnnotationPhase::Finished;
         }
         Ok(())
@@ -199,6 +205,7 @@ impl AnnotatorApp {
         self.phase = AnnotationPhase::Labelling {
             current_index: index,
         };
+        self.leave_manual_class_edit();
         Ok(())
     }
 
@@ -207,7 +214,9 @@ impl AnnotatorApp {
             return Ok(());
         };
         let active_class = self.active_class();
-        self.label_widget.set_selected_class(active_class);
+        if !self.manual_class_edit {
+            self.label_widget.set_selected_class(active_class);
+        }
 
         if let Some(paths) = self.paths.get_mut(index) {
             if self.label_widget.has_paths(paths) {
@@ -233,12 +242,16 @@ impl AnnotatorApp {
         if let Some(position) = self.first_pending_position() {
             self.apply_position(position);
         } else {
+            self.manual_class_edit = false;
+            self.manual_class_edit_changed = false;
             self.phase = AnnotationPhase::Finished;
         }
     }
 
     fn apply_position(&mut self, position: ChunkPosition) {
         self.class_transition = None;
+        self.manual_class_edit = false;
+        self.manual_class_edit_changed = false;
         self.workflow.apply_position(position);
         self.label_widget.set_selected_class(self.active_class());
         self.phase = AnnotationPhase::Labelling {
@@ -254,8 +267,27 @@ impl AnnotatorApp {
         if self.workflow.is_active_class(position) {
             self.apply_position(position);
         } else {
+            self.leave_manual_class_edit();
             self.class_transition = Some(ClassTransition::new(position, direction));
         }
+    }
+
+    fn enter_manual_class_edit(&mut self, open_popup: bool) {
+        if self.current_index().is_none() || self.class_transition.is_some() {
+            return;
+        }
+
+        self.manual_class_edit = true;
+        self.manual_class_edit_changed = false;
+        if open_popup {
+            self.label_widget.open_class_popup();
+        }
+    }
+
+    fn leave_manual_class_edit(&mut self) {
+        self.manual_class_edit = false;
+        self.manual_class_edit_changed = false;
+        self.label_widget.set_selected_class(self.active_class());
     }
 
     fn handle_class_transition_command(&mut self, direction: ClassTransitionDirection) -> bool {
@@ -326,6 +358,8 @@ impl AnnotatorApp {
                 Some(GlobalAction::Previous)
             } else if config.save.is_pressed(input) {
                 Some(GlobalAction::Save)
+            } else if !self.manual_class_edit && config.class_popup.is_pressed(input) {
+                Some(GlobalAction::EditOtherClass)
             } else {
                 None
             }
@@ -335,6 +369,10 @@ impl AnnotatorApp {
             Some(GlobalAction::Next) => self.next(),
             Some(GlobalAction::Previous) => self.previous(),
             Some(GlobalAction::Save) => self.save_current(),
+            Some(GlobalAction::EditOtherClass) => {
+                self.enter_manual_class_edit(false);
+                Ok(())
+            }
             None => Ok(()),
         };
 
@@ -384,6 +422,28 @@ impl AnnotatorApp {
 
             ui.add_space(4.0);
 
+            let can_edit_other_class =
+                self.current_index().is_some() && self.class_transition.is_none();
+            if self.manual_class_edit {
+                ui.label(format!(
+                    "Editing {}, chunk class is {}",
+                    self.label_widget.selected_class().as_str(),
+                    self.active_class().as_str()
+                ));
+                if ui.button("Return to chunk class").clicked() {
+                    self.leave_manual_class_edit();
+                }
+            } else if can_edit_other_class
+                && ui
+                    .button("Edit other class")
+                    .on_hover_text(config.class_popup.label())
+                    .clicked()
+            {
+                self.enter_manual_class_edit(true);
+            }
+
+            ui.add_space(4.0);
+
             ui.horizontal(|ui| {
                 if ui
                     .button("Previous")
@@ -412,6 +472,8 @@ impl AnnotatorApp {
                         ClassTransitionDirection::Next,
                     );
                 } else {
+                    self.manual_class_edit = false;
+                    self.manual_class_edit_changed = false;
                     self.phase = AnnotationPhase::Finished;
                 }
             }
@@ -434,7 +496,7 @@ impl AnnotatorApp {
             ("Resize mode", &config.edit),
             ("Move mode", &config.move_box),
             ("Focus", &config.temporary_focus),
-            ("Class", &config.class_popup),
+            ("Class/edit other", &config.class_popup),
             ("Confirm", &config.confirm),
             ("Cancel", &config.abort),
             ("Delete", &config.delete),
@@ -484,6 +546,11 @@ impl AnnotatorApp {
                         "{}: {}",
                         transition.direction.label(),
                         class.as_str()
+                    ));
+                } else if self.manual_class_edit {
+                    ui.label(format!(
+                        "Manual class edit: {}",
+                        self.label_widget.selected_class().as_str()
                     ));
                 } else {
                     match self.phase {
@@ -544,8 +611,19 @@ impl AnnotatorApp {
                 self.record_error(error);
                 return;
             }
-            if let Err(error) = self.label_widget.ui(ui, true) {
-                self.record_error(error);
+            match self.label_widget.ui(ui, !self.manual_class_edit) {
+                Ok(annotations_changed) => {
+                    if self.manual_class_edit && annotations_changed {
+                        self.manual_class_edit_changed = true;
+                    }
+                    if self.manual_class_edit
+                        && self.manual_class_edit_changed
+                        && !self.label_widget.pointer_interaction_active()
+                    {
+                        self.leave_manual_class_edit();
+                    }
+                }
+                Err(error) => self.record_error(error),
             }
         });
     }
@@ -571,6 +649,7 @@ enum GlobalAction {
     Next,
     Previous,
     Save,
+    EditOtherClass,
 }
 
 impl App for AnnotatorApp {

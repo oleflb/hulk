@@ -28,8 +28,8 @@ IMAGE_EXTENSIONS = {
     .splitlines()
     if extension
 }
-POINT_CLASSES = {"GoalPost", "LSpot", "TSpot", "XSpot"}
-MIGRATED_POINT_CLASSES = {"LSpot", "TSpot", "XSpot"}
+POINT_CLASSES = {"GoalPost", "LSpot", "PenaltySpot", "TSpot", "XSpot"}
+MIGRATED_POINT_CLASSES = POINT_CLASSES
 
 
 class LabelSchemaError(ValueError):
@@ -91,7 +91,12 @@ def load_label_file(
 
 
 def validate_annotation(annotation: Annotation, filename: str) -> None:
-    extra_fields = set(annotation) - {"class", "points", "point"}
+    extra_fields = set(annotation) - {
+        "class",
+        "points",
+        "point",
+        "migration_skipped",
+    }
     if extra_fields:
         fields = ", ".join(sorted(extra_fields))
         raise LabelSchemaError(
@@ -101,6 +106,7 @@ def validate_annotation(annotation: Annotation, filename: str) -> None:
     class_name = annotation.get("class")
     points = annotation.get("points")
     point = annotation.get("point")
+    migration_skipped = annotation.get("migration_skipped", False)
 
     if class_name not in CLASS_MAP:
         raise LabelSchemaError(f"Unknown class '{class_name}' in {filename}")
@@ -130,6 +136,22 @@ def validate_annotation(annotation: Annotation, filename: str) -> None:
         raise LabelSchemaError(
             f"Class '{class_name}' in {filename} cannot combine points and "
             "point geometry"
+        )
+    if not isinstance(migration_skipped, bool):
+        raise LabelSchemaError(
+            f"migration_skipped in {filename} must be a boolean"
+        )
+    if migration_skipped and point is not None:
+        raise LabelSchemaError(
+            f"migration_skipped annotation in {filename} cannot contain point geometry"
+        )
+    if migration_skipped and class_name not in POINT_CLASSES:
+        raise LabelSchemaError(
+            f"Class '{class_name}' in {filename} does not support point migration skips"
+        )
+    if migration_skipped and points is None:
+        raise LabelSchemaError(
+            f"migration_skipped annotation in {filename} must retain points geometry"
         )
 
 

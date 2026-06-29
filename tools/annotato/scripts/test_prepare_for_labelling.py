@@ -44,12 +44,56 @@ def load_prepare_for_labelling(monkeypatch):
     return module
 
 
+def load_annotato_common(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT_DIR))
+    sys.modules.pop("annotato_common", None)
+
+    spec = importlib.util.spec_from_file_location(
+        "annotato_common",
+        SCRIPT_DIR / "annotato_common.py",
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["annotato_common"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_validate_annotation_accepts_skipped_migration(monkeypatch):
+    annotato_common = load_annotato_common(monkeypatch)
+
+    annotato_common.validate_annotation(
+        {
+            "class": "TSpot",
+            "points": [[0.1, 0.2], [0.3, 0.4]],
+            "migration_skipped": True,
+        },
+        "label.json",
+    )
+
+
+def test_validate_annotation_rejects_skipped_migration_with_point(monkeypatch):
+    annotato_common = load_annotato_common(monkeypatch)
+
+    with pytest.raises(annotato_common.LabelSchemaError, match="migration_skipped"):
+        annotato_common.validate_annotation(
+            {
+                "class": "TSpot",
+                "points": [[0.1, 0.2], [0.3, 0.4]],
+                "point": [0.2, 0.3],
+                "migration_skipped": True,
+            },
+            "label.json",
+        )
+
+
 def test_parse_yolo_classes_accepts_ranges_names_and_ids(monkeypatch):
     prepare_for_labelling = load_prepare_for_labelling(monkeypatch)
 
-    class_ids = prepare_for_labelling.parse_yolo_classes("0-2,Robot,7")
+    class_ids = prepare_for_labelling.parse_yolo_classes("0-2,Robot,6")
 
-    assert class_ids == {0, 1, 2, 4, 7}
+    assert class_ids == {0, 1, 2, 4, 6}
 
 
 def test_resolve_sample_size_accepts_count(monkeypatch):

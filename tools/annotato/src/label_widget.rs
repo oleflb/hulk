@@ -62,16 +62,15 @@ impl LabelWidget {
     }
 
     pub fn set_selected_class(&mut self, class: Class) {
-        if self.selected_class == class {
-            return;
+        if self.selected_class != class {
+            self.selected_class = class;
+            self.canvas_state = CanvasState::default();
         }
-        self.selected_class = class;
         self.class_popup_open = false;
         self.class_popup_index = Class::ALL
             .iter()
             .position(|candidate| *candidate == class)
             .unwrap_or(0);
-        self.canvas_state = CanvasState::default();
     }
 
     pub fn mark_labeled_class(&mut self, class: Class) {
@@ -86,15 +85,21 @@ impl LabelWidget {
         self.document.has_pending_migration_for_class(class)
     }
 
-    pub fn ui(&mut self, ui: &mut eframe::egui::Ui, class_locked: bool) -> Result<()> {
+    pub fn pointer_interaction_active(&self) -> bool {
+        self.canvas_state.pointer_interaction_active()
+    }
+
+    pub fn ui(&mut self, ui: &mut eframe::egui::Ui, class_locked: bool) -> Result<bool> {
         self.ensure_texture_loaded(ui)?;
         self.handle_class_popup_shortcut(ui, class_locked);
 
+        let mut annotations_changed = false;
         ui.vertical(|ui| {
             self.toolbar_ui(ui, class_locked);
             ui.add_space(8.0);
 
-            if self.migration_ui(ui) {
+            if let Some(migration_changed) = self.migration_ui(ui) {
+                annotations_changed |= migration_changed;
                 return;
             }
 
@@ -115,6 +120,7 @@ impl LabelWidget {
                 ));
                 if self.canvas_state.take_annotations_changed() {
                     self.document.mark_dirty();
+                    annotations_changed = true;
                 }
             }
             ui.add_space(6.0);
@@ -124,7 +130,7 @@ impl LabelWidget {
             self.class_popup_ui(ui);
         }
 
-        Ok(())
+        Ok(annotations_changed)
     }
 
     fn ensure_texture_loaded(&mut self, ui: &eframe::egui::Ui) -> Result<()> {
@@ -239,35 +245,45 @@ impl LabelWidget {
         });
     }
 
-    fn migration_ui(&mut self, ui: &mut eframe::egui::Ui) -> bool {
+    fn migration_ui(&mut self, ui: &mut eframe::egui::Ui) -> Option<bool> {
         let Some(texture_handle) = self.texture_handle.as_ref() else {
-            return false;
+            return None;
         };
         let Some(image_size) = self.image_size else {
-            return false;
+            return None;
         };
         let Some((annotation_index, pending_count)) =
             self.document.pending_migration(self.selected_class)
         else {
-            return false;
+            return None;
         };
         let annotation = &self.document.annotations()[annotation_index];
         let class = annotation.class;
-        let bounding_box = annotation
+        let bounding_box_rect = annotation
             .bounding_box_ref()
-            .expect("migration annotation has bbox");
-        let crop_rect = migration_crop_rect(bounding_box.rect, image_size);
+            .expect("migration annotation has bbox")
+            .rect;
+        let crop_rect = migration_crop_rect(bounding_box_rect, image_size);
 
+        let mut skip_clicked = false;
         ui.vertical_centered(|ui| {
             ui.heading("Migrate point feature");
             ui.label(format!(
-                "Click the exact {} location inside this legacy crop. The old box is preserved.",
+                "Click the exact {} location inside this crop. The old box is preserved as a guide.",
                 class.as_str()
             ));
             ui.label(format!(
                 "{pending_count} point migrations remaining on this image"
             ));
+            if ui.button("Skip keypoint").clicked() {
+                skip_clicked = true;
+            }
         });
+        if skip_clicked {
+            self.document.annotations_mut()[annotation_index].skip_point_migration();
+            self.document.mark_dirty();
+            return Some(true);
+        }
         ui.add_space(8.0);
 
         let available = ui.available_size_before_wrap();
@@ -296,7 +312,14 @@ impl LabelWidget {
             Stroke::new(1.0, class.color()),
             StrokeKind::Inside,
         );
+        painter.rect_stroke(
+            migration_box_display_rect(bounding_box_rect, crop_rect, display_rect),
+            2.0,
+            Stroke::new(2.0, class.color()),
+            StrokeKind::Inside,
+        );
 
+        let mut annotations_changed = false;
         if response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
             && let Some(point) =
@@ -304,9 +327,10 @@ impl LabelWidget {
         {
             self.document.annotations_mut()[annotation_index].set_point(point);
             self.document.mark_dirty();
+            annotations_changed = true;
         }
 
-        true
+        Some(annotations_changed)
     }
 
     pub fn load_new_image_with_labels(
@@ -330,9 +354,18 @@ impl LabelWidget {
 }
 
 pub fn migration_crop_rect(bounding_box: Rect, image_size: [f32; 2]) -> Rect {
-    let padding = (bounding_box.width().max(bounding_box.height()) * 0.5).max(16.0);
+    let padding = (bounding_box.width().max(bounding_box.height()) * 0.7).max(16.0);
     let image_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(image_size[0], image_size[1]));
     bounding_box.expand(padding).intersect(image_rect)
+}
+
+fn migration_box_display_rect(bounding_box: Rect, crop_rect: Rect, display_rect: Rect) -> Rect {
+    let min_relative = (bounding_box.min - crop_rect.min) / crop_rect.size();
+    let max_relative = (bounding_box.max - crop_rect.min) / crop_rect.size();
+    Rect::from_min_max(
+        display_rect.min + min_relative * display_rect.size(),
+        display_rect.min + max_relative * display_rect.size(),
+    )
 }
 
 pub fn crop_click_to_image_point(
@@ -378,5 +411,28 @@ mod tests {
         assert_eq!(crop.min, Pos2::ZERO);
         assert!(crop.max.x <= 100.0);
         assert!(crop.max.y <= 100.0);
+    }
+
+    #[test]
+    fn migration_crop_adds_bbox_relative_context() {
+        let crop = migration_crop_rect(
+            Rect::from_min_max(Pos2::new(300.0, 300.0), Pos2::new(400.0, 500.0)),
+            [1000.0, 1000.0],
+        );
+
+        assert_eq!(crop.min, Pos2::new(160.0, 160.0));
+        assert_eq!(crop.max, Pos2::new(540.0, 640.0));
+    }
+
+    #[test]
+    fn migration_bbox_guide_maps_into_display_crop() {
+        let bounding_box = Rect::from_min_max(Pos2::new(50.0, 100.0), Pos2::new(150.0, 300.0));
+        let crop = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(190.0, 380.0));
+        let display = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 360.0));
+
+        let guide = migration_box_display_rect(bounding_box, crop, display);
+
+        assert_eq!(guide.min, Pos2::new(40.0, 80.0));
+        assert_eq!(guide.max, Pos2::new(140.0, 280.0));
     }
 }

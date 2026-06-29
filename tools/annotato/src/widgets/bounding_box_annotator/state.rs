@@ -97,6 +97,10 @@ impl CanvasState {
         self.annotations_changed = false;
         annotations_changed
     }
+
+    pub fn pointer_interaction_active(&self) -> bool {
+        self.mode.is_pointer_interaction()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

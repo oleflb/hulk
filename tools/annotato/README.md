@@ -14,6 +14,8 @@ Without `--config`, annotato reads `$XDG_CONFIG_HOME/annotato/config.toml` or `~
 
 Annotato labels images in chunks of 50. Each chunk is labelled one class at a time in `Class::ALL` order: all 50 images for `Ball`, then the same chunk for `GoalPost`, and so on. `Space` marks the current image as reviewed for the active class, saves, skips images already reviewed for that class, and advances. A reviewed image does not need to contain an annotation for that class.
 
+Press `C` or use `Edit other class` during the chunk workflow to temporarily unlock class selection. After one label create/edit/delete, Annotato returns to the chunk class. These manual cross-class fixes only change annotations; they never add to or remove from `labeled_classes`, so an already reviewed class stays reviewed.
+
 Hold `F` for temporary 10x focus around the cursor. Removed class-cycling and corner-cycling keybindings from older configs are ignored during config loading.
 
 ## Config

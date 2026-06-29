@@ -23,7 +23,7 @@ impl LabelWidget {
         }
     }
 
-    pub(super) fn open_class_popup(&mut self) {
+    pub fn open_class_popup(&mut self) {
         self.class_popup_open = true;
         self.class_popup_index = Class::ALL
             .iter()
@@ -104,8 +104,7 @@ impl LabelWidget {
             });
 
         if let Some(class) = chosen_class {
-            self.selected_class = class;
-            self.class_popup_open = false;
+            self.set_selected_class(class);
         }
     }
 }
