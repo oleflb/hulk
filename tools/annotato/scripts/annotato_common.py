@@ -17,6 +17,9 @@ CLASS_NAMES = [
     "XSpot",
 ]
 CLASS_MAP = {name: index for index, name in enumerate(CLASS_NAMES)}
+OBJECT_CLASS_NAMES = ("Ball", "Robot")
+POSE_CLASS_NAMES = ("GoalPost", "LSpot", "PenaltySpot", "TSpot", "XSpot")
+TASK_NAMES = ("object", "pose", "mixed")
 IMAGE_EXTENSIONS = {
     f".{extension}"
     for extension in Path(__file__)
@@ -29,6 +32,31 @@ IMAGE_EXTENSIONS = {
 }
 POINT_CLASSES = {"GoalPost", "LSpot", "PenaltySpot", "TSpot", "XSpot"}
 MIGRATED_POINT_CLASSES = POINT_CLASSES
+
+
+def class_names_for_task(task: str) -> tuple[str, ...]:
+    if task == "object":
+        return OBJECT_CLASS_NAMES
+    if task == "pose":
+        return POSE_CLASS_NAMES
+    if task == "mixed":
+        return tuple(CLASS_NAMES)
+
+    raise ValueError(f"unsupported task: {task}")
+
+
+def class_map_for_task(task: str) -> dict[str, int]:
+    return {
+        class_name: index
+        for index, class_name in enumerate(class_names_for_task(task))
+    }
+
+
+def label_map_for_task(task: str) -> dict[int, str]:
+    return {
+        class_id: class_name
+        for class_name, class_id in class_map_for_task(task).items()
+    }
 
 
 class LabelSchemaError(ValueError):
@@ -46,6 +74,7 @@ def supported_image_paths(folder: Path) -> list[Path]:
 def load_label_file(
     json_path: Path,
     filename: str,
+    allow_unknown_classes: bool = False,
 ) -> tuple[list[str], list[Annotation]]:
     with open(json_path) as f:
         data = json.load(f)
@@ -78,7 +107,7 @@ def load_label_file(
     if not isinstance(labeled_classes, list):
         raise LabelSchemaError(f"labeled_classes in {filename} must be a list")
     for class_name in labeled_classes:
-        if class_name not in CLASS_MAP:
+        if class_name not in CLASS_MAP and not allow_unknown_classes:
             raise LabelSchemaError(
                 f"Unknown labeled class '{class_name}' in {filename}"
             )
