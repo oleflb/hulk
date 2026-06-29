@@ -15,6 +15,7 @@ from annotato_common import CLASS_MAP, CLASS_NAMES, supported_image_paths
 
 MANIFEST_FILENAME = "source_images.json"
 MANIFEST_VERSION = 1
+PRELABELED_DATA_FILENAME = "prelabeled-data.json"
 
 
 @dataclass(frozen=True)
@@ -176,33 +177,20 @@ def sample_visual_diversity(
 ):
     if sample_size is None or sample_size >= len(image_paths):
         return image_paths
-    start_index = seed % len(image_paths)
-    if sample_size == 1:
-        return [image_paths[start_index]]
 
     feature_for_image = feature_for_image or image_fingerprint
-    features = {path: feature_for_image(path) for path in image_paths}
-    selected = [image_paths[start_index]]
-    remaining = [
-        path
-        for index, path in enumerate(image_paths)
-        if index != start_index
-    ]
-
-    while len(selected) < sample_size:
-        next_path = max(
-            remaining,
-            key=lambda path: (
-                min(
-                    squared_distance(features[path], features[selected_path])
-                    for selected_path in selected
-                ),
-                -image_paths.index(path),
-            ),
-        )
-        selected.append(next_path)
-        remaining.remove(next_path)
-
+    features = {
+        path: feature_for_image(path)
+        for path in progress(image_paths)
+    }
+    source_order = {path: index for index, path in enumerate(image_paths)}
+    feature_order = sorted(
+        image_paths,
+        key=lambda path: (features[path], source_order[path]),
+    )
+    start_index = seed % len(feature_order)
+    rotated_order = feature_order[start_index:] + feature_order[:start_index]
+    selected = sample_spread(rotated_order, sample_size)
     selected_paths = set(selected)
     return [path for path in image_paths if path in selected_paths]
 
@@ -243,7 +231,7 @@ def merge_annotations(existing_annotations, new_annotations, replacement_class_i
 
 
 def load_data_json(chunk_path):
-    data_path = chunk_path / "data.json"
+    data_path = chunk_path / PRELABELED_DATA_FILENAME
     if not data_path.exists():
         return {}
 
@@ -252,7 +240,7 @@ def load_data_json(chunk_path):
 
 
 def write_data_json(chunk_path, chunk_annotations):
-    with open(chunk_path / "data.json", "w") as f:
+    with open(chunk_path / PRELABELED_DATA_FILENAME, "w") as f:
         json.dump(chunk_annotations, f)
 
 
@@ -564,13 +552,12 @@ def create_labelling_chunks(
 
     for chunk in progress(list(chunked(image_paths, chunk_size))):
         chunk_name, chunk_path = create_chunk_path(output_path)
-        images_path = chunk_path / "images"
-        images_path.mkdir(parents=True, exist_ok=False)
+        chunk_path.mkdir(parents=True, exist_ok=False)
         chunk_annotations = {}
 
         for image_path in chunk:
             image_name = generated_image_name(image_path)
-            output_image_path = images_path / image_name
+            output_image_path = chunk_path / image_name
             image = None
             if yolo_model is not None or convert_colors:
                 image = load_image(image_path, convert_colors)
@@ -642,7 +629,7 @@ def collect_extend_targets(image_paths, output_path, manifest):
             )
 
         chunk_path = output_path / entry["chunk"]
-        output_image_path = chunk_path / "images" / entry["image"]
+        output_image_path = chunk_path / entry["image"]
         if not output_image_path.exists():
             raise click.ClickException(
                 f"manifest points to a missing image: {output_image_path}"
@@ -760,6 +747,10 @@ def main(
         sample_count,
         sample_fraction,
     )
+    if sample_size is not None:
+        click.echo(
+            f"Sampling {sample_size} of {len(image_paths)} images with {sample_method.lower()}"
+        )
     sampling_result = sample_images(
         image_paths=image_paths,
         sample_size=sample_size,

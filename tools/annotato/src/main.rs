@@ -70,6 +70,21 @@ fn start_labelling_ui(
     )
 }
 
+fn resolve_inputs_and_predictions(
+    inputs: Vec<String>,
+    predictions: Option<PathBuf>,
+) -> (Vec<String>, Option<PathBuf>) {
+    if predictions.is_none() && inputs.len() == 1 {
+        let input_path = PathBuf::from(&inputs[0]);
+        let prelabels_path = input_path.join("prelabeled-data.json");
+        if input_path.is_dir() && prelabels_path.is_file() {
+            return (inputs, Some(prelabels_path));
+        }
+    }
+
+    (inputs, predictions)
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     let arguments = Args::parse();
@@ -78,8 +93,48 @@ fn main() -> Result<()> {
         .set(user_toml::load_config(arguments.config.as_deref())?)
         .expect("once_cell::set failed");
 
-    let image_paths = collect_image_paths(&arguments.inputs)?;
-    start_labelling_ui(image_paths, arguments.predictions).map_err(eframe_error_to_report)?;
+    let (inputs, predictions) =
+        resolve_inputs_and_predictions(arguments.inputs, arguments.predictions);
+    let image_paths = collect_image_paths(&inputs)?;
+    start_labelling_ui(image_paths, predictions).map_err(eframe_error_to_report)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::{self, File},
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("annotato-main-{suffix}"));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn image_folder_uses_prelabeled_data_json_when_present() {
+        let chunk_path = temp_dir();
+        File::create(chunk_path.join("frame.webp")).unwrap();
+        File::create(chunk_path.join("prelabeled-data.json")).unwrap();
+
+        let (inputs, predictions) = resolve_inputs_and_predictions(
+            vec![chunk_path.display().to_string()],
+            None,
+        );
+
+        assert_eq!(inputs, vec![chunk_path.display().to_string()]);
+        assert_eq!(predictions, Some(chunk_path.join("prelabeled-data.json")));
+
+        fs::remove_dir_all(chunk_path).unwrap();
+    }
 }
