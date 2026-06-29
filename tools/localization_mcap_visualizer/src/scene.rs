@@ -12,7 +12,7 @@ use field_mark_association::GlobalLocalizationDetailedDebug;
 use projection::camera_matrix::CameraMatrix;
 use types::field_dimensions::FieldDimensions;
 
-use crate::mcap_recording::{CameraImage, TrajectoryPoint};
+use crate::mcap_recording::{CameraImage, TRAJECTORY_MAX_SAMPLE_GAP_SECONDS, TrajectoryPoint};
 
 const CAMERA_VIEWPORT_DEPTH: f32 = 1.0;
 
@@ -262,7 +262,7 @@ fn setup_scene(
     ));
     commands.spawn((
         FieldMarkings,
-        Mesh3d(meshes.add(field_markings_mesh(&FieldDimensions::SPL_2025))),
+        Mesh3d(meshes.add(empty_mesh(PrimitiveTopology::LineList))),
         MeshMaterial3d(markings_material),
         Transform::default(),
     ));
@@ -480,12 +480,10 @@ fn camera_to_field_transform(
     robot_to_field: linear_algebra::Isometry3<Robot, Field>,
     camera_matrix: &CameraMatrix,
 ) -> Transform {
-    let camera_to_robot = robot_to_camera(camera_matrix).inverse();
+    let camera_to_robot = (camera_matrix.head_to_camera * camera_matrix.robot_to_head)
+        .inner
+        .inverse();
     transform_from_isometry(robot_to_field.inner * camera_to_robot)
-}
-
-fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
-    (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
 }
 
 fn camera_frustum_mesh(camera_matrix: &CameraMatrix, frame: Option<&SceneCameraFrame>) -> Mesh {
@@ -586,6 +584,12 @@ fn trajectory_mesh(points: &[TrajectoryPoint]) -> Mesh {
     let mut positions = Vec::new();
     for window in points.windows(2) {
         if !window[0].seconds.is_finite() || !window[1].seconds.is_finite() {
+            continue;
+        }
+        if window[0].segment_id != window[1].segment_id {
+            continue;
+        }
+        if window[1].seconds - window[0].seconds > TRAJECTORY_MAX_SAMPLE_GAP_SECONDS {
             continue;
         }
         let a = window[0]

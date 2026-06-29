@@ -7103,6 +7103,7 @@ dependencies = [
  "ros-z-cdr",
  "ros2",
  "serde",
+ "stereo_visual_odometry",
  "tokio",
  "tracing",
  "tracing-subscriber",

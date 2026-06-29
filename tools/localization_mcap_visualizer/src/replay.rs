@@ -10,12 +10,14 @@ use std::{
 use color_eyre::Result;
 use coordinate_systems::{Field, Robot};
 use field_mark_association::{
-    FieldMarkAssociationParameters, GlobalLocalizationDebugStatus, GlobalLocalizerParameters,
+    FieldMarkAssociation, FieldMarkAssociationKind, FieldMarkAssociationParameters,
+    FieldMarkAssociations, GlobalLocalizationDebugStatus, GlobalLocalizerParameters,
     PoseHintAssociationParameters, associate_visual_features, find_detected_visual_features,
 };
 use linear_algebra::IntoTransform;
 use localization_3d::{
-    Localization3dParameters, backend_configuration, ingest_foot_heights, ingest_visual_odometry,
+    Localization3dParameters, backend_configuration_from_parameters, ingest_foot_heights,
+    ingest_visual_odometry,
 };
 use localization_factrs::{
     BackendConfiguration, VinsBackend, VinsFrontend, VisualReprojectionAssociation,
@@ -30,8 +32,12 @@ use types::{
 };
 
 use crate::mcap_recording::{
-    EventKind, RecordedEvent, Recording, TrajectoryPoint, nanos_abs_diff, seconds_since,
+    EventKind, RecordedEvent, Recording, TRAJECTORY_MAX_SAMPLE_GAP_SECONDS, TrajectoryPoint,
+    nanos_abs_diff, nanos_since_epoch, seconds_since,
 };
+
+const CAMERA_MATRIX_MAX_TIME_DISTANCE: Duration = Duration::from_millis(100);
+const DEFAULT_POSE_HINT_VISUAL_MIN_FEATURES_PER_FRAME: usize = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayParameters {
@@ -40,12 +46,39 @@ pub struct ReplayParameters {
     pub optimizer_iterations: usize,
     pub max_window_seconds: f64,
     pub visual_feature_noise_variance: f64,
+    pub pose_hint_visual_feature_noise_variance: f64,
+    pub pose_hint_visual_huber_threshold: f64,
+    pub pose_hint_visual_min_features_per_frame: usize,
     pub visual_odometry_covariance: f64,
+    pub override_visual_odometry_covariance: bool,
+    pub include_visual_odometry: bool,
     pub include_global_features: bool,
     pub include_imu: bool,
     pub include_foot_heights: bool,
+    pub recompute_global_features: bool,
     pub global_localizer: GlobalLocalizerParameters,
     pub pose_hint: PoseHintAssociationParameters,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayVisualOdometryEvent {
+    pub log_time: SystemTime,
+    pub publish_time: SystemTime,
+    pub delta: VisualOdometryDelta,
+}
+
+enum ReplayEvent<'a> {
+    Recorded(&'a RecordedEvent),
+    VisualOdometryOverride(&'a ReplayVisualOdometryEvent),
+}
+
+impl ReplayEvent<'_> {
+    fn log_time(&self) -> SystemTime {
+        match self {
+            Self::Recorded(event) => event.log_time,
+            Self::VisualOdometryOverride(event) => event.log_time,
+        }
+    }
 }
 
 impl Default for ReplayParameters {
@@ -53,15 +86,24 @@ impl Default for ReplayParameters {
         let localization_parameters = Localization3dParameters::default();
         let association_parameters = FieldMarkAssociationParameters::default();
         Self {
-            timestamp_mode: TimestampMode::McapPublish,
+            timestamp_mode: TimestampMode::Embedded,
             solve_cadence_ms: 30.0,
             optimizer_iterations: 5,
             max_window_seconds: 3.0,
             visual_feature_noise_variance: localization_parameters.visual_feature_noise_variance,
-            visual_odometry_covariance: 1.0e-4,
+            pose_hint_visual_feature_noise_variance: localization_parameters
+                .pose_hint_visual_feature_noise_variance,
+            pose_hint_visual_huber_threshold: localization_parameters
+                .pose_hint_visual_huber_threshold,
+            pose_hint_visual_min_features_per_frame:
+                DEFAULT_POSE_HINT_VISUAL_MIN_FEATURES_PER_FRAME,
+            visual_odometry_covariance: 1.0e-2,
+            override_visual_odometry_covariance: false,
+            include_visual_odometry: true,
             include_global_features: true,
             include_imu: true,
             include_foot_heights: true,
+            recompute_global_features: false,
             global_localizer: association_parameters.global_localizer,
             pose_hint: association_parameters.pose_hint,
         }
@@ -99,11 +141,22 @@ pub struct ResolveResult {
 
 impl ResolveResult {
     pub fn trajectory(&self) -> Vec<TrajectoryPoint> {
+        let mut segment_id = 0;
+        let mut previous_seconds = None;
         self.samples
             .iter()
-            .map(|sample| TrajectoryPoint {
-                seconds: sample.replay_seconds,
-                robot_to_field: sample.robot_to_field,
+            .map(|sample| {
+                if let Some(previous_seconds) = previous_seconds
+                    && sample.graph_seconds - previous_seconds > TRAJECTORY_MAX_SAMPLE_GAP_SECONDS
+                {
+                    segment_id += 1;
+                }
+                previous_seconds = Some(sample.graph_seconds);
+                TrajectoryPoint {
+                    seconds: sample.graph_seconds,
+                    robot_to_field: sample.robot_to_field,
+                    segment_id,
+                }
             })
             .collect()
     }
@@ -144,7 +197,7 @@ pub fn spawn_resolve(
     sender: Sender<ResolveMessage>,
 ) {
     std::thread::spawn(move || {
-        let result = run_resolve(&recording, parameters, &cancelled, &sender);
+        let result = run_resolve(&recording, parameters, None, &cancelled, &sender);
         let message = match result {
             Ok(Some(result)) => ResolveMessage::Finished(result),
             Ok(None) => ResolveMessage::Cancelled,
@@ -154,9 +207,37 @@ pub fn spawn_resolve(
     });
 }
 
+pub fn resolve_recording(
+    recording: &Recording,
+    parameters: ReplayParameters,
+) -> Result<ResolveResult> {
+    let cancelled = AtomicBool::new(false);
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    run_resolve(recording, parameters, None, &cancelled, &sender)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("resolve was cancelled"))
+}
+
+pub fn resolve_recording_with_visual_odometry_override(
+    recording: &Recording,
+    parameters: ReplayParameters,
+    visual_odometry_override: &[ReplayVisualOdometryEvent],
+) -> Result<ResolveResult> {
+    let cancelled = AtomicBool::new(false);
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    run_resolve(
+        recording,
+        parameters,
+        Some(visual_odometry_override),
+        &cancelled,
+        &sender,
+    )?
+    .ok_or_else(|| color_eyre::eyre::eyre!("resolve was cancelled"))
+}
+
 fn run_resolve(
     recording: &Recording,
     parameters: ReplayParameters,
+    visual_odometry_override: Option<&[ReplayVisualOdometryEvent]>,
     cancelled: &AtomicBool,
     sender: &Sender<ResolveMessage>,
 ) -> Result<Option<ResolveResult>> {
@@ -164,6 +245,9 @@ fn run_resolve(
     let initial_state =
         localization_3d::initial_state_from_camera_matrix(&recording.first_camera_matrix);
     let (mut frontend, mut backend) = initialize(backend_config(&parameters), initial_state);
+    let field_dimensions = recording
+        .field_dimensions
+        .unwrap_or(FieldDimensions::SPL_2025);
     let mut camera_matrices = OnlineCameraMatrices::default();
     let mut vo_timestamps = VisualOdometryTimestampTracker::default();
     let mut stats = ReplayStats::default();
@@ -171,19 +255,28 @@ fn run_resolve(
     let mut has_pending_measurements = false;
     let cadence = Duration::from_secs_f64((parameters.solve_cadence_ms / 1000.0).max(0.001));
     let mut next_solve_time = recording.start_log_time() + cadence;
-    let total_events = recording.event_count();
+    let replay_events = merged_replay_events(recording, visual_odometry_override);
+    let total_events = replay_events.len();
+    let has_recorded_global_features = recording
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::FieldMarkAssociations(_)));
+    let recompute_global_features =
+        parameters.recompute_global_features || !has_recorded_global_features;
 
-    for (index, event) in recording.events().iter().enumerate() {
+    for (index, replay_event) in replay_events.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
+        let replay_time = replay_event.log_time();
 
-        while next_solve_time <= event.log_time {
+        while next_solve_time <= replay_time {
             if has_pending_measurements {
                 solve_and_record(
                     &mut backend,
                     &mut frontend,
                     recording,
+                    parameters.timestamp_mode,
                     next_solve_time,
                     &stats,
                     &mut samples,
@@ -193,29 +286,20 @@ fn run_resolve(
             next_solve_time += cadence;
         }
 
-        match &event.kind {
-            EventKind::Imu(imu) if parameters.include_imu => {
-                frontend.ingest_imu(event.publish_time, *imu)?;
-                stats.imu_ingested += 1;
-                has_pending_measurements = true;
-            }
-            EventKind::CameraMatrix(camera_matrix) => {
-                camera_matrices.push(event, camera_matrix.clone());
-            }
-            EventKind::RobotKinematics(robot_kinematics) if parameters.include_foot_heights => {
-                let mut robot_kinematics = robot_kinematics.as_ref().clone();
-                if parameters.timestamp_mode == TimestampMode::McapPublish {
-                    robot_kinematics.time = Time::from_wallclock(event.publish_time);
-                }
-                ingest_foot_heights(&mut frontend, robot_kinematics)?;
-                stats.foot_heights_ingested += 1;
-                has_pending_measurements = true;
-            }
-            EventKind::VisualOdometry(delta) => {
+        match replay_event {
+            ReplayEvent::VisualOdometryOverride(visual_odometry)
+                if parameters.include_visual_odometry =>
+            {
+                let event = RecordedEvent {
+                    order: 0,
+                    log_time: visual_odometry.log_time,
+                    publish_time: visual_odometry.publish_time,
+                    kind: EventKind::VisualOdometry(visual_odometry.delta.clone()),
+                };
                 ingest_vo_event(
                     recording,
-                    event,
-                    delta,
+                    &event,
+                    &visual_odometry.delta,
                     parameters.timestamp_mode,
                     &mut vo_timestamps,
                     &camera_matrices,
@@ -224,21 +308,69 @@ fn run_resolve(
                     &mut has_pending_measurements,
                 )?;
             }
-            EventKind::DetectedObjects(objects) if parameters.include_global_features => {
-                ingest_global_features(
-                    event,
-                    objects,
-                    &camera_matrices,
-                    &mut frontend,
-                    &parameters,
-                    &mut stats,
-                    &mut has_pending_measurements,
-                )?;
-            }
-            EventKind::DetectedObjects(_) => {
-                stats.global_frames += 1;
-            }
-            _ => {}
+            ReplayEvent::VisualOdometryOverride(_) => {}
+            ReplayEvent::Recorded(event) => match &event.kind {
+                EventKind::Imu(imu) if parameters.include_imu => {
+                    frontend.ingest_imu(event.publish_time, *imu)?;
+                    stats.imu_ingested += 1;
+                    has_pending_measurements = true;
+                }
+                EventKind::CameraMatrix(camera_matrix) => {
+                    camera_matrices.push(event, camera_matrix.clone());
+                }
+                EventKind::RobotKinematics(robot_kinematics) if parameters.include_foot_heights => {
+                    let mut robot_kinematics = robot_kinematics.as_ref().clone();
+                    if parameters.timestamp_mode == TimestampMode::McapPublish {
+                        robot_kinematics.time = Time::from_wallclock(event.publish_time);
+                    }
+                    ingest_foot_heights(&mut frontend, robot_kinematics)?;
+                    stats.foot_heights_ingested += 1;
+                    has_pending_measurements = true;
+                }
+                EventKind::VisualOdometry(delta) if parameters.include_visual_odometry => {
+                    ingest_vo_event(
+                        recording,
+                        event,
+                        delta,
+                        parameters.timestamp_mode,
+                        &mut vo_timestamps,
+                        &camera_matrices,
+                        &mut frontend,
+                        &mut stats,
+                        &mut has_pending_measurements,
+                    )?;
+                }
+                EventKind::VisualOdometry(_) => {}
+                EventKind::FieldMarkAssociations(associations)
+                    if parameters.include_global_features && !recompute_global_features =>
+                {
+                    ingest_recorded_field_mark_associations(
+                        &mut frontend,
+                        event,
+                        associations,
+                        parameters.timestamp_mode,
+                        parameters.pose_hint_visual_min_features_per_frame,
+                        &mut stats,
+                        &mut has_pending_measurements,
+                    )?;
+                }
+                EventKind::DetectedObjects(frame)
+                    if parameters.include_global_features && recompute_global_features =>
+                {
+                    ingest_recomputed_global_features(
+                        event,
+                        frame,
+                        &camera_matrices,
+                        &mut frontend,
+                        &parameters,
+                        &field_dimensions,
+                        &mut stats,
+                        &mut has_pending_measurements,
+                    )?;
+                }
+                EventKind::DetectedObjects(_) | EventKind::FieldMarkAssociations(_) => {}
+                _ => {}
+            },
         }
 
         if index % 250 == 0 {
@@ -255,6 +387,7 @@ fn run_resolve(
             &mut backend,
             &mut frontend,
             recording,
+            parameters.timestamp_mode,
             recording.end_log_time(),
             &stats,
             &mut samples,
@@ -269,13 +402,45 @@ fn run_resolve(
     }))
 }
 
+fn merged_replay_events<'a>(
+    recording: &'a Recording,
+    visual_odometry_override: Option<&'a [ReplayVisualOdometryEvent]>,
+) -> Vec<ReplayEvent<'a>> {
+    let override_visual_odometry = visual_odometry_override.is_some();
+    let override_count = visual_odometry_override.map_or(0, <[ReplayVisualOdometryEvent]>::len);
+    let mut replay_events = Vec::with_capacity(recording.event_count() + override_count);
+    replay_events.extend(recording.events().iter().filter_map(|event| {
+        if override_visual_odometry && matches!(event.kind, EventKind::VisualOdometry(_)) {
+            None
+        } else {
+            Some(ReplayEvent::Recorded(event))
+        }
+    }));
+    if let Some(visual_odometry_override) = visual_odometry_override {
+        replay_events.extend(
+            visual_odometry_override
+                .iter()
+                .map(ReplayEvent::VisualOdometryOverride),
+        );
+    }
+    replay_events.sort_by_key(|event| nanos_since_epoch(event.log_time()));
+    replay_events
+}
+
 fn backend_config(parameters: &ReplayParameters) -> BackendConfiguration {
-    let mut config = backend_configuration(parameters.visual_feature_noise_variance);
+    let localization_parameters = Localization3dParameters {
+        visual_feature_noise_variance: parameters.visual_feature_noise_variance,
+        pose_hint_visual_feature_noise_variance: parameters.pose_hint_visual_feature_noise_variance,
+        pose_hint_visual_huber_threshold: parameters.pose_hint_visual_huber_threshold,
+    };
+    let mut config = backend_configuration_from_parameters(&localization_parameters);
     config.optimizer_max_iterations = parameters.optimizer_iterations.max(1);
     config.max_optimization_window =
         Duration::from_secs_f64(parameters.max_window_seconds.max(0.2));
-    config.visual_odometry_noise =
-        SMatrix::<f64, 6, 6>::identity() * parameters.visual_odometry_covariance.max(1.0e-12);
+    if parameters.override_visual_odometry_covariance {
+        config.visual_odometry_noise =
+            SMatrix::<f64, 6, 6>::identity() * parameters.visual_odometry_covariance.max(1.0e-12);
+    }
     config
 }
 
@@ -312,8 +477,8 @@ fn ingest_vo_event(
         stats.vo_skipped_missing_camera_matrix += 1;
         return Ok(());
     };
-    if previous_camera_matrix.distance > STALE_CAMERA_MATRIX_THRESHOLD
-        || current_camera_matrix.distance > STALE_CAMERA_MATRIX_THRESHOLD
+    if previous_camera_matrix.distance > CAMERA_MATRIX_MAX_TIME_DISTANCE
+        || current_camera_matrix.distance > CAMERA_MATRIX_MAX_TIME_DISTANCE
     {
         stats.vo_skipped_stale_camera_matrix += 1;
         return Ok(());
@@ -333,41 +498,118 @@ fn ingest_vo_event(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ingest_global_features(
-    event: &RecordedEvent,
-    objects: &[types::object_detection::Object<types::object_detection::RobocupObjectLabel>],
-    camera_matrices: &OnlineCameraMatrices,
+fn ingest_recorded_field_mark_associations(
     frontend: &mut VinsFrontend,
-    parameters: &ReplayParameters,
+    event: &RecordedEvent,
+    recorded_associations: &TimeWrapper<FieldMarkAssociations>,
+    timestamp_mode: TimestampMode,
+    pose_hint_visual_min_features_per_frame: usize,
     stats: &mut ReplayStats,
     has_pending_measurements: &mut bool,
 ) -> Result<()> {
     stats.global_frames += 1;
-    let visual_features = find_detected_visual_features(objects);
+    let associations = localization_visual_associations(
+        recorded_associations.inner.associations.clone(),
+        pose_hint_visual_min_features_per_frame,
+    );
+    if associations.is_empty() {
+        return Ok(());
+    }
+
+    stats.global_frames_ingested += 1;
+    stats.global_associations_ingested += associations.len();
+    let associations = associations
+        .into_iter()
+        .map(|association| VisualReprojectionAssociation {
+            detection: association.detection,
+            field_point: association.field_point,
+            kind: match association.kind {
+                FieldMarkAssociationKind::GlobalUnique => {
+                    VisualReprojectionAssociationKind::GlobalUnique
+                }
+                FieldMarkAssociationKind::PoseHint => VisualReprojectionAssociationKind::PoseHint,
+            },
+        });
+    let time = match timestamp_mode {
+        TimestampMode::McapPublish => event.publish_time,
+        TimestampMode::Embedded => recorded_associations.time.to_wallclock(),
+    };
+    frontend.ingest_visual_reprojection_associations(
+        time,
+        associations,
+        recorded_associations.inner.robot_to_camera.inner,
+    )?;
+    *has_pending_measurements = true;
+    Ok(())
+}
+
+fn localization_visual_associations(
+    associations: Vec<FieldMarkAssociation>,
+    pose_hint_visual_min_features_per_frame: usize,
+) -> Vec<FieldMarkAssociation> {
+    let has_global_association = associations
+        .iter()
+        .any(|association| association.kind == FieldMarkAssociationKind::GlobalUnique);
+    if has_global_association {
+        return associations
+            .into_iter()
+            .filter(|association| association.kind == FieldMarkAssociationKind::GlobalUnique)
+            .collect();
+    }
+    if associations.len() >= pose_hint_visual_min_features_per_frame {
+        associations
+    } else {
+        Vec::new()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_recomputed_global_features(
+    event: &RecordedEvent,
+    frame: &crate::mcap_recording::DetectedObjectsFrame,
+    camera_matrices: &OnlineCameraMatrices,
+    frontend: &mut VinsFrontend,
+    parameters: &ReplayParameters,
+    field_dimensions: &FieldDimensions,
+    stats: &mut ReplayStats,
+    has_pending_measurements: &mut bool,
+) -> Result<()> {
+    stats.global_frames += 1;
+    let visual_features = find_detected_visual_features(&frame.objects);
     if visual_features.supported_feature_count() == 0 {
         return Ok(());
     }
     stats.global_candidates += 1;
+    let visual_time = match parameters.timestamp_mode {
+        TimestampMode::McapPublish => event.publish_time,
+        TimestampMode::Embedded => frame.display_time(),
+    };
 
     let Some(camera_matrix) = camera_matrices
-        .nearest(event.publish_time, parameters.timestamp_mode)
+        .nearest(visual_time, parameters.timestamp_mode)
         .map(|nearest| nearest.matrix)
     else {
         return Ok(());
     };
-    if camera_matrix.distance_to(event.publish_time, parameters.timestamp_mode)
-        > STALE_CAMERA_MATRIX_THRESHOLD
+    if camera_matrix.distance_to(visual_time, parameters.timestamp_mode)
+        > CAMERA_MATRIX_MAX_TIME_DISTANCE
     {
         return Ok(());
     }
 
-    let pose_hint = frontend.peek_last_optimization_result().map(|result| {
-        result
-            .transform
-            .cast::<f32>()
-            .framed_transform::<Robot, Field>()
-    });
+    let pose_hint = frontend
+        .peek_last_optimization_result()
+        .filter(|result| {
+            Duration::from_nanos(
+                nanos_abs_diff(result.time, visual_time).min(u64::MAX as u128) as u64,
+            ) <= parameters.pose_hint.max_pose_age
+        })
+        .map(|result| {
+            result
+                .transform
+                .cast::<f32>()
+                .framed_transform::<Robot, Field>()
+        });
     let association_parameters = FieldMarkAssociationParameters {
         global_localizer: parameters.global_localizer,
         pose_hint: parameters.pose_hint,
@@ -375,7 +617,7 @@ fn ingest_global_features(
     let localization = associate_visual_features(
         &visual_features,
         &camera_matrix.matrix.inner,
-        &FieldDimensions::SPL_2025,
+        field_dimensions,
         pose_hint,
         &association_parameters,
     );
@@ -389,7 +631,10 @@ fn ingest_global_features(
         }
     }
 
-    let associations = localization.associations;
+    let associations = localization_visual_associations(
+        localization.associations,
+        parameters.pose_hint_visual_min_features_per_frame,
+    );
     if !associations.is_empty() {
         stats.global_frames_ingested += 1;
         stats.global_associations_ingested += associations.len();
@@ -409,7 +654,7 @@ fn ingest_global_features(
                     },
                 });
         frontend.ingest_visual_reprojection_associations(
-            event.publish_time,
+            visual_time,
             associations,
             robot_to_camera(&camera_matrix.matrix.inner),
         )?;
@@ -422,6 +667,7 @@ fn solve_and_record(
     backend: &mut VinsBackend,
     frontend: &mut VinsFrontend,
     recording: &Recording,
+    timestamp_mode: TimestampMode,
     replay_time: SystemTime,
     stats: &ReplayStats,
     samples: &mut Vec<SolveSample>,
@@ -437,8 +683,8 @@ fn solve_and_record(
     };
 
     samples.push(SolveSample {
-        replay_seconds: recording.seconds_since_start(replay_time),
-        graph_seconds: seconds_since(result.time, recording.start_source_time()),
+        replay_seconds: recording.seconds_since_log_start(replay_time),
+        graph_seconds: seconds_since(result.time, recording.graph_start_time(timestamp_mode)),
         solve_duration,
         robot_to_field: result.transform.framed_transform(),
         diagnostics: backend.compute_last_solve_diagnostics(),
@@ -497,20 +743,22 @@ impl OnlineCameraMatrix {
     }
 }
 
+fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
+    (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
+}
+
 struct NearestCameraMatrix<'a> {
     matrix: &'a OnlineCameraMatrix,
     distance: Duration,
 }
 
 #[derive(Default)]
-struct VisualOdometryTimestampTracker {
-    previous_mcap_publish_time: Option<SystemTime>,
-}
+struct VisualOdometryTimestampTracker;
 
 impl VisualOdometryTimestampTracker {
     fn measurement_times(
         &mut self,
-        event: &RecordedEvent,
+        _event: &RecordedEvent,
         delta: &VisualOdometryDelta,
         mode: TimestampMode,
         recording: &Recording,
@@ -521,30 +769,48 @@ impl VisualOdometryTimestampTracker {
                 delta.current_time.to_wallclock(),
             )),
             TimestampMode::McapPublish => {
-                let current = match recording.aligned_image_time(delta.current_time) {
-                    Some(time) => time,
-                    None => event.publish_time,
-                };
-                let previous = recording
-                    .aligned_image_time(delta.previous_time)
-                    .or(self.previous_mcap_publish_time)
-                    .or_else(|| {
-                        let embedded_duration = delta
-                            .current_time
-                            .to_wallclock()
-                            .duration_since(delta.previous_time.to_wallclock())
-                            .ok()?;
-                        current.checked_sub(embedded_duration)
-                    });
-                self.previous_mcap_publish_time = Some(current);
-                previous.map(|previous| (previous, current))
+                let previous = recording.aligned_image_time(delta.previous_time)?;
+                let current = recording.aligned_image_time(delta.current_time)?;
+                Some((previous, current))
             }
         }
     }
 }
 
-fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
-    (camera_matrix.head_to_camera * camera_matrix.robot_to_head).inner
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-const STALE_CAMERA_MATRIX_THRESHOLD: Duration = Duration::from_millis(100);
+    #[test]
+    fn trajectory_splits_segments_on_large_graph_gap() {
+        let result = ResolveResult {
+            parameters: ReplayParameters::default(),
+            samples: vec![
+                solve_sample_at(0.0),
+                solve_sample_at(0.1),
+                solve_sample_at(0.1 + TRAJECTORY_MAX_SAMPLE_GAP_SECONDS + 0.01),
+            ],
+            stats: ReplayStats::default(),
+            elapsed: Duration::ZERO,
+        };
+
+        let trajectory = result.trajectory();
+
+        assert_eq!(trajectory.len(), 3);
+        assert_eq!(trajectory[0].segment_id, 0);
+        assert_eq!(trajectory[1].segment_id, 0);
+        assert_eq!(trajectory[2].segment_id, 1);
+    }
+
+    fn solve_sample_at(graph_seconds: f64) -> SolveSample {
+        SolveSample {
+            replay_seconds: graph_seconds,
+            graph_seconds,
+            solve_duration: Duration::ZERO,
+            robot_to_field: nalgebra::Isometry3::translation(graph_seconds, 0.0, 0.0)
+                .framed_transform(),
+            diagnostics: None,
+            stats: ReplayStats::default(),
+        }
+    }
+}

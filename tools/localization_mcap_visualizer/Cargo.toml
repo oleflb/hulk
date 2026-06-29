@@ -30,6 +30,7 @@ ros-z = { workspace = true }
 ros-z-cdr = { workspace = true }
 ros2 = { workspace = true }
 serde = { workspace = true }
+stereo_visual_odometry = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

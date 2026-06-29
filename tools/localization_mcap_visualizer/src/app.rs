@@ -21,20 +21,25 @@ use eframe::{
 use egui_bevy::BevyWidget;
 use egui_plot::{Line, Plot, PlotPoints};
 use field_mark_association::{
-    GlobalLocalizationDetailedDebug, GlobalLocalizerParameters, VisualFeatureClass,
-    find_detected_visual_features, localize_global_visual_features_detailed_debug,
+    FieldMarkAssociationKind, FieldMarkAssociations, GlobalLocalizationDebug,
+    GlobalLocalizationDebugStatus, GlobalLocalizationDetailedDebug,
+    GlobalLocalizationDetailedStatus, GlobalLocalizationScore, GlobalLocalizerParameters,
+    VisualFeatureClass, find_detected_visual_features,
+    localize_global_visual_features_detailed_debug,
 };
 use linear_algebra::IntoTransform;
-use localization_3d::initial_robot_to_field_from_camera_matrix;
+use localization_3d::{SolveDiagnostics, initial_robot_to_field_from_camera_matrix};
 use projection::camera_matrix::CameraMatrix;
 use types::{
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
+    time_wrapper::TimeWrapper,
 };
 
 use crate::{
     mcap_recording::{
-        CameraImage, Recording, StereoFrame, StereoImageId, TrajectoryPoint, nanos_since_epoch,
+        CameraImage, Recording, SNAPSHOT_MAX_TIME_DISTANCE, StereoFrame, StereoImageId,
+        TRAJECTORY_MAX_SAMPLE_GAP_SECONDS, TrajectoryPoint, nanos_since_epoch,
     },
     nearest_by_distance,
     replay::{ReplayParameters, ResolveMessage, ResolveProgress, ResolveResult, TimestampMode},
@@ -56,6 +61,7 @@ pub struct LocalizationMcapVisualizerApp {
     image_cache: Option<CachedStereoFrame>,
     left_texture: Option<TextureHandle>,
     right_texture: Option<TextureHandle>,
+    failed_image_id: Option<StereoImageId>,
     resolve: ResolveState,
     resolve_version: SceneVersion,
     camera_matrix_key: Option<CameraMatrixKey>,
@@ -95,6 +101,7 @@ impl LocalizationMcapVisualizerApp {
             image_cache: None,
             left_texture: None,
             right_texture: None,
+            failed_image_id: None,
             resolve: ResolveState::Idle,
             resolve_version: SceneVersion::default(),
             camera_matrix_key: None,
@@ -109,8 +116,10 @@ impl App for LocalizationMcapVisualizerApp {
         self.advance_playback();
         self.poll_resolve();
 
-        let log_time = self.recording.log_time_at_seconds(self.position_seconds);
-        let snapshot = self.recording.latest_snapshot(log_time);
+        let display_time = self
+            .recording
+            .display_time_at_seconds(self.position_seconds);
+        let snapshot = self.recording.latest_snapshot(display_time);
         self.update_stereo_textures(context, snapshot.image_id);
 
         let camera_matrix_key = snapshot
@@ -134,11 +143,13 @@ impl App for LocalizationMcapVisualizerApp {
         }
 
         let current_pose = self.current_robot_to_field(snapshot.recorded_localization);
-        let debug_pose = self.robot_to_field_at_log_time(snapshot.detected_objects_time);
+        let debug_pose = self.robot_to_field_at_display_time(snapshot.detected_objects_time);
         let global_debug = self.update_global_debug_cache(
             camera_matrix.as_ref(),
             camera_matrix_key,
             snapshot.detected_objects_time,
+            snapshot.global_localization_debug.as_ref(),
+            snapshot.global_localization_debug_time,
             debug_pose,
             &snapshot.detected_objects,
         );
@@ -152,11 +163,16 @@ impl App for LocalizationMcapVisualizerApp {
         let playing_before_ui = self.playing;
 
         self.header(context);
-        self.parameters_panel(context);
+        self.parameters_panel(context, snapshot.solve_diagnostics.as_ref());
         self.camera_panel(
             context,
             &snapshot.detected_objects,
             snapshot.detected_objects_time,
+            snapshot.image_display_time,
+            snapshot
+                .field_mark_associations
+                .as_ref()
+                .map(|associations| &associations.inner),
             camera_matrix_for_ui.as_ref(),
             global_debug.as_deref(),
         );
@@ -261,10 +277,15 @@ impl LocalizationMcapVisualizerApp {
         } else {
             None
         };
+        let next_field_dimensions = if field_dimensions_version != SceneVersion::READY {
+            Some(self.field_dimensions())
+        } else {
+            None
+        };
 
         let mut scene_data = self.widget.bevy_app.world_mut().resource_mut::<SceneData>();
-        if field_dimensions_version != SceneVersion::READY {
-            scene_data.set_field_dimensions(FieldDimensions::SPL_2025);
+        if let Some(field_dimensions) = next_field_dimensions {
+            scene_data.set_field_dimensions(field_dimensions);
         }
         scene_data.set_current_robot_to_field(Some(current_pose.inner.cast().framed_transform()));
 
@@ -319,12 +340,17 @@ impl LocalizationMcapVisualizerApp {
 
     fn update_stereo_textures(&mut self, context: &Context, image_id: Option<StereoImageId>) {
         let Some(image_id) = image_id else {
+            self.image_cache = None;
+            self.left_texture = None;
+            self.right_texture = None;
+            self.failed_image_id = None;
             return;
         };
         if self
             .image_cache
             .as_ref()
             .is_some_and(|cache| cache.image_id == image_id)
+            || self.failed_image_id == Some(image_id)
         {
             return;
         }
@@ -334,9 +360,14 @@ impl LocalizationMcapVisualizerApp {
                 self.set_texture(context, StereoSide::Left, &frame.left);
                 self.set_texture(context, StereoSide::Right, &frame.right);
                 self.image_cache = Some(CachedStereoFrame { image_id, frame });
+                self.failed_image_id = None;
             }
             Err(error) => {
                 eprintln!("failed to decode stereo frame {image_id}: {error:#}");
+                self.image_cache = None;
+                self.left_texture = None;
+                self.right_texture = None;
+                self.failed_image_id = Some(image_id);
             }
         }
     }
@@ -386,12 +417,12 @@ impl LocalizationMcapVisualizerApp {
         }
     }
 
-    fn robot_to_field_at_log_time(
+    fn robot_to_field_at_display_time(
         &self,
-        log_time: Option<SystemTime>,
+        display_time: Option<SystemTime>,
     ) -> linear_algebra::Isometry3<Robot, Field, f64> {
-        let seconds = match log_time {
-            Some(log_time) => self.recording.seconds_since_start(log_time),
+        let seconds = match display_time {
+            Some(display_time) => self.recording.seconds_since_start(display_time),
             None => self.position_seconds,
         };
         let pose = self
@@ -412,24 +443,38 @@ impl LocalizationMcapVisualizerApp {
         initial_robot_to_field_from_camera_matrix(&self.recording.first_camera_matrix)
     }
 
+    fn field_dimensions(&self) -> FieldDimensions {
+        self.recording
+            .field_dimensions
+            .unwrap_or(FieldDimensions::SPL_2025)
+    }
+
     fn update_global_debug_cache(
         &mut self,
         camera_matrix: Option<&projection::camera_matrix::CameraMatrix>,
         camera_matrix_key: Option<CameraMatrixKey>,
         detected_objects_time: Option<SystemTime>,
+        recorded_global_debug: Option<&GlobalLocalizationDebug>,
+        recorded_global_debug_time: Option<SystemTime>,
         current_pose: linear_algebra::Isometry3<Robot, Field, f64>,
         objects: &[Object<RobocupObjectLabel>],
     ) -> Option<Arc<GlobalLocalizationDetailedDebug>> {
-        let key = camera_matrix_key.map(|camera_matrix_key| GlobalDebugKey {
-            camera_matrix_key,
-            detected_objects_time_nanos: detected_objects_time.map(nanos_since_epoch),
-            pose_revision: self.resolve_version,
-            global_localizer: self.parameters.global_localizer,
-        });
+        let key = if recorded_global_debug.is_some() || camera_matrix_key.is_some() {
+            Some(GlobalDebugKey {
+                camera_matrix_key,
+                detected_objects_time_nanos: detected_objects_time.map(nanos_since_epoch),
+                recorded_debug_time_nanos: recorded_global_debug_time.map(nanos_since_epoch),
+                pose_revision: self.resolve_version,
+                global_localizer: self.parameters.global_localizer,
+            })
+        } else {
+            None
+        };
 
         if self.global_debug_cache.key != key {
-            let debug = self
-                .compute_global_debug(camera_matrix, current_pose, objects)
+            let debug = recorded_global_debug
+                .map(recorded_global_debug_to_detailed)
+                .or_else(|| self.compute_global_debug(camera_matrix, current_pose, objects))
                 .map(Arc::new);
             self.global_debug_cache.key = key;
             self.global_debug_cache.version = self.global_debug_cache.version.next();
@@ -453,10 +498,11 @@ impl LocalizationMcapVisualizerApp {
             return None;
         }
         let pose_hint = Some(current_pose.inner.cast().framed_transform());
+        let field_dimensions = self.field_dimensions();
         localize_global_visual_features_detailed_debug(
             &visual_features,
             camera_matrix,
-            &FieldDimensions::SPL_2025,
+            &field_dimensions,
             pose_hint,
             &self.parameters.global_localizer,
         )
@@ -478,7 +524,7 @@ impl LocalizationMcapVisualizerApp {
                 ));
                 ui.separator();
                 ui.label(if self.recording.field_dimensions.is_some() {
-                    "field: SPL_2025 override (recording has field_dimensions)"
+                    "field: recorded field_dimensions"
                 } else {
                     "field: SPL_2025 fallback"
                 });
@@ -497,7 +543,11 @@ impl LocalizationMcapVisualizerApp {
         });
     }
 
-    fn parameters_panel(&mut self, context: &Context) {
+    fn parameters_panel(
+        &mut self,
+        context: &Context,
+        recorded_solve_diagnostics: Option<&TimeWrapper<SolveDiagnostics>>,
+    ) {
         SidePanel::left("parameters_panel")
             .resizable(true)
             .default_width(360.0)
@@ -541,14 +591,47 @@ impl LocalizationMcapVisualizerApp {
                 );
                 numeric_row(
                     ui,
+                    "pose-hint visual variance",
+                    &mut self.parameters.pose_hint_visual_feature_noise_variance,
+                    1.0..=100_000.0,
+                );
+                numeric_row(
+                    ui,
+                    "pose-hint Huber",
+                    &mut self.parameters.pose_hint_visual_huber_threshold,
+                    0.1..=100.0,
+                );
+                ui.horizontal(|ui| {
+                    ui.label("pose-hint min features");
+                    ui.add(
+                        DragValue::new(
+                            &mut self.parameters.pose_hint_visual_min_features_per_frame,
+                        )
+                        .range(1..=16),
+                    );
+                });
+                numeric_row(
+                    ui,
                     "VO covariance",
                     &mut self.parameters.visual_odometry_covariance,
                     1.0e-8..=1.0,
                 );
+                ui.checkbox(
+                    &mut self.parameters.override_visual_odometry_covariance,
+                    "override VO covariance",
+                );
                 ui.separator();
+                ui.checkbox(
+                    &mut self.parameters.include_visual_odometry,
+                    "include visual odometry",
+                );
                 ui.checkbox(
                     &mut self.parameters.include_global_features,
                     "include global visual features",
+                );
+                ui.checkbox(
+                    &mut self.parameters.recompute_global_features,
+                    "recompute global features from detections",
                 );
                 ui.checkbox(&mut self.parameters.include_imu, "include IMU orientation");
                 ui.checkbox(
@@ -695,7 +778,7 @@ impl LocalizationMcapVisualizerApp {
                 ui.separator();
                 self.resolve_controls(ui);
                 ui.separator();
-                self.diagnostics(ui);
+                self.diagnostics(ui, recorded_solve_diagnostics);
             });
     }
 
@@ -750,11 +833,26 @@ impl LocalizationMcapVisualizerApp {
         }
     }
 
-    fn diagnostics(&self, ui: &mut Ui) {
+    fn diagnostics(
+        &self,
+        ui: &mut Ui,
+        recorded_solve_diagnostics: Option<&TimeWrapper<SolveDiagnostics>>,
+    ) {
         ui.heading("Diagnostics");
+        if let Some(diagnostics) = recorded_solve_diagnostics {
+            ui.label(format!(
+                "recorded solve diagnostics at {:.2}s",
+                self.recording
+                    .seconds_since_start(diagnostics.time.to_wallclock())
+            ));
+            recorded_solve_diagnostics_summary(ui, &diagnostics.inner);
+            ui.separator();
+        }
+
         let Some(result) = self.resolved_result() else {
             ui.label(
-                RichText::new("Run Resolve to populate solve diagnostics.").color(Color32::GRAY),
+                RichText::new("Run Resolve to populate replay solve diagnostics.")
+                    .color(Color32::GRAY),
             );
             return;
         };
@@ -765,7 +863,8 @@ impl LocalizationMcapVisualizerApp {
             stats.vo_received, stats.vo_ingested, stats.vo_skipped_stale_camera_matrix
         ));
         ui.label(format!(
-            "Global: {} candidates, {} frames ingested, {} associations",
+            "Global: {} frames, {} candidates, {} ingested, {} associations",
+            stats.global_frames,
             stats.global_candidates,
             stats.global_frames_ingested,
             stats.global_associations_ingested
@@ -777,6 +876,7 @@ impl LocalizationMcapVisualizerApp {
                 sample.solve_duration.as_secs_f64() * 1000.0
             ));
             ui.label(format!("graph time: {:.2}s", sample.graph_seconds));
+            ui.label(format!("replay time: {:.2}s", sample.replay_seconds));
             ui.label(format!(
                 "cumulative VO/global: {} / {}",
                 sample.stats.vo_ingested, sample.stats.global_associations_ingested
@@ -809,7 +909,7 @@ impl LocalizationMcapVisualizerApp {
             .show(ui, |plot_ui| {
                 let points = PlotPoints::from_iter(result.samples.iter().map(|sample| {
                     [
-                        sample.replay_seconds,
+                        sample.graph_seconds,
                         sample.solve_duration.as_secs_f64() * 1000.0,
                     ]
                 }));
@@ -828,6 +928,8 @@ impl LocalizationMcapVisualizerApp {
         context: &Context,
         detected_objects: &[Object<RobocupObjectLabel>],
         detected_objects_time: Option<SystemTime>,
+        image_display_time: Option<SystemTime>,
+        field_mark_associations: Option<&FieldMarkAssociations>,
         camera_matrix: Option<&CameraMatrix>,
         global_debug: Option<&GlobalLocalizationDetailedDebug>,
     ) {
@@ -862,13 +964,18 @@ impl LocalizationMcapVisualizerApp {
                         image,
                         detected_objects,
                         detected_objects_time,
+                        image_display_time,
+                        field_mark_associations,
                         global_debug,
                     ),
                     _ => {
                         ui.centered_and_justified(|ui| {
                             ui.label(
-                                RichText::new("recording has no decoded stereo image at this time")
-                                    .color(Color32::GRAY),
+                                RichText::new(format!(
+                                    "no stereo image within {:.0} ms of this display time",
+                                    SNAPSHOT_MAX_TIME_DISTANCE.as_secs_f64() * 1000.0
+                                ))
+                                .color(Color32::GRAY),
                             );
                         });
                     }
@@ -887,6 +994,8 @@ impl LocalizationMcapVisualizerApp {
         image: &CameraImage,
         detected_objects: &[Object<RobocupObjectLabel>],
         detected_objects_time: Option<SystemTime>,
+        image_display_time: Option<SystemTime>,
+        field_mark_associations: Option<&FieldMarkAssociations>,
         global_debug: Option<&GlobalLocalizationDetailedDebug>,
     ) {
         let image_size = vec2(image.width as f32, image.height as f32);
@@ -905,6 +1014,14 @@ impl LocalizationMcapVisualizerApp {
                 );
                 if self.selected_camera == StereoSide::Left {
                     draw_detected_objects(ui, response.rect, image_size, detected_objects);
+                    if let Some(field_mark_associations) = field_mark_associations {
+                        draw_recorded_association_pixels(
+                            ui,
+                            response.rect,
+                            image_size,
+                            field_mark_associations,
+                        );
+                    }
                     if let Some(debug) = global_debug {
                         draw_global_debug_overlay(ui, response.rect, image_size, debug);
                     }
@@ -919,27 +1036,44 @@ impl LocalizationMcapVisualizerApp {
                     }
                 }
             });
+        if self.selected_camera == StereoSide::Right {
+            ui.colored_label(
+                Color32::GRAY,
+                "detection and global-localization overlays are left-camera only",
+            );
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}x{}", image.width, image.height));
             ui.separator();
-            ui.label(format!("{} detections", detected_objects.len()));
+            ui.label(format!("{} left detections", detected_objects.len()));
+            if let Some(field_mark_associations) = field_mark_associations {
+                ui.separator();
+                ui.label(format!(
+                    "{} recorded associations",
+                    field_mark_associations.associations.len()
+                ));
+            }
             if let Some(cache) = &self.image_cache {
+                let frame_display_time =
+                    image_display_time.unwrap_or_else(|| cache.frame.source_time.to_wallclock());
                 ui.separator();
                 ui.label(format!("frame {}", cache.image_id));
                 ui.separator();
                 ui.label(format!(
-                    "image log {:.2}s source {:?}",
-                    self.recording.seconds_since_start(cache.frame.log_time),
+                    "image {:.2}s source {:?}",
+                    self.recording.seconds_since_start(frame_display_time),
                     cache.frame.source_time,
                 ));
                 ui.separator();
                 ui.label(format!(
-                    "publish {:.2}s",
-                    self.recording.seconds_since_start(cache.frame.publish_time),
+                    "log {:.2}s publish {:.2}s",
+                    self.recording.seconds_since_log_start(cache.frame.log_time),
+                    self.recording
+                        .seconds_since_log_start(cache.frame.publish_time),
                 ));
                 if let Some(detected_objects_time) = detected_objects_time {
                     let delta_ms = (self.recording.seconds_since_start(detected_objects_time)
-                        - self.recording.seconds_since_start(cache.frame.log_time))
+                        - self.recording.seconds_since_start(frame_display_time))
                         * 1000.0;
                     ui.separator();
                     ui.label(format!("detections Δ {delta_ms:.1} ms"));
@@ -979,6 +1113,14 @@ impl LocalizationMcapVisualizerApp {
             debug.projected_features.len(),
             debug.associations.len()
         ));
+        if debug.detections.is_empty() && debug.projected_features.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Recorded debug summary only; detailed projections were not recorded.",
+                )
+                .color(Color32::GRAY),
+            );
+        }
         ui.separator();
         egui::ScrollArea::vertical()
             .max_height(180.0)
@@ -1023,7 +1165,7 @@ impl LocalizationMcapVisualizerApp {
             Color32::from_rgb(24, 44, 31),
         );
 
-        let dimensions = FieldDimensions::SPL_2025;
+        let dimensions = self.field_dimensions();
         let field_rect = top_down_field_rect(rect, &dimensions);
         painter.rect_stroke(
             field_rect,
@@ -1160,12 +1302,12 @@ impl LocalizationMcapVisualizerApp {
         let Some(image_id) = self.recording.image_id_from_index(frame_index) else {
             return;
         };
-        let Some(log_time) = self.recording.image_log_time(image_id) else {
+        let Some(display_time) = self.recording.image_display_time(image_id) else {
             return;
         };
         self.position_seconds = self
             .recording
-            .seconds_since_start(log_time)
+            .seconds_since_start(display_time)
             .clamp(0.0, self.recording.duration().as_secs_f64());
     }
 
@@ -1205,13 +1347,14 @@ fn nearest_sample(
     if samples.is_empty() {
         return None;
     }
-    let next = samples.partition_point(|sample| sample.replay_seconds <= seconds);
+    let next = samples.partition_point(|sample| sample.graph_seconds <= seconds);
     nearest_by_seconds(
         next.checked_sub(1).and_then(|index| samples.get(index)),
         samples.get(next),
         seconds,
-        |sample| sample.replay_seconds,
+        |sample| sample.graph_seconds,
     )
+    .filter(|sample| (sample.graph_seconds - seconds).abs() <= TRAJECTORY_MAX_SAMPLE_GAP_SECONDS)
 }
 
 fn nearest_trajectory_point(points: &[TrajectoryPoint], seconds: f64) -> Option<&TrajectoryPoint> {
@@ -1225,6 +1368,7 @@ fn nearest_trajectory_point(points: &[TrajectoryPoint], seconds: f64) -> Option<
         seconds,
         |point| point.seconds,
     )
+    .filter(|point| (point.seconds - seconds).abs() <= TRAJECTORY_MAX_SAMPLE_GAP_SECONDS)
 }
 
 fn nearest_by_seconds<'a, T>(
@@ -1237,6 +1381,65 @@ fn nearest_by_seconds<'a, T>(
         previous.map(|previous| (previous, (get_seconds(previous) - seconds).abs())),
         next.map(|next| (next, (get_seconds(next) - seconds).abs())),
     )
+}
+
+fn recorded_global_debug_to_detailed(
+    debug: &GlobalLocalizationDebug,
+) -> GlobalLocalizationDetailedDebug {
+    GlobalLocalizationDetailedDebug {
+        status: recorded_global_debug_status(debug.status),
+        robot_to_field: debug.robot_to_field,
+        score: GlobalLocalizationScore {
+            inliers: debug.inliers,
+            candidate_score: debug.candidate_score,
+            metric_rms_residual: debug.metric_rms_residual,
+            reprojection_rmse: debug.reprojection_rmse,
+            total_cost: debug.total_cost,
+        },
+        detections: Vec::new(),
+        projected_features: Vec::new(),
+        associations: Vec::new(),
+    }
+}
+
+fn recorded_global_debug_status(
+    status: GlobalLocalizationDebugStatus,
+) -> GlobalLocalizationDetailedStatus {
+    match status {
+        GlobalLocalizationDebugStatus::Ambiguous => GlobalLocalizationDetailedStatus::Ambiguous,
+        #[allow(deprecated)]
+        GlobalLocalizationDebugStatus::Unique => GlobalLocalizationDetailedStatus::Unique,
+        GlobalLocalizationDebugStatus::UniqueModuloSymmetry => {
+            GlobalLocalizationDetailedStatus::UniqueModuloSymmetry
+        }
+    }
+}
+
+fn recorded_solve_diagnostics_summary(ui: &mut Ui, diagnostics: &SolveDiagnostics) {
+    ui.label(format!(
+        "recorded optimizer: {:?}",
+        diagnostics.optimizer_status
+    ));
+    ui.label(format!(
+        "recorded values/factors: {} / {}",
+        diagnostics.value_count, diagnostics.factor_count
+    ));
+    ui.label(format!(
+        "recorded total error: {:.3}",
+        diagnostics.total_error
+    ));
+    ui.label(format!(
+        "recorded VO RMS mean/max: {:.3} / {:.3}",
+        diagnostics.visual_odometry.mean_rms, diagnostics.visual_odometry.max_rms
+    ));
+    ui.label(format!(
+        "recorded visual RMS mean/max: {:.3} / {:.3}",
+        diagnostics.visual_reprojection.mean_rms, diagnostics.visual_reprojection.max_rms
+    ));
+    ui.label(format!(
+        "recorded GP RMS mean/max: {:.3} / {:.3}",
+        diagnostics.gaussian_process_prior.mean_rms, diagnostics.gaussian_process_prior.max_rms
+    ));
 }
 
 fn draw_detected_objects(
@@ -1283,6 +1486,42 @@ fn draw_detected_objects(
             color.gamma_multiply(0.85),
         );
         painter.galley(text_position, galley, Color32::WHITE);
+    }
+}
+
+fn draw_recorded_association_pixels(
+    ui: &mut Ui,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_mark_associations: &FieldMarkAssociations,
+) {
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+    let painter = ui.painter();
+    for association in &field_mark_associations.associations {
+        let position = image_rect.min
+            + vec2(
+                association.detection.x() * scale.x,
+                association.detection.y() * scale.y,
+            );
+        if !image_rect.contains(position) {
+            continue;
+        }
+        let color = match association.kind {
+            FieldMarkAssociationKind::GlobalUnique => Color32::from_rgb(120, 255, 170),
+            FieldMarkAssociationKind::PoseHint => Color32::from_rgb(120, 180, 255),
+        };
+        painter.circle_stroke(position, 7.0, Stroke::new(2.0, color));
+        painter.line_segment(
+            [position - vec2(5.0, 0.0), position + vec2(5.0, 0.0)],
+            Stroke::new(1.5, color),
+        );
+        painter.line_segment(
+            [position - vec2(0.0, 5.0), position + vec2(0.0, 5.0)],
+            Stroke::new(1.5, color),
+        );
     }
 }
 
@@ -1520,8 +1759,9 @@ struct CameraMatrixKey {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GlobalDebugKey {
-    camera_matrix_key: CameraMatrixKey,
+    camera_matrix_key: Option<CameraMatrixKey>,
     detected_objects_time_nanos: Option<u128>,
+    recorded_debug_time_nanos: Option<u128>,
     pose_revision: SceneVersion,
     global_localizer: GlobalLocalizerParameters,
 }
