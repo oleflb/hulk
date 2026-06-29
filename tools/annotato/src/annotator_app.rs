@@ -48,6 +48,8 @@ pub struct AnnotatorApp {
     class_transition: Option<ClassTransition>,
     manual_class_edit: bool,
     manual_class_edit_changed: bool,
+    next_was_down: bool,
+    previous_was_down: bool,
     last_error: Option<String>,
 }
 
@@ -84,6 +86,8 @@ impl AnnotatorApp {
             class_transition: None,
             manual_class_edit: false,
             manual_class_edit_changed: false,
+            next_was_down: false,
+            previous_was_down: false,
             last_error: None,
         };
         app.move_to_first_pending();
@@ -352,9 +356,11 @@ impl AnnotatorApp {
 
         let config = &CONFIG.get().unwrap().keybindings;
         let action = ctx.input(|input| {
-            if config.next.is_pressed(input) {
+            let next_down = config.next.is_down(input);
+            let previous_down = config.previous.is_down(input);
+            let navigation_action = if next_down && !self.next_was_down {
                 Some(GlobalAction::Next)
-            } else if config.previous.is_pressed(input) {
+            } else if previous_down && !self.previous_was_down {
                 Some(GlobalAction::Previous)
             } else if config.save.is_pressed(input) {
                 Some(GlobalAction::Save)
@@ -362,7 +368,11 @@ impl AnnotatorApp {
                 Some(GlobalAction::EditOtherClass)
             } else {
                 None
-            }
+            };
+
+            self.next_was_down = next_down;
+            self.previous_was_down = previous_down;
+            navigation_action
         });
 
         let result = match action {
