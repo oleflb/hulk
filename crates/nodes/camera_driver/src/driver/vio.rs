@@ -443,7 +443,7 @@ fn vin_attr(config: &Config, mipi_rx: HardwareId) -> VinAttr {
     }
 }
 
-/// Builds one LPWM channel config for sensor trigger output.
+/// Builds one LPWM channel template. LPWM remains disabled in the current normal-mode setup.
 fn lpwm_channel(config: &Config) -> LpwmChannelConfig {
     let period_us = ((1_000_000 + config.fps / 2) / config.fps).saturating_sub(1);
     LpwmChannelConfig {

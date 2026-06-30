@@ -1,6 +1,6 @@
 # Camera Driver
 
-`camera_driver` is the ROS-Z node for the X5 SC132GS stereo camera module. It opens the two X5 VIO pipelines in SC132GS `SLAVE_M` mode with VIN LPWM trigger generation, rectifies the camera streams with GDC, encodes them with the X5 HEVC encoder, and publishes compressed access units for transport to the robot body.
+`camera_driver` is the ROS-Z node for the X5 SC132GS stereo camera module. It opens the two X5 VIO pipelines in SC132GS normal mode without VIN LPWM trigger generation, rectifies the camera streams with GDC, encodes them with the X5 HEVC encoder, and publishes compressed access units for transport to the robot body.
 
 ## Run
 
@@ -38,7 +38,7 @@ The driver publishes `EncodedFrameCodec::Hevc` and one access unit per `EncodedF
 
 The VSE output frame is passed to MediaCodec as an external NV12 input buffer. Encoded SDK output stays leased until the ROS-Z publisher actually needs an owned payload, so the driver avoids copying raw high-resolution frames.
 
-`EncodedFrame.timestamp_ns` uses the VIN trigger timestamp (`trig_tv`) when the SDK reports one, and falls back to the VSE frame timestamp otherwise. Runtime stats print `trigger_ts=<frames-with-trigger>/<frames>` plus left-minus-right `sync` deltas so LPWM hardware sync can be verified on robot hardware.
+`EncodedFrame.timestamp_ns` uses the VSE/VIN frame timestamp reported by the SDK. `trigger_ts=<frames-with-trigger>/<frames>` remains a diagnostic counter, but normal/no-LPWM mode is expected to run without trigger timestamps. Runtime stats also print left-minus-right timestamp deltas as observability, not as a hardware-sync guarantee.
 
 Decoded NV12, RGB, or YCbCr images are intentionally produced by downstream receivers or debug tools, not by `camera_driver`. Developer and debug runs use `encoded_frame_decoder_node` to decode HEVC into `types::nv12_image::Nv12Image` on `inputs/left_nv12_image` and `inputs/right_nv12_image`. The Orin gameplay path builds `hulk_ros_z` with `--features orin-vision`, decodes the stereo HEVC streams with GStreamer/NVMM/CUDA in `orin_vision_node`, and feeds YOLO from CUDA device memory without publishing decoded pixels through ROS-Z.
 
@@ -46,14 +46,14 @@ Decoded NV12, RGB, or YCbCr images are intentionally produced by downstream rece
 
 ## Validation
 
-At startup, the node waits for calibration, `SLAVE_M`/LPWM camera setup events, at least 90% of the expected frames, and matching VIN trigger timestamp coverage in the configured startup window. Runtime statistics print once per second.
+At startup, the node waits for calibration, normal/no-LPWM camera setup events, and at least 90% of the expected frames in the configured startup window. Runtime statistics print once per second.
 
 Robot validation checklist:
 
 1. Start the node on the X5 with enough `/dev/shm` for the 64 MiB ROS-Z SHM pool.
-2. Confirm startup prints both cameras with `mode=Slave lpwm=true` and then `startup validation: ok`.
-3. Confirm stats show stable 60 fps per side and `trigger_ts=N/N` rather than `0/N`.
-4. Confirm `sync` deltas are stable and close to `0 ms`.
+2. Confirm startup prints both cameras with `mode=Normal lpwm=false` and then `startup validation: ok`.
+3. Confirm stats show stable 60 fps per side. `trigger_ts=0/N` is expected in normal/no-LPWM mode.
+4. Confirm left-minus-right timestamp deltas are stable enough for the current unsynced camera mode.
 5. Subscribe to both HEVC topics and verify both streams decode.
 
-Bad LPWM outcomes to diagnose: camera open/start failure may indicate deployed SC132GS library or wiring does not support `SLAVE_M`; `trigger_ts=0/N` means frames arrive but SDK trigger timestamps are not reported; unstable or sub-60 fps suggests LPWM period or trigger mode needs hardware-specific adjustment.
+Unstable or sub-60 fps output usually indicates VIO/encoder backpressure, SDK setup problems, or insufficient runtime resources such as `/dev/shm` headroom.
