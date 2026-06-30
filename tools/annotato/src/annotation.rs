@@ -6,7 +6,7 @@ use crate::{
     classes::Class,
 };
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AnnotationFormat {
     class: Class,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,76 +30,7 @@ impl AnnotationFormat {
     }
 }
 
-impl<'de> Deserialize<'de> for AnnotationFormat {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct RawAnnotationFormat {
-            class: Class,
-            #[serde(default)]
-            points: Option<[[f32; 2]; 2]>,
-            #[serde(default)]
-            point: Option<[f32; 2]>,
-            #[serde(default)]
-            migration_skipped: bool,
-        }
-
-        let raw = RawAnnotationFormat::deserialize(deserializer)?;
-        if raw.points.is_none() && raw.point.is_none() {
-            return Err(D::Error::custom(
-                "annotation must contain `points` or `point` geometry",
-            ));
-        }
-        if let Some(points) = raw.points {
-            for point in points {
-                validate_normalized_point(point).map_err(D::Error::custom)?;
-            }
-        }
-        if let Some(point) = raw.point {
-            validate_normalized_point(point).map_err(D::Error::custom)?;
-        }
-        if raw.point.is_some() && !raw.class.supports_points() {
-            return Err(D::Error::custom(format!(
-                "{} does not support point geometry",
-                raw.class.as_str()
-            )));
-        }
-        if raw.points.is_some() && raw.point.is_some() && !raw.class.requires_point() {
-            return Err(D::Error::custom(format!(
-                "{} cannot combine `points` and `point` geometry",
-                raw.class.as_str()
-            )));
-        }
-        if raw.migration_skipped && raw.point.is_some() {
-            return Err(D::Error::custom(
-                "migration_skipped annotations cannot contain `point` geometry",
-            ));
-        }
-        if raw.migration_skipped && !raw.class.requires_point() {
-            return Err(D::Error::custom(format!(
-                "{} does not support point migration skips",
-                raw.class.as_str()
-            )));
-        }
-        if raw.migration_skipped && raw.points.is_none() {
-            return Err(D::Error::custom(
-                "migration_skipped annotations must retain legacy `points` geometry",
-            ));
-        }
-
-        Ok(Self {
-            class: raw.class,
-            points: raw.points,
-            point: raw.point,
-            migration_skipped: raw.migration_skipped,
-        })
-    }
-}
-
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LabelFileFormat {
     pub labeled_classes: Vec<Class>,
     pub annotations: Vec<AnnotationFormat>,
@@ -121,40 +52,6 @@ impl LabelFileFormat {
         self.annotations
             .iter()
             .any(|annotation| annotation.class() == class && annotation.needs_point_migration())
-    }
-}
-
-impl<'de> Deserialize<'de> for LabelFileFormat {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct CurrentLabelFileFormat {
-            #[serde(default)]
-            labeled_classes: Vec<Class>,
-            #[serde(default)]
-            annotations: Vec<AnnotationFormat>,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum AnyLabelFileFormat {
-            Current(CurrentLabelFileFormat),
-            Legacy(Vec<AnnotationFormat>),
-        }
-
-        match AnyLabelFileFormat::deserialize(deserializer)? {
-            AnyLabelFileFormat::Current(current) => Ok(Self {
-                labeled_classes: normalize_labeled_classes(current.labeled_classes),
-                annotations: current.annotations,
-            }),
-            AnyLabelFileFormat::Legacy(annotations) => Ok(Self {
-                labeled_classes: infer_labeled_classes(&annotations),
-                annotations,
-            }),
-        }
     }
 }
 
