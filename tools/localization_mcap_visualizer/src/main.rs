@@ -39,6 +39,51 @@ struct Arguments {
     /// Run headless replay with only IMU orientation factors and priors enabled.
     #[arg(long)]
     orientation_only_summary: bool,
+    /// Recompute field-feature associations from detections during headless replay.
+    #[arg(long)]
+    recompute_global_features: bool,
+    /// Override visual-odometry covariance during headless replay.
+    #[arg(long)]
+    vo_covariance: Option<f64>,
+    /// Drop compensated visual-odometry translations above this threshold in meters.
+    #[arg(long)]
+    max_vo_translation: Option<f32>,
+    /// Drop compensated visual-odometry rotations above this threshold in degrees.
+    #[arg(long)]
+    max_vo_rotation_deg: Option<f32>,
+    /// Disable visual odometry during headless replay.
+    #[arg(long)]
+    no_visual_odometry: bool,
+    /// Disable field-feature associations during headless replay.
+    #[arg(long)]
+    no_global_features: bool,
+    /// Override pose-hint visual-feature covariance during headless replay.
+    #[arg(long)]
+    pose_hint_noise: Option<f64>,
+    /// Override minimum pose-hint features per ingested frame during headless replay.
+    #[arg(long)]
+    pose_hint_min_features: Option<usize>,
+    /// Override weak pose-hint frames required before global recovery is accepted.
+    #[arg(long)]
+    recovery_frames: Option<usize>,
+    /// Override maximum global-recovery translation disagreement in meters.
+    #[arg(long)]
+    recovery_max_distance: Option<f32>,
+    /// Override maximum global-recovery yaw disagreement in degrees.
+    #[arg(long)]
+    recovery_max_angle_deg: Option<f32>,
+    /// Override global localization metric RMS threshold during headless replay.
+    #[arg(long)]
+    global_rms_threshold: Option<f32>,
+    /// Override global localization minimum inliers during headless replay.
+    #[arg(long)]
+    global_min_inliers: Option<usize>,
+    /// Override pose-hint healthy RMSE threshold during headless replay.
+    #[arg(long)]
+    pose_hint_healthy_rmse: Option<f32>,
+    /// Override pose-hint second-best projection margin during headless replay.
+    #[arg(long)]
+    pose_hint_margin: Option<f32>,
     /// Print visual-odometry compensation diagnostics without opening the UI.
     #[arg(long)]
     vo_diagnostics: bool,
@@ -70,7 +115,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if arguments.resolve_summary {
-        print_resolve_summary(&recording)?;
+        print_resolve_summary(&recording, replay_parameters(&arguments))?;
         return Ok(());
     }
     if arguments.vo_diagnostics {
@@ -115,6 +160,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn replay_parameters(arguments: &Arguments) -> ReplayParameters {
+    let mut parameters = ReplayParameters {
+        recompute_global_features: arguments.recompute_global_features,
+        ..ReplayParameters::default()
+    };
+    if let Some(vo_covariance) = arguments.vo_covariance {
+        parameters.override_visual_odometry_covariance = true;
+        parameters.visual_odometry_covariance = vo_covariance;
+    }
+    parameters.max_visual_odometry_translation = arguments.max_vo_translation;
+    parameters.max_visual_odometry_rotation = arguments.max_vo_rotation_deg.map(f32::to_radians);
+    if arguments.no_visual_odometry {
+        parameters.include_visual_odometry = false;
+    }
+    if arguments.no_global_features {
+        parameters.include_global_features = false;
+    }
+    if let Some(pose_hint_noise) = arguments.pose_hint_noise {
+        parameters.pose_hint_visual_feature_noise_variance = pose_hint_noise;
+    }
+    if let Some(pose_hint_min_features) = arguments.pose_hint_min_features {
+        parameters.pose_hint_visual_min_features_per_frame = pose_hint_min_features;
+    }
+    if let Some(recovery_frames) = arguments.recovery_frames {
+        parameters.pose_hint.recovery_frames = recovery_frames.max(1);
+    }
+    if let Some(recovery_max_distance) = arguments.recovery_max_distance {
+        parameters.pose_hint.recovery_max_pose_distance = recovery_max_distance;
+    }
+    if let Some(recovery_max_angle_deg) = arguments.recovery_max_angle_deg {
+        parameters.pose_hint.recovery_max_pose_angle = recovery_max_angle_deg.to_radians();
+    }
+    if let Some(global_rms_threshold) = arguments.global_rms_threshold {
+        parameters.global_localizer.rms_threshold = global_rms_threshold;
+    }
+    if let Some(global_min_inliers) = arguments.global_min_inliers {
+        parameters.global_localizer.min_inliers = global_min_inliers;
+    }
+    if let Some(pose_hint_healthy_rmse) = arguments.pose_hint_healthy_rmse {
+        parameters.pose_hint.healthy_max_rmse_px = pose_hint_healthy_rmse;
+    }
+    if let Some(pose_hint_margin) = arguments.pose_hint_margin {
+        parameters.pose_hint.second_best_reprojection_margin_px = pose_hint_margin;
+    }
+    parameters
+}
+
 fn print_regenerated_vo_diagnostics(
     recording: &Recording,
     model_path: &PathBuf,
@@ -146,14 +238,19 @@ fn print_resolve_regenerated_vo_summary(
         trajectory_metrics(&replay.trajectory())
     );
     println!(
-        "replay_stats vo_received={} vo_ingested={} vo_dropped_invalid={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} solve_samples={}",
+        "replay_stats vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
         replay.stats.vo_received,
         replay.stats.vo_ingested,
         replay.stats.vo_dropped_invalid,
+        replay.stats.vo_dropped_gated,
         replay.stats.vo_skipped_stale_camera_matrix,
         replay.stats.global_candidates,
         replay.stats.global_frames_ingested,
         replay.stats.global_associations_ingested,
+        replay.stats.global_unique_frames_ingested,
+        replay.stats.global_unique_associations_ingested,
+        replay.stats.pose_hint_frames_ingested,
+        replay.stats.pose_hint_associations_ingested,
         replay.samples.len(),
     );
     Ok(())
@@ -671,8 +768,11 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
     values[index]
 }
 
-fn print_resolve_summary(recording: &mcap_recording::Recording) -> Result<()> {
-    let replay = resolve_recording(recording, ReplayParameters::default())?;
+fn print_resolve_summary(
+    recording: &mcap_recording::Recording,
+    parameters: ReplayParameters,
+) -> Result<()> {
+    let replay = resolve_recording(recording, parameters)?;
     println!(
         "recorded_localization {}",
         trajectory_metrics(&recording.recorded_localization_trajectory())
@@ -682,14 +782,19 @@ fn print_resolve_summary(recording: &mcap_recording::Recording) -> Result<()> {
         trajectory_metrics(&replay.trajectory())
     );
     println!(
-        "replay_stats vo_received={} vo_ingested={} vo_dropped_invalid={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} solve_samples={}",
+        "replay_stats vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
         replay.stats.vo_received,
         replay.stats.vo_ingested,
         replay.stats.vo_dropped_invalid,
+        replay.stats.vo_dropped_gated,
         replay.stats.vo_skipped_stale_camera_matrix,
         replay.stats.global_candidates,
         replay.stats.global_frames_ingested,
         replay.stats.global_associations_ingested,
+        replay.stats.global_unique_frames_ingested,
+        replay.stats.global_unique_associations_ingested,
+        replay.stats.pose_hint_frames_ingested,
+        replay.stats.pose_hint_associations_ingested,
         replay.samples.len(),
     );
     Ok(())

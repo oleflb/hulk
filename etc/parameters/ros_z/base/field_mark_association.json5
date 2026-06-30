@@ -15,8 +15,12 @@
   pose_hint: {
     enabled: true,
     max_pose_age: { nanos: 250000000, secs: 0 },
-    association_gate: 0.35,
-    second_best_margin: 0.25,
     max_reprojection_error_px: 80.0,
+    second_best_reprojection_margin_px: 15.0,
+    healthy_min_inliers: 3,
+    healthy_max_rmse_px: 10.0,
+    recovery_frames: 20,
+    recovery_max_pose_distance: 0.2,
+    recovery_max_pose_angle: 0.08726646,
   },
 }

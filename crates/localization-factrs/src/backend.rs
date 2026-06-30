@@ -47,6 +47,8 @@ use tokio::sync::{
 
 const INITIAL_CAMERA_INTRINSICS_PRIOR_SIGMA: f64 = 1e-3;
 const INITIAL_POSE_PRIOR_SIGMA: f64 = 10.0;
+const GLOBAL_VISUAL_HUBER_THRESHOLD: f64 = 2.0;
+const VISUAL_ODOMETRY_HUBER_THRESHOLD: f64 = 2.0;
 // Empty intervals are inserted only to keep graph components connected across
 // dropped recording data. They use zero-start-velocity GP priors so stale
 // pre-gap velocity is not treated as measured ballistic motion.
@@ -71,7 +73,7 @@ pub struct BackendConfiguration {
     pub gyroscope_process_noise: Matrix3<f64>,
     pub accelerometer_process_noise: Matrix3<f64>,
     pub gravity: Vector3<f64>,
-    
+
     pub roll_pitch_yaw_noise: Matrix3<f64>,
     pub visual_feature_noise: Matrix2<f64>,
     pub pose_hint_visual_feature_noise: Matrix2<f64>,
@@ -582,7 +584,9 @@ impl VinsBackend {
                     group.measurements,
                     self.config.visual_feature_noise,
                 );
-                let factor = FactorBuilder::new(residual, keys).build();
+                let factor = FactorBuilder::new(residual, keys)
+                    .robust(Huber::new(GLOBAL_VISUAL_HUBER_THRESHOLD))
+                    .build();
 
                 graph.add_factor(factor);
             }
@@ -688,7 +692,9 @@ impl VinsBackend {
                     self.config.visual_odometry_noise,
                     self.config.knot_spacing.as_secs_f64(),
                 );
-                let factor = FactorBuilder::new(residual, keys).build();
+                let factor = FactorBuilder::new(residual, keys)
+                    .robust(Huber::new(VISUAL_ODOMETRY_HUBER_THRESHOLD))
+                    .build();
 
                 graph.add_factor(factor);
             }
@@ -731,7 +737,9 @@ impl VinsBackend {
                     self.config.visual_odometry_noise,
                     self.config.knot_spacing.as_secs_f64(),
                 );
-                let factor = FactorBuilder::new(residual, keys).build();
+                let factor = FactorBuilder::new(residual, keys)
+                    .robust(Huber::new(VISUAL_ODOMETRY_HUBER_THRESHOLD))
+                    .build();
 
                 graph.add_factor(factor);
             }
@@ -1415,6 +1423,7 @@ mod tests {
             pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
+            gravity: Vector3::new(0.0, 0.0, 9.81),
         }
     }
 

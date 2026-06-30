@@ -32,6 +32,7 @@ fn imu_on_spline() {
             pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
+            gravity: Vector3::new(0.0, 0.0, 9.81),
         },
         InitialState::default(),
     );

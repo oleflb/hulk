@@ -11,8 +11,8 @@ use color_eyre::Result;
 use coordinate_systems::{Field, Robot};
 use field_mark_association::{
     FieldMarkAssociation, FieldMarkAssociationKind, FieldMarkAssociationParameters,
-    FieldMarkAssociations, GlobalLocalizationDebugStatus, GlobalLocalizerParameters,
-    PoseHintAssociationParameters, associate_visual_features, find_detected_visual_features,
+    FieldMarkAssociationState, FieldMarkAssociations, GlobalLocalizationDebugStatus,
+    GlobalLocalizerParameters, PoseHintAssociationParameters, find_detected_visual_features,
 };
 use linear_algebra::IntoTransform;
 use localization_3d::{
@@ -51,6 +51,8 @@ pub struct ReplayParameters {
     pub pose_hint_visual_min_features_per_frame: usize,
     pub visual_odometry_covariance: f64,
     pub override_visual_odometry_covariance: bool,
+    pub max_visual_odometry_translation: Option<f32>,
+    pub max_visual_odometry_rotation: Option<f32>,
     pub include_visual_odometry: bool,
     pub include_global_features: bool,
     pub include_imu: bool,
@@ -99,6 +101,8 @@ impl Default for ReplayParameters {
                 DEFAULT_POSE_HINT_VISUAL_MIN_FEATURES_PER_FRAME,
             visual_odometry_covariance: 1.0e-2,
             override_visual_odometry_covariance: false,
+            max_visual_odometry_translation: None,
+            max_visual_odometry_rotation: None,
             include_visual_odometry: true,
             include_global_features: true,
             include_imu: true,
@@ -179,6 +183,7 @@ pub struct ReplayStats {
     pub vo_received: usize,
     pub vo_ingested: usize,
     pub vo_dropped_invalid: usize,
+    pub vo_dropped_gated: usize,
     pub vo_skipped_missing_camera_matrix: usize,
     pub vo_skipped_stale_camera_matrix: usize,
     pub global_frames: usize,
@@ -188,6 +193,10 @@ pub struct ReplayStats {
     pub global_unique_modulo_symmetry: usize,
     pub global_frames_ingested: usize,
     pub global_associations_ingested: usize,
+    pub global_unique_frames_ingested: usize,
+    pub global_unique_associations_ingested: usize,
+    pub pose_hint_frames_ingested: usize,
+    pub pose_hint_associations_ingested: usize,
 }
 
 pub fn spawn_resolve(
@@ -250,6 +259,7 @@ fn run_resolve(
         .unwrap_or(FieldDimensions::SPL_2025);
     let mut camera_matrices = OnlineCameraMatrices::default();
     let mut vo_timestamps = VisualOdometryTimestampTracker::default();
+    let mut association_state = FieldMarkAssociationState::default();
     let mut stats = ReplayStats::default();
     let mut samples = Vec::new();
     let mut has_pending_measurements = false;
@@ -301,6 +311,8 @@ fn run_resolve(
                     &event,
                     &visual_odometry.delta,
                     parameters.timestamp_mode,
+                    parameters.max_visual_odometry_translation,
+                    parameters.max_visual_odometry_rotation,
                     &mut vo_timestamps,
                     &camera_matrices,
                     &mut frontend,
@@ -333,6 +345,8 @@ fn run_resolve(
                         event,
                         delta,
                         parameters.timestamp_mode,
+                        parameters.max_visual_odometry_translation,
+                        parameters.max_visual_odometry_rotation,
                         &mut vo_timestamps,
                         &camera_matrices,
                         &mut frontend,
@@ -362,6 +376,7 @@ fn run_resolve(
                         frame,
                         &camera_matrices,
                         &mut frontend,
+                        &mut association_state,
                         &parameters,
                         &field_dimensions,
                         &mut stats,
@@ -450,6 +465,8 @@ fn ingest_vo_event(
     event: &RecordedEvent,
     delta: &VisualOdometryDelta,
     timestamp_mode: TimestampMode,
+    max_visual_odometry_translation: Option<f32>,
+    max_visual_odometry_rotation: Option<f32>,
     vo_timestamps: &mut VisualOdometryTimestampTracker,
     camera_matrices: &OnlineCameraMatrices,
     frontend: &mut VinsFrontend,
@@ -484,6 +501,17 @@ fn ingest_vo_event(
         return Ok(());
     }
 
+    if visual_odometry_is_gated(
+        delta,
+        &previous_camera_matrix.matrix.matrix.inner,
+        &current_camera_matrix.matrix.matrix.inner,
+        max_visual_odometry_translation,
+        max_visual_odometry_rotation,
+    ) {
+        stats.vo_dropped_gated += 1;
+        return Ok(());
+    }
+
     let mut delta = delta.clone();
     delta.previous_time = Time::from_wallclock(previous_time);
     delta.current_time = Time::from_wallclock(current_time);
@@ -496,6 +524,28 @@ fn ingest_vo_event(
     stats.vo_ingested += 1;
     *has_pending_measurements = true;
     Ok(())
+}
+
+fn visual_odometry_is_gated(
+    delta: &VisualOdometryDelta,
+    previous_camera_matrix: &CameraMatrix,
+    current_camera_matrix: &CameraMatrix,
+    max_translation: Option<f32>,
+    max_rotation: Option<f32>,
+) -> bool {
+    if max_translation.is_none() && max_rotation.is_none() {
+        return false;
+    }
+
+    let previous_robot_to_left_camera = robot_to_camera(previous_camera_matrix);
+    let current_robot_to_left_camera = robot_to_camera(current_camera_matrix);
+    let current_robot_to_previous_robot = previous_robot_to_left_camera.inverse()
+        * delta.current_left_camera_to_previous_left_camera
+        * current_robot_to_left_camera;
+
+    max_translation
+        .is_some_and(|max| current_robot_to_previous_robot.translation.vector.norm() > max)
+        || max_rotation.is_some_and(|max| current_robot_to_previous_robot.rotation.angle() > max)
 }
 
 fn ingest_recorded_field_mark_associations(
@@ -518,6 +568,7 @@ fn ingest_recorded_field_mark_associations(
 
     stats.global_frames_ingested += 1;
     stats.global_associations_ingested += associations.len();
+    record_ingested_association_stats(stats, &associations);
     let associations = associations
         .into_iter()
         .map(|association| VisualReprojectionAssociation {
@@ -569,6 +620,7 @@ fn ingest_recomputed_global_features(
     frame: &crate::mcap_recording::DetectedObjectsFrame,
     camera_matrices: &OnlineCameraMatrices,
     frontend: &mut VinsFrontend,
+    association_state: &mut FieldMarkAssociationState,
     parameters: &ReplayParameters,
     field_dimensions: &FieldDimensions,
     stats: &mut ReplayStats,
@@ -614,12 +666,13 @@ fn ingest_recomputed_global_features(
         global_localizer: parameters.global_localizer,
         pose_hint: parameters.pose_hint,
     };
-    let localization = associate_visual_features(
+    let localization = association_state.associate_visual_features_with_debug(
         &visual_features,
         &camera_matrix.matrix.inner,
         field_dimensions,
         pose_hint,
         &association_parameters,
+        true,
     );
     match localization.debug.as_ref().map(|debug| debug.status) {
         None => stats.global_none += 1,
@@ -638,6 +691,7 @@ fn ingest_recomputed_global_features(
     if !associations.is_empty() {
         stats.global_frames_ingested += 1;
         stats.global_associations_ingested += associations.len();
+        record_ingested_association_stats(stats, &associations);
         let associations =
             associations
                 .into_iter()
@@ -661,6 +715,29 @@ fn ingest_recomputed_global_features(
         *has_pending_measurements = true;
     }
     Ok(())
+}
+
+fn record_ingested_association_stats(
+    stats: &mut ReplayStats,
+    associations: &[FieldMarkAssociation],
+) {
+    let global_unique_count = associations
+        .iter()
+        .filter(|association| association.kind == FieldMarkAssociationKind::GlobalUnique)
+        .count();
+    let pose_hint_count = associations
+        .iter()
+        .filter(|association| association.kind == FieldMarkAssociationKind::PoseHint)
+        .count();
+
+    if global_unique_count > 0 {
+        stats.global_unique_frames_ingested += 1;
+        stats.global_unique_associations_ingested += global_unique_count;
+    }
+    if pose_hint_count > 0 {
+        stats.pose_hint_frames_ingested += 1;
+        stats.pose_hint_associations_ingested += pose_hint_count;
+    }
 }
 
 fn solve_and_record(

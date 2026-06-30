@@ -752,27 +752,61 @@ impl LocalizationMcapVisualizerApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("association gate m");
-                    ui.add(
-                        DragValue::new(&mut self.parameters.pose_hint.association_gate)
-                            .speed(0.01)
-                            .range(0.01..=2.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("second-best margin m");
-                    ui.add(
-                        DragValue::new(&mut self.parameters.pose_hint.second_best_margin)
-                            .speed(0.01)
-                            .range(0.0..=2.0),
-                    );
-                });
-                ui.horizontal(|ui| {
                     ui.label("reprojection gate px");
                     ui.add(
                         DragValue::new(&mut self.parameters.pose_hint.max_reprojection_error_px)
                             .speed(1.0)
                             .range(1.0..=500.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("second-best margin px");
+                    ui.add(
+                        DragValue::new(
+                            &mut self.parameters.pose_hint.second_best_reprojection_margin_px,
+                        )
+                        .speed(1.0)
+                        .range(0.0..=200.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("healthy min inliers");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.healthy_min_inliers)
+                            .speed(1.0)
+                            .range(1..=20),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("healthy RMSE px");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.healthy_max_rmse_px)
+                            .speed(1.0)
+                            .range(1.0..=200.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("recovery frames");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.recovery_frames)
+                            .speed(1.0)
+                            .range(1..=30),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("recovery distance m");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.recovery_max_pose_distance)
+                            .speed(0.05)
+                            .range(0.05..=5.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("recovery yaw rad");
+                    ui.add(
+                        DragValue::new(&mut self.parameters.pose_hint.recovery_max_pose_angle)
+                            .speed(0.01)
+                            .range(0.01..=std::f32::consts::PI),
                     );
                 });
                 ui.separator();

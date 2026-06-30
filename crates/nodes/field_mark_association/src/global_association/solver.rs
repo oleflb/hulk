@@ -20,7 +20,7 @@ use super::{
     GlobalAssociationConfig, GlobalLocalizationDebugAssociation, GlobalLocalizationDebugDetection,
     GlobalLocalizationDebugProjection, GlobalLocalizationDetailedDebug,
     GlobalLocalizationDetailedStatus, GlobalLocalizationScore, PoseHintAssociationConfig,
-    VisualFeatureClass,
+    PoseHintAssociationResult, VisualFeatureClass,
     map::{LandmarkMap, MapTriplet, MapTripletBin, triplet_bin},
 };
 
@@ -68,12 +68,12 @@ pub(crate) fn associate_with_pose_hint(
     input: GlobalLocalizationInput<'_>,
     global_config: GlobalAssociationConfig,
     pose_config: PoseHintAssociationConfig,
-) -> Vec<FeatureAssociation> {
+) -> PoseHintAssociationResult {
     if !pose_config.enabled || !valid_intrinsic(input.camera_intrinsic) {
-        return Vec::new();
+        return PoseHintAssociationResult::default();
     }
     let Some(robot_to_field) = input.pose_hint else {
-        return Vec::new();
+        return PoseHintAssociationResult::default();
     };
 
     let map = cached_landmark_map(input.field_dimensions, global_config.min_map_baseline);
@@ -83,7 +83,7 @@ pub(crate) fn associate_with_pose_hint(
     if !camera_origin.iter().all(|value| value.is_finite())
         || camera_origin.z.abs() <= HORIZON_EPSILON
     {
-        return Vec::new();
+        return PoseHintAssociationResult::default();
     }
 
     let detection_set = detection_points(
@@ -93,60 +93,42 @@ pub(crate) fn associate_with_pose_hint(
         input.camera_intrinsic,
         global_config,
     );
-    let ground_to_field = robot_to_field * input.ground_to_robot;
     let field_to_camera =
         field_to_camera_from_robot_to_field(input.robot_to_camera, robot_to_field);
-    let mut options = detection_set
-        .detections
-        .iter()
-        .enumerate()
-        .filter_map(|(detection_index, detection)| {
-            pose_hint_option(
-                &map,
-                detection_index,
-                detection,
-                ground_to_field,
-                field_to_camera,
-                input.camera_intrinsic,
-                pose_config,
-            )
-        })
-        .collect::<Vec<_>>();
 
-    options.sort_by(|left, right| {
-        left.residual
-            .total_cmp(&right.residual)
-            .then_with(|| right.confidence.total_cmp(&left.confidence))
-            .then_with(|| left.detection_index.cmp(&right.detection_index))
-            .then_with(|| left.landmark_id.cmp(&right.landmark_id))
-    });
-
-    let mut used_detections = HashSet::new();
-    let mut used_landmarks = HashSet::new();
     let mut associations = Vec::new();
-    for option in options {
-        if used_detections.contains(&option.detection_index)
-            || used_landmarks.contains(&option.landmark_id)
-        {
-            continue;
+    let mut residuals = Vec::new();
+    for class_index in 0..CLASS_COUNT {
+        let class_associations = pose_hint_assignments_for_class(
+            &map,
+            &detection_set.detections,
+            field_to_camera,
+            input.camera_intrinsic,
+            pose_config,
+            class_index,
+        );
+        for option in class_associations {
+            let Some(detection) = detection_set.detections.get(option.detection_index) else {
+                continue;
+            };
+            let Some(landmark) = map.landmarks.get(option.landmark_id) else {
+                continue;
+            };
+            residuals.push(option.reprojection_error_px);
+            associations.push(FeatureAssociation {
+                detection_id: detection.id,
+                landmark_id: landmark.id,
+                detection: detection.pixel,
+                field_point: landmark.xy,
+            });
         }
-        used_detections.insert(option.detection_index);
-        used_landmarks.insert(option.landmark_id);
-        let Some(detection) = detection_set.detections.get(option.detection_index) else {
-            continue;
-        };
-        let Some(landmark) = map.landmarks.get(option.landmark_id) else {
-            continue;
-        };
-        associations.push(FeatureAssociation {
-            detection_id: detection.id,
-            landmark_id: landmark.id,
-            detection: detection.pixel,
-            field_point: landmark.xy,
-        });
     }
 
-    associations
+    let reprojection_rmse = reprojection_rmse(&residuals);
+    PoseHintAssociationResult {
+        associations,
+        reprojection_rmse,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -154,55 +136,139 @@ struct PoseHintOption {
     detection_index: usize,
     landmark_id: usize,
     confidence: f32,
-    residual: f32,
+    reprojection_error_px: f32,
 }
 
-fn pose_hint_option(
+fn pose_hint_assignments_for_class(
     map: &LandmarkMap,
-    detection_index: usize,
-    detection: &DetectionPoint,
-    ground_to_field: Isometry3<Ground, Field>,
+    detections: &[DetectionPoint],
     field_to_camera: Isometry3<Field, Camera>,
     intrinsic: Intrinsic,
     config: PoseHintAssociationConfig,
-) -> Option<PoseHintOption> {
-    let predicted = ground_to_field * detection.ground.extend(0.0);
-    let predicted = point![<Field>, predicted.x(), predicted.y()];
+    class_index: usize,
+) -> Vec<PoseHintOption> {
+    let landmark_ids = &map.landmarks_by_class[class_index];
+    if landmark_ids.is_empty() {
+        return Vec::new();
+    }
 
-    let mut best: Option<(usize, f32)> = None;
-    let mut second_best = f32::INFINITY;
-    for &landmark_id in &map.landmarks_by_class[detection.class.index()] {
-        let landmark = map.landmarks.get(landmark_id)?;
-        let residual = (landmark.xy - predicted).inner.norm();
-        if !residual.is_finite() {
+    let mut row_ranges = Vec::new();
+    let mut options = Vec::new();
+    for (detection_index, detection) in detections
+        .iter()
+        .enumerate()
+        .filter(|(_, detection)| detection.class.index() == class_index)
+    {
+        let detection_options = pose_hint_options_for_detection(
+            map,
+            detection_index,
+            detection,
+            field_to_camera,
+            intrinsic,
+            config,
+        );
+        if detection_options.is_empty() {
             continue;
         }
-        if best.is_none_or(|(_, best_residual)| residual < best_residual) {
-            if let Some((_, best_residual)) = best {
-                second_best = best_residual;
-            }
-            best = Some((landmark_id, residual));
-        } else if residual < second_best {
-            second_best = residual;
+        let row_start = options.len();
+        options.extend(detection_options);
+        row_ranges.push(row_start..options.len());
+    }
+    if row_ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(zero) = NotNan::new(0.0) else {
+        return Vec::new();
+    };
+    let mut costs = Array2::from_elem((row_ranges.len(), landmark_ids.len()), zero);
+    for (row, range) in row_ranges.iter().enumerate() {
+        for option in &options[range.clone()] {
+            let Some(column) = landmark_ids
+                .iter()
+                .position(|landmark_id| *landmark_id == option.landmark_id)
+            else {
+                continue;
+            };
+            let value = (config.max_reprojection_error_px - option.reprojection_error_px).max(0.0)
+                + option.confidence * 1.0e-3;
+            let Ok(cost) = NotNan::new(value) else {
+                continue;
+            };
+            costs[(row, column)] = cost;
         }
     }
 
-    let (landmark_id, residual) = best?;
-    if residual > config.association_gate || second_best - residual < config.second_best_margin {
-        return None;
+    AssignmentProblem::from_costs(costs)
+        .solve()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(row, assignment)| {
+            let assignment = assignment?;
+            if assignment.cost <= 0.0 {
+                return None;
+            }
+            options[row_ranges[row].clone()]
+                .iter()
+                .find(|option| option.landmark_id == landmark_ids[assignment.to])
+                .copied()
+        })
+        .collect()
+}
+
+fn pose_hint_options_for_detection(
+    map: &LandmarkMap,
+    detection_index: usize,
+    detection: &DetectionPoint,
+    field_to_camera: Isometry3<Field, Camera>,
+    intrinsic: Intrinsic,
+    config: PoseHintAssociationConfig,
+) -> Vec<PoseHintOption> {
+    let mut candidates = map.landmarks_by_class[detection.class.index()]
+        .iter()
+        .filter_map(|&landmark_id| {
+            let landmark = map.landmarks.get(landmark_id)?;
+            let projected = project_field_point(field_to_camera, intrinsic, landmark.xy)?;
+            let reprojection_error_px = (projected - detection.pixel).inner.norm();
+            reprojection_error_px
+                .is_finite()
+                .then_some((landmark_id, reprojection_error_px))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
+
+    let Some((best_landmark_id, best_error)) = candidates.first().copied() else {
+        return Vec::new();
+    };
+    if best_error > config.max_reprojection_error_px {
+        return Vec::new();
+    }
+    if let Some((_, second_best_error)) = candidates.get(1).copied()
+        && second_best_error - best_error < config.second_best_reprojection_margin_px
+    {
+        return Vec::new();
     }
 
-    let landmark = map.landmarks.get(landmark_id)?;
-    let projected = project_field_point(field_to_camera, intrinsic, landmark.xy)?;
-    let reprojection_error = (projected - detection.pixel).inner.norm();
-    if !reprojection_error.is_finite() || reprojection_error > config.max_reprojection_error_px {
-        return None;
-    }
+    candidates
+        .into_iter()
+        .take_while(|(_, error)| *error <= config.max_reprojection_error_px)
+        .map(|(landmark_id, reprojection_error_px)| PoseHintOption {
+            detection_index,
+            landmark_id,
+            confidence: detection.confidence,
+            reprojection_error_px,
+        })
+        .filter(|option| option.landmark_id == best_landmark_id)
+        .collect()
+}
 
-    Some(PoseHintOption {
-        detection_index,
-        landmark_id,
-        confidence: detection.confidence,
-        residual,
+fn reprojection_rmse(residuals: &[f32]) -> Option<f32> {
+    (!residuals.is_empty()).then(|| {
+        (residuals
+            .iter()
+            .map(|residual| residual.powi(2))
+            .sum::<f32>()
+            / residuals.len() as f32)
+            .sqrt()
     })
 }

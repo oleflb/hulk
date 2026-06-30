@@ -9,6 +9,7 @@ use color_eyre::{Result, eyre::Context as _};
 use coordinate_systems::{Camera, Field, Pixel, Robot};
 use global_association::{
     FeatureAssociation, GlobalAssociator, GlobalLocalizationInput, GlobalLocalizationResult,
+    PoseHintAssociationResult,
 };
 use linear_algebra::{Isometry3, Point2, Point3, point};
 use projection::camera_matrix::CameraMatrix;
@@ -83,6 +84,20 @@ pub struct GlobalVisualLocalization {
     pub associations: Vec<FieldMarkAssociation>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FieldMarkAssociationState {
+    weak_pose_hint_frames: usize,
+    pending_global_recovery: Option<GlobalRecoveryCandidate>,
+    has_global_lock: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GlobalRecoveryCandidate {
+    robot_to_field: Isometry3<Robot, Field>,
+    associations: Vec<FieldMarkAssociation>,
+    consecutive_frames: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
 /// Published debug data for a successful global localization hypothesis.
 pub struct GlobalLocalizationDebug {
@@ -143,7 +158,11 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let localization_cache = node
-        .create_cache::<Option<Isometry3<Field, Robot>>>("localization", 1)?
+        .create_cache::<TimeWrapper<Option<Isometry3<Field, Robot>>>>(
+            "localization/timestamped",
+            128,
+        )?
+        .with_stamp(|message| message.time)
         .build()
         .await?;
 
@@ -164,6 +183,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .publisher::<Option<GlobalLocalizationDebug>>("debug/global_localization")?
         .build()
         .await?;
+    let mut association_state = FieldMarkAssociationState::default();
 
     loop {
         let item = detected_objects.recv().await?;
@@ -184,35 +204,45 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             let robot_to_camera = robot_to_camera(&camera_matrix);
             let field_dimensions = *field_dimensions.as_ref();
             let pose_hint = localization_cache
-                .get_latest()
-                .zip(localization_cache.latest_stamp())
-                .and_then(|(localization, stamp)| {
+                .get_nearest_with_stamp(image_time)
+                .and_then(|(stamp, localization)| {
                     (time_distance(stamp, image_time) <= parameters.pose_hint.max_pose_age)
-                        .then(|| localization.as_ref().map(|pose| pose.clone().inverse()))
+                        .then(|| {
+                            localization
+                                .inner
+                                .as_ref()
+                                .map(|pose| pose.clone().inverse())
+                        })
                         .flatten()
                 });
             let include_debug = global_localization_publisher.has_subscribers();
 
-            let localization = tokio::task::spawn_blocking(move || {
+            let mut state = std::mem::take(&mut association_state);
+            let (state, localization) = tokio::task::spawn_blocking(move || {
                 let visual_features = find_detected_visual_features(&objects);
                 if visual_features.supported_feature_count() == 0 {
-                    return GlobalVisualLocalization {
-                        debug: None,
-                        associations: Vec::new(),
-                    };
+                    return (
+                        state,
+                        GlobalVisualLocalization {
+                            debug: None,
+                            associations: Vec::new(),
+                        },
+                    );
                 }
 
-                associate_visual_features_with_debug(
+                let localization = state.associate_visual_features_with_debug(
                     &visual_features,
                     &camera_matrix,
                     &field_dimensions,
                     pose_hint,
                     &parameters,
                     include_debug,
-                )
+                );
+                (state, localization)
             })
             .await
             .wrap_err("field mark association task failed")?;
+            association_state = state;
 
             let debug = localization.debug.clone();
             global_localization_publisher
@@ -250,7 +280,7 @@ pub fn associate_visual_features(
     pose_hint: Option<Isometry3<Robot, Field>>,
     parameters: &FieldMarkAssociationParameters,
 ) -> GlobalVisualLocalization {
-    associate_visual_features_with_debug(
+    FieldMarkAssociationState::default().associate_visual_features_with_debug(
         visual_features,
         camera_matrix,
         field_dimensions,
@@ -260,43 +290,156 @@ pub fn associate_visual_features(
     )
 }
 
-fn associate_visual_features_with_debug(
-    visual_features: &DetectedVisualFeatures,
-    camera_matrix: &CameraMatrix,
-    field_dimensions: &FieldDimensions,
-    pose_hint: Option<Isometry3<Robot, Field>>,
-    parameters: &FieldMarkAssociationParameters,
-    include_debug: bool,
-) -> GlobalVisualLocalization {
-    let localizer = GlobalAssociator::new(parameters.global_localizer);
-    let input = GlobalLocalizationInput {
-        visual_features,
-        field_dimensions,
-        ground_to_robot: camera_matrix.ground_to_robot,
-        robot_to_camera: robot_to_camera(camera_matrix),
-        camera_intrinsic: camera_matrix.intrinsics,
-        pose_hint,
-    };
-    let result = localizer.localize(input.clone());
-    let debug = if include_debug {
-        result.as_ref().map(global_localization_debug_from_result)
-    } else {
-        None
-    };
-    let associations = if let Some(associations) = result
-        .as_ref()
-        .and_then(GlobalLocalizationResult::unique_feature_associations)
-    {
-        field_mark_associations(associations.iter(), FieldMarkAssociationKind::GlobalUnique)
-    } else {
-        let associations = localizer.associate_with_pose_hint(input, parameters.pose_hint);
-        field_mark_associations(associations.iter(), FieldMarkAssociationKind::PoseHint)
-    };
+impl FieldMarkAssociationState {
+    /// Associates visual field features while preserving pose-hint health and global recovery state.
+    pub fn associate_visual_features_with_debug(
+        &mut self,
+        visual_features: &DetectedVisualFeatures,
+        camera_matrix: &CameraMatrix,
+        field_dimensions: &FieldDimensions,
+        pose_hint: Option<Isometry3<Robot, Field>>,
+        parameters: &FieldMarkAssociationParameters,
+        include_debug: bool,
+    ) -> GlobalVisualLocalization {
+        let localizer = GlobalAssociator::new(parameters.global_localizer);
+        let input = GlobalLocalizationInput {
+            visual_features,
+            field_dimensions,
+            ground_to_robot: camera_matrix.ground_to_robot,
+            robot_to_camera: robot_to_camera(camera_matrix),
+            camera_intrinsic: camera_matrix.intrinsics,
+            pose_hint,
+        };
 
-    GlobalVisualLocalization {
-        debug,
-        associations,
+        let pose_hint_result =
+            localizer.associate_with_pose_hint(input.clone(), parameters.pose_hint);
+        if self.has_global_lock && pose_hint_result.is_healthy(parameters.pose_hint) {
+            self.reset_recovery();
+            return GlobalVisualLocalization {
+                debug: None,
+                associations: pose_hint_field_mark_associations(&pose_hint_result),
+            };
+        }
+
+        self.note_weak_pose_hint_frame();
+        let result = localizer.localize(input);
+        let debug = if include_debug {
+            result.as_ref().map(global_localization_debug_from_result)
+        } else {
+            None
+        };
+        let associations =
+            self.global_recovery_associations(result.as_ref(), pose_hint, parameters);
+
+        GlobalVisualLocalization {
+            debug,
+            associations,
+        }
     }
+
+    fn note_weak_pose_hint_frame(&mut self) {
+        self.weak_pose_hint_frames = self.weak_pose_hint_frames.saturating_add(1);
+        self.has_global_lock = false;
+    }
+
+    fn reset_recovery(&mut self) {
+        self.weak_pose_hint_frames = 0;
+        self.pending_global_recovery = None;
+    }
+
+    fn global_recovery_associations(
+        &mut self,
+        result: Option<&GlobalLocalizationResult>,
+        pose_hint: Option<Isometry3<Robot, Field>>,
+        parameters: &FieldMarkAssociationParameters,
+    ) -> Vec<FieldMarkAssociation> {
+        if self.weak_pose_hint_frames < parameters.pose_hint.recovery_frames {
+            return Vec::new();
+        }
+        let Some(result) = result else {
+            self.pending_global_recovery = None;
+            return Vec::new();
+        };
+        let Some(associations) = result.unique_feature_associations() else {
+            self.pending_global_recovery = None;
+            return Vec::new();
+        };
+        let robot_to_field = result.associations().robot_to_field;
+        if let Some(pose_hint) = pose_hint {
+            if !poses_agree(robot_to_field, pose_hint, parameters.pose_hint) {
+                self.pending_global_recovery = None;
+                return Vec::new();
+            }
+            self.has_global_lock = true;
+            self.reset_recovery();
+            return field_mark_associations(
+                associations.iter(),
+                FieldMarkAssociationKind::GlobalUnique,
+            );
+        }
+
+        let associations =
+            field_mark_associations(associations.iter(), FieldMarkAssociationKind::GlobalUnique);
+        let consecutive_frames = self
+            .pending_global_recovery
+            .as_ref()
+            .filter(|pending| {
+                poses_agree(robot_to_field, pending.robot_to_field, parameters.pose_hint)
+            })
+            .map_or(1, |pending| pending.consecutive_frames + 1);
+        self.pending_global_recovery = Some(GlobalRecoveryCandidate {
+            robot_to_field,
+            associations: associations.clone(),
+            consecutive_frames,
+        });
+        if consecutive_frames >= parameters.pose_hint.recovery_frames {
+            let associations = self
+                .pending_global_recovery
+                .take()
+                .map(|pending| pending.associations)
+                .unwrap_or_default();
+            self.has_global_lock = true;
+            self.weak_pose_hint_frames = 0;
+            associations
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn pose_hint_field_mark_associations(
+    result: &PoseHintAssociationResult,
+) -> Vec<FieldMarkAssociation> {
+    field_mark_associations(
+        result.associations.iter(),
+        FieldMarkAssociationKind::PoseHint,
+    )
+}
+
+fn poses_agree(
+    left: Isometry3<Robot, Field>,
+    right: Isometry3<Robot, Field>,
+    config: PoseHintAssociationParameters,
+) -> bool {
+    let translation_delta = left.inner.translation.vector - right.inner.translation.vector;
+    let translation_distance =
+        nalgebra::Vector2::new(translation_delta.x, translation_delta.y).norm();
+    let yaw_distance = yaw_difference(left, right).abs();
+    translation_distance <= config.recovery_max_pose_distance
+        && yaw_distance <= config.recovery_max_pose_angle
+}
+
+fn yaw_difference(left: Isometry3<Robot, Field>, right: Isometry3<Robot, Field>) -> f32 {
+    let (_, _, left_yaw) = left.inner.rotation.euler_angles();
+    let (_, _, right_yaw) = right.inner.rotation.euler_angles();
+    let mut difference = left_yaw - right_yaw;
+    while difference > std::f32::consts::PI {
+        difference -= std::f32::consts::TAU;
+    }
+    while difference < -std::f32::consts::PI {
+        difference += std::f32::consts::TAU;
+    }
+    difference
 }
 
 /// Runs global localization and returns debug data plus backend-safe associations.

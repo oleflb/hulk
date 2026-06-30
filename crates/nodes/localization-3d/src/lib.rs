@@ -197,7 +197,7 @@ fn backend_configuration_with_pose_hint(
             * pose_hint_visual_feature_noise_variance,
         pose_hint_visual_huber_threshold,
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
-        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-4,
+        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-2,
         foot_ground_sigma: 1e-2,
         gravity: Vector3::new(0.0, 0.0, 9.81),
     }
@@ -258,6 +258,10 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 
     let localization_publisher = node
         .publisher::<Option<Isometry3<Field, Robot>>>("localization")?
+        .build()
+        .await?;
+    let timestamped_localization_publisher = node
+        .publisher::<TimeWrapper<Option<Isometry3<Field, Robot>>>>("localization/timestamped")?
         .build()
         .await?;
     let calibrated_intrinsics_publisher = node
@@ -337,6 +341,12 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 ) {
                     let localization = Some(transform);
                     localization_publisher.publish(&localization).await?;
+                    timestamped_localization_publisher
+                        .publish(&TimeWrapper {
+                            time: visual_odometer.time,
+                            inner: localization,
+                        })
+                        .await?;
                 }
             }
             robot_kinematics = robot_kinematics_subscriber.recv() => {
@@ -351,6 +361,20 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             result = frontend.wait_for_optimization_result() => {
                 result?;
                 let result = frontend.last_optimization_result();
+                let timestamped_backend_transform = result.as_ref().map(|result| {
+                    let backend_localization = localization_transform_from_backend_pose(&result.transform);
+                    if let Some(camera_matrix) = fresh_camera_matrix(
+                        &camera_matrix_cache,
+                        Time::from_wallclock(result.time),
+                    ) {
+                        constrain_localization_to_ground(
+                            backend_localization,
+                            &camera_matrix.inner.ground_to_robot,
+                        )
+                    } else {
+                        backend_localization
+                    }
+                });
                 let transform = result.as_ref().map(|result| {
                     live_localization.reset(result, &visual_odometer_cache, &camera_matrix_cache);
                     live_localization
@@ -373,6 +397,14 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 });
 
                 localization_publisher.publish(&transform).await?;
+                if let Some(result) = result.as_ref() {
+                    timestamped_localization_publisher
+                        .publish(&TimeWrapper {
+                            time: Time::from_wallclock(result.time),
+                            inner: timestamped_backend_transform,
+                        })
+                        .await?;
+                }
 
                 if let Some(result) = result {
                     calibrated_intrinsics_publisher

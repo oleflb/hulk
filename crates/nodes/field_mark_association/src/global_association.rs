@@ -74,12 +74,20 @@ pub struct PoseHintAssociationConfig {
     pub enabled: bool,
     /// Maximum accepted age difference between image time and pose hint time.
     pub max_pose_age: Duration,
-    /// Maximum field-space distance from pose-projected detection to same-class landmark.
-    pub association_gate: f32,
-    /// Minimum distance gap between the closest and second-closest same-class landmark.
-    pub second_best_margin: f32,
     /// Maximum reprojection error under the current pose hint.
     pub max_reprojection_error_px: f32,
+    /// Minimum pixel gap between the closest and second-closest same-class landmark projection.
+    pub second_best_reprojection_margin_px: f32,
+    /// Minimum pose-hint associations needed to consider tracking healthy.
+    pub healthy_min_inliers: usize,
+    /// Maximum pose-hint frame reprojection RMSE for healthy tracking.
+    pub healthy_max_rmse_px: f32,
+    /// Weak or missing pose-hint frames before global recovery can be considered.
+    pub recovery_frames: usize,
+    /// Maximum translation difference for accepting a global result against a pose hint.
+    pub recovery_max_pose_distance: f32,
+    /// Maximum yaw difference for accepting a global result against a pose hint.
+    pub recovery_max_pose_angle: f32,
 }
 
 impl Default for PoseHintAssociationConfig {
@@ -87,9 +95,13 @@ impl Default for PoseHintAssociationConfig {
         Self {
             enabled: true,
             max_pose_age: Duration::from_millis(250),
-            association_gate: 0.35,
-            second_best_margin: 0.25,
             max_reprojection_error_px: 80.0,
+            second_best_reprojection_margin_px: 15.0,
+            healthy_min_inliers: 3,
+            healthy_max_rmse_px: 10.0,
+            recovery_frames: 20,
+            recovery_max_pose_distance: 0.2,
+            recovery_max_pose_angle: 5.0_f32.to_radians(),
         }
     }
 }
@@ -100,15 +112,33 @@ impl PoseHintAssociationConfig {
             return Err("pose_hint.max_pose_age must be > 0".to_string());
         }
         validate_positive_f32(
-            self.association_gate,
-            "pose_hint.association_gate must be finite and > 0",
-        )?;
-        if !self.second_best_margin.is_finite() || self.second_best_margin < 0.0 {
-            return Err("pose_hint.second_best_margin must be finite and >= 0".to_string());
-        }
-        validate_positive_f32(
             self.max_reprojection_error_px,
             "pose_hint.max_reprojection_error_px must be finite and > 0",
+        )?;
+        if !self.second_best_reprojection_margin_px.is_finite()
+            || self.second_best_reprojection_margin_px < 0.0
+        {
+            return Err(
+                "pose_hint.second_best_reprojection_margin_px must be finite and >= 0".to_string(),
+            );
+        }
+        if self.healthy_min_inliers == 0 {
+            return Err("pose_hint.healthy_min_inliers must be > 0".to_string());
+        }
+        validate_positive_f32(
+            self.healthy_max_rmse_px,
+            "pose_hint.healthy_max_rmse_px must be finite and > 0",
+        )?;
+        if self.recovery_frames == 0 {
+            return Err("pose_hint.recovery_frames must be > 0".to_string());
+        }
+        validate_positive_f32(
+            self.recovery_max_pose_distance,
+            "pose_hint.recovery_max_pose_distance must be finite and > 0",
+        )?;
+        validate_positive_f32(
+            self.recovery_max_pose_angle,
+            "pose_hint.recovery_max_pose_angle must be finite and > 0",
         )
     }
 }
@@ -206,8 +236,23 @@ impl GlobalAssociator {
         &self,
         input: GlobalLocalizationInput<'_>,
         config: PoseHintAssociationConfig,
-    ) -> Vec<FeatureAssociation> {
+    ) -> PoseHintAssociationResult {
         solver::associate_with_pose_hint(input, self.config, config)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PoseHintAssociationResult {
+    pub associations: Vec<FeatureAssociation>,
+    pub reprojection_rmse: Option<f32>,
+}
+
+impl PoseHintAssociationResult {
+    pub(crate) fn is_healthy(&self, config: PoseHintAssociationConfig) -> bool {
+        self.associations.len() >= config.healthy_min_inliers
+            && self
+                .reprojection_rmse
+                .is_some_and(|rmse| rmse <= config.healthy_max_rmse_px)
     }
 }
 
@@ -452,8 +497,8 @@ mod tests {
             PoseHintAssociationConfig::default(),
         );
 
-        assert_eq!(associations.len(), 1);
-        assert_eq!(associations[0].field_point, penalty_spot);
+        assert_eq!(associations.associations.len(), 1);
+        assert_eq!(associations.associations[0].field_point, penalty_spot);
     }
 
     #[test]
@@ -472,12 +517,12 @@ mod tests {
                 Some(Isometry3::<Robot, Field>::identity()),
             ),
             PoseHintAssociationConfig {
-                association_gate: FieldDimensions::SPL_2025.penalty_marker_distance + 0.1,
+                second_best_reprojection_margin_px: 10_000.0,
                 ..Default::default()
             },
         );
 
-        assert!(associations.is_empty());
+        assert!(associations.associations.is_empty());
     }
 
     #[test]
