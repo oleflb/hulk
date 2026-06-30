@@ -394,6 +394,7 @@ pub struct PresentationTimestampUs(pub u64);
 #[derive(Clone, Copy, Debug)]
 pub struct MipiConfig {
     pub rx_enabled: bool,
+    pub rx_extension: MipiRxExtensionConfig,
     pub lane_count: MipiLaneCount,
     pub data_type: MipiDataType,
     pub frame_rate: FrameRate,
@@ -404,6 +405,11 @@ pub struct MipiConfig {
     pub frame_length: FrameLength,
     pub settle: SettleTime,
     pub channel: ChannelId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MipiRxExtensionConfig {
+    pub nocheck: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -551,10 +557,13 @@ pub struct VseOutputChannelAttr {
     pub frame_rate: FrameRateControl,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct FrameRateControl {
-    pub source: FrameRate,
-    pub target: FrameRate,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameRateControl {
+    Disabled,
+    Fixed {
+        source: FrameRate,
+        target: FrameRate,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -912,6 +921,10 @@ impl CameraConfigStorage {
         mipi.rx_attr.settle = config.mipi.settle.0;
         mipi.rx_attr.channel_num = 1;
         mipi.rx_attr.channel_sel[0] = u16_from_u32(config.mipi.channel.0, "MIPI channel")?;
+        if config.mipi.rx_extension.nocheck {
+            mipi.rx_ex_mask |= 0x1;
+            mipi.rx_attr_ex.nocheck = 1;
+        }
 
         let mut camera = Box::new(raw::camera_config_t::default());
         set_c_string(&mut camera.name, config.module.sdk_name())?;
@@ -2100,7 +2113,7 @@ impl SensorMode {
             Self::Dol4 => raw::sensor_mode_e_DOL4_M,
             Self::Pwl => raw::sensor_mode_e_PWL_M,
             Self::Slave => raw::sensor_mode_e_SLAVE_M,
-            Self::Mono => raw::sensor_mode_e_MONO_M,
+            Self::Mono => self.sdk_value(),
         }
     }
 }
@@ -2350,9 +2363,12 @@ impl Rect {
 #[cfg(x5cam_x5_target)]
 impl FrameRateControl {
     fn raw(self) -> raw::frame_fps_ctrl_t {
-        raw::frame_fps_ctrl_t {
-            src: self.source.as_u16(),
-            dst: self.target.as_u16(),
+        match self {
+            Self::Disabled => raw::frame_fps_ctrl_t { src: 0, dst: 0 },
+            Self::Fixed { source, target } => raw::frame_fps_ctrl_t {
+                src: source.as_u16(),
+                dst: target.as_u16(),
+            },
         }
     }
 }

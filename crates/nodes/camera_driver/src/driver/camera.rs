@@ -10,6 +10,7 @@ use camera_driver_sys::{
     PresentationTimestampUs, Rotation, SensorMode, SensorModule,
 };
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use tracing::warn;
 
 use super::{
     config::Config,
@@ -20,6 +21,8 @@ use super::{
 
 const EVENT_QUEUE_CAPACITY: usize = 4;
 const ENCODER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const VSE_FRAME_TIMEOUT_MS: u32 = 1_000;
+const MAX_CONSECUTIVE_VSE_GETFRAME_ERRORS: u32 = 5;
 
 /// X5 camera backend with two VIO pipelines and HEVC encoders.
 pub struct X5Camera {
@@ -175,6 +178,7 @@ fn spawn_worker(
         let mut encoder = encoder;
 
         let mut pts_index = 0u64;
+        let mut consecutive_vse_getframe_errors = 0u32;
         let mut pending_metadata = VecDeque::new();
         while running.load(Ordering::SeqCst) {
             if let Err(err) = encoder.release_pending_outputs() {
@@ -183,19 +187,41 @@ fn spawn_worker(
             }
             encoder.release_pending_inputs();
 
-            let lease = match pipe.get_frame(1_000) {
-                Ok(lease) => lease,
-                Err(err) => {
-                    if running.load(Ordering::SeqCst) {
-                        send_error(&tx, channel, format!("get VSE frame: {err:#}"));
+            let lease = match pipe.get_frame(VSE_FRAME_TIMEOUT_MS) {
+                Ok(lease) => {
+                    if consecutive_vse_getframe_errors > 0 {
+                        warn!(
+                            ?channel,
+                            recovered_after = consecutive_vse_getframe_errors,
+                            "VSE frame dequeue recovered"
+                        );
+                        consecutive_vse_getframe_errors = 0;
                     }
-                    break;
+                    lease
+                }
+                Err(err) => {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    consecutive_vse_getframe_errors += 1;
+                    if consecutive_vse_getframe_errors >= MAX_CONSECUTIVE_VSE_GETFRAME_ERRORS {
+                        send_error(&tx, channel, format!("get VSE frame: {err:#}"));
+                        break;
+                    }
+                    warn!(
+                        ?channel,
+                        consecutive_errors = consecutive_vse_getframe_errors,
+                        max_errors = MAX_CONSECUTIVE_VSE_GETFRAME_ERRORS,
+                        error = %err,
+                        "VSE frame dequeue failed; retrying"
+                    );
+                    continue;
                 }
             };
 
             let frame_id = lease.frame_id();
+            let timestamp_ns = lease.timestamp_ns();
             let trigger_timestamp_ns = lease.trigger_timestamp_ns();
-            let timestamp_ns = trigger_timestamp_ns.unwrap_or_else(|| lease.timestamp_ns());
             let pts_us = (pts_index * 1_000_000) / config.fps.max(1) as u64;
             pts_index = pts_index.wrapping_add(1);
             let metadata = PendingFrameMetadata {
@@ -359,8 +385,8 @@ fn camera_setup(
         channel,
         host: sensor.host,
         sensor: SensorModule::Sc132gs,
-        sensor_mode: SensorMode::Slave,
-        lpwm_enabled: true,
+        sensor_mode: SensorMode::Normal,
+        lpwm_enabled: false,
         raw_width: config.raw_width,
         raw_height: config.raw_height,
         out_width: config.out_width,

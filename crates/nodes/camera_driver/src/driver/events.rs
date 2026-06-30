@@ -114,7 +114,7 @@ pub struct EncodedFrame {
     pub channel: Channel,
     /// VSE frame identifier.
     pub frame_id: u32,
-    /// VIN trigger timestamp in nanoseconds when available, otherwise VSE timestamp.
+    /// VSE/VIN frame timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// VIN trigger timestamp in nanoseconds, when reported by the SDK.
     pub trigger_timestamp_ns: Option<u64>,

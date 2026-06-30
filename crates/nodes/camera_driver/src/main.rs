@@ -301,7 +301,7 @@ fn print_startup_banner(config: &Config) {
         "  output      : {}x{} HEVC @ {} fps, {} kbps per camera",
         config.out_width, config.out_height, config.fps, config.bitrate_kbps
     );
-    println!("  sync        : SC132GS SLAVE_M with VIN LPWM trigger timestamps");
+    println!("  sync        : none (SC132GS NORMAL_M with VIN frame timestamps)");
     println!(
         "  hosts       : left={} right={}",
         config.left_host, config.right_host

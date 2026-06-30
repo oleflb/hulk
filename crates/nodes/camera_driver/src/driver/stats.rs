@@ -204,8 +204,8 @@ impl Stats {
                 );
             }
             ensure!(
-                setup.sensor_mode == SensorMode::Slave && setup.lpwm_enabled,
-                "{} external trigger setup is not active: mode={:?} lpwm={}",
+                setup.sensor_mode == SensorMode::Normal && !setup.lpwm_enabled,
+                "{} unsynced normal-mode setup is not active: mode={:?} lpwm={}",
                 expected_channel,
                 setup.sensor_mode,
                 setup.lpwm_enabled,
@@ -221,14 +221,6 @@ impl Stats {
                     "{} emitted {} encoded frames in startup window, expected at least {}",
                     channel,
                     st.frames_total,
-                    min_frames
-                );
-            }
-            if st.trigger_timestamps_total < min_frames {
-                bail!(
-                    "{} reported {} VIN trigger timestamps in startup window, expected at least {}",
-                    channel,
-                    st.trigger_timestamps_total,
                     min_frames
                 );
             }
@@ -268,7 +260,7 @@ impl Stats {
         }
         if self.stereo_delta.samples_window != 0 {
             println!(
-                "  sync  samples={} last_delta={:.3}ms max_abs_delta={:.3}ms",
+                "  stereo timestamp delta samples={} last_delta={:.3}ms max_abs_delta={:.3}ms",
                 self.stereo_delta.samples_window,
                 self.stereo_delta.last_delta_ns.unwrap_or(0) as f64 / 1_000_000.0,
                 self.stereo_delta.max_abs_delta_ns as f64 / 1_000_000.0,
