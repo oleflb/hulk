@@ -48,7 +48,7 @@ pub struct Localization3dParameters {
 impl Default for Localization3dParameters {
     fn default() -> Self {
         Self {
-            visual_feature_noise_variance: 100.0,
+            visual_feature_noise_variance: 10_000.0,
             pose_hint_visual_feature_noise_variance:
                 DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE,
             pose_hint_visual_huber_threshold: DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD,
@@ -144,7 +144,7 @@ impl From<BackendResidualDiagnostics> for SolveResidualDiagnostics {
 
 const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 const VISUAL_ODOMETER_TOPIC: &str = "visual_odometry/current_left_camera_to_visual_odometer";
-const DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE: f64 = 400.0;
+const DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE: f64 = 100_000.0;
 const DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD: f64 = 2.0;
 
 type VisualOdometerCache = Cache<VisualOdometer>;

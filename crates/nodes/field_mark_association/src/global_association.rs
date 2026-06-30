@@ -51,7 +51,7 @@ pub struct GlobalAssociationConfig {
 impl Default for GlobalAssociationConfig {
     fn default() -> Self {
         Self {
-            min_inliers: 3,
+            min_inliers: 5,
             min_confidence: 0.3,
             min_detection_baseline: 0.1,
             min_map_baseline: 0.25,
@@ -98,10 +98,10 @@ impl Default for PoseHintAssociationConfig {
             max_reprojection_error_px: 80.0,
             second_best_reprojection_margin_px: 15.0,
             healthy_min_inliers: 3,
-            healthy_max_rmse_px: 10.0,
-            recovery_frames: 20,
-            recovery_max_pose_distance: 0.2,
-            recovery_max_pose_angle: 5.0_f32.to_radians(),
+            healthy_max_rmse_px: 30.0,
+            recovery_frames: 5,
+            recovery_max_pose_distance: 0.5,
+            recovery_max_pose_angle: 15.0_f32.to_radians(),
         }
     }
 }

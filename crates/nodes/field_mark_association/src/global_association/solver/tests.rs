@@ -395,7 +395,9 @@ fn run_projected_subsample_cases(
             .pop()
             .unwrap_or_else(|| random_pose_in_and_around_field(&field, &mut rng));
         let visible = projected_landmarks(&map, pose);
-        let Some(selected) = random_non_collinear_subsample(&visible, &map, &mut rng) else {
+        let Some(selected) =
+            random_non_collinear_subsample(&visible, config.min_inliers, &map, &mut rng)
+        else {
             continue;
         };
         let frame = synthetic_frame(&add_pixel_noise(selected, &mut rng, noise_px));
@@ -537,17 +539,19 @@ fn pixel_inside_image(pixel: Point2<Pixel>, margin: f32) -> bool {
 
 fn random_non_collinear_subsample(
     visible: &[ProjectedSyntheticFeature],
+    min_count: usize,
     map: &LandmarkMap,
     rng: &mut DeterministicRng,
 ) -> Option<Vec<ProjectedSyntheticFeature>> {
-    if visible.len() < 3 {
+    if visible.len() < min_count.max(3) {
         return None;
     }
     let max_count = visible.len().min(8);
+    let min_count = min_count.max(3).min(max_count);
     for _ in 0..64 {
         let mut selected = visible.to_vec();
         rng.shuffle(&mut selected);
-        selected.truncate(3 + rng.usize_below(max_count - 2));
+        selected.truncate(min_count + rng.usize_below(max_count - min_count + 1));
         if has_useful_class_mix(&selected, visible)
             && has_non_collinear_landmark_triplet(&selected, map)
         {
