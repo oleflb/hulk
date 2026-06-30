@@ -13,13 +13,10 @@ The X5 backend is only available for the `x5cam_x5_target` build configuration. 
 For target validation, build the real backend inside the X5 SDK container so the aarch64 linker, sysroot, SDK headers, and SDK libraries all match:
 
 ```bash
-podman build -t camera-driver-x5 -f crates/nodes/camera_driver/Containerfile .
-
-podman run --rm \
-  -v "$PWD":/work \
-  camera-driver-x5 \
-  cargo build -p camera_driver --target aarch64-unknown-linux-gnu
+crates/nodes/camera_driver/build.sh
 ```
+
+The build script persists Cargo registry and git caches under `$(./scripts/resolve_data_home)/container-cargo-home`, so repeated container builds do not need to redownload Cargo dependencies.
 
 The node configures a 64 MiB ROS-Z shared-memory pool and forces encoded frame payloads through SHM. Containers running this node need at least that much available POSIX shared memory, for example with `--shm-size=128m` or an equivalent `/dev/shm` mount.
 
