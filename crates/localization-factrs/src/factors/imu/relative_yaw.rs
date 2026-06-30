@@ -5,11 +5,11 @@ use factrs::{
     variables::SE23,
 };
 
-use super::orientation::{relative_orientation, relative_yaw_error, relative_yaw_information_root};
+use super::orientation::{relative_heading_yaw, relative_yaw_error, relative_yaw_information_root};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RelativeYawFactor {
-    measured_relative_orientation: SO3,
+    measured_relative_yaw: f64,
     information_root: f64,
 }
 
@@ -23,8 +23,7 @@ impl Residual for RelativeYawFactor {
     }
 
     fn residual<T: Numeric>(&self, (start, end): (SE23<T>, SE23<T>)) -> VectorX<T> {
-        let raw_error =
-            relative_yaw_error(start.rot(), end.rot(), &self.measured_relative_orientation);
+        let raw_error = relative_yaw_error(start.rot(), end.rot(), self.measured_relative_yaw);
 
         VectorX::<T>::from_element(1, T::from(self.information_root) * raw_error)
     }
@@ -37,7 +36,7 @@ impl RelativeYawFactor {
         roll_pitch_yaw_noise: Matrix3<f64>,
     ) -> Self {
         Self {
-            measured_relative_orientation: relative_orientation(
+            measured_relative_yaw: relative_heading_yaw(
                 &measured_start_orientation,
                 &measured_end_orientation,
             ),
@@ -73,6 +72,27 @@ mod tests {
         let residual = factor.residual((predicted_start, predicted_end));
 
         assert!(residual.norm() < 1.0e-12);
+    }
+
+    #[test]
+    fn relative_yaw_factor_uses_heading_yaw_not_tangent_yaw() {
+        let measured_start = so3_from_euler_angles(0.3, -0.2, 0.1);
+        let measured_end = so3_from_euler_angles(-0.4, 0.2, 0.6);
+        let predicted_start = SE23::from_rot_vel_trans(
+            so3_from_euler_angles(-0.7, 0.3, 1.0),
+            Vector3::zeros(),
+            Vector3::zeros(),
+        );
+        let predicted_end = SE23::from_rot_vel_trans(
+            so3_from_euler_angles(0.6, -0.4, 1.5),
+            Vector3::zeros(),
+            Vector3::zeros(),
+        );
+        let factor = RelativeYawFactor::new(measured_start, measured_end, Matrix3::identity());
+
+        let residual = factor.residual((predicted_start, predicted_end));
+
+        assert!(residual[0].abs() < 1.0e-12);
     }
 
     #[test]

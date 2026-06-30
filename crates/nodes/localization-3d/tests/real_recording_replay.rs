@@ -8,8 +8,8 @@ use std::{
 
 use booster::ImuState;
 use field_mark_association::{
-    FieldMarkAssociationParameters, GlobalLocalizerParameters, find_detected_visual_features,
-    localize_global_visual_features,
+    FieldMarkAssociationParameters, FieldMarkAssociationState, GlobalLocalizerParameters,
+    find_detected_visual_features, localize_global_visual_features,
 };
 use linear_algebra::IntoTransform;
 use localization_3d::{
@@ -40,15 +40,14 @@ const EXPECTED_IMU_SAMPLE_COUNT: usize = 5981;
 const EXPECTED_CAMERA_MATRIX_COUNT: usize = 4923;
 const EXPECTED_FIELD_DIMENSIONS_COUNT: usize = 6;
 const EXPECTED_DETECTED_OBJECT_FRAME_COUNT: usize = 710;
-// Static-height-gated global localizations are ingested only when the landmark
-// associations are unique enough to be safe as fixed backend factors.
-const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 75;
+// Hardened visual association suppresses unsafe fixed landmark factors for this fixture.
+const EXPECTED_VISUAL_FEATURE_FRAME_COUNT: usize = 0;
 const EXPECTED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 75;
 const EXPECTED_RELAXED_GLOBAL_LOCALIZATION_DEBUG_FRAME_COUNT: usize = 37;
 const EXPECTED_GOALPOST_DETECTION_COUNT: usize = 723;
-const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 185;
-const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 170;
-const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 170;
+const EXPECTED_SOLVER_SOLUTION_COUNT: usize = 184;
+const EXPECTED_OPTIMIZED_SAMPLE_COUNT: usize = 169;
+const EXPECTED_RAW_BACKEND_SOLVE_SAMPLE_COUNT: usize = 169;
 const EXPECTED_LANDMARK_COUNT: usize = 4;
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +97,7 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
 
     let parameters = Localization3dParameters::default();
     let association_parameters = FieldMarkAssociationParameters::default();
+    let mut association_state = FieldMarkAssociationState::default();
     let solve_every_nth_round = solve_every_nth_round();
     let solve_cadence = solve_cadence_duration(solve_every_nth_round);
     let (mut frontend, mut backend) = initialize(
@@ -182,12 +182,13 @@ fn real_recording_replay_produces_expected_trajectory_streams() -> Result<(), Bo
                 let pose_hint = frontend
                     .peek_last_optimization_result()
                     .map(|result| result.transform.cast::<f32>().framed_transform());
-                let localization = localize_global_visual_features(
+                let localization = association_state.associate_visual_features_with_debug(
                     &visual_features,
                     camera_matrix,
                     field_dimensions.as_ref(),
                     pose_hint,
-                    &association_parameters.global_localizer,
+                    &association_parameters,
+                    true,
                 );
                 let relaxed_debug_localization = localize_global_visual_features(
                     &visual_features,
