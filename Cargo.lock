@@ -2409,6 +2409,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera_viewer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "eframe",
+ "encoded_frame_decoder",
+ "ros-z",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "types",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"

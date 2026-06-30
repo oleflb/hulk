@@ -123,6 +123,7 @@ members = [
   "crates/zed",
   "crates/zenoh_bridge",
   "tools/annotato",
+  "tools/camera_viewer",
   "tools/depp",
   "tools/fanta",
   "tools/hydra-bench",
