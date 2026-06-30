@@ -58,6 +58,58 @@ use zenoh::shm::{BlockOn, GarbageCollect, PosixShmProviderBackend, ShmProvider};
 
 const STDERR_TAIL_BYTES: usize = 8 * 1024;
 
+/// Returns whether an Annex B HEVC access unit contains an IRAP NAL unit.
+///
+/// This is used when starting a raw HEVC decoder mid-stream: frames before the
+/// first intra/random-access picture may be accepted by the decoder but produce
+/// no output, so their metadata must not enter the output-order FIFO.
+pub fn hevc_access_unit_contains_irap(access_unit: &[u8]) -> bool {
+    let mut offset = 0;
+    while let Some(start_code) = find_hevc_start_code(access_unit, offset) {
+        let nal_start = start_code.end;
+        let nal_end = find_hevc_start_code(access_unit, nal_start)
+            .map(|next| next.start)
+            .unwrap_or(access_unit.len());
+
+        if nal_end.saturating_sub(nal_start) >= 2 {
+            let nal_unit_type = (access_unit[nal_start] >> 1) & 0x3f;
+            if (16..=23).contains(&nal_unit_type) {
+                return true;
+            }
+        }
+
+        offset = nal_end;
+    }
+    false
+}
+
+struct HevcStartCode {
+    start: usize,
+    end: usize,
+}
+
+fn find_hevc_start_code(data: &[u8], from: usize) -> Option<HevcStartCode> {
+    let mut index = from;
+    while index + 3 <= data.len() {
+        if data[index] == 0 && data[index + 1] == 0 {
+            if data[index + 2] == 1 {
+                return Some(HevcStartCode {
+                    start: index,
+                    end: index + 3,
+                });
+            }
+            if index + 4 <= data.len() && data[index + 2] == 0 && data[index + 3] == 1 {
+                return Some(HevcStartCode {
+                    start: index,
+                    end: index + 4,
+                });
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Hardware acceleration mode passed to FFmpeg.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HardwareAcceleration {
@@ -525,5 +577,45 @@ fn read_stderr_tail(mut stderr: impl Read, tail: StderrTail) {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hevc_irap_detection_finds_idr_in_annex_b_access_unit() {
+        let access_unit = [
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            32 << 1,
+            0x01,
+            0xaa,
+            0x00,
+            0x00,
+            0x01,
+            20 << 1,
+            0x01,
+            0xbb,
+        ];
+
+        assert!(hevc_access_unit_contains_irap(&access_unit));
+    }
+
+    #[test]
+    fn hevc_irap_detection_ignores_non_irap_access_unit() {
+        let access_unit = [0x00, 0x00, 0x01, 1 << 1, 0x01, 0xcc];
+
+        assert!(!hevc_access_unit_contains_irap(&access_unit));
+    }
+
+    #[test]
+    fn hevc_irap_detection_requires_annex_b_start_code() {
+        let access_unit = [20 << 1, 0x01, 0xbb];
+
+        assert!(!hevc_access_unit_contains_irap(&access_unit));
     }
 }

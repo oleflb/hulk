@@ -1,10 +1,20 @@
-use std::{boxed::Box, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    boxed::Box, collections::VecDeque, future::Future, path::PathBuf, pin::Pin, sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::{Result, eyre::WrapErr};
-use encoded_frame_decoder::{DecodedFrame, DecoderConfig, FfmpegHevcDecoder, OutputPixelFormat};
+use encoded_frame_decoder::{
+    DecodedFrame, DecoderConfig, FfmpegHevcDecoder, OutputPixelFormat,
+    hevc_access_unit_contains_irap,
+};
 use ros_z::{prelude::*, qos::QosHistory, shm::ShmProviderBuilder, time::Time};
 use tokio::task::JoinSet;
-use types::{encoded_frame::EncodedFrame, nv12_image::Nv12Image, time_wrapper::TimeWrapper};
+use types::{
+    encoded_frame::{EncodedFrame, EncodedFrameCodec},
+    nv12_image::Nv12Image,
+    time_wrapper::TimeWrapper,
+};
 use zenoh::shm::{PosixShmProviderBackend, ShmProvider};
 
 pub const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
@@ -114,6 +124,9 @@ async fn run_channel(
 
             let frame_time = wrapped_frame.time;
             let frame = wrapped_frame.inner;
+            if frame.codec != EncodedFrameCodec::Hevc {
+                color_eyre::eyre::bail!("unsupported encoded frame codec {:?}", frame.codec);
+            }
 
             let decoded = {
                 let decoder = ensure_decoder(
@@ -125,16 +138,45 @@ async fn run_channel(
                 )
                 .wrap_err_with(|| format!("create {channel} decoder"))?;
 
-                tokio::task::block_in_place(|| decoder.decode_frame(&frame))
+                if !decoder.is_synchronized {
+                    if !hevc_access_unit_contains_irap(&frame.data) {
+                        continue;
+                    }
+                    decoder.is_synchronized = true;
+                }
+
+                decoder.pending_metadata.push_back(PendingFrameMetadata {
+                    time: frame_time,
+                    frame_identifier: frame.frame_identifier,
+                    timestamp_ns: frame.timestamp_ns,
+                    presentation_timestamp_us: frame.presentation_timestamp_us,
+                });
+
+                let decoded = tokio::task::block_in_place(|| decoder.decoder.decode_frame(&frame))
                     .wrap_err_with(|| format!("decode {channel} HEVC frame"))?
+                    .map(|decoded| {
+                        let metadata = decoder.pending_metadata.pop_front().ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "decoded {channel} frame has no queued metadata"
+                            )
+                        })?;
+                        Ok::<_, color_eyre::Report>((metadata, decoded))
+                    })
+                    .transpose()?;
+
+                if decoded.is_none() {
+                    decoder.pending_metadata.clear();
+                    decoder.is_synchronized = false;
+                }
+                decoded
             };
-            let Some(decoded) = decoded else {
+            let Some((metadata, decoded)) = decoded else {
                 tracing::warn!(channel, "decoder timed out; restarting FFmpeg decoder");
                 decoder = None;
                 continue;
             };
 
-            let image = nv12_image_from_decoded_frame(frame_time, &frame, decoded)
+            let image = nv12_image_from_decoded_frame(metadata, decoded)
                 .wrap_err_with(|| format!("build {channel} NV12 image"))?;
             publisher.publish(&image).await?;
         }
@@ -154,7 +196,7 @@ fn ensure_decoder<'a>(
     height: u32,
     ffmpeg_path: &PathBuf,
     decoded_shm_provider: Arc<ShmProvider<PosixShmProviderBackend>>,
-) -> Result<&'a mut FfmpegHevcDecoder> {
+) -> Result<&'a mut DecoderState> {
     let recreate = decoder
         .as_ref()
         .is_none_or(|decoder| decoder.width != width || decoder.height != height);
@@ -166,23 +208,30 @@ fn ensure_decoder<'a>(
             width,
             height,
             decoder: FfmpegHevcDecoder::spawn(config)?,
+            pending_metadata: VecDeque::new(),
+            is_synchronized: false,
         });
     }
-    Ok(&mut decoder
-        .as_mut()
-        .expect("decoder was just initialized")
-        .decoder)
+    Ok(decoder.as_mut().expect("decoder was just initialized"))
 }
 
 struct DecoderState {
     width: u32,
     height: u32,
     decoder: FfmpegHevcDecoder,
+    pending_metadata: VecDeque<PendingFrameMetadata>,
+    is_synchronized: bool,
+}
+
+struct PendingFrameMetadata {
+    time: Time,
+    frame_identifier: u32,
+    timestamp_ns: u64,
+    presentation_timestamp_us: u64,
 }
 
 fn nv12_image_from_decoded_frame(
-    time: Time,
-    encoded: &EncodedFrame,
+    metadata: PendingFrameMetadata,
     decoded: DecodedFrame,
 ) -> Result<Nv12Image> {
     if decoded.pixel_format != OutputPixelFormat::Nv12 {
@@ -193,10 +242,10 @@ fn nv12_image_from_decoded_frame(
     }
 
     Ok(Nv12Image {
-        time,
-        frame_identifier: encoded.frame_identifier,
-        timestamp_ns: encoded.timestamp_ns,
-        presentation_timestamp_us: encoded.presentation_timestamp_us,
+        time: metadata.time,
+        frame_identifier: metadata.frame_identifier,
+        timestamp_ns: metadata.timestamp_ns,
+        presentation_timestamp_us: metadata.presentation_timestamp_us,
         width: decoded.width,
         height: decoded.height,
         step: decoded.width,

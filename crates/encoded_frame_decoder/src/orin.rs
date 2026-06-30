@@ -31,8 +31,12 @@ impl OrinStereoDecoderConfig {
 
 #[cfg(feature = "orin-gst-cuda")]
 mod imp {
-    use std::sync::{Arc, Mutex};
-    use std::{ffi::c_void, ptr};
+    use std::{
+        collections::VecDeque,
+        ffi::c_void,
+        ptr,
+        sync::{Arc, Mutex},
+    };
 
     use color_eyre::{Result, eyre::WrapErr};
     use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtrMut, sys as cuda_sys};
@@ -61,6 +65,7 @@ mod imp {
     }
 
     const CUDA_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY: u32 = 1;
+    const MAX_PENDING_DECODER_METADATA: usize = 256;
 
     pub struct OrinStereoDecoder {
         config: OrinStereoDecoderConfig,
@@ -119,8 +124,8 @@ mod imp {
             frame: TimeWrapper<EncodedFrame>,
         ) -> Result<Option<DeviceStereoNv12>> {
             let metadata = FrameMetadata::from_encoded_frame(&frame);
-            self.left.push(&frame.inner)?;
-            let decoded = self.left.try_pull(metadata)?;
+            self.left.push(&frame.inner, metadata)?;
+            let decoded = self.left.try_pull()?;
             self.push_decoded_left(decoded)
         }
 
@@ -129,8 +134,8 @@ mod imp {
             frame: TimeWrapper<EncodedFrame>,
         ) -> Result<Option<DeviceStereoNv12>> {
             let metadata = FrameMetadata::from_encoded_frame(&frame);
-            self.right.push(&frame.inner)?;
-            let decoded = self.right.try_pull(metadata)?;
+            self.right.push(&frame.inner, metadata)?;
+            let decoded = self.right.try_pull()?;
             self.push_decoded_right(decoded)
         }
 
@@ -164,49 +169,83 @@ mod imp {
             let buffer_index = self.next_buffer;
             self.next_buffer = (self.next_buffer + 1) % self.buffers.len();
             let slot = self.buffers[buffer_index].clone();
-            let mut buffer = slot
-                .lock()
-                .map_err(|_| color_eyre::eyre::eyre!("stereo CUDA buffer slot lock poisoned"))?
-                .take()
-                .ok_or_else(|| {
-                    color_eyre::eyre::eyre!("stereo CUDA buffer {buffer_index} is still in use")
-                })?;
+            let mut buffer = CheckedOutCudaBuffer::take(slot, buffer_index)?;
 
-            // This is intentionally a hard runtime boundary: getting a CUDA pointer
-            // to Jetson NVMM requires platform-specific EGL/NvBufSurface interop.
-            // The safe public API and GStreamer low-latency decode path are wired;
-            // the interop is isolated here so it can be completed against the Orin
-            // sysroot without affecting portable builds.
+            // Keep Jetson-specific EGL/NvBufSurface interop isolated so portable
+            // builds do not depend on the Orin sysroot or CUDA runtime libraries.
             self.jetson.pack_nvmm_pair_into_stereo_cuda_buffer(
                 &pair.left,
                 &pair.right,
-                &mut buffer,
+                buffer.as_mut(),
                 &self.stream,
                 self.config.width,
                 self.config.height,
             )?;
 
             let address = {
-                let (device_ptr, sync_on_drop) = buffer.device_ptr_mut(&self.stream);
+                let (device_ptr, sync_on_drop) = buffer.as_mut().device_ptr_mut(&self.stream);
                 let address = device_ptr as usize;
                 drop(sync_on_drop);
                 address
             };
+            let device_ptr = DevicePointer::new(address)?;
 
-            let guard = Arc::new(DeviceBufferGuardImpl {
-                _cuda: self.cuda.clone(),
-                slot,
-                buffer: Mutex::new(Some(buffer)),
-            });
+            let guard = buffer.into_guard(self.cuda.clone());
             Ok(DeviceStereoNv12::new(
                 pair.metadata,
                 self.config.width,
                 self.config.height,
                 buffer_index,
-                DevicePointer::new(address)?,
+                device_ptr,
                 guard,
             )?
             .with_stream_id(self.stream.cu_stream() as usize))
+        }
+    }
+
+    struct CheckedOutCudaBuffer {
+        slot: Arc<Mutex<Option<CudaSlice<u8>>>>,
+        buffer: Option<CudaSlice<u8>>,
+    }
+
+    impl CheckedOutCudaBuffer {
+        fn take(slot: Arc<Mutex<Option<CudaSlice<u8>>>>, buffer_index: usize) -> Result<Self> {
+            let buffer = slot
+                .lock()
+                .map_err(|_| color_eyre::eyre::eyre!("stereo CUDA buffer slot lock poisoned"))?
+                .take()
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("stereo CUDA buffer {buffer_index} is still in use")
+                })?;
+            Ok(Self {
+                slot,
+                buffer: Some(buffer),
+            })
+        }
+
+        fn as_mut(&mut self) -> &mut CudaSlice<u8> {
+            self.buffer
+                .as_mut()
+                .expect("checked-out CUDA buffer must be present")
+        }
+
+        fn into_guard(mut self, cuda: Arc<CudaContext>) -> Arc<DeviceBufferGuardImpl> {
+            Arc::new(DeviceBufferGuardImpl {
+                _cuda: cuda,
+                slot: self.slot.clone(),
+                buffer: Mutex::new(self.buffer.take()),
+            })
+        }
+    }
+
+    impl Drop for CheckedOutCudaBuffer {
+        fn drop(&mut self) {
+            let Some(buffer) = self.buffer.take() else {
+                return;
+            };
+            if let Ok(mut slot) = self.slot.lock() {
+                *slot = Some(buffer);
+            }
         }
     }
 
@@ -231,9 +270,12 @@ mod imp {
     }
 
     struct GstHevcDecoder {
+        name: String,
         appsrc: AppSrc,
         appsink: AppSink,
-        _pipeline: gst::Pipeline,
+        bus: gst::Bus,
+        pipeline: gst::Pipeline,
+        pending_metadata: VecDeque<FrameMetadata>,
     }
 
     impl GstHevcDecoder {
@@ -273,15 +315,22 @@ mod imp {
             pipeline
                 .set_state(gst::State::Playing)
                 .wrap_err_with(|| format!("start {name} GStreamer decoder"))?;
+            let bus = pipeline
+                .bus()
+                .ok_or_else(|| color_eyre::eyre::eyre!("{name} GStreamer pipeline has no bus"))?;
 
             Ok(Self {
+                name: name.to_string(),
                 appsrc,
                 appsink,
-                _pipeline: pipeline,
+                bus,
+                pipeline,
+                pending_metadata: VecDeque::new(),
             })
         }
 
-        fn push(&self, frame: &EncodedFrame) -> Result<()> {
+        fn push(&mut self, frame: &EncodedFrame, metadata: FrameMetadata) -> Result<()> {
+            self.check_bus()?;
             let mut buffer =
                 gst::Buffer::with_size(frame.data.len()).wrap_err("allocate HEVC GstBuffer")?;
             {
@@ -299,18 +348,81 @@ mod imp {
             self.appsrc.push_buffer(buffer).map_err(|err| {
                 color_eyre::eyre::eyre!("push HEVC access unit into GStreamer: {err:?}")
             })?;
+            self.pending_metadata.push_back(metadata);
+            while self.pending_metadata.len() > MAX_PENDING_DECODER_METADATA {
+                self.pending_metadata.pop_front();
+            }
+            self.check_bus()?;
             Ok(())
         }
 
-        fn try_pull(&self, metadata: FrameMetadata) -> Result<Option<DecodedNvmmFrame>> {
+        fn try_pull(&mut self) -> Result<Option<DecodedNvmmFrame>> {
+            self.check_bus()?;
             let sample = self.appsink.try_pull_sample(gst::ClockTime::ZERO);
+            self.check_bus()?;
             let Some(sample) = sample else {
                 return Ok(None);
             };
             let buffer = sample
                 .buffer_owned()
                 .ok_or_else(|| color_eyre::eyre::eyre!("decoded sample has no buffer"))?;
+            let pts = buffer.pts().ok_or_else(|| {
+                color_eyre::eyre::eyre!("{} decoded sample has no PTS", self.name)
+            })?;
+            let metadata = self.take_metadata_for_pts(pts.useconds())?;
             Ok(Some(DecodedNvmmFrame { metadata, buffer }))
+        }
+
+        fn take_metadata_for_pts(&mut self, pts_us: u64) -> Result<FrameMetadata> {
+            let index = self
+                .pending_metadata
+                .iter()
+                .position(|metadata| metadata.presentation_timestamp_us == pts_us)
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "{} decoded sample PTS {pts_us} us has no queued metadata",
+                        self.name
+                    )
+                })?;
+            if index > 0 {
+                self.pending_metadata.drain(..index);
+            }
+            self.pending_metadata.pop_front().ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "{} decoded sample PTS {pts_us} us metadata queue was empty",
+                    self.name
+                )
+            })
+        }
+
+        fn check_bus(&self) -> Result<()> {
+            while let Some(message) = self.bus.timed_pop(gst::ClockTime::ZERO) {
+                match message.view() {
+                    gst::MessageView::Error(error) => {
+                        let source = error
+                            .src()
+                            .map(|source| source.path_string())
+                            .unwrap_or_else(|| "unknown".into());
+                        let debug = error.debug().unwrap_or_else(|| "no debug info".into());
+                        color_eyre::eyre::bail!(
+                            "{} GStreamer pipeline error from {source}: {} ({debug})",
+                            self.name,
+                            error.error()
+                        );
+                    }
+                    gst::MessageView::Eos(_) => {
+                        color_eyre::eyre::bail!("{} GStreamer pipeline reached EOS", self.name);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for GstHevcDecoder {
+        fn drop(&mut self) {
+            let _ = self.pipeline.set_state(gst::State::Null);
         }
     }
 
@@ -378,15 +490,10 @@ mod imp {
         ) -> Result<()> {
             let (dst_ptr, sync_on_drop) = dst.device_ptr_mut(stream);
             let image_size = crate::device_stereo::nv12_image_size(width, height)?;
+            let right_dst = device_ptr_offset(dst_ptr, image_size)?;
             unsafe {
                 self.copy_nvmm_frame_to_device(left, dst_ptr, stream, width, height)?;
-                self.copy_nvmm_frame_to_device(
-                    right,
-                    dst_ptr + image_size as cuda_sys::CUdeviceptr,
-                    stream,
-                    width,
-                    height,
-                )?;
+                self.copy_nvmm_frame_to_device(right, right_dst, stream, width, height)?;
             }
             drop(sync_on_drop);
             Ok(())
@@ -408,6 +515,7 @@ mod imp {
             if surface.is_null() {
                 color_eyre::eyre::bail!("decoded NVMM GstBuffer did not contain NvBufSurface");
             }
+            unsafe { validate_nvbuf_surface(surface, width, height)? };
 
             let map_result = unsafe { (self.map_egl_image)(surface, 0) };
             if map_result != 0 {
@@ -431,10 +539,7 @@ mod imp {
             width: u32,
             height: u32,
         ) -> Result<()> {
-            let params = unsafe { (*surface).surfaceList };
-            if params.is_null() {
-                color_eyre::eyre::bail!("NvBufSurface surfaceList is null");
-            }
+            let params = unsafe { validate_nvbuf_surface(surface, width, height)? };
             let egl_image = unsafe { (*params).mappedAddr.eglImage } as *mut c_void;
             if egl_image.is_null() {
                 color_eyre::eyre::bail!("NvBufSurface EGL image is null after mapping");
@@ -449,6 +554,9 @@ mod imp {
                 )
                 .result()
                 .wrap_err("register NvBufSurface EGL image with CUDA")?;
+            }
+            if resource.is_null() {
+                color_eyre::eyre::bail!("CUDA EGL registration returned a null resource");
             }
 
             let copy_result = unsafe {
@@ -487,6 +595,43 @@ mod imp {
         color_eyre::eyre::bail!("failed to load Jetson library: {}", errors.join(", "))
     }
 
+    unsafe fn validate_nvbuf_surface(
+        surface: *mut jetson::NvBufSurface,
+        width: u32,
+        height: u32,
+    ) -> Result<*mut jetson::NvBufSurfaceParams> {
+        if surface.is_null() {
+            color_eyre::eyre::bail!("NvBufSurface is null");
+        }
+        if unsafe { (*surface).batchSize } == 0 || unsafe { (*surface).numFilled } == 0 {
+            color_eyre::eyre::bail!("NvBufSurface has no filled batch entry");
+        }
+
+        let params = unsafe { (*surface).surfaceList };
+        if params.is_null() {
+            color_eyre::eyre::bail!("NvBufSurface surfaceList is null");
+        }
+
+        let actual_width = unsafe { (*params).width };
+        let actual_height = unsafe { (*params).height };
+        if actual_width != width || actual_height != height {
+            color_eyre::eyre::bail!(
+                "NvBufSurface dimensions {actual_width}x{actual_height} do not match expected {width}x{height}"
+            );
+        }
+        Ok(params)
+    }
+
+    fn device_ptr_offset(
+        ptr: cuda_sys::CUdeviceptr,
+        offset: usize,
+    ) -> Result<cuda_sys::CUdeviceptr> {
+        let offset = cuda_sys::CUdeviceptr::try_from(offset)
+            .map_err(|_| color_eyre::eyre::eyre!("CUDA device pointer offset is too large"))?;
+        ptr.checked_add(offset)
+            .ok_or_else(|| color_eyre::eyre::eyre!("CUDA device pointer offset overflow"))
+    }
+
     unsafe fn copy_egl_frame_nv12_to_device(
         egl_frame: jetson::CUeglFrame,
         dst: cuda_sys::CUdeviceptr,
@@ -494,6 +639,26 @@ mod imp {
         width: u32,
         height: u32,
     ) -> Result<()> {
+        if egl_frame.frameType as u32 != 1 {
+            color_eyre::eyre::bail!(
+                "CUDA EGL frame is not pitch-backed NV12 (frameType={})",
+                egl_frame.frameType as u32
+            );
+        }
+        if egl_frame.planeCount < 2 {
+            color_eyre::eyre::bail!(
+                "CUDA EGL frame exposes {} plane(s), expected at least 2",
+                egl_frame.planeCount
+            );
+        }
+        if egl_frame.width < width || egl_frame.height < height {
+            color_eyre::eyre::bail!(
+                "CUDA EGL frame dimensions {}x{} are smaller than expected {width}x{height}",
+                egl_frame.width,
+                egl_frame.height
+            );
+        }
+
         let y_plane = unsafe { egl_frame.frame.pPitch[0] } as cuda_sys::CUdeviceptr;
         let uv_plane = unsafe { egl_frame.frame.pPitch[1] } as cuda_sys::CUdeviceptr;
         if y_plane == 0 || uv_plane == 0 {
@@ -503,18 +668,17 @@ mod imp {
         let pitch = egl_frame.pitch as usize;
         let width = width as usize;
         let height = height as usize;
+        if pitch < width {
+            color_eyre::eyre::bail!("CUDA EGL frame pitch {pitch} is smaller than width {width}");
+        }
+        let y_size = width
+            .checked_mul(height)
+            .ok_or_else(|| color_eyre::eyre::eyre!("NV12 luma plane size overflow"))?;
+        let uv_dst = device_ptr_offset(dst, y_size)?;
         copy_2d_device_to_device(y_plane, pitch, dst, width, width, height, stream)
             .wrap_err("copy NV12 luma plane")?;
-        copy_2d_device_to_device(
-            uv_plane,
-            pitch,
-            dst + (width * height) as cuda_sys::CUdeviceptr,
-            width,
-            width,
-            height / 2,
-            stream,
-        )
-        .wrap_err("copy NV12 chroma plane")?;
+        copy_2d_device_to_device(uv_plane, pitch, uv_dst, width, width, height / 2, stream)
+            .wrap_err("copy NV12 chroma plane")?;
         Ok(())
     }
 
