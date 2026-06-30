@@ -45,6 +45,9 @@ struct Arguments {
     /// Override visual-odometry covariance during headless replay.
     #[arg(long)]
     vo_covariance: Option<f64>,
+    /// Seconds to ignore at the start of resolve-summary trajectory metrics.
+    #[arg(long, default_value_t = 5.0)]
+    metrics_skip_seconds: f64,
     /// Drop compensated visual-odometry translations above this threshold in meters.
     #[arg(long)]
     max_vo_translation: Option<f32>,
@@ -57,9 +60,18 @@ struct Arguments {
     /// Disable field-feature associations during headless replay.
     #[arg(long)]
     no_global_features: bool,
+    /// Disable IMU orientation factors during headless replay.
+    #[arg(long)]
+    no_imu: bool,
+    /// Disable foot-height factors during headless replay.
+    #[arg(long)]
+    no_foot_heights: bool,
     /// Override pose-hint visual-feature covariance during headless replay.
     #[arg(long)]
     pose_hint_noise: Option<f64>,
+    /// Override global visual-feature covariance during headless replay.
+    #[arg(long)]
+    visual_noise: Option<f64>,
     /// Override minimum pose-hint features per ingested frame during headless replay.
     #[arg(long)]
     pose_hint_min_features: Option<usize>,
@@ -115,7 +127,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if arguments.resolve_summary {
-        print_resolve_summary(&recording, replay_parameters(&arguments))?;
+        print_resolve_summary(
+            &recording,
+            replay_parameters(&arguments),
+            arguments.metrics_skip_seconds,
+        )?;
         return Ok(());
     }
     if arguments.vo_diagnostics {
@@ -177,8 +193,17 @@ fn replay_parameters(arguments: &Arguments) -> ReplayParameters {
     if arguments.no_global_features {
         parameters.include_global_features = false;
     }
+    if arguments.no_imu {
+        parameters.include_imu = false;
+    }
+    if arguments.no_foot_heights {
+        parameters.include_foot_heights = false;
+    }
     if let Some(pose_hint_noise) = arguments.pose_hint_noise {
         parameters.pose_hint_visual_feature_noise_variance = pose_hint_noise;
+    }
+    if let Some(visual_noise) = arguments.visual_noise {
+        parameters.visual_feature_noise_variance = visual_noise;
     }
     if let Some(pose_hint_min_features) = arguments.pose_hint_min_features {
         parameters.pose_hint_visual_min_features_per_frame = pose_hint_min_features;
@@ -238,7 +263,9 @@ fn print_resolve_regenerated_vo_summary(
         trajectory_metrics(&replay.trajectory())
     );
     println!(
-        "replay_stats vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
+        "replay_stats imu_ingested={} foot_heights_ingested={} vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
+        replay.stats.imu_ingested,
+        replay.stats.foot_heights_ingested,
         replay.stats.vo_received,
         replay.stats.vo_ingested,
         replay.stats.vo_dropped_invalid,
@@ -771,18 +798,24 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
 fn print_resolve_summary(
     recording: &mcap_recording::Recording,
     parameters: ReplayParameters,
+    metrics_skip_seconds: f64,
 ) -> Result<()> {
     let replay = resolve_recording(recording, parameters)?;
     println!(
         "recorded_localization {}",
-        trajectory_metrics(&recording.recorded_localization_trajectory())
+        trajectory_metrics_with_skip(
+            &recording.recorded_localization_trajectory(),
+            metrics_skip_seconds,
+        )
     );
     println!(
         "replayed_localization {}",
-        trajectory_metrics(&replay.trajectory())
+        trajectory_metrics_with_skip(&replay.trajectory(), metrics_skip_seconds)
     );
     println!(
-        "replay_stats vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
+        "replay_stats imu_ingested={} foot_heights_ingested={} vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
+        replay.stats.imu_ingested,
+        replay.stats.foot_heights_ingested,
         replay.stats.vo_received,
         replay.stats.vo_ingested,
         replay.stats.vo_dropped_invalid,
@@ -838,12 +871,17 @@ fn robot_to_camera(
 }
 
 fn trajectory_metrics(trajectory: &[TrajectoryPoint]) -> String {
+    trajectory_metrics_with_skip(trajectory, 5.0)
+}
+
+fn trajectory_metrics_with_skip(trajectory: &[TrajectoryPoint], skip_seconds: f64) -> String {
     let Some(first) = trajectory.first() else {
         return "samples=0".to_string();
     };
+    let skip_seconds = skip_seconds.max(0.0);
     let samples = trajectory
         .iter()
-        .filter(|sample| sample.seconds - first.seconds >= 5.0)
+        .filter(|sample| sample.seconds - first.seconds >= skip_seconds)
         .collect::<Vec<_>>();
     let samples = if samples.is_empty() {
         trajectory.iter().collect::<Vec<_>>()
