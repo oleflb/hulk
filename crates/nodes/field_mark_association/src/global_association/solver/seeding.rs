@@ -3,9 +3,7 @@ use super::*;
 pub(super) fn cheap_triplet_seeds(problem: &Problem) -> CheapSeedSearch {
     let mut search = CheapSeedSearch {
         candidates: Vec::new(),
-        retained_keys: HashMap::new(),
         truncated: false,
-        worst_candidate_index: None,
     };
     let mut lookup_hits = 0;
     let mut bin_probes = 0;
@@ -80,17 +78,16 @@ pub(super) fn cheap_triplet_seeds(problem: &Problem) -> CheapSeedSearch {
     });
     for (_, cell) in transform_cells {
         if let Some(candidate) = cheap_candidate(problem, cell.transform) {
-            insert_cheap_candidate(&mut search, candidate, &problem.map);
+            search.candidates.push(candidate);
         }
     }
+    retain_best_cheap_candidates(&mut search, &problem.map);
 
     search
 }
 
 fn detection_triplets(problem: &Problem) -> DetectionTriplets {
-    let mut heap = BinaryHeap::new();
-    let mut sequence = 0;
-    let mut truncated = false;
+    let mut triplets = Vec::new();
     for first in 0..problem.detections.len() {
         for second in (first + 1)..problem.detections.len() {
             for third in (second + 1)..problem.detections.len() {
@@ -113,44 +110,32 @@ fn detection_triplets(problem: &Problem) -> DetectionTriplets {
                     continue;
                 }
                 if let Some(triplet) = make_detection_triplet(problem, a, b, c) {
-                    record_detection_triplet(&mut heap, &mut sequence, &mut truncated, triplet);
+                    triplets.push(triplet);
                 }
                 if let Some(triplet) = make_detection_triplet(problem, b, a, c) {
-                    record_detection_triplet(&mut heap, &mut sequence, &mut truncated, triplet);
+                    triplets.push(triplet);
                 }
             }
         }
     }
+    triplets.sort_by(compare_detection_triplet_priority);
+    let truncated = triplets.len() > MAX_SCANNED_DETECTION_TRIPLETS;
+    triplets.truncate(MAX_SCANNED_DETECTION_TRIPLETS);
     DetectionTriplets {
-        triplets: heap.into_iter().map(|entry| entry.0.triplet).collect(),
+        triplets,
         truncated,
     }
 }
 
-fn record_detection_triplet(
-    heap: &mut BinaryHeap<Reverse<DetectionTripletQueueEntry>>,
-    sequence: &mut usize,
-    truncated: &mut bool,
-    triplet: DetectionTriplet,
-) {
-    let Ok(priority) = NotNan::new(triplet.priority) else {
-        return;
-    };
-    let entry = DetectionTripletQueueEntry {
-        priority,
-        sequence: *sequence,
-        triplet,
-    };
-    *sequence += 1;
-
-    if heap.len() < MAX_SCANNED_DETECTION_TRIPLETS {
-        heap.push(Reverse(entry));
-    } else if heap.peek().is_some_and(|worst| entry > worst.0) {
-        heap.pop();
-        heap.push(Reverse(entry));
-        *truncated = true;
-    } else {
-        *truncated = true;
+fn retain_best_cheap_candidates(search: &mut CheapSeedSearch, map: &LandmarkMap) {
+    search.candidates.sort_by(compare_cheap_candidates);
+    let mut keys = HashSet::new();
+    search
+        .candidates
+        .retain(|candidate| keys.insert(canonical_cheap_candidate_key(candidate, map)));
+    if search.candidates.len() > MAX_CHEAP_SEEDS {
+        search.truncated = true;
+        search.candidates.truncate(MAX_CHEAP_SEEDS);
     }
 }
 
@@ -205,9 +190,6 @@ fn similarity_from_triplet(
     detection_triplet: &DetectionTriplet,
     map_triplet: &MapTriplet,
 ) -> Similarity2<f32> {
-    debug_assert!(problem.map.landmarks.get(map_triplet.landmark_a).is_some());
-    debug_assert!(problem.map.landmarks.get(map_triplet.landmark_b).is_some());
-    debug_assert!(problem.map.landmarks.get(map_triplet.landmark_c).is_some());
     let scale = map_triplet.pair_dist / detection_triplet.distance;
     let theta = map_triplet.pair_angle - detection_triplet.angle;
     let rotation = nalgebra::UnitComplex::new(theta);

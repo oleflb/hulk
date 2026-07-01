@@ -30,7 +30,7 @@ use crate::{
             AdjacentVisualOdometryFactor, VisualOdometryDelta, VisualOdometryFactor,
             VisualOdometryMeasurement,
         },
-        visual_reprojection::{PoseHintVisualReprojectionFactor, VisualReprojectionFactor},
+        visual_reprojection::VisualReprojectionFactor,
     },
     initial_state::InitialState,
     interval_measurement::IntervalMeasurements,
@@ -584,7 +584,31 @@ impl VinsBackend {
         }
     }
 
-    fn ingest_visual(&mut self, mut visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
+    fn ingest_visual(&mut self, visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
+        self.ingest_visual_frames(
+            visuals,
+            "visual",
+            self.config.visual_feature_noise,
+            GLOBAL_VISUAL_HUBER_THRESHOLD,
+        );
+    }
+
+    fn ingest_pose_hint_visual(&mut self, visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
+        self.ingest_visual_frames(
+            visuals,
+            "pose-hint visual",
+            self.config.pose_hint_visual_feature_noise,
+            self.config.pose_hint_visual_huber_threshold,
+        );
+    }
+
+    fn ingest_visual_frames(
+        &mut self,
+        mut visuals: Vec<Vec<VisualReprojectionMeasurement>>,
+        sensor_name: &str,
+        noise: Matrix2<f64>,
+        huber_threshold: f64,
+    ) {
         visuals.retain(|visual| !visual.is_empty());
         let Some(last) = visuals.last() else {
             return;
@@ -596,7 +620,7 @@ impl VinsBackend {
         let interval_groups = self.interval_groups(visuals, |visual| visual_frame_time(visual));
 
         for group in interval_groups {
-            if !self.prepare_interval_for_measurements(group.start_index, "visual") {
+            if !self.prepare_interval_for_measurements(group.start_index, sensor_name) {
                 continue;
             }
 
@@ -606,55 +630,15 @@ impl VinsBackend {
                 CameraIntrinsics(0),
             );
             let graph = self.optimizer.graph_mut();
-            // factrs robust kernels are factor-wide, so keep each 2D measurement
-            // in its own factor to avoid downweighting unrelated residuals.
             for measurement in group.measurements.into_iter().flatten() {
                 let residual = VisualReprojectionFactor::new(
                     group.start_time,
                     group.end_time,
-                    vec![vec![measurement]],
-                    self.config.visual_feature_noise,
+                    [measurement],
+                    noise,
                 );
                 let factor = FactorBuilder::new(residual, keys)
-                    .robust(Huber::new(GLOBAL_VISUAL_HUBER_THRESHOLD))
-                    .build();
-
-                graph.add_factor(factor);
-            }
-        }
-    }
-
-    fn ingest_pose_hint_visual(&mut self, mut visuals: Vec<Vec<VisualReprojectionMeasurement>>) {
-        visuals.retain(|visual| !visual.is_empty());
-        let Some(last) = visuals.last() else {
-            return;
-        };
-
-        let last_time = visual_frame_time(last);
-        self.update_last_knot_time(last_time);
-
-        let interval_groups = self.interval_groups(visuals, |visual| visual_frame_time(visual));
-
-        for group in interval_groups {
-            if !self.prepare_interval_for_measurements(group.start_index, "pose-hint visual") {
-                continue;
-            }
-
-            let keys = (
-                State(group.start_index),
-                State(group.start_index + 1),
-                CameraIntrinsics(0),
-            );
-            let graph = self.optimizer.graph_mut();
-            for measurement in group.measurements.into_iter().flatten() {
-                let residual = PoseHintVisualReprojectionFactor::new(
-                    group.start_time,
-                    group.end_time,
-                    measurement,
-                    self.config.pose_hint_visual_feature_noise,
-                );
-                let factor = FactorBuilder::new(residual, keys)
-                    .robust(Huber::new(self.config.pose_hint_visual_huber_threshold))
+                    .robust(Huber::new(huber_threshold))
                     .build();
 
                 graph.add_factor(factor);
@@ -1180,8 +1164,7 @@ impl VinsBackend {
         let graph = self.optimizer.graph();
         let mut visual_odometry = self.residual_diagnostics::<VisualOdometryFactor>();
         visual_odometry.extend(self.residual_diagnostics::<AdjacentVisualOdometryFactor>());
-        let mut visual_reprojection = self.residual_diagnostics::<VisualReprojectionFactor>();
-        visual_reprojection.extend(self.residual_diagnostics::<PoseHintVisualReprojectionFactor>());
+        let visual_reprojection = self.residual_diagnostics::<VisualReprojectionFactor>();
 
         BackendSolveDiagnostics {
             optimizer_status,
@@ -1569,21 +1552,6 @@ mod tests {
             .collect()
     }
 
-    fn pose_hint_visual_reprojection_factor_count(
-        backend: &mut VinsBackend,
-        state: State,
-    ) -> usize {
-        backend
-            .optimizer
-            .graph_mut()
-            .factors_for_residual::<PoseHintVisualReprojectionFactor, _>((
-                state,
-                State(state.0 + 1),
-                CameraIntrinsics(0),
-            ))
-            .count()
-    }
-
     fn visual_odometry_factor_count(backend: &mut VinsBackend, state: State) -> usize {
         backend
             .optimizer
@@ -1793,11 +1761,7 @@ mod tests {
 
         let _ = backend.solve_once().expect("solve should succeed");
 
-        assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 0);
-        assert_eq!(
-            pose_hint_visual_reprojection_factor_count(&mut backend, State(0)),
-            1
-        );
+        assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 1);
     }
 
     #[test]

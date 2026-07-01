@@ -30,9 +30,6 @@ pub(crate) struct Landmark {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MapTriplet {
-    pub landmark_a: usize,
-    pub landmark_b: usize,
-    pub landmark_c: usize,
     pub xy_a: Point2<Field>,
     pub pair_dist: f32,
     pub pair_angle: f32,
@@ -89,9 +86,6 @@ impl LandmarkMap {
                         .entry(MapTripletBin::new(a.class, b.class, c.class, alpha, beta))
                         .or_insert_with(Vec::new)
                         .push(MapTriplet {
-                            landmark_a: a.id,
-                            landmark_b: b.id,
-                            landmark_c: c.id,
                             xy_a: a.xy,
                             pair_dist,
                             pair_angle: v.y.atan2(v.x),

@@ -118,61 +118,6 @@ fn nearest_landmark(
         .min_by(|left, right| left.1.total_cmp(&right.1))
 }
 
-pub(super) fn insert_cheap_candidate(
-    search: &mut CheapSeedSearch,
-    candidate: CheapCandidate,
-    map: &LandmarkMap,
-) {
-    let key = canonical_cheap_candidate_key(&candidate, map);
-    if let Some(&candidate_index) = search.retained_keys.get(&key) {
-        if compare_cheap_candidates(&candidate, &search.candidates[candidate_index]).is_lt() {
-            search.candidates[candidate_index] = candidate;
-            refresh_worst_cheap_candidate(search);
-        }
-        return;
-    }
-
-    if search.candidates.len() < MAX_CHEAP_SEEDS {
-        search.candidates.push(candidate);
-        let candidate_index = search.candidates.len() - 1;
-        search.retained_keys.insert(key, candidate_index);
-        if search.worst_candidate_index.is_none_or(|worst_index| {
-            compare_cheap_candidates(
-                &search.candidates[candidate_index],
-                &search.candidates[worst_index],
-            )
-            .is_gt()
-        }) {
-            search.worst_candidate_index = Some(candidate_index);
-        }
-        return;
-    }
-
-    let worst_index = search
-        .worst_candidate_index
-        .or_else(|| refresh_worst_cheap_candidate(search));
-    search.truncated = true;
-    if let Some(worst_index) = worst_index
-        && compare_cheap_candidates(&candidate, &search.candidates[worst_index]).is_lt()
-    {
-        let dropped_key = canonical_cheap_candidate_key(&search.candidates[worst_index], map);
-        search.candidates[worst_index] = candidate;
-        search.retained_keys.remove(&dropped_key);
-        search.retained_keys.insert(key, worst_index);
-        refresh_worst_cheap_candidate(search);
-    }
-}
-
-fn refresh_worst_cheap_candidate(search: &mut CheapSeedSearch) -> Option<usize> {
-    search.worst_candidate_index = search
-        .candidates
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| compare_cheap_candidates(left, right))
-        .map(|(index, _)| index);
-    search.worst_candidate_index
-}
-
 pub(super) fn compare_cheap_candidates(
     left: &CheapCandidate,
     right: &CheapCandidate,

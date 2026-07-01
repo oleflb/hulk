@@ -26,11 +26,6 @@ pub struct VisualReprojectionFactor {
     duration: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct PoseHintVisualReprojectionFactor {
-    inner: VisualReprojectionFactor,
-}
-
 #[factrs::mark]
 impl Residual for VisualReprojectionFactor {
     type Input = (SE23, SE23, CameraIntrinsics);
@@ -52,7 +47,7 @@ impl VisualReprojectionFactor {
     pub fn new(
         start_time: SystemTime,
         end_time: SystemTime,
-        frames: Vec<Vec<VisualReprojectionMeasurement>>,
+        measurements: impl IntoIterator<Item = VisualReprojectionMeasurement>,
         visual_feature_noise: Matrix2<f64>,
     ) -> Self {
         let pixel_information_root = visual_feature_noise
@@ -70,15 +65,15 @@ impl VisualReprojectionFactor {
             end_time,
             duration,
         };
-        factor.extend_frames(frames);
+        factor.extend_measurements(measurements);
         factor
     }
 
-    pub fn extend_frames(
+    pub fn extend_measurements(
         &mut self,
-        frames: impl IntoIterator<Item = Vec<VisualReprojectionMeasurement>>,
+        measurements: impl IntoIterator<Item = VisualReprojectionMeasurement>,
     ) {
-        for measurement in frames.into_iter().flatten() {
+        for measurement in measurements {
             self.measurement_taus.push(tau::<f64>(
                 self.start_time,
                 self.end_time,
@@ -129,38 +124,6 @@ impl VisualReprojectionFactor {
     }
 }
 
-#[factrs::mark]
-impl Residual for PoseHintVisualReprojectionFactor {
-    type Input = (SE23, SE23, CameraIntrinsics);
-    type Differ = ForwardProp;
-
-    fn dim_out(&self) -> usize {
-        self.inner.dim_out()
-    }
-
-    fn residual<T: Numeric>(&self, input: (SE23<T>, SE23<T>, CameraIntrinsics<T>)) -> VectorX<T> {
-        self.inner.residual(input)
-    }
-}
-
-impl PoseHintVisualReprojectionFactor {
-    pub fn new(
-        start_time: SystemTime,
-        end_time: SystemTime,
-        measurement: VisualReprojectionMeasurement,
-        visual_feature_noise: Matrix2<f64>,
-    ) -> Self {
-        Self {
-            inner: VisualReprojectionFactor::new(
-                start_time,
-                end_time,
-                vec![vec![measurement]],
-                visual_feature_noise,
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
@@ -185,12 +148,12 @@ mod tests {
         let factor = VisualReprojectionFactor::new(
             time,
             time + Duration::from_secs(1),
-            vec![vec![VisualReprojectionMeasurement {
+            [VisualReprojectionMeasurement {
                 time,
                 detection: Point2::new(0.0, 0.0),
                 field_point: Point3::new(0.0, 0.0, 2.0),
                 robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
-            }]],
+            }],
             Matrix2::identity(),
         );
         let intrinsics = CameraIntrinsics::new(vector![100.0, 100.0], vector![0.0, 0.0]);
@@ -207,12 +170,12 @@ mod tests {
         let factor = VisualReprojectionFactor::new(
             time,
             time + Duration::from_secs(1),
-            vec![vec![VisualReprojectionMeasurement {
+            [VisualReprojectionMeasurement {
                 time,
                 detection: Point2::new(0.0, 0.0),
                 field_point: Point3::new(0.0, 0.0, 2.0),
                 robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
-            }]],
+            }],
             Matrix2::identity(),
         );
         let intrinsics = CameraIntrinsics::new(vector![100.0, 100.0], vector![0.0, 0.0]);
@@ -232,7 +195,7 @@ mod tests {
         let factor = VisualReprojectionFactor::new(
             time,
             time + Duration::from_secs(1),
-            vec![vec![
+            [
                 VisualReprojectionMeasurement {
                     time,
                     detection: Point2::new(10.0, 20.0),
@@ -245,7 +208,7 @@ mod tests {
                     field_point: Point3::new(0.0, 0.0, 1.0e-4),
                     robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
                 },
-            ]],
+            ],
             Matrix2::identity(),
         );
         let intrinsics = CameraIntrinsics::new(vector![100.0, 100.0], vector![0.0, 0.0]);
@@ -265,12 +228,12 @@ mod tests {
         let factor = VisualReprojectionFactor::new(
             time,
             time + Duration::from_secs(1),
-            vec![vec![VisualReprojectionMeasurement {
+            [VisualReprojectionMeasurement {
                 time,
                 detection: Point2::new(0.0, 0.0),
                 field_point: Point3::new(0.0, 0.0, 2.0),
                 robot_to_camera: SE3::from_rot_trans(SO3::identity(), Vector3::zeros()),
-            }]],
+            }],
             Matrix2::identity(),
         );
         let intrinsics = CameraIntrinsics::new(vector![100.0, 100.0], vector![0.0, 0.0]);

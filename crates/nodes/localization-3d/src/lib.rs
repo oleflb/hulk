@@ -289,8 +289,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         }
     }));
     let mut live_localization = LiveVisualOdometryLocalization::default();
-    let mut has_global_visual_lock = false;
-    let mut has_backend_result_after_global_lock = false;
+    let mut global_visual_lock = GlobalVisualLock::Unlocked;
 
     loop {
         select! {
@@ -303,7 +302,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     .any(|association| {
                         matches!(association.kind, FieldMarkAssociationKind::GlobalUnique)
                     });
-                if has_global_associations && !has_global_visual_lock {
+                if has_global_associations && !global_visual_lock.has_backend_result() {
                     continue;
                 }
 
@@ -315,14 +314,13 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 if global_pose.inner.is_none() {
                     continue;
                 }
-                if has_global_visual_lock && !has_backend_result_after_global_lock {
+                if matches!(global_visual_lock, GlobalVisualLock::WaitingForBackend) {
                     continue;
                 }
 
                 ingest_global_pose(&mut frontend, global_pose)
                     .wrap_err("failed to ingest global pose reset into frontend")?;
-                has_global_visual_lock = true;
-                has_backend_result_after_global_lock = false;
+                global_visual_lock = GlobalVisualLock::WaitingForBackend;
                 live_localization.clear();
             }
             // IMU payloads have no sensor timestamp; ros-z source time is the aligned clock.
@@ -345,7 +343,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             }
             visual_odometer = visual_odometer_subscriber.recv() => {
                 let visual_odometer = visual_odometer?;
-                if !has_backend_result_after_global_lock {
+                if !global_visual_lock.has_backend_result() {
                     continue;
                 }
 
@@ -380,45 +378,18 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             result = frontend.wait_for_optimization_result() => {
                 result?;
                 let result = frontend.last_optimization_result();
-                let timestamped_backend_transform = if has_global_visual_lock {
-                    result.as_ref().map(|result| {
-                        let backend_localization = localization_transform_from_backend_pose(&result.transform);
-                        if let Some(camera_matrix) = fresh_camera_matrix(
-                            &camera_matrix_cache,
-                            Time::from_wallclock(result.time),
-                        ) {
-                            constrain_localization_to_ground(
-                                backend_localization,
-                                &camera_matrix.inner.ground_to_robot,
-                            )
-                        } else {
-                            backend_localization
-                        }
-                    })
+                let timestamped_backend_transform = if global_visual_lock.is_active() {
+                    result.as_ref().map(|result| backend_localization_for_result(result, &camera_matrix_cache))
                 } else {
                     None
                 };
-                let transform = if has_global_visual_lock {
+                let transform = if global_visual_lock.is_active() {
                     result.as_ref().map(|result| {
-                        has_backend_result_after_global_lock = true;
+                        global_visual_lock = GlobalVisualLock::Locked;
                         live_localization.reset(result, &visual_odometer_cache, &camera_matrix_cache);
                         live_localization
                             .field_to_robot_latest(&visual_odometer_cache, &camera_matrix_cache)
-                            .unwrap_or_else(|| {
-                                let backend_localization =
-                                    localization_transform_from_backend_pose(&result.transform);
-                                if let Some(camera_matrix) = fresh_camera_matrix(
-                                    &camera_matrix_cache,
-                                    Time::from_wallclock(result.time),
-                                ) {
-                                    constrain_localization_to_ground(
-                                        backend_localization,
-                                        &camera_matrix.inner.ground_to_robot,
-                                    )
-                                } else {
-                                    backend_localization
-                                }
-                            })
+                            .unwrap_or_else(|| backend_localization_for_result(result, &camera_matrix_cache))
                     })
                 } else {
                     None
@@ -443,6 +414,23 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalVisualLock {
+    Unlocked,
+    WaitingForBackend,
+    Locked,
+}
+
+impl GlobalVisualLock {
+    fn is_active(self) -> bool {
+        !matches!(self, Self::Unlocked)
+    }
+
+    fn has_backend_result(self) -> bool {
+        matches!(self, Self::Locked)
     }
 }
 
@@ -610,6 +598,20 @@ fn localization_transform_from_backend_pose(
     robot_to_field: &nalgebra::Isometry3<f64>,
 ) -> Isometry3<Field, Robot> {
     robot_to_field.inverse().cast::<f32>().framed_transform()
+}
+
+fn backend_localization_for_result(
+    result: &OptimizationResult,
+    camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+) -> Isometry3<Field, Robot> {
+    let backend_localization = localization_transform_from_backend_pose(&result.transform);
+    if let Some(camera_matrix) =
+        fresh_camera_matrix(camera_matrix_cache, Time::from_wallclock(result.time))
+    {
+        constrain_localization_to_ground(backend_localization, &camera_matrix.inner.ground_to_robot)
+    } else {
+        backend_localization
+    }
 }
 
 fn localization_transform_constrained_to_ground(

@@ -100,35 +100,6 @@ pub(super) struct DetectionTriplets {
     pub(super) truncated: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct DetectionTripletQueueEntry {
-    pub(super) priority: NotNan<f32>,
-    pub(super) sequence: usize,
-    pub(super) triplet: DetectionTriplet,
-}
-
-impl Ord for DetectionTripletQueueEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| self.sequence.cmp(&other.sequence))
-    }
-}
-
-impl PartialOrd for DetectionTripletQueueEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for DetectionTripletQueueEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
-    }
-}
-
-impl Eq for DetectionTripletQueueEntry {}
-
 #[derive(Clone, Debug)]
 pub(super) struct Candidate {
     pub(super) score: f32,
@@ -217,38 +188,28 @@ impl CheapCandidate {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct AssociationKey {
-    pairs: [(usize, usize); MAX_DETECTIONS],
-    len: usize,
-}
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(super) struct AssociationKey(Vec<(usize, usize)>);
 
 impl AssociationKey {
     pub(super) fn empty() -> Self {
-        Self {
-            pairs: [(usize::MAX, usize::MAX); MAX_DETECTIONS],
-            len: 0,
-        }
+        Self(Vec::new())
     }
 
-    pub(super) fn is_empty(self) -> bool {
-        self.len == 0
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub(super) fn push(&mut self, detection_index: usize, landmark_id: usize) {
-        debug_assert!(self.len < MAX_DETECTIONS);
-        if let Some(pair) = self.pairs.get_mut(self.len) {
-            *pair = (detection_index, landmark_id);
-            self.len += 1;
-        }
+        self.0.push((detection_index, landmark_id));
     }
 
     pub(super) fn sort(&mut self) {
-        self.pairs[..self.len].sort_unstable();
+        self.0.sort_unstable();
     }
 
     pub(super) fn symmetric(mut self, map: &LandmarkMap) -> Self {
-        for (_, landmark_id) in &mut self.pairs[..self.len] {
+        for (_, landmark_id) in &mut self.0 {
             *landmark_id = map.symmetric_id(*landmark_id);
         }
         self.sort();
@@ -256,50 +217,15 @@ impl AssociationKey {
     }
 }
 
-impl PartialEq for AssociationKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.pairs[..self.len] == other.pairs[..other.len]
-    }
-}
-
-impl Eq for AssociationKey {}
-
-impl std::hash::Hash for AssociationKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&self.pairs[..self.len], state);
-    }
-}
-
-impl Ord for AssociationKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.pairs[..self.len].cmp(&other.pairs[..other.len])
-    }
-}
-
-impl PartialOrd for AssociationKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 pub(super) struct CheapSeedSearch {
     pub(super) candidates: Vec<CheapCandidate>,
-    pub(super) retained_keys: HashMap<AssociationKey, usize>,
     pub(super) truncated: bool,
-    pub(super) worst_candidate_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct SeedState {
     pub(super) seed: CheapCandidate,
     pub(super) upper_bound: f32,
-    pub(super) refined: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SeedQueueEntry {
-    pub(super) upper_bound: NotNan<f32>,
-    pub(super) index: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -329,18 +255,4 @@ pub(super) enum SymmetryRelation {
     Symmetric,
     Other,
     Missing,
-}
-
-impl Ord for SeedQueueEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.upper_bound
-            .cmp(&other.upper_bound)
-            .then_with(|| self.index.cmp(&other.index))
-    }
-}
-
-impl PartialOrd for SeedQueueEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }

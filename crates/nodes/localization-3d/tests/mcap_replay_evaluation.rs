@@ -814,10 +814,6 @@ fn replay_graph_variant(
                     Some(GlobalLocalizationDebugStatus::Ambiguous) => {
                         global_stats.localizer_ambiguous += 1;
                     }
-                    #[allow(deprecated)]
-                    Some(GlobalLocalizationDebugStatus::Unique) => {
-                        global_stats.localizer_ambiguous += 1;
-                    }
                     Some(GlobalLocalizationDebugStatus::UniqueModuloSymmetry) => {
                         global_stats.localizer_unique_modulo_symmetry += 1;
                     }
