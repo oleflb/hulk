@@ -13,6 +13,7 @@ use crate::factors::{
 #[derive(Debug, Clone)]
 pub enum SensorMeasurement {
     Imu(ImuMeasurement),
+    GlobalPose(GlobalPoseMeasurement),
     Visual(Vec<VisualReprojectionMeasurement>),
     PoseHintVisual(Vec<VisualReprojectionMeasurement>),
     VisualOdometry(VisualOdometryMeasurement),
@@ -23,6 +24,7 @@ impl SensorMeasurement {
     pub fn time(&self) -> SystemTime {
         match self {
             SensorMeasurement::Imu(imu) => imu.time,
+            SensorMeasurement::GlobalPose(global_pose) => global_pose.time,
             SensorMeasurement::Visual(visual) | SensorMeasurement::PoseHintVisual(visual) => {
                 visual
                     .first()
@@ -39,6 +41,12 @@ impl SensorMeasurement {
 pub struct ImuMeasurement {
     pub time: SystemTime,
     pub state: ImuState,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalPoseMeasurement {
+    pub time: SystemTime,
+    pub robot_to_field: SE3<f64>,
 }
 
 /// A fixed visual feature association in domain frames.

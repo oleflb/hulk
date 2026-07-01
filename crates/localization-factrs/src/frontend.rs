@@ -16,7 +16,7 @@ use crate::factors::{
     foot_above_ground::FootHeightMeasurement, visual_odometry::VisualOdometryMeasurement,
 };
 use crate::measurements::{
-    ImuMeasurement, SensorMeasurement, VisualReprojectionAssociation,
+    GlobalPoseMeasurement, ImuMeasurement, SensorMeasurement, VisualReprojectionAssociation,
     VisualReprojectionAssociationKind, VisualReprojectionMeasurement,
 };
 
@@ -76,6 +76,22 @@ impl VinsFrontend {
         let measurement = ImuMeasurement { time, state };
         self.measurement_sender
             .send(SensorMeasurement::Imu(measurement))
+            .map_err(|_| VinsFrontendError::BackendDisconnected)
+    }
+
+    /// Reinitializes the backend around an accepted global visual pose.
+    pub fn ingest_global_pose(
+        &mut self,
+        time: SystemTime,
+        robot_to_field: nalgebra::Isometry3<f64>,
+    ) -> Result<(), VinsFrontendError> {
+        let measurement = GlobalPoseMeasurement {
+            time,
+            robot_to_field: isometry3_f64_to_se3(robot_to_field),
+        };
+
+        self.measurement_sender
+            .send(SensorMeasurement::GlobalPose(measurement))
             .map_err(|_| VinsFrontendError::BackendDisconnected)
     }
 
@@ -174,16 +190,15 @@ pub enum VinsFrontendError {
 }
 
 fn isometry3_to_se3(isometry: nalgebra::Isometry3<f32>) -> SE3 {
+    isometry3_f64_to_se3(isometry.cast())
+}
+
+fn isometry3_f64_to_se3(isometry: nalgebra::Isometry3<f64>) -> SE3 {
     let rotation = isometry.rotation.quaternion();
-    let translation = isometry.translation.vector.cast::<f64>();
+    let translation = isometry.translation.vector;
 
     SE3::from_rot_trans(
-        SO3::from_xyzw(
-            rotation.i as f64,
-            rotation.j as f64,
-            rotation.k as f64,
-            rotation.w as f64,
-        ),
+        SO3::from_xyzw(rotation.i, rotation.j, rotation.k, rotation.w),
         translation,
     )
 }

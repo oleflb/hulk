@@ -34,7 +34,9 @@ use crate::{
     },
     initial_state::InitialState,
     interval_measurement::IntervalMeasurements,
-    measurements::{ImuMeasurement, SensorMeasurement, VisualReprojectionMeasurement},
+    measurements::{
+        GlobalPoseMeasurement, ImuMeasurement, SensorMeasurement, VisualReprojectionMeasurement,
+    },
     schur_marginalization::marginalize,
     splines::SE23Spline,
     symbols::{CameraIntrinsics, State},
@@ -237,6 +239,18 @@ pub fn initialize_graph(
     (graph, values)
 }
 
+fn optimizer_from_graph(config: &BackendConfiguration, graph: Graph) -> GaussNewton {
+    let mut optimizer = GaussNewton::new(
+        BaseOptParams {
+            max_iterations: config.optimizer_max_iterations,
+            ..Default::default()
+        },
+        graph,
+    );
+    optimizer.set_dense_normal_equations(true);
+    optimizer
+}
+
 impl VinsBackend {
     pub(crate) fn new(
         config: BackendConfiguration,
@@ -251,14 +265,7 @@ impl VinsBackend {
 
         let (graph, values) = initialize_graph(&initial_state, &config);
 
-        let mut optimizer = GaussNewton::new(
-            BaseOptParams {
-                max_iterations: config.optimizer_max_iterations,
-                ..Default::default()
-            },
-            graph,
-        );
-        optimizer.set_dense_normal_equations(true);
+        let optimizer = optimizer_from_graph(&config, graph);
 
         Self {
             interval_assigner: IntervalAssigner::new(config.knot_spacing),
@@ -1056,8 +1063,13 @@ impl VinsBackend {
 
     fn ingest_measurements(
         &mut self,
-        new_measurements: IntervalMeasurements,
+        mut new_measurements: IntervalMeasurements,
     ) -> Result<(), VinsBackendError> {
+        if let Some(global_pose) = new_measurements.latest_global_pose().cloned() {
+            self.reset_to_global_pose(global_pose.clone());
+            new_measurements.retain_at_or_after(global_pose.time);
+        }
+
         self.ingest_imu(new_measurements.imu);
         self.ingest_visual(new_measurements.visual);
         self.ingest_pose_hint_visual(new_measurements.pose_hint_visual);
@@ -1065,6 +1077,37 @@ impl VinsBackend {
         self.ingest_foot_heights(new_measurements.foot_heights);
 
         Ok(())
+    }
+
+    fn reset_to_global_pose(&mut self, global_pose: GlobalPoseMeasurement) {
+        let camera_intrinsics = self
+            .values
+            .get(CameraIntrinsics(0))
+            .cloned()
+            .unwrap_or_else(|| self.initial_state.camera_intrinsics.clone());
+        self.initial_state = InitialState::new(
+            SE23::from_rot_vel_trans(
+                global_pose.robot_to_field.rot().clone(),
+                Vector3::zeros(),
+                global_pose.robot_to_field.xyz().into_owned(),
+            ),
+            camera_intrinsics,
+        );
+
+        let (graph, values) = initialize_graph(&self.initial_state, &self.config);
+        self.optimizer = optimizer_from_graph(&self.config, graph);
+        self.values = values;
+        self.interval_assigner = IntervalAssigner::new(self.config.knot_spacing);
+        let _ = self.interval_assigner.assign_interval(global_pose.time);
+        self.last_knot_time = Some(global_pose.time);
+        self.highest_initialized_interval = None;
+        self.last_imu_attitude_measurement = None;
+        self.latest_imu_attitude_measurement = None;
+        self.next_imu_attitude_knot_index = 0;
+        self.last_imu_knot_orientation = None;
+        self.last_optimizer_status = None;
+        self.last_imu_kinematics_measurement_time = None;
+        self.init_intervals_through(0);
     }
 
     fn optimize(&mut self) -> Option<OptimizationResult> {
@@ -1467,6 +1510,13 @@ mod tests {
             previous_time,
             current_time,
             robot_delta: SE3::from_rot_trans(SO3::identity(), Vector3::new(x, 0.0, 0.0)),
+        })
+    }
+
+    fn global_pose(time: SystemTime, x: f64, y: f64, z: f64) -> SensorMeasurement {
+        SensorMeasurement::GlobalPose(GlobalPoseMeasurement {
+            time,
+            robot_to_field: SE3::from_rot_trans(SO3::identity(), Vector3::new(x, y, z)),
         })
     }
 
@@ -1955,6 +2005,42 @@ mod tests {
         let _ = backend.solve_once().expect("solve should succeed");
 
         assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 1);
+    }
+
+    #[test]
+    fn global_pose_measurement_resets_backend_state() {
+        let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+        measurement_sender
+            .send(visual_odometry(
+                start,
+                start + Duration::from_millis(100),
+                3.0,
+            ))
+            .expect("visual odometry should send");
+        let _ = backend.solve_once().expect("initial solve should succeed");
+
+        let reset_time = start + Duration::from_secs(1);
+        measurement_sender
+            .send(global_pose(reset_time, 1.0, 2.0, 0.45))
+            .expect("global pose should send");
+
+        let result = backend
+            .solve_once()
+            .expect("reset solve should succeed")
+            .expect("reset should produce a result");
+
+        assert_eq!(result.time, reset_time);
+        assert!((result.latest_pose.xyz() - Vector3::new(1.0, 2.0, 0.45)).norm() < 1.0e-9);
+        assert!(result.latest_pose.uvw().norm() < 1.0e-9);
+        assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 0);
     }
 
     #[test]
