@@ -5,59 +5,32 @@ pub(super) fn oriented_candidate(problem: &Problem, candidate: &Candidate) -> Ca
         return candidate.clone();
     };
     let symmetric = symmetric_candidate(candidate, &problem.map);
-    let current_score = hint_reprojection_score(problem, candidate, hint);
-    let symmetric_score = hint_reprojection_score(problem, &symmetric, hint);
-    if symmetric_score.is_better_than(current_score) {
+    if yaw_error_to_hint(problem, &symmetric, hint) < yaw_error_to_hint(problem, candidate, hint) {
         symmetric
     } else {
         candidate.clone()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct HintReprojectionScore {
-    projected_matches: usize,
-    squared_reprojection_error: f32,
-}
-
-impl HintReprojectionScore {
-    fn is_better_than(self, other: Self) -> bool {
-        self.projected_matches > other.projected_matches
-            || (self.projected_matches == other.projected_matches
-                && self.squared_reprojection_error < other.squared_reprojection_error)
-    }
-}
-
-fn hint_reprojection_score(
+fn yaw_error_to_hint(
     problem: &Problem,
     candidate: &Candidate,
     hint: Isometry3<Robot, Field>,
-) -> HintReprojectionScore {
-    let field_to_camera = field_to_camera_from_robot_to_field(problem.robot_to_camera, hint);
-    let mut score = HintReprojectionScore {
-        projected_matches: 0,
-        squared_reprojection_error: 0.0,
-    };
+) -> f32 {
+    yaw_difference(robot_to_field_for_candidate(problem, candidate), hint).abs()
+}
 
-    for accepted in &candidate.matches {
-        let Some(detection) = problem.detections.get(accepted.detection_index) else {
-            continue;
-        };
-        let Some(landmark) = problem.map.landmarks.get(accepted.landmark_id) else {
-            continue;
-        };
-        let Some(projected) = project_field_point(field_to_camera, problem.k, landmark.xy) else {
-            continue;
-        };
-        let residual_squared = (projected - detection.pixel).inner.norm_squared();
-        if !residual_squared.is_finite() {
-            continue;
-        }
-        score.projected_matches += 1;
-        score.squared_reprojection_error += residual_squared;
+fn yaw_difference(left: Isometry3<Robot, Field>, right: Isometry3<Robot, Field>) -> f32 {
+    let (_, _, left_yaw) = left.inner.rotation.euler_angles();
+    let (_, _, right_yaw) = right.inner.rotation.euler_angles();
+    let mut difference = left_yaw - right_yaw;
+    while difference > std::f32::consts::PI {
+        difference -= std::f32::consts::TAU;
     }
-
-    score
+    while difference < -std::f32::consts::PI {
+        difference += std::f32::consts::TAU;
+    }
+    difference
 }
 
 fn symmetric_candidate(candidate: &Candidate, map: &LandmarkMap) -> Candidate {

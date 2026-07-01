@@ -80,15 +80,19 @@ fn stable_matches_reject_mixed_symmetry_branch() -> Result<(), String> {
 }
 
 #[test]
-fn oriented_candidate_prefers_associations_reprojecting_under_pose_hint() -> Result<(), String> {
+fn oriented_candidate_prefers_yaw_branch_under_drifted_pose_hint() -> Result<(), String> {
     let field = FieldDimensions::SPL_2025;
     let config = GlobalAssociationConfig::default();
     let map = LandmarkMap::new(&field, config.min_map_baseline);
     let pose = robot_to_field(-0.2, 0.15, 0.08);
+    let drifted_pose_hint = robot_to_field(-3.0, -2.0, 0.08);
     let selected = selected_goal_side_features(&map, &field, pose)?;
     let frame = synthetic_frame(&selected);
-    let problem = Problem::new(synthetic_input(&frame.features, &field, Some(pose)), config)
-        .ok_or_else(|| "synthetic problem should be valid".to_string())?;
+    let problem = Problem::new(
+        synthetic_input(&frame.features, &field, Some(drifted_pose_hint)),
+        config,
+    )
+    .ok_or_else(|| "synthetic problem should be valid".to_string())?;
     let symmetric = candidate_from_problem_truth(&problem, &frame, &map, true)?;
 
     let resolved = oriented_candidate(&problem, &symmetric);

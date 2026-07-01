@@ -81,7 +81,6 @@ pub struct GlobalVisualLocalization {
 pub struct FieldMarkAssociationState {
     pending_global_recovery: Option<GlobalRecoveryCandidate>,
     has_global_lock: bool,
-    last_global_lock: Option<Isometry3<Robot, Field>>,
 }
 
 #[derive(Debug, Clone)]
@@ -412,18 +411,29 @@ impl FieldMarkAssociationState {
             }
         }
 
-        if self
-            .last_global_lock
-            .is_some_and(|last| poses_agree(robot_to_field, last, parameters.pose_hint))
-        {
-            return self.accept_global_associations(robot_to_field, associations, false);
+        if self.has_global_lock {
+            let Some(branch_hint) = pose_hint else {
+                self.pending_global_recovery = None;
+                return AcceptedFieldMarkAssociations::empty();
+            };
+            if !poses_are_on_same_symmetry_branch(robot_to_field, branch_hint, parameters.pose_hint)
+            {
+                self.pending_global_recovery = None;
+                return AcceptedFieldMarkAssociations::empty();
+            }
+
+            return self.stage_global_recovery(robot_to_field, associations, parameters);
         }
 
-        if self.has_global_lock && pose_hint.is_some() {
-            self.pending_global_recovery = None;
-            return AcceptedFieldMarkAssociations::empty();
-        }
+        self.stage_global_recovery(robot_to_field, associations, parameters)
+    }
 
+    fn stage_global_recovery(
+        &mut self,
+        robot_to_field: Isometry3<Robot, Field>,
+        associations: Vec<FieldMarkAssociation>,
+        parameters: &FieldMarkAssociationParameters,
+    ) -> AcceptedFieldMarkAssociations {
         let consecutive_frames = self
             .pending_global_recovery
             .as_ref()
@@ -453,7 +463,6 @@ impl FieldMarkAssociationState {
         reset_backend: bool,
     ) -> AcceptedFieldMarkAssociations {
         self.has_global_lock = true;
-        self.last_global_lock = Some(robot_to_field);
         self.pending_global_recovery = None;
         if reset_backend {
             AcceptedFieldMarkAssociations::global(robot_to_field, associations)
@@ -483,6 +492,14 @@ fn poses_agree(
     let yaw_distance = yaw_difference(left, right).abs();
     translation_distance <= config.recovery_max_pose_distance
         && yaw_distance <= config.recovery_max_pose_angle
+}
+
+fn poses_are_on_same_symmetry_branch(
+    left: Isometry3<Robot, Field>,
+    right: Isometry3<Robot, Field>,
+    config: PoseHintAssociationParameters,
+) -> bool {
+    yaw_difference(left, right).abs() <= config.recovery_max_branch_yaw_error
 }
 
 fn yaw_difference(left: Isometry3<Robot, Field>, right: Isometry3<Robot, Field>) -> f32 {
@@ -698,6 +715,7 @@ mod tests {
     use geometry::rectangle::Rectangle;
     use types::bounding_box::BoundingBox;
 
+    use super::global_association::{FeatureAssociations, GlobalLocalizationScore};
     use super::*;
 
     #[test]
@@ -768,7 +786,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unhealthy_tracking_recovers_on_same_symmetry_branch_after_stable_frames() {
+        let parameters = recovery_parameters();
+        let global_pose = robot_to_field(2.0, 1.0, 0.2);
+        let drifted_hint_on_same_branch = robot_to_field(-1.5, -1.0, 0.25);
+        let result = unique_result(global_pose);
+        let mut state = globally_locked_state();
+
+        let first = state.global_recovery_associations(
+            Some(&result),
+            Some(drifted_hint_on_same_branch),
+            &parameters,
+        );
+        let second = state.global_recovery_associations(
+            Some(&result),
+            Some(drifted_hint_on_same_branch),
+            &parameters,
+        );
+
+        assert!(first.global_pose.is_none());
+        assert!(first.associations.is_empty());
+        let recovered_pose = second
+            .global_pose
+            .expect("stable same-branch recovery should reset backend");
+        assert_eq!(
+            recovered_pose.inner.translation.vector.x,
+            global_pose.inner.translation.vector.x
+        );
+        assert_eq!(second.associations.len(), 1);
+    }
+
+    #[test]
+    fn unhealthy_tracking_rejects_symmetric_branch_flip() {
+        let parameters = recovery_parameters();
+        let flipped_global_pose = robot_to_field(2.0, 1.0, std::f32::consts::PI + 0.2);
+        let drifted_hint = robot_to_field(-1.5, -1.0, 0.2);
+        let result = unique_result(flipped_global_pose);
+        let mut state = globally_locked_state();
+
+        let first =
+            state.global_recovery_associations(Some(&result), Some(drifted_hint), &parameters);
+        let second =
+            state.global_recovery_associations(Some(&result), Some(drifted_hint), &parameters);
+
+        assert!(first.global_pose.is_none());
+        assert!(first.associations.is_empty());
+        assert!(second.global_pose.is_none());
+        assert!(second.associations.is_empty());
+    }
+
+    #[test]
+    fn locked_recovery_without_pose_hint_fails_closed() {
+        let parameters = recovery_parameters();
+        let result = unique_result(robot_to_field(2.0, 1.0, 0.2));
+        let mut state = globally_locked_state();
+
+        let first = state.global_recovery_associations(Some(&result), None, &parameters);
+        let second = state.global_recovery_associations(Some(&result), None, &parameters);
+
+        assert!(first.global_pose.is_none());
+        assert!(first.associations.is_empty());
+        assert!(second.global_pose.is_none());
+        assert!(second.associations.is_empty());
+    }
+
     fn feature_pixels(features: &[DetectedVisualFeature]) -> Vec<Point2<Pixel>> {
         features.iter().map(|feature| feature.pixel).collect()
+    }
+
+    fn recovery_parameters() -> FieldMarkAssociationParameters {
+        FieldMarkAssociationParameters {
+            pose_hint: PoseHintAssociationParameters {
+                recovery_frames: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn globally_locked_state() -> FieldMarkAssociationState {
+        FieldMarkAssociationState {
+            has_global_lock: true,
+            ..Default::default()
+        }
+    }
+
+    fn unique_result(robot_to_field: Isometry3<Robot, Field>) -> GlobalLocalizationResult {
+        GlobalLocalizationResult::UniqueModuloSymmetry(FeatureAssociations {
+            robot_to_field,
+            features: vec![FeatureAssociation {
+                detection_id: 0,
+                landmark_id: 0,
+                detection: point![<Pixel>, 1.0, 2.0],
+                field_point: point![<Field>, 3.0, 4.0],
+            }],
+            score: GlobalLocalizationScore {
+                inliers: 1,
+                candidate_score: 1.0,
+                metric_rms_residual: 0.0,
+                reprojection_rmse: 0.0,
+                total_cost: 0.0,
+            },
+        })
+    }
+
+    fn robot_to_field(x: f32, y: f32, yaw: f32) -> Isometry3<Robot, Field> {
+        Isometry3::wrap(nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(x, y, 0.0),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw),
+        ))
     }
 }

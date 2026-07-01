@@ -22,5 +22,6 @@
     recovery_frames: 5,
     recovery_max_pose_distance: 0.5,
     recovery_max_pose_angle: 0.2617994,
+    recovery_max_branch_yaw_error: 1.2217305,
   },
 }

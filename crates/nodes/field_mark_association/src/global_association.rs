@@ -88,6 +88,8 @@ pub struct PoseHintAssociationConfig {
     pub recovery_max_pose_distance: f32,
     /// Maximum yaw difference for accepting a global result against a pose hint.
     pub recovery_max_pose_angle: f32,
+    /// Maximum yaw difference for accepting a global recovery on the same symmetry branch.
+    pub recovery_max_branch_yaw_error: f32,
 }
 
 impl Default for PoseHintAssociationConfig {
@@ -102,6 +104,7 @@ impl Default for PoseHintAssociationConfig {
             recovery_frames: 5,
             recovery_max_pose_distance: 0.5,
             recovery_max_pose_angle: 15.0_f32.to_radians(),
+            recovery_max_branch_yaw_error: 70.0_f32.to_radians(),
         }
     }
 }
@@ -139,7 +142,17 @@ impl PoseHintAssociationConfig {
         validate_positive_f32(
             self.recovery_max_pose_angle,
             "pose_hint.recovery_max_pose_angle must be finite and > 0",
-        )
+        )?;
+        if !self.recovery_max_branch_yaw_error.is_finite()
+            || self.recovery_max_branch_yaw_error <= 0.0
+            || self.recovery_max_branch_yaw_error >= std::f32::consts::FRAC_PI_2
+        {
+            return Err(
+                "pose_hint.recovery_max_branch_yaw_error must be finite and in (0, pi/2)"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
