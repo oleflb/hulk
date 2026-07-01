@@ -121,6 +121,7 @@ members = [
   "tools/mujoco-simulator/mujoco-rust-server",
   "tools/parameter_tester",
   "tools/pepsi",
+  "tools/robot_viewer",
   "tools/tensorrt-compile",
   "tools/twix",
   "tools/twix-legacy",
