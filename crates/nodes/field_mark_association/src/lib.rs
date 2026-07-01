@@ -71,15 +71,17 @@ pub struct FieldMarkAssociations {
 pub struct GlobalVisualLocalization {
     /// Debug payload for the best visual global localization result, if any.
     pub debug: Option<GlobalLocalizationDebug>,
+    /// Accepted global pose when global recovery should reset the backend state.
+    pub accepted_global_pose: Option<Isometry3<Robot, Field>>,
     /// Fixed associations selected by either global uniqueness or pose-hint fallback.
     pub associations: Vec<FieldMarkAssociation>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FieldMarkAssociationState {
-    weak_pose_hint_frames: usize,
     pending_global_recovery: Option<GlobalRecoveryCandidate>,
     has_global_lock: bool,
+    last_global_lock: Option<Isometry3<Robot, Field>>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +89,37 @@ struct GlobalRecoveryCandidate {
     robot_to_field: Isometry3<Robot, Field>,
     associations: Vec<FieldMarkAssociation>,
     consecutive_frames: usize,
+}
+
+struct AcceptedFieldMarkAssociations {
+    associations: Vec<FieldMarkAssociation>,
+    global_pose: Option<Isometry3<Robot, Field>>,
+}
+
+impl AcceptedFieldMarkAssociations {
+    fn empty() -> Self {
+        Self {
+            associations: Vec::new(),
+            global_pose: None,
+        }
+    }
+
+    fn associations(associations: Vec<FieldMarkAssociation>) -> Self {
+        Self {
+            associations,
+            global_pose: None,
+        }
+    }
+
+    fn global(
+        robot_to_field: Isometry3<Robot, Field>,
+        associations: Vec<FieldMarkAssociation>,
+    ) -> Self {
+        Self {
+            associations,
+            global_pose: Some(robot_to_field),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -174,6 +207,12 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .publisher::<Option<GlobalLocalizationDebug>>("debug/global_localization")?
         .build()
         .await?;
+    let global_pose_publisher = node
+        .publisher::<TimeWrapper<Option<Isometry3<Robot, Field>>>>(
+            "field_mark_association/global_pose",
+        )?
+        .build()
+        .await?;
     let mut association_state = FieldMarkAssociationState::default();
 
     loop {
@@ -216,6 +255,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                         state,
                         GlobalVisualLocalization {
                             debug: None,
+                            accepted_global_pose: None,
                             associations: Vec::new(),
                         },
                     );
@@ -239,6 +279,14 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             global_localization_publisher
                 .publish_if_subscribed(|| ready(debug))
                 .await?;
+            if localization.accepted_global_pose.is_some() {
+                global_pose_publisher
+                    .publish(&TimeWrapper {
+                        time: image_time,
+                        inner: localization.accepted_global_pose,
+                    })
+                    .await?;
+            }
 
             let message = TimeWrapper {
                 time: image_time,
@@ -308,33 +356,36 @@ impl FieldMarkAssociationState {
             self.reset_recovery();
             return GlobalVisualLocalization {
                 debug: None,
+                accepted_global_pose: None,
                 associations: pose_hint_field_mark_associations(&pose_hint_result),
             };
         }
 
-        self.note_weak_pose_hint_frame();
-        let result = localizer.localize(input);
+        let trusted_pose_hint = if self.has_global_lock {
+            pose_hint
+        } else {
+            None
+        };
+        let result = localizer.localize(GlobalLocalizationInput {
+            pose_hint: trusted_pose_hint,
+            ..input
+        });
         let debug = if include_debug {
             result.as_ref().map(global_localization_debug_from_result)
         } else {
             None
         };
-        let associations =
-            self.global_recovery_associations(result.as_ref(), pose_hint, parameters);
+        let accepted =
+            self.global_recovery_associations(result.as_ref(), trusted_pose_hint, parameters);
 
         GlobalVisualLocalization {
             debug,
-            associations,
+            accepted_global_pose: accepted.global_pose,
+            associations: accepted.associations,
         }
     }
 
-    fn note_weak_pose_hint_frame(&mut self) {
-        self.weak_pose_hint_frames = self.weak_pose_hint_frames.saturating_add(1);
-        self.has_global_lock = false;
-    }
-
     fn reset_recovery(&mut self) {
-        self.weak_pose_hint_frames = 0;
         self.pending_global_recovery = None;
     }
 
@@ -343,34 +394,36 @@ impl FieldMarkAssociationState {
         result: Option<&GlobalLocalizationResult>,
         pose_hint: Option<Isometry3<Robot, Field>>,
         parameters: &FieldMarkAssociationParameters,
-    ) -> Vec<FieldMarkAssociation> {
-        if self.weak_pose_hint_frames < parameters.pose_hint.recovery_frames {
-            return Vec::new();
-        }
+    ) -> AcceptedFieldMarkAssociations {
         let Some(result) = result else {
             self.pending_global_recovery = None;
-            return Vec::new();
+            return AcceptedFieldMarkAssociations::empty();
         };
         let Some(associations) = result.unique_feature_associations() else {
             self.pending_global_recovery = None;
-            return Vec::new();
+            return AcceptedFieldMarkAssociations::empty();
         };
         let robot_to_field = result.associations().robot_to_field;
-        if let Some(pose_hint) = pose_hint {
-            if !poses_agree(robot_to_field, pose_hint, parameters.pose_hint) {
-                self.pending_global_recovery = None;
-                return Vec::new();
-            }
-            self.has_global_lock = true;
-            self.reset_recovery();
-            return field_mark_associations(
-                associations.iter(),
-                FieldMarkAssociationKind::GlobalUnique,
-            );
-        }
-
         let associations =
             field_mark_associations(associations.iter(), FieldMarkAssociationKind::GlobalUnique);
+        if let Some(pose_hint) = pose_hint {
+            if poses_agree(robot_to_field, pose_hint, parameters.pose_hint) {
+                return self.accept_global_associations(robot_to_field, associations, false);
+            }
+        }
+
+        if self
+            .last_global_lock
+            .is_some_and(|last| poses_agree(robot_to_field, last, parameters.pose_hint))
+        {
+            return self.accept_global_associations(robot_to_field, associations, false);
+        }
+
+        if self.has_global_lock && pose_hint.is_some() {
+            self.pending_global_recovery = None;
+            return AcceptedFieldMarkAssociations::empty();
+        }
+
         let consecutive_frames = self
             .pending_global_recovery
             .as_ref()
@@ -384,16 +437,28 @@ impl FieldMarkAssociationState {
             consecutive_frames,
         });
         if consecutive_frames >= parameters.pose_hint.recovery_frames {
-            let associations = self
-                .pending_global_recovery
-                .take()
-                .map(|pending| pending.associations)
-                .unwrap_or_default();
-            self.has_global_lock = true;
-            self.weak_pose_hint_frames = 0;
-            associations
+            let Some(pending) = self.pending_global_recovery.take() else {
+                return AcceptedFieldMarkAssociations::empty();
+            };
+            self.accept_global_associations(pending.robot_to_field, pending.associations, true)
         } else {
-            Vec::new()
+            AcceptedFieldMarkAssociations::empty()
+        }
+    }
+
+    fn accept_global_associations(
+        &mut self,
+        robot_to_field: Isometry3<Robot, Field>,
+        associations: Vec<FieldMarkAssociation>,
+        reset_backend: bool,
+    ) -> AcceptedFieldMarkAssociations {
+        self.has_global_lock = true;
+        self.last_global_lock = Some(robot_to_field);
+        self.pending_global_recovery = None;
+        if reset_backend {
+            AcceptedFieldMarkAssociations::global(robot_to_field, associations)
+        } else {
+            AcceptedFieldMarkAssociations::associations(associations)
         }
     }
 }
@@ -475,6 +540,7 @@ fn localize_global_visual_features_with_debug(
         } else {
             None
         },
+        accepted_global_pose: None,
         associations: result
             .as_ref()
             .and_then(GlobalLocalizationResult::unique_feature_associations)

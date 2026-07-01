@@ -82,7 +82,7 @@ pub struct PoseHintAssociationConfig {
     pub healthy_min_inliers: usize,
     /// Maximum pose-hint frame reprojection RMSE for healthy tracking.
     pub healthy_max_rmse_px: f32,
-    /// Weak or missing pose-hint frames before global recovery can be considered.
+    /// Consecutive agreeing global-localization frames required before recovery is accepted.
     pub recovery_frames: usize,
     /// Maximum translation difference for accepting a global result against a pose hint.
     pub recovery_max_pose_distance: f32,
