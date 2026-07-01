@@ -4,6 +4,7 @@ use std::{
     fs::{self, File},
     future::Future,
     io::BufWriter,
+    num::NonZeroUsize,
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -11,22 +12,26 @@ use std::{
 };
 
 use booster::{ImuState, MotorState};
-use color_eyre::{
-    Result,
-    eyre::{WrapErr, eyre},
-};
+use color_eyre::{Result, eyre::WrapErr};
 use coordinate_systems::{Field, Ground, Robot};
 use field_mark_association::{FieldMarkAssociations, GlobalLocalizationDebug};
+use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use kinematics::joints::{Joints, head::HeadJoints};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
 use localization_3d::SolveDiagnostics;
-use mcap::{Writer, records::MessageHeader};
+use mcap::{Compression, WriteOptions, Writer, records::MessageHeader};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
-use ros_z::{Message, attachment::Attachment, prelude::*, time::Time};
+use ros_z::{
+    Message,
+    attachment::Attachment,
+    prelude::*,
+    pubsub::RawSubscriber,
+    qos::{QosHistory, QosReliability},
+    time::Time,
+};
 use ros_z_streams::Announcement;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::mpsc, task::JoinSet};
 use types::{
     field_dimensions::FieldDimensions,
     motion_command::MotionCommand,
@@ -36,8 +41,12 @@ use types::{
     time_wrapper::TimeWrapper,
     visual_odometry::{VisualOdometer, VisualOdometryDelta},
 };
+use zenoh::sample::Sample;
 
 type ChannelId = u16;
+type RecorderTasks = FuturesUnordered<BoxFuture<'static, Result<RecordedSample>>>;
+
+const DEFAULT_QUEUE_DEPTH: usize = 8;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Message)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +55,7 @@ pub struct LocalizationRecorderParameters {
     pub output_path: PathBuf,
     pub max_duration: Option<Duration>,
     pub include_raw_images: bool,
+    pub queue_depth: usize,
 }
 
 impl Default for LocalizationRecorderParameters {
@@ -55,6 +65,7 @@ impl Default for LocalizationRecorderParameters {
             output_path: PathBuf::from("/tmp/localization_recording.mcap"),
             max_duration: None,
             include_raw_images: false,
+            queue_depth: DEFAULT_QUEUE_DEPTH,
         }
     }
 }
@@ -66,6 +77,9 @@ impl LocalizationRecorderParameters {
         }
         if self.max_duration.is_some_and(|duration| duration.is_zero()) {
             return Err("max_duration must be positive when set".to_string());
+        }
+        if self.queue_depth == 0 {
+            return Err("queue_depth must be positive".to_string());
         }
         Ok(())
     }
@@ -105,164 +119,164 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         )
     })?;
     let writer = McapWriter::new(BufWriter::new(file))?;
-    let (sample_sender, sample_receiver) = mpsc::unbounded_channel();
-    let writer_task = tokio::spawn(write_mcap(sample_receiver, writer));
+    let mut writer = writer;
 
-    let mut recorders = JoinSet::new();
-    spawn_topic::<ImuState>(
+    let mut recorders = RecorderTasks::new();
+    subscribe_topic::<ImuState>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "inputs/imu_state",
     )
     .await?;
-    spawn_topic::<VisualOdometryDelta>(
+    subscribe_topic::<VisualOdometryDelta>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "visual_odometry/current_left_camera_to_previous_left_camera",
     )
     .await?;
-    spawn_topic::<TimeWrapper<RobotKinematics>>(
+    subscribe_topic::<TimeWrapper<RobotKinematics>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "robot_kinematics",
     )
     .await?;
-    spawn_topic::<TimeWrapper<Option<Side>>>(
+    subscribe_topic::<TimeWrapper<Option<Side>>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "support_foot",
     )
     .await?;
-    spawn_topic::<TimeWrapper<Option<Isometry3<Ground, Robot>>>>(
+    subscribe_topic::<TimeWrapper<Option<Isometry3<Ground, Robot>>>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "ground_to_robot",
     )
     .await?;
-    spawn_topic::<TimeWrapper<CameraMatrix>>(
+    subscribe_topic::<TimeWrapper<CameraMatrix>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "camera_matrix",
     )
     .await?;
-    spawn_topic::<Vec<Object<RobocupObjectLabel>>>(
+    subscribe_topic::<Vec<Object<RobocupObjectLabel>>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "detected_objects",
     )
     .await?;
-    spawn_topic::<Announcement>(
+    subscribe_topic::<Announcement>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "detected_objects/announce",
     )
     .await?;
-    spawn_topic::<FieldDimensions>(
+    subscribe_topic::<FieldDimensions>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "field_dimensions",
     )
     .await?;
-    spawn_topic::<Option<Isometry3<Field, Robot>>>(
+    subscribe_topic::<Option<Isometry3<Field, Robot>>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "localization",
     )
     .await?;
-    spawn_topic::<VisualOdometer>(
+    subscribe_topic::<VisualOdometer>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "visual_odometry/current_left_camera_to_visual_odometer",
     )
     .await?;
-    spawn_topic::<Option<nalgebra::Isometry3<f32>>>(
+    subscribe_topic::<Option<nalgebra::Isometry3<f32>>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "debug/visual_odometry/previous_left_camera_to_current_left_camera",
     )
     .await?;
-    spawn_topic::<Option<GlobalLocalizationDebug>>(
+    subscribe_topic::<Option<GlobalLocalizationDebug>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "debug/global_localization",
     )
     .await?;
-    spawn_topic::<TimeWrapper<FieldMarkAssociations>>(
+    subscribe_topic::<TimeWrapper<FieldMarkAssociations>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "field_mark_association/associations",
     )
     .await?;
-    spawn_topic::<Intrinsic>(
+    subscribe_topic::<Intrinsic>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "debug/calibrated_intrinsics",
     )
     .await?;
-    spawn_topic::<TimeWrapper<SolveDiagnostics>>(
+    subscribe_topic::<TimeWrapper<SolveDiagnostics>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "debug/solve_diagnostics",
     )
     .await?;
-    spawn_topic::<Joints<MotorState>>(
+    subscribe_topic::<Joints<MotorState>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "inputs/serial_motor_states",
     )
     .await?;
-    spawn_topic::<MotionCommand>(
+    subscribe_topic::<MotionCommand>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "behavior/motion_command",
     )
     .await?;
-    spawn_topic::<MotionCommand>(
+    subscribe_topic::<MotionCommand>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "motion_command",
     )
     .await?;
-    spawn_topic::<HeadJoints<f32>>(&node, &mut recorders, sample_sender.clone(), "look_at").await?;
-    spawn_topic::<HeadJoints<f32>>(
+    subscribe_topic::<HeadJoints<f32>>(&node, &mut recorders, parameters.queue_depth, "look_at")
+        .await?;
+    subscribe_topic::<HeadJoints<f32>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "look_around_target_joints",
     )
     .await?;
-    spawn_topic::<HeadJoints<f32>>(
+    subscribe_topic::<HeadJoints<f32>>(
         &node,
         &mut recorders,
-        sample_sender.clone(),
+        parameters.queue_depth,
         "head_joints_command",
     )
     .await?;
 
     if parameters.include_raw_images {
-        spawn_topic::<TimeWrapper<StereoImagePair>>(
+        subscribe_topic::<TimeWrapper<StereoImagePair>>(
             &node,
             &mut recorders,
-            sample_sender.clone(),
+            parameters.queue_depth,
             "inputs/stereo_image_pair",
         )
         .await?;
@@ -271,35 +285,20 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     tracing::info!(
         path = %parameters.output_path.display(),
         include_raw_images = parameters.include_raw_images,
+        queue_depth = parameters.queue_depth,
+        compression = "lz4",
         "localization recording started"
     );
 
-    drop(sample_sender);
-    let recorder_result = if let Some(max_duration) = parameters.max_duration {
-        tokio::select! {
-            _ = tokio::time::sleep(max_duration) => {
-                Ok(())
-            }
-            result = recorders.join_next() => {
-                handle_recorder_result(result)
-            }
-        }
-    } else {
-        let mut recorder_result = Ok(());
-        while let Some(join_result) = recorders.join_next().await {
-            if let Err(error) = handle_recorder_result(Some(join_result)) {
-                recorder_result = Err(error);
-                break;
-            }
-        }
-        recorder_result
-    };
-
-    recorders.abort_all();
-    drain_aborted_recorders(recorders).await;
-    let samples_written = writer_task
-        .await
-        .wrap_err("localization recorder writer task panicked")??;
+    let mut samples_written = 0;
+    let recorder_result = record_samples(
+        &mut recorders,
+        &mut writer,
+        parameters.max_duration,
+        &mut samples_written,
+    )
+    .await;
+    let finish_result = writer.finish();
     tracing::info!(
         path = %parameters.output_path.display(),
         samples_written,
@@ -307,92 +306,106 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     );
 
     recorder_result?;
+    finish_result?;
 
     Ok(())
 }
 
-async fn spawn_topic<T>(
+async fn subscribe_topic<T>(
     node: &Node,
-    recorders: &mut JoinSet<Result<()>>,
-    sample_sender: mpsc::UnboundedSender<RecordedSample>,
+    recorders: &mut RecorderTasks,
+    queue_depth: usize,
     topic: &'static str,
 ) -> Result<()>
 where
     T: Message + Send + Sync + 'static,
 {
-    let mut subscriber = node.subscriber::<T>(topic)?.raw().build().await?;
-    let channel = Arc::new(RecordedChannel::for_message::<T>(topic));
+    let subscriber = node
+        .subscriber::<T>(topic)?
+        .raw()
+        .qos(recorder_qos(queue_depth))
+        .build()
+        .await?;
+    let recorder = TopicRecorder {
+        subscriber,
+        channel: RecordedChannel::for_message::<T>(topic),
+    };
 
-    recorders.spawn(async move {
-        loop {
-            let sample = subscriber
-                .recv()
-                .await
-                .wrap_err_with(|| format!("failed to receive raw sample from {topic}"))?;
-            let attachment = sample
-                .attachment()
-                .ok_or_else(|| eyre!("sample on {topic} has no ros-z attachment"))
-                .and_then(|raw| {
-                    Attachment::try_from(raw).map_err(|error| {
-                        eyre!("failed to decode ros-z attachment on {topic}: {error}")
-                    })
-                })?;
-            let source_time = attachment.source_time();
-            let transport_time = sample
-                .timestamp()
-                .map(|timestamp| Time::from_wallclock(timestamp.get_time().to_system_time()))
-                .unwrap_or(source_time);
-            let payload = sample.payload().to_bytes().to_vec();
-            let sequence = u32::try_from(attachment.sequence_number).unwrap_or(u32::MAX);
-
-            sample_sender
-                .send(RecordedSample {
-                    channel: channel.clone(),
-                    payload,
-                    sequence,
-                    log_time: time_to_mcap_nanos(transport_time),
-                    publish_time: time_to_mcap_nanos(source_time),
-                })
-                .map_err(|_| eyre!("localization recorder writer stopped"))?;
-        }
-    });
+    recorders.push(receive_sample(recorder));
 
     Ok(())
 }
 
-fn handle_recorder_result(
-    result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>,
+fn recorder_qos(queue_depth: usize) -> QosProfile {
+    QosProfile {
+        reliability: QosReliability::BestEffort,
+        history: QosHistory::KeepLast(NonZeroUsize::new(queue_depth).unwrap_or(NonZeroUsize::MIN)),
+        ..Default::default()
+    }
+}
+
+fn receive_sample(mut recorder: TopicRecorder) -> BoxFuture<'static, Result<RecordedSample>> {
+    async move {
+        let sample = recorder.subscriber.recv().await.wrap_err_with(|| {
+            format!(
+                "failed to receive raw sample from {}",
+                recorder.channel.topic
+            )
+        })?;
+
+        Ok(RecordedSample { recorder, sample })
+    }
+    .boxed()
+}
+
+async fn record_samples(
+    recorders: &mut RecorderTasks,
+    writer: &mut McapWriter<BufWriter<File>>,
+    max_duration: Option<Duration>,
+    samples_written: &mut usize,
 ) -> Result<()> {
-    if let Some(result) = result {
-        result.wrap_err("localization recorder task panicked")??;
+    if let Some(max_duration) = max_duration {
+        let timer = tokio::time::sleep(max_duration);
+        tokio::pin!(timer);
+
+        loop {
+            tokio::select! {
+                _ = &mut timer => return Ok(()),
+                result = recorders.next() => {
+                    if !handle_recorded_sample(result, recorders, writer, samples_written)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
+
+    while let Some(result) = recorders.next().await {
+        handle_recorded_sample(Some(result), recorders, writer, samples_written)?;
+    }
+
     Ok(())
 }
 
-async fn write_mcap(
-    mut sample_receiver: mpsc::UnboundedReceiver<RecordedSample>,
-    mut writer: McapWriter<BufWriter<File>>,
-) -> Result<usize> {
-    let mut samples_written = 0;
-    while let Some(sample) = sample_receiver.recv().await {
-        writer.write(sample)?;
-        samples_written += 1;
+fn handle_recorded_sample(
+    result: Option<Result<RecordedSample>>,
+    recorders: &mut RecorderTasks,
+    writer: &mut McapWriter<BufWriter<File>>,
+    samples_written: &mut usize,
+) -> Result<bool> {
+    let Some(result) = result else {
+        return Ok(false);
+    };
+    let RecordedSample { recorder, sample } = result?;
+
+    if writer.write(&recorder.channel, &sample)? {
+        *samples_written += 1;
     }
-    writer.finish()?;
-    Ok(samples_written)
+    recorders.push(receive_sample(recorder));
+
+    Ok(true)
 }
 
-async fn drain_aborted_recorders(mut recorders: JoinSet<Result<()>>) {
-    while let Some(result) = recorders.join_next().await {
-        if let Err(error) = result
-            && !error.is_cancelled()
-        {
-            tracing::debug!(?error, "localization recorder task failed while stopping");
-        }
-    }
-}
-
-#[derive(Clone)]
 struct RecordedChannel {
     topic: &'static str,
     schema_name: String,
@@ -420,12 +433,14 @@ impl RecordedChannel {
     }
 }
 
+struct TopicRecorder {
+    subscriber: RawSubscriber,
+    channel: RecordedChannel,
+}
+
 struct RecordedSample {
-    channel: Arc<RecordedChannel>,
-    payload: Vec<u8>,
-    sequence: u32,
-    log_time: u64,
-    publish_time: u64,
+    recorder: TopicRecorder,
+    sample: Sample,
 }
 
 struct McapWriter<W: std::io::Write + std::io::Seek> {
@@ -439,28 +454,55 @@ where
 {
     fn new(writer: W) -> Result<Self> {
         Ok(Self {
-            writer: Writer::new(writer)?,
+            writer: WriteOptions::new()
+                .compression(Some(Compression::Lz4))
+                .create(writer)?,
             channel_mapping: BTreeMap::new(),
         })
     }
 
-    fn write(&mut self, sample: RecordedSample) -> Result<()> {
-        let channel_id = match self.channel_mapping.get(sample.channel.topic).copied() {
+    fn write(&mut self, channel: &RecordedChannel, sample: &Sample) -> Result<bool> {
+        let Some(raw_attachment) = sample.attachment() else {
+            tracing::warn!(
+                topic = channel.topic,
+                "localization recorder skipped sample without ros-z attachment"
+            );
+            return Ok(false);
+        };
+        let attachment = match Attachment::try_from(raw_attachment) {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                tracing::warn!(
+                    topic = channel.topic,
+                    ?error,
+                    "localization recorder skipped sample with invalid ros-z attachment"
+                );
+                return Ok(false);
+            }
+        };
+        let source_time = attachment.source_time();
+        let transport_time = sample
+            .timestamp()
+            .map(|timestamp| Time::from_wallclock(timestamp.get_time().to_system_time()))
+            .unwrap_or(source_time);
+        let sequence = u32::try_from(attachment.sequence_number).unwrap_or(u32::MAX);
+        let payload = sample.payload().to_bytes();
+
+        let channel_id = match self.channel_mapping.get(channel.topic).copied() {
             Some(channel_id) => channel_id,
             None => {
                 let schema_id = self.writer.add_schema(
-                    &sample.channel.schema_name,
+                    &channel.schema_name,
                     "ros-z-schema-json",
-                    &sample.channel.schema_data,
+                    &channel.schema_data,
                 )?;
                 let channel_id = self.writer.add_channel(
                     schema_id,
-                    sample.channel.topic,
+                    channel.topic,
                     "ros-z-cdr",
-                    &sample.channel.metadata,
+                    &channel.metadata,
                 )?;
-                self.channel_mapping
-                    .insert(sample.channel.topic, channel_id);
+                self.channel_mapping.insert(channel.topic, channel_id);
                 channel_id
             }
         };
@@ -468,14 +510,14 @@ where
         self.writer.write_to_known_channel(
             &MessageHeader {
                 channel_id,
-                sequence: sample.sequence,
-                log_time: sample.log_time,
-                publish_time: sample.publish_time,
+                sequence,
+                log_time: time_to_mcap_nanos(transport_time),
+                publish_time: time_to_mcap_nanos(source_time),
             },
-            &sample.payload,
+            payload.as_ref(),
         )?;
 
-        Ok(())
+        Ok(true)
     }
 
     fn finish(mut self) -> Result<()> {
