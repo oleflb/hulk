@@ -925,9 +925,10 @@ impl LocalizationMcapVisualizerApp {
             stats.vo_received, stats.vo_ingested, stats.vo_skipped_stale_camera_matrix
         ));
         ui.label(format!(
-            "Global: {} frames, {} candidates, {} ingested, {} associations",
+            "Global: {} frames, {} candidates, {} resets, {} ingested, {} associations",
             stats.global_frames,
             stats.global_candidates,
+            stats.global_pose_resets,
             stats.global_frames_ingested,
             stats.global_associations_ingested
         ));

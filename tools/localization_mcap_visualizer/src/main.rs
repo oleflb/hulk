@@ -75,7 +75,7 @@ struct Arguments {
     /// Override minimum pose-hint features per ingested frame during headless replay.
     #[arg(long)]
     pose_hint_min_features: Option<usize>,
-    /// Override weak pose-hint frames required before global recovery is accepted.
+    /// Override consecutive agreeing global-localization frames required for recovery.
     #[arg(long)]
     recovery_frames: Option<usize>,
     /// Override maximum global-recovery translation disagreement in meters.
@@ -263,7 +263,7 @@ fn print_resolve_regenerated_vo_summary(
         trajectory_metrics(&replay.trajectory())
     );
     println!(
-        "replay_stats imu_ingested={} foot_heights_ingested={} vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
+        "replay_stats imu_ingested={} foot_heights_ingested={} vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_pose_resets={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
         replay.stats.imu_ingested,
         replay.stats.foot_heights_ingested,
         replay.stats.vo_received,
@@ -272,6 +272,7 @@ fn print_resolve_regenerated_vo_summary(
         replay.stats.vo_dropped_gated,
         replay.stats.vo_skipped_stale_camera_matrix,
         replay.stats.global_candidates,
+        replay.stats.global_pose_resets,
         replay.stats.global_frames_ingested,
         replay.stats.global_associations_ingested,
         replay.stats.global_unique_frames_ingested,
@@ -813,7 +814,7 @@ fn print_resolve_summary(
         trajectory_metrics_with_skip(&replay.trajectory(), metrics_skip_seconds)
     );
     println!(
-        "replay_stats imu_ingested={} foot_heights_ingested={} vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
+        "replay_stats imu_ingested={} foot_heights_ingested={} vo_received={} vo_ingested={} vo_dropped_invalid={} vo_dropped_gated={} vo_stale_camera_skips={} global_candidates={} global_pose_resets={} global_frames_ingested={} global_associations_ingested={} global_unique_frames_ingested={} global_unique_associations_ingested={} pose_hint_frames_ingested={} pose_hint_associations_ingested={} solve_samples={}",
         replay.stats.imu_ingested,
         replay.stats.foot_heights_ingested,
         replay.stats.vo_received,
@@ -822,6 +823,7 @@ fn print_resolve_summary(
         replay.stats.vo_dropped_gated,
         replay.stats.vo_skipped_stale_camera_matrix,
         replay.stats.global_candidates,
+        replay.stats.global_pose_resets,
         replay.stats.global_frames_ingested,
         replay.stats.global_associations_ingested,
         replay.stats.global_unique_frames_ingested,
@@ -851,12 +853,13 @@ fn print_orientation_only_summary(recording: &mcap_recording::Recording) -> Resu
         trajectory_metrics(&replay.trajectory())
     );
     println!(
-        "replay_stats imu_ingested={} vo_received={} vo_ingested={} foot_heights_ingested={} global_candidates={} global_frames_ingested={} global_associations_ingested={} solve_samples={}",
+        "replay_stats imu_ingested={} vo_received={} vo_ingested={} foot_heights_ingested={} global_candidates={} global_pose_resets={} global_frames_ingested={} global_associations_ingested={} solve_samples={}",
         replay.stats.imu_ingested,
         replay.stats.vo_received,
         replay.stats.vo_ingested,
         replay.stats.foot_heights_ingested,
         replay.stats.global_candidates,
+        replay.stats.global_pose_resets,
         replay.stats.global_frames_ingested,
         replay.stats.global_associations_ingested,
         replay.samples.len(),

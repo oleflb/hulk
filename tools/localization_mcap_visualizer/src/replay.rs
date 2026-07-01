@@ -70,6 +70,13 @@ pub struct ReplayVisualOdometryEvent {
     pub delta: VisualOdometryDelta,
 }
 
+#[derive(Default)]
+struct ReplayLocalizationState {
+    suppress_until_global_lock: bool,
+    has_global_visual_lock: bool,
+    has_backend_result_after_global_lock: bool,
+}
+
 enum ReplayEvent<'a> {
     Recorded(&'a RecordedEvent),
     VisualOdometryOverride(&'a ReplayVisualOdometryEvent),
@@ -193,6 +200,7 @@ pub struct ReplayStats {
     pub global_none: usize,
     pub global_ambiguous: usize,
     pub global_unique_modulo_symmetry: usize,
+    pub global_pose_resets: usize,
     pub global_frames_ingested: usize,
     pub global_associations_ingested: usize,
     pub global_unique_frames_ingested: usize,
@@ -278,6 +286,10 @@ fn run_resolve(
         .any(|event| matches!(event.kind, EventKind::FieldMarkAssociations(_)));
     let recompute_global_features =
         parameters.recompute_global_features || !has_recorded_global_features;
+    let mut localization_state = ReplayLocalizationState {
+        suppress_until_global_lock: parameters.include_global_features && recompute_global_features,
+        ..Default::default()
+    };
 
     for (index, replay_event) in replay_events.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
@@ -294,6 +306,7 @@ fn run_resolve(
                     parameters.timestamp_mode,
                     next_solve_time,
                     &stats,
+                    &mut localization_state,
                     &mut samples,
                 )?;
                 has_pending_measurements = false;
@@ -385,6 +398,7 @@ fn run_resolve(
                         &parameters,
                         &field_dimensions,
                         &mut stats,
+                        &mut localization_state,
                         &mut has_pending_measurements,
                     )?;
                 }
@@ -410,6 +424,7 @@ fn run_resolve(
             parameters.timestamp_mode,
             recording.end_log_time(),
             &stats,
+            &mut localization_state,
             &mut samples,
         )?;
     }
@@ -636,6 +651,7 @@ fn ingest_recomputed_global_features(
     parameters: &ReplayParameters,
     field_dimensions: &FieldDimensions,
     stats: &mut ReplayStats,
+    localization_state: &mut ReplayLocalizationState,
     has_pending_measurements: &mut bool,
 ) -> Result<()> {
     stats.global_frames += 1;
@@ -661,19 +677,23 @@ fn ingest_recomputed_global_features(
         return Ok(());
     }
 
-    let pose_hint = frontend
-        .peek_last_optimization_result()
-        .filter(|result| {
-            Duration::from_nanos(
-                nanos_abs_diff(result.time, visual_time).min(u64::MAX as u128) as u64,
-            ) <= parameters.pose_hint.max_pose_age
-        })
-        .map(|result| {
-            result
-                .transform
-                .cast::<f32>()
-                .framed_transform::<Robot, Field>()
-        });
+    let pose_hint = if localization_state.has_backend_result_after_global_lock {
+        frontend
+            .peek_last_optimization_result()
+            .filter(|result| {
+                Duration::from_nanos(
+                    nanos_abs_diff(result.time, visual_time).min(u64::MAX as u128) as u64,
+                ) <= parameters.pose_hint.max_pose_age
+            })
+            .map(|result| {
+                result
+                    .transform
+                    .cast::<f32>()
+                    .framed_transform::<Robot, Field>()
+            })
+    } else {
+        None
+    };
     let association_parameters = FieldMarkAssociationParameters {
         global_localizer: parameters.global_localizer,
         pose_hint: parameters.pose_hint,
@@ -694,6 +714,17 @@ fn ingest_recomputed_global_features(
         Some(GlobalLocalizationDebugStatus::UniqueModuloSymmetry) => {
             stats.global_unique_modulo_symmetry += 1;
         }
+    }
+
+    if let Some(robot_to_field) = localization.accepted_global_pose
+        && (!localization_state.has_global_visual_lock
+            || localization_state.has_backend_result_after_global_lock)
+    {
+        frontend.ingest_global_pose(visual_time, robot_to_field.inner.cast::<f64>())?;
+        localization_state.has_global_visual_lock = true;
+        localization_state.has_backend_result_after_global_lock = false;
+        stats.global_pose_resets += 1;
+        *has_pending_measurements = true;
     }
 
     let associations = localization_visual_associations(
@@ -759,6 +790,7 @@ fn solve_and_record(
     timestamp_mode: TimestampMode,
     replay_time: SystemTime,
     stats: &ReplayStats,
+    localization_state: &mut ReplayLocalizationState,
     samples: &mut Vec<SolveSample>,
 ) -> Result<()> {
     let solve_started = Instant::now();
@@ -770,6 +802,11 @@ fn solve_and_record(
     let Some(result) = frontend.last_optimization_result() else {
         return Ok(());
     };
+    if localization_state.has_global_visual_lock {
+        localization_state.has_backend_result_after_global_lock = true;
+    } else if localization_state.suppress_until_global_lock {
+        return Ok(());
+    }
 
     samples.push(SolveSample {
         replay_seconds: recording.seconds_since_log_start(replay_time),
