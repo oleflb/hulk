@@ -16,7 +16,7 @@ use projection::intrinsic::Intrinsic;
 use crate::{DetectedVisualFeature, DetectedVisualFeatures};
 
 use super::{
-    CLASS_COUNT, FeatureAssociation, FeatureAssociations, GLOBAL_LOCALIZER_MAX_DETECTIONS,
+    FEATURE_CLASSES, FeatureAssociation, FeatureAssociations, GLOBAL_LOCALIZER_MAX_DETECTIONS,
     GlobalAssociationConfig, GlobalLocalizationDebugAssociation, GlobalLocalizationDebugDetection,
     GlobalLocalizationDebugProjection, GlobalLocalizationDetailedDebug,
     GlobalLocalizationDetailedStatus, GlobalLocalizationScore, PoseHintAssociationConfig,
@@ -98,14 +98,14 @@ pub(crate) fn associate_with_pose_hint(
 
     let mut associations = Vec::new();
     let mut residuals = Vec::new();
-    for class_index in 0..CLASS_COUNT {
+    for class in FEATURE_CLASSES {
         let class_associations = pose_hint_assignments_for_class(
             &map,
             &detection_set.detections,
             field_to_camera,
             input.camera_intrinsic,
             pose_config,
-            class_index,
+            class,
         );
         for option in class_associations {
             let Some(detection) = detection_set.detections.get(option.detection_index) else {
@@ -145,9 +145,9 @@ fn pose_hint_assignments_for_class(
     field_to_camera: Isometry3<Field, Camera>,
     intrinsic: Intrinsic,
     config: PoseHintAssociationConfig,
-    class_index: usize,
+    class: VisualFeatureClass,
 ) -> Vec<PoseHintOption> {
-    let landmark_ids = &map.landmarks_by_class[class_index];
+    let landmark_ids = map.landmarks_for_class(class);
     if landmark_ids.is_empty() {
         return Vec::new();
     }
@@ -157,7 +157,7 @@ fn pose_hint_assignments_for_class(
     for (detection_index, detection) in detections
         .iter()
         .enumerate()
-        .filter(|(_, detection)| detection.class.index() == class_index)
+        .filter(|(_, detection)| detection.class == class)
     {
         let detection_options = pose_hint_options_for_detection(
             map,
@@ -224,7 +224,8 @@ fn pose_hint_options_for_detection(
     intrinsic: Intrinsic,
     config: PoseHintAssociationConfig,
 ) -> Vec<PoseHintOption> {
-    let mut candidates = map.landmarks_by_class[detection.class.index()]
+    let mut candidates = map
+        .landmarks_for_class(detection.class)
         .iter()
         .filter_map(|&landmark_id| {
             let landmark = map.landmarks.get(landmark_id)?;

@@ -2,16 +2,18 @@ use super::*;
 
 pub(super) fn optimistic_seed_score_fast(problem: &Problem, transform: Similarity2<f32>) -> f32 {
     let mut total = -problem.high_confidence_unmatched_penalty;
-    for class_index in 0..CLASS_COUNT {
+    for class in FEATURE_CLASSES {
         let mut values = [0.0; MAX_DETECTIONS];
         let mut value_count = 0;
         for (detection_index, _) in problem
             .detections
             .iter()
             .enumerate()
-            .filter(|(_, detection)| detection.class.index() == class_index)
+            .filter(|(_, detection)| detection.class == class)
         {
-            let Some(value) = problem.map.landmarks_by_class[class_index]
+            let Some(value) = problem
+                .map
+                .landmarks_for_class(class)
                 .iter()
                 .filter_map(|&landmark_id| {
                     optimistic_edge_value(problem, transform, detection_index, landmark_id)
@@ -26,7 +28,7 @@ pub(super) fn optimistic_seed_score_fast(problem: &Problem, transform: Similarit
             }
         }
         values[..value_count].sort_by(|left, right| right.total_cmp(left));
-        total += values[..value_count.min(problem.map.landmarks_by_class[class_index].len())]
+        total += values[..value_count.min(problem.map.landmarks_for_class(class).len())]
             .iter()
             .sum::<f32>();
     }

@@ -29,9 +29,11 @@ pub(super) fn cheap_triplet_seeds(problem: &Problem) -> CheapSeedSearch {
         for alpha_offset in -TRIPLET_BIN_RADIUS..=TRIPLET_BIN_RADIUS {
             for beta_offset in -TRIPLET_BIN_RADIUS..=TRIPLET_BIN_RADIUS {
                 let key = MapTripletBin {
-                    class_a: problem.detections[triplet.a].class.index(),
-                    class_b: problem.detections[triplet.b].class.index(),
-                    class_c: problem.detections[triplet.c].class.index(),
+                    classes: [
+                        problem.detections[triplet.a].class,
+                        problem.detections[triplet.b].class,
+                        problem.detections[triplet.c].class,
+                    ],
                     alpha_bin: alpha_bin.saturating_add(alpha_offset),
                     beta_bin: beta_bin.saturating_add(beta_offset),
                 };
@@ -175,9 +177,9 @@ fn make_detection_triplet(
     }
     let confidence =
         (detection_a.confidence + detection_b.confidence + detection_c.confidence) / 3.0;
-    let rarity = (problem.map.class_rarity_weight[detection_a.class.index()]
-        + problem.map.class_rarity_weight[detection_b.class.index()]
-        + problem.map.class_rarity_weight[detection_c.class.index()])
+    let rarity = (problem.map.rarity_weight(detection_a.class)
+        + problem.map.rarity_weight(detection_b.class)
+        + problem.map.rarity_weight(detection_c.class))
         / 3.0;
     Some(DetectionTriplet {
         a,

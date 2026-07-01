@@ -106,7 +106,9 @@ fn nearest_landmark(
     class: VisualFeatureClass,
     predicted: Point2<Field>,
 ) -> Option<(usize, f32)> {
-    problem.map.landmarks_by_class[class.index()]
+    problem
+        .map
+        .landmarks_for_class(class)
         .iter()
         .filter_map(|&landmark_id| {
             let landmark = problem.map.landmarks.get(landmark_id)?;

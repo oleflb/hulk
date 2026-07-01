@@ -48,13 +48,8 @@ fn transform_within_trust_region(seed: Similarity2<f32>, refined: Similarity2<f3
 
 fn assign_under_transform(problem: &Problem, transform: Similarity2<f32>, gate: f32) -> Vec<Match> {
     let mut assignments = Vec::new();
-    for class_index in 0..CLASS_COUNT {
-        assignments.extend(solve_assignment_for_class(
-            problem,
-            transform,
-            gate,
-            class_index,
-        ));
+    for class in FEATURE_CLASSES {
+        assignments.extend(solve_assignment_for_class(problem, transform, gate, class));
     }
     assignments
 }
@@ -63,9 +58,9 @@ fn solve_assignment_for_class(
     problem: &Problem,
     transform: Similarity2<f32>,
     gate: f32,
-    class_index: usize,
+    class: VisualFeatureClass,
 ) -> Vec<Match> {
-    let landmarks = &problem.map.landmarks_by_class[class_index];
+    let landmarks = problem.map.landmarks_for_class(class);
     if landmarks.is_empty() {
         return Vec::new();
     }
@@ -76,7 +71,7 @@ fn solve_assignment_for_class(
         .detections
         .iter()
         .enumerate()
-        .filter(|(_, detection)| detection.class.index() == class_index)
+        .filter(|(_, detection)| detection.class == class)
     {
         let row_start = options.len();
         append_landmark_options(
@@ -273,7 +268,7 @@ pub(super) fn candidate_metrics_from_matches(
 }
 
 pub(super) fn detection_evidence(problem: &Problem, accepted: Match) -> f32 {
-    accepted.confidence * problem.map.class_rarity_weight[accepted.class.index()]
+    accepted.confidence * problem.map.rarity_weight(accepted.class)
 }
 
 pub(super) fn unmatched_penalty_for_detection(

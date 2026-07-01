@@ -615,11 +615,10 @@ fn has_useful_class_mix(
 }
 
 fn class_count(features: &[ProjectedSyntheticFeature]) -> usize {
-    let mut present = [false; CLASS_COUNT];
-    for feature in features {
-        present[feature.class.index()] = true;
-    }
-    present.into_iter().filter(|is_present| *is_present).count()
+    FEATURE_CLASSES
+        .into_iter()
+        .filter(|class| features.iter().any(|feature| feature.class == *class))
+        .count()
 }
 
 fn has_non_collinear_landmark_triplet(

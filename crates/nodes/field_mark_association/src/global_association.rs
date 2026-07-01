@@ -9,7 +9,13 @@ mod solver;
 
 pub(crate) use solver::{GlobalLocalizationInput, GlobalLocalizationResult};
 
-pub(crate) const CLASS_COUNT: usize = 5;
+pub(crate) const FEATURE_CLASSES: [VisualFeatureClass; 5] = [
+    VisualFeatureClass::GoalPost,
+    VisualFeatureClass::LSpot,
+    VisualFeatureClass::TSpot,
+    VisualFeatureClass::XSpot,
+    VisualFeatureClass::PenaltySpot,
+];
 pub(crate) const GLOBAL_LOCALIZER_MAX_DETECTIONS: usize = 32;
 
 #[derive(Clone, Debug)]
@@ -275,7 +281,7 @@ impl Default for GlobalAssociator {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Field-feature classes supported by the global association solver.
 pub enum VisualFeatureClass {
     /// Upright goalpost landmark detected at its field-contact point.
@@ -288,18 +294,6 @@ pub enum VisualFeatureClass {
     XSpot,
     /// Penalty marker landmark.
     PenaltySpot,
-}
-
-impl VisualFeatureClass {
-    pub(crate) fn index(self) -> usize {
-        match self {
-            Self::GoalPost => 0,
-            Self::LSpot => 1,
-            Self::TSpot => 2,
-            Self::PenaltySpot => 3,
-            Self::XSpot => 4,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -211,7 +211,7 @@ fn retain_best_detections(detections: &mut Vec<DetectionPoint>, map: &LandmarkMa
 }
 
 pub(super) fn detection_priority(detection: &DetectionPoint, map: &LandmarkMap) -> f32 {
-    detection.confidence * map.class_rarity_weight[detection.class.index()]
+    detection.confidence * map.rarity_weight(detection.class)
 }
 
 fn usable_confidence(confidence: f32, min_confidence: f32) -> bool {

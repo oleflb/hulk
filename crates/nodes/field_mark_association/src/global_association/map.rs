@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use itertools::Itertools;
 use linear_algebra::Point2;
@@ -6,7 +6,7 @@ use types::field_dimensions::{FieldDimensions, Half, Side};
 
 use coordinate_systems::Field;
 
-use super::{CLASS_COUNT, VisualFeatureClass};
+use super::{FEATURE_CLASSES, VisualFeatureClass};
 
 const SYMMETRY_EPSILON: f32 = 1.0e-4;
 pub(crate) const TRIPLET_BIN_SIZE: f32 = 0.12;
@@ -15,9 +15,9 @@ const MIN_MAP_TRIPLET_ABS_BETA: f32 = 0.03;
 #[derive(Clone, Debug)]
 pub(crate) struct LandmarkMap {
     pub landmarks: Vec<Landmark>,
-    pub landmarks_by_class: [Vec<usize>; CLASS_COUNT],
+    landmarks_by_class: BTreeMap<VisualFeatureClass, Vec<usize>>,
     pub map_triplets_by_bin: HashMap<MapTripletBin, Vec<MapTriplet>>,
-    pub class_rarity_weight: [f32; CLASS_COUNT],
+    class_rarity_weight: BTreeMap<VisualFeatureClass, f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,9 +42,7 @@ pub(crate) struct MapTriplet {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MapTripletBin {
-    pub class_a: usize,
-    pub class_b: usize,
-    pub class_c: usize,
+    pub classes: [VisualFeatureClass; 3],
     pub alpha_bin: i16,
     pub beta_bin: i16,
 }
@@ -54,9 +52,15 @@ impl LandmarkMap {
         let mut landmarks = candidate_landmarks(field);
         fill_symmetric_ids(&mut landmarks);
 
-        let mut landmarks_by_class = std::array::from_fn(|_| Vec::new());
+        let mut landmarks_by_class = FEATURE_CLASSES
+            .into_iter()
+            .map(|class| (class, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
         for landmark in &landmarks {
-            landmarks_by_class[landmark.class.index()].push(landmark.id);
+            landmarks_by_class
+                .entry(landmark.class)
+                .or_default()
+                .push(landmark.id);
         }
 
         let mut map_triplets_by_bin = HashMap::new();
@@ -98,10 +102,14 @@ impl LandmarkMap {
             }
         }
 
-        let class_rarity_weight = std::array::from_fn(|index| {
-            let count = landmarks_by_class[index].len();
-            if count == 0 { 0.0 } else { 1.0 / count as f32 }
-        });
+        let class_rarity_weight = FEATURE_CLASSES
+            .into_iter()
+            .map(|class| {
+                let count = landmarks_by_class.get(&class).map_or(0, Vec::len);
+                let weight = if count == 0 { 0.0 } else { 1.0 / count as f32 };
+                (class, weight)
+            })
+            .collect();
 
         Self {
             landmarks,
@@ -118,7 +126,17 @@ impl LandmarkMap {
     }
 
     pub fn has_class(&self, class: VisualFeatureClass) -> bool {
-        !self.landmarks_by_class[class.index()].is_empty()
+        !self.landmarks_for_class(class).is_empty()
+    }
+
+    pub fn landmarks_for_class(&self, class: VisualFeatureClass) -> &[usize] {
+        self.landmarks_by_class
+            .get(&class)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn rarity_weight(&self, class: VisualFeatureClass) -> f32 {
+        self.class_rarity_weight.get(&class).copied().unwrap_or(0.0)
     }
 }
 
@@ -131,9 +149,7 @@ impl MapTripletBin {
         beta: f32,
     ) -> Self {
         Self {
-            class_a: class_a.index(),
-            class_b: class_b.index(),
-            class_c: class_c.index(),
+            classes: [class_a, class_b, class_c],
             alpha_bin: triplet_bin(alpha),
             beta_bin: triplet_bin(beta),
         }
@@ -271,23 +287,15 @@ mod tests {
         let map = LandmarkMap::new(&FieldDimensions::SPL_2025, 0.25);
 
         assert_eq!(
-            map.landmarks_by_class[VisualFeatureClass::GoalPost.index()].len(),
+            map.landmarks_for_class(VisualFeatureClass::GoalPost).len(),
             4
         );
+        assert_eq!(map.landmarks_for_class(VisualFeatureClass::LSpot).len(), 12);
+        assert_eq!(map.landmarks_for_class(VisualFeatureClass::TSpot).len(), 10);
+        assert_eq!(map.landmarks_for_class(VisualFeatureClass::XSpot).len(), 3);
         assert_eq!(
-            map.landmarks_by_class[VisualFeatureClass::LSpot.index()].len(),
-            12
-        );
-        assert_eq!(
-            map.landmarks_by_class[VisualFeatureClass::TSpot.index()].len(),
-            10
-        );
-        assert_eq!(
-            map.landmarks_by_class[VisualFeatureClass::XSpot.index()].len(),
-            3
-        );
-        assert_eq!(
-            map.landmarks_by_class[VisualFeatureClass::PenaltySpot.index()].len(),
+            map.landmarks_for_class(VisualFeatureClass::PenaltySpot)
+                .len(),
             2
         );
     }
