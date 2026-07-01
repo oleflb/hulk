@@ -39,7 +39,7 @@ impl<T: Numeric> CameraIntrinsics<T> {
         point_camera: VectorView3<S>,
         min_depth: S,
     ) -> Option<Vector2<S>> {
-        if !(point_camera.z > min_depth) {
+        if point_camera.z <= min_depth {
             return None;
         }
 

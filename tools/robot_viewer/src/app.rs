@@ -108,9 +108,7 @@ fn stabilize_sample<T>(
             Some(sample)
         }
         (None, Some(anchor_time)) => {
-            let Some(last) = stabilized.as_ref() else {
-                return None;
-            };
+            let last = stabilized.as_ref()?;
             if anchor_time.abs_diff(last.anchor_time) <= RENDER_SAMPLE_GRACE {
                 Some(last.sample.clone())
             } else {
@@ -665,10 +663,10 @@ fn draw_projected_field_markings(
         image_size,
         field_to_camera,
         intrinsics,
-        -half_length,
-        -half_width,
-        half_length,
-        half_width,
+        ProjectedFieldRect {
+            min: [-half_length, -half_width],
+            max: [half_length, half_width],
+        },
     );
     draw_projected_segment(
         painter,
@@ -685,10 +683,12 @@ fn draw_projected_field_markings(
         image_size,
         field_to_camera,
         intrinsics,
-        [0.0, 0.0],
-        dimensions.center_circle_diameter / 2.0,
-        0.0,
-        std::f32::consts::TAU,
+        ProjectedArc {
+            center: [0.0, 0.0],
+            radius: dimensions.center_circle_diameter / 2.0,
+            start: 0.0,
+            end: std::f32::consts::TAU,
+        },
     );
 
     for sign in [-1.0, 1.0] {
@@ -698,10 +698,12 @@ fn draw_projected_field_markings(
             image_size,
             field_to_camera,
             intrinsics,
-            dimensions,
-            sign,
-            dimensions.goal_box_area_length,
-            dimensions.goal_box_area_width,
+            ProjectedGoalArea {
+                dimensions,
+                sign,
+                length: dimensions.goal_box_area_length,
+                width: dimensions.goal_box_area_width,
+            },
         );
         draw_projected_goal_area(
             painter,
@@ -709,10 +711,12 @@ fn draw_projected_field_markings(
             image_size,
             field_to_camera,
             intrinsics,
-            dimensions,
-            sign,
-            dimensions.penalty_area_length,
-            dimensions.penalty_area_width,
+            ProjectedGoalArea {
+                dimensions,
+                sign,
+                length: dimensions.penalty_area_length,
+                width: dimensions.penalty_area_width,
+            },
         );
 
         let penalty_x = sign * (half_length - dimensions.penalty_marker_distance);
@@ -777,17 +781,35 @@ fn draw_projected_field_mark_association_residuals(
     }
 }
 
+struct ProjectedFieldRect {
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+struct ProjectedGoalArea {
+    dimensions: FieldDimensions,
+    sign: f32,
+    length: f32,
+    width: f32,
+}
+
+struct ProjectedArc {
+    center: [f32; 2],
+    radius: f32,
+    start: f32,
+    end: f32,
+}
+
 fn draw_projected_rect(
     painter: &egui::Painter,
     image_rect: Rect,
     image_size: Vec2,
     field_to_camera: &Isometry3<Field, Camera>,
     intrinsics: Intrinsic,
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
+    rect: ProjectedFieldRect,
 ) {
+    let [min_x, min_y] = rect.min;
+    let [max_x, max_y] = rect.max;
     draw_projected_segment(
         painter,
         image_rect,
@@ -832,14 +854,11 @@ fn draw_projected_goal_area(
     image_size: Vec2,
     field_to_camera: &Isometry3<Field, Camera>,
     intrinsics: Intrinsic,
-    dimensions: FieldDimensions,
-    sign: f32,
-    length: f32,
-    width: f32,
+    area: ProjectedGoalArea,
 ) {
-    let goal_line_x = sign * dimensions.length / 2.0;
-    let inner_x = goal_line_x - sign * length;
-    let half_width = width / 2.0;
+    let goal_line_x = area.sign * area.dimensions.length / 2.0;
+    let inner_x = goal_line_x - area.sign * area.length;
+    let half_width = area.width / 2.0;
 
     draw_projected_segment(
         painter,
@@ -921,10 +940,12 @@ fn draw_projected_corner_arcs(
             image_size,
             field_to_camera,
             intrinsics,
-            center,
-            dimensions.corner_arc_radius,
-            start,
-            start + std::f32::consts::FRAC_PI_2,
+            ProjectedArc {
+                center,
+                radius: dimensions.corner_arc_radius,
+                start,
+                end: start + std::f32::consts::FRAC_PI_2,
+            },
         );
     }
 }
@@ -964,25 +985,22 @@ fn draw_projected_arc(
     image_size: Vec2,
     field_to_camera: &Isometry3<Field, Camera>,
     intrinsics: Intrinsic,
-    center: [f32; 2],
-    radius: f32,
-    start: f32,
-    end: f32,
+    arc: ProjectedArc,
 ) {
-    if radius <= 0.0 {
+    if arc.radius <= 0.0 {
         return;
     }
 
-    let samples = ((radius * (end - start).abs()) / FIELD_LINE_SAMPLE_STEP)
+    let samples = ((arc.radius * (arc.end - arc.start).abs()) / FIELD_LINE_SAMPLE_STEP)
         .ceil()
         .clamp(8.0, 160.0) as usize;
     let mut previous = None;
 
     for index in 0..=samples {
-        let angle = start + (end - start) * index as f32 / samples as f32;
+        let angle = arc.start + (arc.end - arc.start) * index as f32 / samples as f32;
         let point = [
-            center[0] + radius * angle.cos(),
-            center[1] + radius * angle.sin(),
+            arc.center[0] + arc.radius * angle.cos(),
+            arc.center[1] + arc.radius * angle.sin(),
         ];
         draw_projected_point_step(
             painter,

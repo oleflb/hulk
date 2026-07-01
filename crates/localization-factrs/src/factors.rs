@@ -1,3 +1,4 @@
+pub(crate) mod field_containment;
 pub(crate) mod foot_above_ground;
 pub(crate) mod gaussian_process_prior;
 pub(crate) mod imu;

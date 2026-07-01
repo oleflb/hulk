@@ -17,13 +17,12 @@ pub(super) fn solve_problem(problem: &Problem) -> Option<GlobalLocalizationResul
         return None;
     }
 
-    let stable = stable_candidate(problem, &accepted_candidates);
-
-    let Some(stable) = stable else {
-        return None;
-    };
+    let stable = stable_candidate(problem, &accepted_candidates)?;
     let stable = oriented_candidate(problem, &stable);
     let associations = to_public(&stable, problem);
+    if !robot_position_within_field_boundary(problem, associations.robot_to_field) {
+        return None;
+    }
 
     Some(GlobalLocalizationResult::UniqueModuloSymmetry(associations))
 }

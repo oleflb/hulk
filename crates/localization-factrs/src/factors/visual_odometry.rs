@@ -83,13 +83,6 @@ impl VisualOdometryFactor {
         }
     }
 
-    pub fn extend_measurements(
-        &mut self,
-        measurements: impl IntoIterator<Item = VisualOdometryDelta>,
-    ) {
-        self.measurements.extend(measurements);
-    }
-
     fn residuals_on_spline<T: Numeric>(&self, start: SE23<T>, end: SE23<T>) -> VectorX<T> {
         let mut residuals = VectorX::<T>::zeros(self.dim_out());
         if self.measurements.is_empty() {
@@ -129,13 +122,6 @@ impl AdjacentVisualOdometryFactor {
             information_root: information_root(visual_odometry_noise),
             duration,
         }
-    }
-
-    pub fn extend_measurements(
-        &mut self,
-        measurements: impl IntoIterator<Item = VisualOdometryDelta>,
-    ) {
-        self.measurements.extend(measurements);
     }
 
     fn residuals_on_splines<T: Numeric>(

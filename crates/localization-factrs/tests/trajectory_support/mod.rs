@@ -11,8 +11,8 @@ use factrs::{core::SO3, variables::SE23};
 use indicatif::ProgressIterator;
 use linear_algebra::{IntoFramed, Point2 as FramedPoint2, Point3 as FramedPoint3};
 use localization_factrs::{
-    BackendConfiguration, CameraIntrinsics, InitialState, VisualReprojectionAssociation,
-    VisualReprojectionAssociationKind, initialize,
+    BackendConfiguration, CameraIntrinsics, FieldContainmentConfiguration, InitialState,
+    VisualReprojectionAssociation, VisualReprojectionAssociationKind, initialize,
 };
 use nalgebra::{Matrix2, Matrix3, Point2, Point3, SMatrix, Vector3, vector};
 use rand::{Rng, SeedableRng};
@@ -196,6 +196,7 @@ pub fn run_trajectory_test(config: TrajectoryTestConfig) -> Result<(), Box<dyn E
             pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
+            field_containment: FieldContainmentConfiguration::default(),
             gravity: Vector3::new(0.0, 0.0, 9.81),
         },
         initial_state,

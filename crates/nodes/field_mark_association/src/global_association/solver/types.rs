@@ -64,6 +64,7 @@ pub(super) struct Problem {
     pub(super) detections: Vec<DetectionPoint>,
     pub(super) detections_truncated: bool,
     pub(super) camera_xy_ground: Vector2<f32>,
+    pub(super) field_boundary: Vector2<f32>,
     pub(super) high_confidence_unmatched_penalty: f32,
 }
 

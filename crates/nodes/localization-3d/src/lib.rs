@@ -15,8 +15,9 @@ use field_mark_association::{FieldMarkAssociationKind, FieldMarkAssociations};
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Isometry3, point};
 use localization_factrs::{
-    BackendConfiguration, CameraIntrinsics, InitialState, OptimizationResult, VinsFrontend,
-    VinsFrontendError, VisualReprojectionAssociation, VisualReprojectionAssociationKind,
+    BackendConfiguration, CameraIntrinsics, FieldContainmentConfiguration, InitialState,
+    OptimizationResult, VinsFrontend, VinsFrontendError, VisualReprojectionAssociation,
+    VisualReprojectionAssociationKind,
     backend::{
         BackendOptimizerStatus, BackendSolveDiagnostics,
         ResidualDiagnostics as BackendResidualDiagnostics,
@@ -25,10 +26,14 @@ use localization_factrs::{
 };
 use nalgebra::{Matrix2, Matrix3, Point3, SMatrix, Vector3, vector};
 use projection::{camera_matrix::CameraMatrix, intrinsic::Intrinsic};
-use ros_z::{Message, cache::Cache, context::Context, parameter::NodeParametersExt, time::Time};
+use ros_z::{
+    Message, cache::Cache, context::Context, parameter::NodeParametersExt, qos::QosDurability,
+    time::Time,
+};
 use serde::{Deserialize, Serialize};
 use tokio::select;
 use types::{
+    field_dimensions::FieldDimensions,
     time_wrapper::TimeWrapper,
     visual_odometry::{VisualOdometer, VisualOdometryDelta as VisualOdometryDeltaMessage},
 };
@@ -43,6 +48,8 @@ pub struct Localization3dParameters {
     pub pose_hint_visual_feature_noise_variance: f64,
     /// Huber threshold for pose-hint visual residuals in whitened residual units.
     pub pose_hint_visual_huber_threshold: f64,
+    /// Soft field containment sigma in meters outside field plus border strip.
+    pub field_containment_sigma: f64,
 }
 
 impl Default for Localization3dParameters {
@@ -52,6 +59,7 @@ impl Default for Localization3dParameters {
             pose_hint_visual_feature_noise_variance:
                 DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE,
             pose_hint_visual_huber_threshold: DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD,
+            field_containment_sigma: DEFAULT_FIELD_CONTAINMENT_SIGMA,
         }
     }
 }
@@ -74,6 +82,9 @@ impl Localization3dParameters {
             || self.pose_hint_visual_huber_threshold <= 0.0
         {
             return Err("pose_hint_visual_huber_threshold must be finite and > 0".to_string());
+        }
+        if !self.field_containment_sigma.is_finite() || self.field_containment_sigma <= 0.0 {
+            return Err("field_containment_sigma must be finite and > 0".to_string());
         }
         Ok(())
     }
@@ -146,6 +157,7 @@ const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 const VISUAL_ODOMETER_TOPIC: &str = "visual_odometry/current_left_camera_to_visual_odometer";
 const DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE: f64 = 100_000.0;
 const DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD: f64 = 2.0;
+const DEFAULT_FIELD_CONTAINMENT_SIGMA: f64 = 1.0;
 
 type VisualOdometerCache = Cache<VisualOdometer>;
 
@@ -158,16 +170,30 @@ pub fn backend_configuration(visual_feature_noise_variance: f64) -> BackendConfi
         visual_feature_noise_variance,
         DEFAULT_POSE_HINT_VISUAL_FEATURE_NOISE_VARIANCE,
         DEFAULT_POSE_HINT_VISUAL_HUBER_THRESHOLD,
+        DEFAULT_FIELD_CONTAINMENT_SIGMA,
+        &FieldDimensions::SPL_2025,
     )
 }
 
 pub fn backend_configuration_from_parameters(
     parameters: &Localization3dParameters,
 ) -> BackendConfiguration {
+    backend_configuration_from_parameters_and_field_dimensions(
+        parameters,
+        &FieldDimensions::SPL_2025,
+    )
+}
+
+pub fn backend_configuration_from_parameters_and_field_dimensions(
+    parameters: &Localization3dParameters,
+    field_dimensions: &FieldDimensions,
+) -> BackendConfiguration {
     backend_configuration_with_pose_hint(
         parameters.visual_feature_noise_variance,
         parameters.pose_hint_visual_feature_noise_variance,
         parameters.pose_hint_visual_huber_threshold,
+        parameters.field_containment_sigma,
+        field_dimensions,
     )
 }
 
@@ -175,6 +201,8 @@ fn backend_configuration_with_pose_hint(
     visual_feature_noise_variance: f64,
     pose_hint_visual_feature_noise_variance: f64,
     pose_hint_visual_huber_threshold: f64,
+    field_containment_sigma: f64,
+    field_dimensions: &FieldDimensions,
 ) -> BackendConfiguration {
     let process_noise = Matrix3::identity() * 0.01;
     BackendConfiguration {
@@ -199,6 +227,10 @@ fn backend_configuration_with_pose_hint(
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-2,
         foot_ground_sigma: 1e-2,
+        field_containment: FieldContainmentConfiguration::from_field_dimensions(
+            field_dimensions,
+            field_containment_sigma,
+        ),
         gravity: Vector3::new(0.0, 0.0, 9.81),
     }
 }
@@ -227,6 +259,15 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let camera_matrix_cache = node
         .create_cache::<TimeWrapper<CameraMatrix>>("camera_matrix", 128)?
         .with_stamp(|message| message.time)
+        .build()
+        .await?;
+
+    let field_dimensions_cache = node
+        .create_cache::<FieldDimensions>("field_dimensions", 1)?
+        .with_qos(ros_z::qos::QosProfile {
+            durability: QosDurability::TransientLocal,
+            ..Default::default()
+        })
         .build()
         .await?;
 
@@ -274,9 +315,13 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     let initial_state = wait_for_initial_state(&camera_matrix_cache).await;
+    let field_dimensions = wait_for_field_dimensions(&field_dimensions_cache).await;
     let localization_parameters = parameters.snapshot().typed().clone();
     let (mut frontend, backend) = initialize(
-        backend_configuration_from_parameters(&localization_parameters),
+        backend_configuration_from_parameters_and_field_dimensions(
+            &localization_parameters,
+            &field_dimensions,
+        ),
         initial_state,
     );
     let runtime = tokio::runtime::Handle::current();
@@ -652,6 +697,18 @@ async fn wait_for_initial_state(
     loop {
         if let Some(camera_matrix) = camera_matrix_cache.get_latest() {
             return initial_state_from_camera_matrix(&camera_matrix.inner);
+        }
+        interval.tick().await;
+    }
+}
+
+async fn wait_for_field_dimensions(
+    field_dimensions_cache: &Cache<FieldDimensions>,
+) -> FieldDimensions {
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        if let Some(field_dimensions) = field_dimensions_cache.get_latest() {
+            return *field_dimensions.as_ref();
         }
         interval.tick().await;
     }

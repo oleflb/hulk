@@ -339,11 +339,6 @@ pub enum GlobalLocalizationDetailedStatus {
     /// Returned associations are plausible, but uniqueness was not certified.
     /// This can also mean the bounded search was truncated before all competitors were excluded.
     Ambiguous,
-    /// Deprecated status from the pre-symmetry contract. New solver results do not emit it.
-    #[deprecated(
-        note = "use UniqueModuloSymmetry; global localization has unavoidable 180 degree field symmetry"
-    )]
-    Unique,
     /// Returned stable associations are unique after quotienting the unavoidable 180 degree field
     /// symmetry.
     UniqueModuloSymmetry,

@@ -8,7 +8,7 @@ pub(super) fn remove_equivalent_candidates(
     let mut keys = Vec::new();
     for candidate in candidates {
         let key = candidate_equivalence_key(&candidate, map);
-        if key.is_empty() || keys.iter().any(|existing| *existing == key) {
+        if key.is_empty() || keys.contains(&key) {
             continue;
         }
         keys.push(key);

@@ -62,7 +62,7 @@ members = [
   "crates/nodes/led_handler",
   "crates/nodes/line_detection",
   "crates/nodes/localization",
-   "crates/nodes/localization-3d",
+  "crates/nodes/localization-3d",
   "crates/nodes/localization_recorder",
   "crates/nodes/look_around",
   "crates/nodes/look_at",

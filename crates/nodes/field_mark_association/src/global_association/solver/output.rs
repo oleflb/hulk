@@ -103,6 +103,17 @@ pub(super) fn to_public(candidate: &Candidate, problem: &Problem) -> FeatureAsso
     }
 }
 
+pub(super) fn robot_position_within_field_boundary(
+    problem: &Problem,
+    robot_to_field: Isometry3<Robot, Field>,
+) -> bool {
+    let position = robot_to_field.inner.translation.vector;
+    position.x.is_finite()
+        && position.y.is_finite()
+        && position.x.abs() <= problem.field_boundary.x
+        && position.y.abs() <= problem.field_boundary.y
+}
+
 fn reprojection_score(
     candidate: &Candidate,
     problem: &Problem,

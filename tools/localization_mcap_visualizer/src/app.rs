@@ -69,6 +69,25 @@ pub struct LocalizationMcapVisualizerApp {
     global_debug_cache: CachedGlobalDebug,
 }
 
+struct GlobalDebugInput<'a> {
+    camera_matrix: Option<&'a CameraMatrix>,
+    camera_matrix_key: Option<CameraMatrixKey>,
+    detected_objects_time: Option<SystemTime>,
+    recorded_global_debug: Option<&'a GlobalLocalizationDebug>,
+    recorded_global_debug_time: Option<SystemTime>,
+    current_pose: linear_algebra::Isometry3<Robot, Field, f64>,
+    objects: &'a [Object<RobocupObjectLabel>],
+}
+
+struct CameraPanelData<'a> {
+    detected_objects: &'a [Object<RobocupObjectLabel>],
+    detected_objects_time: Option<SystemTime>,
+    image_display_time: Option<SystemTime>,
+    field_mark_associations: Option<&'a FieldMarkAssociations>,
+    camera_matrix: Option<&'a CameraMatrix>,
+    global_debug: Option<&'a GlobalLocalizationDetailedDebug>,
+}
+
 impl LocalizationMcapVisualizerApp {
     pub fn new(
         creation_context: &CreationContext,
@@ -144,15 +163,15 @@ impl App for LocalizationMcapVisualizerApp {
 
         let current_pose = self.current_robot_to_field(snapshot.recorded_localization);
         let debug_pose = self.robot_to_field_at_display_time(snapshot.detected_objects_time);
-        let global_debug = self.update_global_debug_cache(
-            camera_matrix.as_ref(),
+        let global_debug = self.update_global_debug_cache(GlobalDebugInput {
+            camera_matrix: camera_matrix.as_ref(),
             camera_matrix_key,
-            snapshot.detected_objects_time,
-            snapshot.global_localization_debug.as_ref(),
-            snapshot.global_localization_debug_time,
-            debug_pose,
-            &snapshot.detected_objects,
-        );
+            detected_objects_time: snapshot.detected_objects_time,
+            recorded_global_debug: snapshot.global_localization_debug.as_ref(),
+            recorded_global_debug_time: snapshot.global_localization_debug_time,
+            current_pose: debug_pose,
+            objects: &snapshot.detected_objects,
+        });
         let camera_matrix_for_ui = camera_matrix.clone();
         self.update_scene_data(camera_matrix.take(), current_pose, global_debug.clone());
 
@@ -166,15 +185,17 @@ impl App for LocalizationMcapVisualizerApp {
         self.parameters_panel(context, snapshot.solve_diagnostics.as_ref());
         self.camera_panel(
             context,
-            &snapshot.detected_objects,
-            snapshot.detected_objects_time,
-            snapshot.image_display_time,
-            snapshot
-                .field_mark_associations
-                .as_ref()
-                .map(|associations| &associations.inner),
-            camera_matrix_for_ui.as_ref(),
-            global_debug.as_deref(),
+            CameraPanelData {
+                detected_objects: &snapshot.detected_objects,
+                detected_objects_time: snapshot.detected_objects_time,
+                image_display_time: snapshot.image_display_time,
+                field_mark_associations: snapshot
+                    .field_mark_associations
+                    .as_ref()
+                    .map(|associations| &associations.inner),
+                camera_matrix: camera_matrix_for_ui.as_ref(),
+                global_debug: global_debug.as_deref(),
+            },
         );
         self.timeline_panel(context);
         self.viewport(context);
@@ -451,19 +472,13 @@ impl LocalizationMcapVisualizerApp {
 
     fn update_global_debug_cache(
         &mut self,
-        camera_matrix: Option<&projection::camera_matrix::CameraMatrix>,
-        camera_matrix_key: Option<CameraMatrixKey>,
-        detected_objects_time: Option<SystemTime>,
-        recorded_global_debug: Option<&GlobalLocalizationDebug>,
-        recorded_global_debug_time: Option<SystemTime>,
-        current_pose: linear_algebra::Isometry3<Robot, Field, f64>,
-        objects: &[Object<RobocupObjectLabel>],
+        input: GlobalDebugInput<'_>,
     ) -> Option<Arc<GlobalLocalizationDetailedDebug>> {
-        let key = if recorded_global_debug.is_some() || camera_matrix_key.is_some() {
+        let key = if input.recorded_global_debug.is_some() || input.camera_matrix_key.is_some() {
             Some(GlobalDebugKey {
-                camera_matrix_key,
-                detected_objects_time_nanos: detected_objects_time.map(nanos_since_epoch),
-                recorded_debug_time_nanos: recorded_global_debug_time.map(nanos_since_epoch),
+                camera_matrix_key: input.camera_matrix_key,
+                detected_objects_time_nanos: input.detected_objects_time.map(nanos_since_epoch),
+                recorded_debug_time_nanos: input.recorded_global_debug_time.map(nanos_since_epoch),
                 pose_revision: self.resolve_version,
                 global_localizer: self.parameters.global_localizer,
             })
@@ -472,9 +487,16 @@ impl LocalizationMcapVisualizerApp {
         };
 
         if self.global_debug_cache.key != key {
-            let debug = recorded_global_debug
+            let debug = input
+                .recorded_global_debug
                 .map(recorded_global_debug_to_detailed)
-                .or_else(|| self.compute_global_debug(camera_matrix, current_pose, objects))
+                .or_else(|| {
+                    self.compute_global_debug(
+                        input.camera_matrix,
+                        input.current_pose,
+                        input.objects,
+                    )
+                })
                 .map(Arc::new);
             self.global_debug_cache.key = key;
             self.global_debug_cache.version = self.global_debug_cache.version.next();
@@ -600,6 +622,12 @@ impl LocalizationMcapVisualizerApp {
                     "pose-hint Huber",
                     &mut self.parameters.pose_hint_visual_huber_threshold,
                     0.1..=100.0,
+                );
+                numeric_row(
+                    ui,
+                    "field containment sigma",
+                    &mut self.parameters.field_containment_sigma,
+                    0.05..=10.0,
                 );
                 ui.horizontal(|ui| {
                     ui.label("pose-hint min features");
@@ -957,16 +985,7 @@ impl LocalizationMcapVisualizerApp {
         ));
     }
 
-    fn camera_panel(
-        &mut self,
-        context: &Context,
-        detected_objects: &[Object<RobocupObjectLabel>],
-        detected_objects_time: Option<SystemTime>,
-        image_display_time: Option<SystemTime>,
-        field_mark_associations: Option<&FieldMarkAssociations>,
-        camera_matrix: Option<&CameraMatrix>,
-        global_debug: Option<&GlobalLocalizationDetailedDebug>,
-    ) {
+    fn camera_panel(&mut self, context: &Context, data: CameraPanelData<'_>) {
         SidePanel::right("camera_panel")
             .resizable(true)
             .default_width(520.0)
@@ -992,16 +1011,7 @@ impl LocalizationMcapVisualizerApp {
                     .as_ref()
                     .map(|cache| cache.active(self.selected_camera));
                 match (texture, image) {
-                    (Some(texture), Some(image)) => self.camera_image(
-                        ui,
-                        texture,
-                        image,
-                        detected_objects,
-                        detected_objects_time,
-                        image_display_time,
-                        field_mark_associations,
-                        global_debug,
-                    ),
+                    (Some(texture), Some(image)) => self.camera_image(ui, texture, image, &data),
                     _ => {
                         ui.centered_and_justified(|ui| {
                             ui.label(
@@ -1015,9 +1025,9 @@ impl LocalizationMcapVisualizerApp {
                     }
                 }
                 ui.separator();
-                self.global_debug_panel(ui, global_debug);
+                self.global_debug_panel(ui, data.global_debug);
                 ui.separator();
-                self.top_down_association_view(ui, global_debug, camera_matrix);
+                self.top_down_association_view(ui, data.global_debug, data.camera_matrix);
             });
     }
 
@@ -1026,11 +1036,7 @@ impl LocalizationMcapVisualizerApp {
         ui: &mut Ui,
         texture: &TextureHandle,
         image: &CameraImage,
-        detected_objects: &[Object<RobocupObjectLabel>],
-        detected_objects_time: Option<SystemTime>,
-        image_display_time: Option<SystemTime>,
-        field_mark_associations: Option<&FieldMarkAssociations>,
-        global_debug: Option<&GlobalLocalizationDetailedDebug>,
+        data: &CameraPanelData<'_>,
     ) {
         let image_size = vec2(image.width as f32, image.height as f32);
         let available = ui.available_size().max(vec2(1.0, 1.0));
@@ -1047,8 +1053,8 @@ impl LocalizationMcapVisualizerApp {
                         .sense(Sense::hover()),
                 );
                 if self.selected_camera == StereoSide::Left {
-                    draw_detected_objects(ui, response.rect, image_size, detected_objects);
-                    if let Some(field_mark_associations) = field_mark_associations {
+                    draw_detected_objects(ui, response.rect, image_size, data.detected_objects);
+                    if let Some(field_mark_associations) = data.field_mark_associations {
                         draw_recorded_association_pixels(
                             ui,
                             response.rect,
@@ -1056,11 +1062,15 @@ impl LocalizationMcapVisualizerApp {
                             field_mark_associations,
                         );
                     }
-                    if let Some(debug) = global_debug {
+                    if let Some(debug) = data.global_debug {
                         draw_global_debug_overlay(ui, response.rect, image_size, debug);
                     }
-                    let hover_info =
-                        image_hover_info(&response, image_size, detected_objects, global_debug);
+                    let hover_info = image_hover_info(
+                        &response,
+                        image_size,
+                        data.detected_objects,
+                        data.global_debug,
+                    );
                     if !hover_info.is_empty() {
                         response.on_hover_ui(|ui| {
                             for line in hover_info {
@@ -1079,8 +1089,8 @@ impl LocalizationMcapVisualizerApp {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}x{}", image.width, image.height));
             ui.separator();
-            ui.label(format!("{} left detections", detected_objects.len()));
-            if let Some(field_mark_associations) = field_mark_associations {
+            ui.label(format!("{} left detections", data.detected_objects.len()));
+            if let Some(field_mark_associations) = data.field_mark_associations {
                 ui.separator();
                 ui.label(format!(
                     "{} recorded associations",
@@ -1088,8 +1098,9 @@ impl LocalizationMcapVisualizerApp {
                 ));
             }
             if let Some(cache) = &self.image_cache {
-                let frame_display_time =
-                    image_display_time.unwrap_or_else(|| cache.frame.source_time.to_wallclock());
+                let frame_display_time = data
+                    .image_display_time
+                    .unwrap_or_else(|| cache.frame.source_time.to_wallclock());
                 ui.separator();
                 ui.label(format!("frame {}", cache.image_id));
                 ui.separator();
@@ -1105,7 +1116,7 @@ impl LocalizationMcapVisualizerApp {
                     self.recording
                         .seconds_since_log_start(cache.frame.publish_time),
                 ));
-                if let Some(detected_objects_time) = detected_objects_time {
+                if let Some(detected_objects_time) = data.detected_objects_time {
                     let delta_ms = (self.recording.seconds_since_start(detected_objects_time)
                         - self.recording.seconds_since_start(frame_display_time))
                         * 1000.0;
@@ -1361,7 +1372,7 @@ impl LocalizationMcapVisualizerApp {
 
     fn resolved_result(&self) -> Option<&ResolveResult> {
         match &self.resolve {
-            ResolveState::Done(result) => Some(result),
+            ResolveState::Done(result) => Some(result.as_ref()),
             _ => None,
         }
     }
@@ -1442,7 +1453,9 @@ fn recorded_global_debug_status(
     match status {
         GlobalLocalizationDebugStatus::Ambiguous => GlobalLocalizationDetailedStatus::Ambiguous,
         #[allow(deprecated)]
-        GlobalLocalizationDebugStatus::Unique => GlobalLocalizationDetailedStatus::Unique,
+        GlobalLocalizationDebugStatus::Unique => {
+            GlobalLocalizationDetailedStatus::UniqueModuloSymmetry
+        }
         GlobalLocalizationDebugStatus::UniqueModuloSymmetry => {
             GlobalLocalizationDetailedStatus::UniqueModuloSymmetry
         }
@@ -1814,6 +1827,6 @@ enum ResolveState {
         cancel: Arc<AtomicBool>,
         progress: ResolveProgress,
     },
-    Done(ResolveResult),
+    Done(Box<ResolveResult>),
     Failed(String),
 }

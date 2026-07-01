@@ -1,4 +1,6 @@
-pub use backend::{BackendConfiguration, VinsBackend, VinsBackendError};
+pub use backend::{
+    BackendConfiguration, FieldContainmentConfiguration, VinsBackend, VinsBackendError,
+};
 pub use camera_intrinsics::CameraIntrinsics;
 pub use frontend::{OptimizationResult, VinsFrontend, VinsFrontendError};
 pub use initial_state::InitialState;

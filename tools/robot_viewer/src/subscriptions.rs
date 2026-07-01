@@ -305,7 +305,7 @@ impl ProcessedPublications {
 
 fn refresh_debug_streams(state: &mut ViewerState, subscriptions: &mut DebugSubscriptions) {
     if let Some(record) = subscriptions.field_dimensions.latest() {
-        state.field_dimensions = Some(record.value.clone());
+        state.field_dimensions = Some(record.value);
     }
     update_debug_status(
         &mut state.field_status,
@@ -314,7 +314,7 @@ fn refresh_debug_streams(state: &mut ViewerState, subscriptions: &mut DebugSubsc
     );
 
     if let Some(record) = subscriptions.localization.latest() {
-        state.localization = record.value.clone();
+        state.localization = record.value;
     }
     update_debug_status(
         &mut state.localization_status,
@@ -350,7 +350,7 @@ fn refresh_debug_streams(state: &mut ViewerState, subscriptions: &mut DebugSubsc
     );
 
     if let Some(record) = subscriptions.calibrated_intrinsics.latest() {
-        state.calibrated_intrinsics = Some(record.value.clone());
+        state.calibrated_intrinsics = Some(record.value);
     }
     update_debug_status(
         &mut state.calibrated_intrinsics_status,

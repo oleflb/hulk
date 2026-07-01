@@ -7,7 +7,9 @@ use factrs::{
     variables::{MatrixLieGroup, SE23},
 };
 use linear_algebra::IntoFramed;
-use localization_factrs::{BackendConfiguration, InitialState, SE23Spline, initialize, tau};
+use localization_factrs::{
+    BackendConfiguration, FieldContainmentConfiguration, InitialState, SE23Spline, initialize, tau,
+};
 use log::LevelFilter;
 use nalgebra::{Matrix2, Matrix3, SMatrix, Vector3, vector};
 
@@ -32,6 +34,7 @@ fn imu_on_spline() {
             pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
+            field_containment: FieldContainmentConfiguration::default(),
             gravity: Vector3::new(0.0, 0.0, 9.81),
         },
         InitialState::default(),

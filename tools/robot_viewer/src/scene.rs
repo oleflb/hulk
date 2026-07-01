@@ -510,6 +510,7 @@ fn update_field_markings(
         .expect("field markings mesh handle should be valid");
 }
 
+#[allow(clippy::type_complexity)]
 fn update_camera_viewport(
     data: Res<ViewerData>,
     mut frustum: Single<(&Mesh3d, &mut Transform, &mut Visibility), With<CameraFrustum>>,

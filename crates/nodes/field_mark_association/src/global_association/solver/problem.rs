@@ -8,6 +8,7 @@ impl Problem {
         if !valid_intrinsic(input.camera_intrinsic) {
             return None;
         }
+        let field_boundary = field_boundary_limits(input.field_dimensions)?;
 
         let map = cached_landmark_map(input.field_dimensions, cfg.min_map_baseline);
         let ground_to_camera = input.robot_to_camera * input.ground_to_robot;
@@ -46,16 +47,27 @@ impl Problem {
             detections,
             detections_truncated: detection_set.truncated,
             camera_xy_ground: Vector2::new(camera_origin.x, camera_origin.y),
+            field_boundary,
             high_confidence_unmatched_penalty,
         })
     }
+}
+
+type LandmarkMapCacheEntry = (LandmarkMapCacheKey, Arc<LandmarkMap>);
+type LandmarkMapCache = Mutex<Vec<LandmarkMapCacheEntry>>;
+
+pub(super) fn field_boundary_limits(field_dimensions: &FieldDimensions) -> Option<Vector2<f32>> {
+    let x_limit = field_dimensions.length * 0.5 + field_dimensions.border_strip_width;
+    let y_limit = field_dimensions.width * 0.5 + field_dimensions.border_strip_width;
+    (x_limit.is_finite() && x_limit > 0.0 && y_limit.is_finite() && y_limit > 0.0)
+        .then_some(Vector2::new(x_limit, y_limit))
 }
 
 pub(super) fn cached_landmark_map(
     field_dimensions: &FieldDimensions,
     min_map_baseline: f32,
 ) -> Arc<LandmarkMap> {
-    static CACHE: OnceLock<Mutex<Vec<(LandmarkMapCacheKey, Arc<LandmarkMap>)>>> = OnceLock::new();
+    static CACHE: OnceLock<LandmarkMapCache> = OnceLock::new();
     let key = landmark_map_cache_key(field_dimensions, min_map_baseline);
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
     {

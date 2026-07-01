@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::{
     factors::{
+        field_containment::FieldContainmentFactor,
         foot_above_ground::{FootHeightMeasurement, IntervalFootAboveGroundFactor},
         gaussian_process_prior::GaussianProcessPriorFactor,
         imu::{
@@ -39,6 +40,8 @@ use crate::{
     symbols::{CameraIntrinsics, State},
     tau,
 };
+
+use types::field_dimensions::FieldDimensions;
 
 use tokio::sync::{
     mpsc::{UnboundedReceiver, error::TryRecvError},
@@ -80,6 +83,32 @@ pub struct BackendConfiguration {
     pub pose_hint_visual_huber_threshold: f64,
     pub visual_odometry_noise: SMatrix<f64, 6, 6>,
     pub foot_ground_sigma: f64,
+    pub field_containment: FieldContainmentConfiguration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FieldContainmentConfiguration {
+    pub x_limit: f64,
+    pub y_limit: f64,
+    pub sigma: f64,
+}
+
+impl FieldContainmentConfiguration {
+    pub fn from_field_dimensions(field_dimensions: &FieldDimensions, sigma: f64) -> Self {
+        Self {
+            x_limit: field_dimensions.length as f64 * 0.5
+                + field_dimensions.border_strip_width as f64,
+            y_limit: field_dimensions.width as f64 * 0.5
+                + field_dimensions.border_strip_width as f64,
+            sigma,
+        }
+    }
+}
+
+impl Default for FieldContainmentConfiguration {
+    fn default() -> Self {
+        Self::from_field_dimensions(&FieldDimensions::SPL_2025, 1.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,12 +197,13 @@ pub struct VinsBackend {
     last_imu_knot_orientation: Option<ImuKnotOrientation>,
     /// Optimizer status from the most recent solve.
     last_optimizer_status: Option<BackendOptimizerStatus>,
-    /// Diagnostics from the most recent solve.
-    last_solve_diagnostics: Option<BackendSolveDiagnostics>,
     last_imu_kinematics_measurement_time: Option<SystemTime>,
 }
 
-pub fn initialize_graph(initial_state: &InitialState) -> (Graph, Values) {
+pub fn initialize_graph(
+    initial_state: &InitialState,
+    config: &BackendConfiguration,
+) -> (Graph, Values) {
     let mut graph = Graph::default();
     let mut values = Values::default();
 
@@ -202,6 +232,7 @@ pub fn initialize_graph(initial_state: &InitialState) -> (Graph, Values) {
         .build();
     graph.add_factor(factor);
     values.insert(State(0), initial_pose);
+    add_field_containment_factor(&mut graph, State(0), config);
 
     (graph, values)
 }
@@ -218,7 +249,7 @@ impl VinsBackend {
             "optimizer_max_iterations must be positive"
         );
 
-        let (graph, values) = initialize_graph(&initial_state);
+        let (graph, values) = initialize_graph(&initial_state, &config);
 
         let mut optimizer = GaussNewton::new(
             BaseOptParams {
@@ -244,7 +275,6 @@ impl VinsBackend {
             next_imu_attitude_knot_index: 0,
             last_imu_knot_orientation: None,
             last_optimizer_status: None,
-            last_solve_diagnostics: None,
             last_imu_kinematics_measurement_time: None,
         }
     }
@@ -569,19 +599,13 @@ impl VinsBackend {
                 CameraIntrinsics(0),
             );
             let graph = self.optimizer.graph_mut();
-            if let Some(factor) = graph
-                .factors_for_residual_mut::<VisualReprojectionFactor, _>(keys)
-                .next()
-            {
-                factor
-                    .residual_as_mut::<VisualReprojectionFactor>()
-                    .expect("factor query must return matching residual")
-                    .extend_frames(group.measurements);
-            } else {
+            // factrs robust kernels are factor-wide, so keep each 2D measurement
+            // in its own factor to avoid downweighting unrelated residuals.
+            for measurement in group.measurements.into_iter().flatten() {
                 let residual = VisualReprojectionFactor::new(
                     group.start_time,
                     group.end_time,
-                    group.measurements,
+                    vec![vec![measurement]],
                     self.config.visual_feature_noise,
                 );
                 let factor = FactorBuilder::new(residual, keys)
@@ -670,25 +694,13 @@ impl VinsBackend {
                 continue;
             }
 
-            let measurements = group
-                .measurements
-                .into_iter()
-                .map(|measurement| measurement.delta)
-                .collect::<Vec<_>>();
-
             let keys = (State(group.start_index), State(group.start_index + 1));
             let graph = self.optimizer.graph_mut();
-            if let Some(factor) = graph
-                .factors_for_residual_mut::<VisualOdometryFactor, _>(keys)
-                .next()
-            {
-                factor
-                    .residual_as_mut::<VisualOdometryFactor>()
-                    .expect("factor query must return matching residual")
-                    .extend_measurements(measurements);
-            } else {
+            // factrs robust kernels are factor-wide, so keep each 6D delta in
+            // its own factor to avoid downweighting unrelated residuals.
+            for measurement in group.measurements {
                 let residual = VisualOdometryFactor::new(
-                    measurements,
+                    vec![measurement.delta],
                     self.config.visual_odometry_noise,
                     self.config.knot_spacing.as_secs_f64(),
                 );
@@ -711,29 +723,17 @@ impl VinsBackend {
                 continue;
             }
 
-            let measurements = group
-                .measurements
-                .into_iter()
-                .map(|measurement| measurement.delta)
-                .collect::<Vec<_>>();
-
             let keys = (
                 State(group.start_index),
                 State(group.start_index + 1),
                 State(group.start_index + 2),
             );
             let graph = self.optimizer.graph_mut();
-            if let Some(factor) = graph
-                .factors_for_residual_mut::<AdjacentVisualOdometryFactor, _>(keys)
-                .next()
-            {
-                factor
-                    .residual_as_mut::<AdjacentVisualOdometryFactor>()
-                    .expect("factor query must return matching residual")
-                    .extend_measurements(measurements);
-            } else {
+            // factrs robust kernels are factor-wide, so keep each 6D delta in
+            // its own factor to avoid downweighting unrelated residuals.
+            for measurement in group.measurements {
                 let residual = AdjacentVisualOdometryFactor::new(
-                    measurements,
+                    vec![measurement.delta],
                     self.config.visual_odometry_noise,
                     self.config.knot_spacing.as_secs_f64(),
                 );
@@ -1291,8 +1291,11 @@ fn init_interval_states(
     let start = State(interval_start_index);
     let end = State(interval_start_index + 1);
 
-    values.init_if_missing(&initial_state.pose, start, false);
+    if values.init_if_missing(&initial_state.pose, start, false) {
+        add_field_containment_factor(graph, start, config);
+    }
     if values.init_if_missing(&initial_state.pose, end, is_empty_bridge_interval) {
+        add_field_containment_factor(graph, end, config);
         let gp_residual = if is_empty_bridge_interval {
             GaussianProcessPriorFactor::new_zero_start_velocity_bridge(
                 config.knot_spacing.as_secs_f64(),
@@ -1312,6 +1315,13 @@ fn init_interval_states(
 
         graph.add_factor(gp_factor);
     }
+}
+
+fn add_field_containment_factor(graph: &mut Graph, state: State, config: &BackendConfiguration) {
+    let containment = config.field_containment;
+    let residual =
+        FieldContainmentFactor::new(containment.x_limit, containment.y_limit, containment.sigma);
+    graph.add_factor(FactorBuilder::new(residual, state).build());
 }
 
 #[derive(Debug, Clone)]
@@ -1423,6 +1433,7 @@ mod tests {
             pose_hint_visual_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
+            field_containment: FieldContainmentConfiguration::default(),
             gravity: Vector3::new(0.0, 0.0, 9.81),
         }
     }
@@ -1459,22 +1470,24 @@ mod tests {
         })
     }
 
-    fn visual_reprojection(time: SystemTime) -> SensorMeasurement {
-        SensorMeasurement::Visual(vec![VisualReprojectionMeasurement {
+    fn visual_reprojection_measurement(
+        time: SystemTime,
+        detection_x: f64,
+    ) -> VisualReprojectionMeasurement {
+        VisualReprojectionMeasurement {
             time,
-            detection: nalgebra::point![0.0, 0.0],
+            detection: nalgebra::point![detection_x, 0.0],
             field_point: nalgebra::point![0.0, 0.0, 2.0],
             robot_to_camera: SE3::identity(),
-        }])
+        }
+    }
+
+    fn visual_reprojection(time: SystemTime) -> SensorMeasurement {
+        SensorMeasurement::Visual(vec![visual_reprojection_measurement(time, 0.0)])
     }
 
     fn pose_hint_visual_reprojection(time: SystemTime) -> SensorMeasurement {
-        SensorMeasurement::PoseHintVisual(vec![VisualReprojectionMeasurement {
-            time,
-            detection: nalgebra::point![0.0, 0.0],
-            field_point: nalgebra::point![0.0, 0.0, 2.0],
-            robot_to_camera: SE3::identity(),
-        }])
+        SensorMeasurement::PoseHintVisual(vec![visual_reprojection_measurement(time, 0.0)])
     }
 
     fn visual_reprojection_factor_count(backend: &mut VinsBackend, state: State) -> usize {
@@ -1487,6 +1500,23 @@ mod tests {
                 CameraIntrinsics(0),
             ))
             .count()
+    }
+
+    fn visual_reprojection_factor_dimensions(backend: &VinsBackend, state: State) -> Vec<usize> {
+        backend
+            .optimizer
+            .graph()
+            .factors_for_residual::<VisualReprojectionFactor, _>((
+                state,
+                State(state.0 + 1),
+                CameraIntrinsics(0),
+            ))
+            .map(|factor| {
+                factor
+                    .try_dim_out(backend.values())
+                    .expect("visual reprojection factor should have a dimension")
+            })
+            .collect()
     }
 
     fn pose_hint_visual_reprojection_factor_count(
@@ -1512,6 +1542,19 @@ mod tests {
             .count()
     }
 
+    fn visual_odometry_factor_dimensions(backend: &VinsBackend, state: State) -> Vec<usize> {
+        backend
+            .optimizer
+            .graph()
+            .factors_for_residual::<VisualOdometryFactor, _>((state, State(state.0 + 1)))
+            .map(|factor| {
+                factor
+                    .try_dim_out(backend.values())
+                    .expect("visual odometry factor should have a dimension")
+            })
+            .collect()
+    }
+
     fn adjacent_visual_odometry_factor_count(backend: &mut VinsBackend, state: State) -> usize {
         backend
             .optimizer
@@ -1521,6 +1564,34 @@ mod tests {
                 State(state.0 + 1),
                 State(state.0 + 2),
             ))
+            .count()
+    }
+
+    fn adjacent_visual_odometry_factor_dimensions(
+        backend: &VinsBackend,
+        state: State,
+    ) -> Vec<usize> {
+        backend
+            .optimizer
+            .graph()
+            .factors_for_residual::<AdjacentVisualOdometryFactor, _>((
+                state,
+                State(state.0 + 1),
+                State(state.0 + 2),
+            ))
+            .map(|factor| {
+                factor
+                    .try_dim_out(backend.values())
+                    .expect("adjacent visual odometry factor should have a dimension")
+            })
+            .collect()
+    }
+
+    fn field_containment_factor_count(backend: &VinsBackend, state: State) -> usize {
+        backend
+            .optimizer
+            .graph()
+            .factors_for_residual::<FieldContainmentFactor, _>(state)
             .count()
     }
 
@@ -1570,6 +1641,31 @@ mod tests {
 
         assert!(backend.values().get_raw(CameraIntrinsics(0)).is_some());
         assert!(backend.values().get_raw(State(0)).is_some());
+    }
+
+    #[test]
+    fn field_containment_factors_are_attached_to_initialized_states() {
+        let (_measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        assert_eq!(field_containment_factor_count(&backend, State(0)), 1);
+
+        backend
+            .ingest_sensor_measurements([stationary_imu(start)])
+            .expect("IMU should ingest");
+        backend
+            .ingest_sensor_measurements([stationary_imu(start + Duration::from_millis(50))])
+            .expect("IMU should ingest");
+
+        assert_eq!(field_containment_factor_count(&backend, State(0)), 1);
+        assert_eq!(field_containment_factor_count(&backend, State(1)), 1);
     }
 
     #[test]
@@ -1676,6 +1772,32 @@ mod tests {
     }
 
     #[test]
+    fn visual_reprojection_huber_is_per_measurement_residual_block() {
+        let (_measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        backend
+            .ingest_sensor_measurements([SensorMeasurement::Visual(vec![
+                visual_reprojection_measurement(start, 0.0),
+                visual_reprojection_measurement(start, 1.0),
+            ])])
+            .expect("visual measurements should ingest");
+
+        assert_eq!(visual_reprojection_factor_count(&mut backend, State(0)), 2);
+        assert_eq!(
+            visual_reprojection_factor_dimensions(&backend, State(0)),
+            vec![2, 2]
+        );
+    }
+
+    #[test]
     fn visual_odometry_measurements_create_interval_factor() {
         let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
@@ -1700,6 +1822,36 @@ mod tests {
         assert!(backend.values().get_raw(State(0)).is_some());
         assert!(backend.values().get_raw(State(1)).is_some());
         assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 1);
+    }
+
+    #[test]
+    fn visual_odometry_huber_is_per_delta_residual_block() {
+        let (_measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        backend
+            .ingest_sensor_measurements([
+                visual_odometry(start, start + Duration::from_millis(50), 0.05),
+                visual_odometry(
+                    start + Duration::from_millis(60),
+                    start + Duration::from_millis(100),
+                    0.04,
+                ),
+            ])
+            .expect("visual odometry measurements should ingest");
+
+        assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 2);
+        assert_eq!(
+            visual_odometry_factor_dimensions(&backend, State(0)),
+            vec![6, 6]
+        );
     }
 
     #[test]
@@ -1731,6 +1883,44 @@ mod tests {
         assert_eq!(
             adjacent_visual_odometry_factor_count(&mut backend, State(0)),
             1
+        );
+    }
+
+    #[test]
+    fn adjacent_visual_odometry_huber_is_per_delta_residual_block() {
+        let (_measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
+        let mut backend = VinsBackend::new(
+            backend_configuration(),
+            InitialState::default(),
+            measurement_receiver,
+            result_sender,
+        );
+        let start = SystemTime::UNIX_EPOCH;
+
+        backend
+            .ingest_sensor_measurements([
+                stationary_imu(start),
+                visual_odometry(
+                    start + Duration::from_millis(100),
+                    start + Duration::from_millis(200),
+                    0.1,
+                ),
+                visual_odometry(
+                    start + Duration::from_millis(120),
+                    start + Duration::from_millis(200),
+                    0.08,
+                ),
+            ])
+            .expect("adjacent visual odometry measurements should ingest");
+
+        assert_eq!(
+            adjacent_visual_odometry_factor_count(&mut backend, State(0)),
+            2
+        );
+        assert_eq!(
+            adjacent_visual_odometry_factor_dimensions(&backend, State(0)),
+            vec![6, 6]
         );
     }
 

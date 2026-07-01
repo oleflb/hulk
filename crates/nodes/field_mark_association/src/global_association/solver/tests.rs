@@ -465,6 +465,48 @@ fn deterministic_poses(field: &FieldDimensions) -> Vec<Isometry3<Robot, Field>> 
     poses
 }
 
+#[test]
+fn robot_field_boundary_includes_border_strip() {
+    let field = FieldDimensions::SPL_2025;
+    let problem = boundary_problem(&field);
+    let x_limit = field.length * 0.5 + field.border_strip_width;
+    let y_limit = field.width * 0.5 + field.border_strip_width;
+
+    assert!(robot_position_within_field_boundary(
+        &problem,
+        robot_to_field(x_limit, y_limit, 0.0),
+    ));
+    assert!(robot_position_within_field_boundary(
+        &problem,
+        robot_to_field(-x_limit, -y_limit, 0.0),
+    ));
+    assert!(!robot_position_within_field_boundary(
+        &problem,
+        robot_to_field(x_limit + 0.01, 0.0, 0.0),
+    ));
+    assert!(!robot_position_within_field_boundary(
+        &problem,
+        robot_to_field(0.0, -y_limit - 0.01, 0.0),
+    ));
+}
+
+fn boundary_problem(field: &FieldDimensions) -> Problem {
+    let cfg = GlobalAssociationConfig::default();
+    Problem {
+        cfg,
+        k: synthetic_camera_intrinsic(),
+        ground_to_robot: Isometry3::<Ground, Robot>::identity(),
+        robot_to_camera: synthetic_robot_to_camera(),
+        pose_hint: None,
+        map: std::sync::Arc::new(LandmarkMap::new(field, cfg.min_map_baseline)),
+        detections: Vec::new(),
+        detections_truncated: false,
+        camera_xy_ground: Vector2::zeros(),
+        field_boundary: field_boundary_limits(field).expect("field boundary should be valid"),
+        high_confidence_unmatched_penalty: 0.0,
+    }
+}
+
 fn random_pose_in_and_around_field(
     field: &FieldDimensions,
     rng: &mut DeterministicRng,

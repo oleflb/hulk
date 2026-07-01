@@ -34,20 +34,11 @@ pub use global_association::{
 const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 const DETECTED_OBJECTS_SAFETY_LAG: Duration = Duration::from_millis(50);
 
-#[derive(Clone, Debug, Deserialize, Serialize, Message)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Message)]
 #[serde(deny_unknown_fields)]
 pub struct FieldMarkAssociationParameters {
     pub global_localizer: GlobalLocalizerParameters,
     pub pose_hint: PoseHintAssociationParameters,
-}
-
-impl Default for FieldMarkAssociationParameters {
-    fn default() -> Self {
-        Self {
-            global_localizer: GlobalLocalizerParameters::default(),
-            pose_hint: PoseHintAssociationParameters::default(),
-        }
-    }
 }
 
 impl FieldMarkAssociationParameters {

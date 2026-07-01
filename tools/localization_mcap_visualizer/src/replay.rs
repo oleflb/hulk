@@ -16,8 +16,8 @@ use field_mark_association::{
 };
 use linear_algebra::IntoTransform;
 use localization_3d::{
-    Localization3dParameters, backend_configuration_from_parameters, ingest_foot_heights,
-    ingest_visual_odometry,
+    Localization3dParameters, backend_configuration_from_parameters_and_field_dimensions,
+    ingest_foot_heights, ingest_visual_odometry,
 };
 use localization_factrs::{
     BackendConfiguration, VinsBackend, VinsFrontend, VisualReprojectionAssociation,
@@ -48,6 +48,7 @@ pub struct ReplayParameters {
     pub visual_feature_noise_variance: f64,
     pub pose_hint_visual_feature_noise_variance: f64,
     pub pose_hint_visual_huber_threshold: f64,
+    pub field_containment_sigma: f64,
     pub pose_hint_visual_min_features_per_frame: usize,
     pub visual_odometry_covariance: f64,
     pub override_visual_odometry_covariance: bool,
@@ -97,6 +98,7 @@ impl Default for ReplayParameters {
                 .pose_hint_visual_feature_noise_variance,
             pose_hint_visual_huber_threshold: localization_parameters
                 .pose_hint_visual_huber_threshold,
+            field_containment_sigma: localization_parameters.field_containment_sigma,
             pose_hint_visual_min_features_per_frame:
                 DEFAULT_POSE_HINT_VISUAL_MIN_FEATURES_PER_FRAME,
             visual_odometry_covariance: 1.0e-2,
@@ -123,7 +125,7 @@ pub enum TimestampMode {
 #[derive(Clone, Debug)]
 pub enum ResolveMessage {
     Progress(ResolveProgress),
-    Finished(ResolveResult),
+    Finished(Box<ResolveResult>),
     Failed(String),
     Cancelled,
 }
@@ -208,7 +210,7 @@ pub fn spawn_resolve(
     std::thread::spawn(move || {
         let result = run_resolve(&recording, parameters, None, &cancelled, &sender);
         let message = match result {
-            Ok(Some(result)) => ResolveMessage::Finished(result),
+            Ok(Some(result)) => ResolveMessage::Finished(Box::new(result)),
             Ok(None) => ResolveMessage::Cancelled,
             Err(error) => ResolveMessage::Failed(format!("{error:#}")),
         };
@@ -253,12 +255,15 @@ fn run_resolve(
     let started = Instant::now();
     let initial_state =
         localization_3d::initial_state_from_camera_matrix(&recording.first_camera_matrix);
-    let (mut frontend, mut backend) = initialize(backend_config(&parameters), initial_state);
     let field_dimensions = recording
         .field_dimensions
         .unwrap_or(FieldDimensions::SPL_2025);
+    let (mut frontend, mut backend) = initialize(
+        backend_config(&parameters, &field_dimensions),
+        initial_state,
+    );
     let mut camera_matrices = OnlineCameraMatrices::default();
-    let mut vo_timestamps = VisualOdometryTimestampTracker::default();
+    let mut vo_timestamps = VisualOdometryTimestampTracker;
     let mut association_state = FieldMarkAssociationState::default();
     let mut stats = ReplayStats::default();
     let mut samples = Vec::new();
@@ -442,13 +447,20 @@ fn merged_replay_events<'a>(
     replay_events
 }
 
-fn backend_config(parameters: &ReplayParameters) -> BackendConfiguration {
+fn backend_config(
+    parameters: &ReplayParameters,
+    field_dimensions: &FieldDimensions,
+) -> BackendConfiguration {
     let localization_parameters = Localization3dParameters {
         visual_feature_noise_variance: parameters.visual_feature_noise_variance,
         pose_hint_visual_feature_noise_variance: parameters.pose_hint_visual_feature_noise_variance,
         pose_hint_visual_huber_threshold: parameters.pose_hint_visual_huber_threshold,
+        field_containment_sigma: parameters.field_containment_sigma,
     };
-    let mut config = backend_configuration_from_parameters(&localization_parameters);
+    let mut config = backend_configuration_from_parameters_and_field_dimensions(
+        &localization_parameters,
+        field_dimensions,
+    );
     config.optimizer_max_iterations = parameters.optimizer_iterations.max(1);
     config.max_optimization_window =
         Duration::from_secs_f64(parameters.max_window_seconds.max(0.2));
