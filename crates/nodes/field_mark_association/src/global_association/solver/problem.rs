@@ -186,6 +186,7 @@ fn raw_detections(
         (VisualFeatureClass::GoalPost, features.goalposts.as_slice()),
         (VisualFeatureClass::LSpot, features.l_spots.as_slice()),
         (VisualFeatureClass::TSpot, features.t_spots.as_slice()),
+        (VisualFeatureClass::XSpot, features.x_spots.as_slice()),
         (
             VisualFeatureClass::PenaltySpot,
             features.penalty_spots.as_slice(),

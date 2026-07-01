@@ -146,9 +146,6 @@ pub enum GlobalLocalizationDebugStatus {
     /// Uniqueness was not certified because a competitor may remain or the bounded search ended
     /// inconclusively.
     Ambiguous,
-    /// Reserved old wire tag for the removed strict-unique status. New code must not emit it.
-    #[deprecated(note = "strict unique is no longer emitted; use UniqueModuloSymmetry")]
-    Unique,
     /// The assignment is unique after quotienting the unavoidable 180 degree
     /// field symmetry. The chosen branch follows the pose hint when available.
     UniqueModuloSymmetry,
@@ -657,12 +654,18 @@ pub struct DetectedVisualFeatures {
     pub t_spots: Vec<DetectedVisualFeature>,
     /// Penalty spot detections, represented by bounding-box centers.
     pub penalty_spots: Vec<DetectedVisualFeature>,
+    /// x-spot detections, represented by bounding-box centers.
+    pub x_spots: Vec<DetectedVisualFeature>,
 }
 
 impl DetectedVisualFeatures {
     /// Counts detections from classes supported by global localization.
     pub fn supported_feature_count(&self) -> usize {
-        self.goalposts.len() + self.l_spots.len() + self.t_spots.len() + self.penalty_spots.len()
+        self.goalposts.len()
+            + self.l_spots.len()
+            + self.t_spots.len()
+            + self.penalty_spots.len()
+            + self.x_spots.len()
     }
 }
 
@@ -686,6 +689,9 @@ pub fn find_detected_visual_features(
                     .push(DetectedVisualFeature::new(pixel_center(object), confidence)),
                 RobocupObjectLabel::PenaltySpot => features
                     .penalty_spots
+                    .push(DetectedVisualFeature::new(pixel_center(object), confidence)),
+                RobocupObjectLabel::XSpot => features
+                    .x_spots
                     .push(DetectedVisualFeature::new(pixel_center(object), confidence)),
                 _ => {}
             }

@@ -184,6 +184,11 @@ impl FieldDimensions {
         point![0.0, unsigned_y * side.sign()]
     }
 
+    pub fn x_crossing(&self, side: Side) -> Point2<Field> {
+        let unsigned_y = self.center_circle_diameter / 2.0;
+        point![0.0, unsigned_y * side.sign()]
+    }
+
     pub fn penalty_box_corner(&self, half: Half, side: Side) -> Point2<Field> {
         let unsigned_x = self.length / 2.0 - self.penalty_area_length;
         let unsigned_y = self.penalty_area_width / 2.0;

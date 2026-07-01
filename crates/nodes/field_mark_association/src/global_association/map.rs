@@ -181,6 +181,11 @@ fn candidate_points(field: &FieldDimensions) -> Vec<(VisualFeatureClass, Point2<
             .map(|point| (VisualFeatureClass::TSpot, point)),
     );
     points.extend(
+        x_spot_candidates(field)
+            .into_iter()
+            .map(|point| (VisualFeatureClass::XSpot, point)),
+    );
+    points.extend(
         penalty_spot_candidates(field)
             .into_iter()
             .map(|point| (VisualFeatureClass::PenaltySpot, point)),
@@ -241,6 +246,15 @@ fn t_spot_candidates(field: &FieldDimensions) -> Vec<Point2<Field>> {
         .collect()
 }
 
+fn x_spot_candidates(field: &FieldDimensions) -> Vec<Point2<Field>> {
+    [
+        field.center(),
+        field.x_crossing(Side::Left),
+        field.x_crossing(Side::Right),
+    ]
+    .into()
+}
+
 fn penalty_spot_candidates(field: &FieldDimensions) -> Vec<Point2<Field>> {
     [Half::Opponent, Half::Own]
         .into_iter()
@@ -267,6 +281,10 @@ mod tests {
         assert_eq!(
             map.landmarks_by_class[VisualFeatureClass::TSpot.index()].len(),
             10
+        );
+        assert_eq!(
+            map.landmarks_by_class[VisualFeatureClass::XSpot.index()].len(),
+            3
         );
         assert_eq!(
             map.landmarks_by_class[VisualFeatureClass::PenaltySpot.index()].len(),

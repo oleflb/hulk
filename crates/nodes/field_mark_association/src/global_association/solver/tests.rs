@@ -677,6 +677,7 @@ fn synthetic_frame(selected: &[ProjectedSyntheticFeature]) -> SyntheticFrame {
         VisualFeatureClass::GoalPost,
         VisualFeatureClass::LSpot,
         VisualFeatureClass::TSpot,
+        VisualFeatureClass::XSpot,
         VisualFeatureClass::PenaltySpot,
     ] {
         for feature in selected.iter().filter(|feature| feature.class == class) {
@@ -700,6 +701,7 @@ fn push_synthetic_feature(
         VisualFeatureClass::GoalPost => features.goalposts.push(detection),
         VisualFeatureClass::LSpot => features.l_spots.push(detection),
         VisualFeatureClass::TSpot => features.t_spots.push(detection),
+        VisualFeatureClass::XSpot => features.x_spots.push(detection),
         VisualFeatureClass::PenaltySpot => features.penalty_spots.push(detection),
     }
 }

@@ -9,7 +9,7 @@ mod solver;
 
 pub(crate) use solver::{GlobalLocalizationInput, GlobalLocalizationResult};
 
-pub(crate) const CLASS_COUNT: usize = 4;
+pub(crate) const CLASS_COUNT: usize = 5;
 pub(crate) const GLOBAL_LOCALIZER_MAX_DETECTIONS: usize = 32;
 
 #[derive(Clone, Debug)]
@@ -284,6 +284,8 @@ pub enum VisualFeatureClass {
     LSpot,
     /// T-shaped line crossing landmark.
     TSpot,
+    /// X-shaped line crossing landmark.
+    XSpot,
     /// Penalty marker landmark.
     PenaltySpot,
 }
@@ -295,6 +297,7 @@ impl VisualFeatureClass {
             Self::LSpot => 1,
             Self::TSpot => 2,
             Self::PenaltySpot => 3,
+            Self::XSpot => 4,
         }
     }
 }
@@ -481,6 +484,7 @@ mod tests {
                 project_point(field.goal_post(Half::Opponent, Side::Right)),
             ],
             l_spots: vec![project_point(field.corner(Half::Opponent, Side::Left))],
+            x_spots: Vec::new(),
             t_spots: vec![project_point(field.t_crossing(Side::Left))],
             penalty_spots: vec![project_point(field.penalty_spot(Half::Opponent))],
         }
@@ -583,6 +587,7 @@ mod tests {
             .iter_mut()
             .chain(features.l_spots.iter_mut())
             .chain(features.t_spots.iter_mut())
+            .chain(features.x_spots.iter_mut())
             .chain(features.penalty_spots.iter_mut())
         {
             feature.confidence = 0.1;
