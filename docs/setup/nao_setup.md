@@ -16,6 +16,7 @@ Flashing with pepsi is the preferred option.
 ### Using `pepsi gammaray`
 
 Pepsi automatically downloads the latest configured release of the HULKs-OS image.
+It also builds and uploads the `hulk-runtime` container image, so local Podman is required.
 To flash a robot use:
 
 ```sh

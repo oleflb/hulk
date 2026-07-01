@@ -22,8 +22,8 @@ use tokio::{
 
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
-const BOOSTER_SSH_FLAGS: &[&str] = &[
-    "-lbooster",
+pub const BOOSTER_USER: &str = "booster";
+pub const SSH_OPTIONS: &[&str] = &[
     "-oLogLevel=quiet",
     "-oStrictHostKeyChecking=no",
     "-oUserKnownHostsFile=/dev/null",
@@ -125,8 +125,9 @@ impl Robot {
         command.env("SSH_ASKPASS", temp_file.as_os_str());
         command.env("SSH_ASKPASS_REQUIRE", "force");
 
-        for flag in BOOSTER_SSH_FLAGS {
-            command.arg(flag);
+        command.arg("-l").arg(BOOSTER_USER);
+        for option in SSH_OPTIONS {
+            command.arg(option);
         }
         command.arg(self.address.to_string());
         Ok(command)
@@ -140,14 +141,14 @@ impl Robot {
         command.env("SSH_ASKPASS", temp_file.as_os_str());
         command.env("SSH_ASKPASS_REQUIRE", "force");
 
-        let ssh_flags = BOOSTER_SSH_FLAGS.join(" ");
+        let ssh_options = SSH_OPTIONS.join(" ");
         command
             .stdout(Stdio::piped())
             .arg("--recursive")
             .arg("--times")
             .arg("--no-inc-recursive")
             .arg("--human-readable")
-            .arg(format!("--rsh=ssh {ssh_flags}"));
+            .arg(format!("--rsh=ssh -l {BOOSTER_USER} {ssh_options}"));
         Ok(command)
     }
 
