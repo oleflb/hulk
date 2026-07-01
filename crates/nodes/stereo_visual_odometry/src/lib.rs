@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::Result;
+use color_eyre::{Result, eyre::WrapErr};
 use coordinate_systems::Camera;
 use linear_algebra::Point3;
 use nalgebra as na;
@@ -105,22 +105,30 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let parameters = node_parameters.snapshot();
         let parameters = parameters.typed();
 
-        let start_time = Instant::now();
         let had_previous_image = previous_image_time.is_some();
+        let pose_estimation_parameters = parameters.pose_estimation_parameters.clone();
+        let (returned_pipeline, odometry_result, duration) =
+            tokio::task::spawn_blocking(move || {
+                let start_time = Instant::now();
+                let odometry = pipeline.process(&stereo_image_pair, &pose_estimation_parameters);
+                (pipeline, odometry, start_time.elapsed())
+            })
+            .await
+            .wrap_err("visual odometry task failed")?;
+        pipeline = returned_pipeline;
+
         let mut process_failed = false;
-        let odometry =
-            match pipeline.process(&stereo_image_pair, &parameters.pose_estimation_parameters) {
-                Ok(odometry) => odometry,
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        "visual odometry frame processing failed; resetting tracking"
-                    );
-                    process_failed = true;
-                    None
-                }
-            };
-        let duration = start_time.elapsed();
+        let odometry = match odometry_result {
+            Ok(odometry) => odometry,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "visual odometry frame processing failed; resetting tracking"
+                );
+                process_failed = true;
+                None
+            }
+        };
 
         debug_odometry_pub
             .publish_if_subscribed(|| ready(odometry))

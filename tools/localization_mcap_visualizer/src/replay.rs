@@ -91,7 +91,7 @@ impl Default for ReplayParameters {
             timestamp_mode: TimestampMode::Embedded,
             solve_cadence_ms: 30.0,
             optimizer_iterations: 5,
-            max_window_seconds: 3.0,
+            max_window_seconds: 2.0,
             visual_feature_noise_variance: localization_parameters.visual_feature_noise_variance,
             pose_hint_visual_feature_noise_variance: localization_parameters
                 .pose_hint_visual_feature_noise_variance,

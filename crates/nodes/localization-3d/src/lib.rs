@@ -179,7 +179,7 @@ fn backend_configuration_with_pose_hint(
     let process_noise = Matrix3::identity() * 0.01;
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
-        max_optimization_window: Duration::from_secs(3),
+        max_optimization_window: Duration::from_secs(2),
         optimizer_max_iterations: 2,
         gyroscope_noise: Matrix3::identity() * 0.1_f64.powi(2),
         // TODO: tune accelerometer noise
