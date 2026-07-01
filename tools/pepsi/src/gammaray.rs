@@ -1,13 +1,4 @@
-use std::{
-    env,
-    fmt::Write,
-    fs::{set_permissions, write as write_file},
-    io::Write as IoWrite,
-    os::unix::fs::PermissionsExt,
-    path::Path,
-    process::Stdio,
-    str,
-};
+use std::{fmt::Write, path::Path, process::Stdio, str};
 
 use clap::Args;
 use color_eyre::{
@@ -18,8 +9,7 @@ use color_eyre::{
 use argument_parsers::RobotAddress;
 use indicatif::ProgressBar;
 use repository::{Repository, team::Team};
-use robot::{BOOSTER_USER, Network, Robot, SSH_OPTIONS};
-use tempfile::{NamedTempFile, tempdir};
+use robot::{Network, Robot};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -61,11 +51,6 @@ pub async fn gammaray(arguments: Arguments, repository: &Repository) -> Result<(
     let progress = ProgressIndicator::new();
 
     let team = repository.read_team_configuration().await?;
-
-    let build_task = progress.task("runtime image", true);
-    let result = build_runtime_image(setup_path, &build_task.progress).await;
-    build_task.finish_with(result.as_ref());
-    result.wrap_err("failed to build runtime image")?;
 
     progress
         .map_tasks(
@@ -173,9 +158,9 @@ async fn gammaray_robot(
         .await
         .wrap_err("failed to install podman on robot")?;
 
-    install_runtime_image(&robot, password, &progress_bar)
+    build_runtime_image_on_robot(&robot, setup, &progress_bar)
         .await
-        .wrap_err("failed to install runtime image")?;
+        .wrap_err("failed to build runtime image on robot")?;
 
     robot
         .rsync_with_robot()?
@@ -311,91 +296,40 @@ async fn gammaray_robot(
     Ok(())
 }
 
-async fn build_runtime_image(setup: &Path, progress_bar: &ProgressBar) -> Result<()> {
-    let runtime_context = setup.join("inference-runtime");
-    let containerfile = runtime_context.join("Containerfile");
-
-    let mut command = Command::new("podman");
-    command
-        .args(["build", "--tag", RUNTIME_IMAGE, "--file"])
-        .arg(containerfile)
-        .arg(runtime_context);
-    command
-        .run_with_log("building runtime image", progress_bar, b'\n')
-        .await
-}
-
-async fn install_runtime_image(
+async fn build_runtime_image_on_robot(
     robot: &Robot,
-    password: &str,
+    setup: &Path,
     progress_bar: &ProgressBar,
 ) -> Result<()> {
-    let askpass =
-        create_askpass_script(password).wrap_err("failed to create SSH askpass script")?;
-    let ssh_directory = create_ssh_wrapper_directory().wrap_err("failed to create SSH wrapper")?;
-    let path = format!(
-        "{}:{}",
-        ssh_directory.path().display(),
-        env::var("PATH").unwrap_or_default()
-    );
-    let destination = format!("{BOOSTER_USER}@{}::", robot.address);
+    const REMOTE_RUNTIME_CONTEXT_PARENT: &str = "/home/booster/.cache/hulk";
+    const REMOTE_RUNTIME_CONTEXT: &str = "/home/booster/.cache/hulk/inference-runtime";
+    const REMOTE_CONTAINERFILE: &str = "/home/booster/.cache/hulk/inference-runtime/Containerfile";
 
-    let mut command = Command::new("podman");
-    command
-        .env("PATH", path)
-        .env("SSH_ASKPASS", askpass.path())
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .arg("--ssh")
-        .arg("native")
-        .args([
-            "image",
-            "scp",
-            "--format",
-            "oci-archive",
-            RUNTIME_IMAGE,
-            &destination,
-        ]);
-    command
-        .run_with_log("uploading runtime image", progress_bar, b'\n')
+    robot
+        .ssh_to_robot()?
+        .arg(format!("mkdir -p {REMOTE_RUNTIME_CONTEXT_PARENT}"))
+        .ssh_with_log("creating runtime image build directory", progress_bar)
+        .await?;
+
+    robot
+        .rsync_with_robot()?
+        .arg("--delete")
+        .arg("--info=progress2")
+        .arg(setup.join("inference-runtime"))
+        .arg(format!(
+            "{}:{REMOTE_RUNTIME_CONTEXT_PARENT}/",
+            robot.address
+        ))
+        .rsync_with_log("uploading runtime image build context", progress_bar)
         .await?;
 
     robot
         .ssh_to_robot()?
         .arg(format!(
-            "podman save --format oci-archive {RUNTIME_IMAGE} | sudo podman load"
+            "sudo podman build --tag {RUNTIME_IMAGE} --file {REMOTE_CONTAINERFILE} {REMOTE_RUNTIME_CONTEXT}"
         ))
-        .ssh_with_log("loading runtime image", progress_bar)
+        .ssh_with_log("building runtime image", progress_bar)
         .await
-}
-
-fn create_askpass_script(password: &str) -> Result<NamedTempFile> {
-    let mut file = NamedTempFile::new()?;
-    writeln!(file, "#!/usr/bin/env sh")?;
-    writeln!(file, "printf '%s\\n' {}", shell_quote(password))?;
-    set_permissions(file.path(), std::fs::Permissions::from_mode(0o700))?;
-    Ok(file)
-}
-
-fn create_ssh_wrapper_directory() -> Result<tempfile::TempDir> {
-    let directory = tempdir()?;
-    let ssh_options = SSH_OPTIONS
-        .iter()
-        .map(|option| shell_quote(option))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for binary in ["ssh", "scp"] {
-        let path = directory.path().join(binary);
-        write_file(
-            &path,
-            format!("#!/usr/bin/env sh\nexec /usr/bin/{binary} {ssh_options} \"$@\"\n"),
-        )?;
-        set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(directory)
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn install_podman(robot: &Robot, progress_bar: &ProgressBar) -> Result<()> {
