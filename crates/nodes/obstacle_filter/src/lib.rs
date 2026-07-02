@@ -151,10 +151,10 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 for (detection_time, (detected_objects, detected_poses)) in item.persistent {
                     let detected_objects = detected_objects.unwrap_or_default();
                     let detected_poses = detected_poses.unwrap_or_default();
-                    let camera_matrix = camera_matrix_cache.get_nearest(detection_time);
+                    let camera_matrix = camera_matrix_cache.get_before(detection_time);
                     let current_odometry_to_last_odometry =
-                        current_odometry_to_last_odometry_cache.get_nearest(detection_time);
-                    let ground_to_field = ground_to_field_cache.get_nearest(detection_time);
+                        current_odometry_to_last_odometry_cache.get_before(detection_time);
+                    let ground_to_field = ground_to_field_cache.get_before(detection_time);
 
                     obstacle_filter.process_detection(
                         detection_time,
@@ -205,7 +205,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
                 for (player_state_time, player_state) in network_player_states {
                     let Some(ground_to_field) =
-                        ground_to_field_cache.get_nearest(player_state_time)
+                        ground_to_field_cache.get_before(player_state_time)
                     else {
                         continue;
                     };

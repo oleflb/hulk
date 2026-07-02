@@ -1,10 +1,8 @@
 use std::time::Duration;
 
 use coordinate_systems::Ground;
-use filtering::kalman_filter::KalmanFilter;
-use linear_algebra::{IntoFramed, Isometry2, distance};
-use nalgebra::{Matrix2, Matrix2x4, Matrix4};
-use ordered_float::NotNan;
+use linear_algebra::Isometry2;
+use nalgebra::{Matrix2, Matrix4};
 use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use ros_z::{Message, time::Time};
 use serde::{Deserialize, Serialize};
@@ -46,18 +44,18 @@ impl BallFilter {
         &mut self,
         delta_time: Duration,
         last_to_current_odometry: Isometry2<Ground, Ground>,
-        velocity_decay: f32,
-        moving_process_noise: Matrix4<f32>,
-        resting_process_noise: Matrix2<f32>,
+        velocity_decay_per_second: f32,
+        moving_process_noise_per_second: Matrix4<f32>,
+        resting_process_noise_per_second: Matrix2<f32>,
         log_likelihood_of_zero_velocity_threshold: f32,
     ) {
         for hypothesis in self.hypotheses.iter_mut() {
             hypothesis.predict(
                 delta_time,
                 last_to_current_odometry,
-                velocity_decay,
-                moving_process_noise,
-                resting_process_noise,
+                velocity_decay_per_second,
+                moving_process_noise_per_second,
+                resting_process_noise_per_second,
                 log_likelihood_of_zero_velocity_threshold,
             )
         }
@@ -99,33 +97,10 @@ impl BallFilter {
         measurement: MultivariateNormalDistribution<2>,
         initial_moving_covariance: Matrix4<f32>,
     ) {
-        let closest_hypothesis = self.hypotheses.iter().min_by_key(|hypothesis| {
-            NotNan::new(distance(
-                measurement.mean.framed().as_point(),
-                hypothesis.position().position,
-            ))
-            .expect("distance is nan")
-        });
-
-        let mut new_hypothesis = MultivariateNormalDistribution {
-            mean: closest_hypothesis.map_or(
-                nalgebra::vector![measurement.mean.x, measurement.mean.y, 0.0, 0.0],
-                |hypothesis| {
-                    let old_position = hypothesis.position().position.inner.coords;
-                    nalgebra::vector![old_position.x, old_position.y, 0.0, 0.0]
-                },
-            ),
+        let new_hypothesis = MultivariateNormalDistribution {
+            mean: nalgebra::vector![measurement.mean.x, measurement.mean.y, 0.0, 0.0],
             covariance: initial_moving_covariance,
         };
-
-        if closest_hypothesis.is_some() {
-            KalmanFilter::update(
-                &mut new_hypothesis,
-                Matrix2x4::identity(),
-                measurement.mean,
-                measurement.covariance,
-            )
-        }
 
         let new_hypothesis = BallHypothesis {
             mode: BallMode::Moving(new_hypothesis),

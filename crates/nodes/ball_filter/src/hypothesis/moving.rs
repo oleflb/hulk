@@ -11,8 +11,8 @@ pub(super) trait MovingPredict {
         &mut self,
         delta_time: Duration,
         last_to_current_odometry: Isometry2<Ground, Ground>,
-        velocity_decay: f32,
-        process_noise: Matrix4<f32>,
+        velocity_decay_per_second: f32,
+        process_noise_per_second: Matrix4<f32>,
     );
 }
 
@@ -25,13 +25,22 @@ impl MovingPredict for MultivariateNormalDistribution<4> {
         &mut self,
         delta_time: Duration,
         last_to_current_odometry: Isometry2<Ground, Ground>,
-        velocity_decay: f32,
-        process_noise: Matrix4<f32>,
+        velocity_decay_per_second: f32,
+        process_noise_per_second: Matrix4<f32>,
     ) {
         let dt = delta_time.as_secs_f32();
+        let velocity_decay = velocity_decay_per_second.powf(dt);
+        let position_velocity_factor = if velocity_decay_per_second > 0.0
+            && (velocity_decay_per_second - 1.0).abs() > f32::EPSILON
+        {
+            (velocity_decay - 1.0) / velocity_decay_per_second.ln()
+        } else {
+            dt
+        };
+        let process_noise = process_noise_per_second * dt;
         let constant_velocity_prediction = matrix![
-            1.0, 0.0, dt, 0.0;
-            0.0, 1.0, 0.0, dt;
+            1.0, 0.0, position_velocity_factor, 0.0;
+            0.0, 1.0, 0.0, position_velocity_factor;
             0.0, 0.0, velocity_decay, 0.0;
             0.0, 0.0, 0.0, velocity_decay;
         ];

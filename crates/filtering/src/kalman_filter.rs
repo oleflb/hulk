@@ -42,11 +42,11 @@ impl<const STATE_DIMENSION: usize> KalmanFilter<STATE_DIMENSION>
         let residual_covariance =
             measurement_prediction * self.covariance * measurement_prediction.transpose()
                 + measurement_noise;
-        let kalman_gain = self.covariance
-            * measurement_prediction.transpose()
-            * residual_covariance
-                .try_inverse()
-                .expect("Residual covariance matrix is not invertible");
+        let Some(residual_covariance_inverse) = residual_covariance.try_inverse() else {
+            return;
+        };
+        let kalman_gain =
+            self.covariance * measurement_prediction.transpose() * residual_covariance_inverse;
         self.mean += kalman_gain * residual;
         self.covariance -= kalman_gain * measurement_prediction * self.covariance;
     }

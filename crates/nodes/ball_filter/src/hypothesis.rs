@@ -71,34 +71,38 @@ impl BallHypothesis {
         &mut self,
         delta_time: Duration,
         last_to_current_odometry: Isometry2<Ground, Ground>,
-        velocity_decay: f32,
-        moving_process_noise: Matrix4<f32>,
-        resting_process_noise: Matrix2<f32>,
+        velocity_decay_per_second: f32,
+        moving_process_noise_per_second: Matrix4<f32>,
+        resting_process_noise_per_second: Matrix2<f32>,
         log_likelihood_of_zero_velocity_threshold: f32,
     ) {
         match &mut self.mode {
-            BallMode::Resting(resting) => {
-                RestingPredict::predict(resting, last_to_current_odometry, resting_process_noise)
-            }
+            BallMode::Resting(resting) => RestingPredict::predict(
+                resting,
+                delta_time,
+                last_to_current_odometry,
+                resting_process_noise_per_second,
+            ),
             BallMode::Moving(moving) => {
                 MovingPredict::predict(
                     moving,
                     delta_time,
                     last_to_current_odometry,
-                    velocity_decay,
-                    moving_process_noise,
+                    velocity_decay_per_second,
+                    moving_process_noise_per_second,
                 );
 
-                let velocity_covariance = moving.covariance.fixed_view::<2, 2>(0, 0);
+                let velocity_covariance = moving.covariance.fixed_view::<2, 2>(2, 2);
                 let velocity = nalgebra::vector![moving.mean.z, moving.mean.w];
 
-                let exponent = -velocity.dot(
-                    &velocity_covariance
-                        .cholesky()
-                        .expect("covariance not invertible")
-                        .solve(&velocity),
-                ) / 2.;
+                let Some(cholesky) = velocity_covariance.cholesky() else {
+                    return;
+                };
+                let exponent = -velocity.dot(&cholesky.solve(&velocity)) / 2.;
                 let determinant = velocity_covariance.determinant();
+                if determinant <= 0.0 {
+                    return;
+                }
 
                 let log_likelihood_of_zero_velocity =
                     exponent - (2. * PI * determinant.sqrt()).ln();

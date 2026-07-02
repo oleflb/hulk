@@ -1,9 +1,17 @@
 {
-  hidden_validity_exponential_decay_factor: 0.9997000098228456,
+  hidden_validity_exponential_decay_factor: 0.9910403,
   hypothesis_merge_distance: 0.10000000149011612,
   hypothesis_timeout: {
     nanos: 0,
     secs: 20,
+  },
+  maximum_odometry_age: {
+    nanos: 50000000,
+    secs: 0,
+  },
+  maximum_camera_matrix_age: {
+    nanos: 100000000,
+    secs: 0,
   },
   log_likelihood_of_zero_velocity_threshold: 0.5,
   maximum_matching_cost: 0.25,
@@ -12,11 +20,14 @@
   noise: {
     detection_noise: [5.0, 5.0],
     initial_covariance: [0.5, 0.5, 40.0, 40.0],
-    process_noise_moving: [0.005, 0.005, 0.02, 0.02],
-    process_noise_resting: [0.001, 0.001],
+    // Per-second process noise. The filter scales these values by elapsed time.
+    process_noise_moving: [0.5, 0.5, 2.0, 2.0],
+    process_noise_resting: [0.1, 0.1],
   },
   validity_discard_threshold: 0.2,
   validity_output_threshold: 0.5,
-  velocity_decay_factor: 0.998,
-  visible_validity_exponential_decay_factor: 0.96,
+  // Per-second velocity decay, roughly equivalent to the old 0.998 per 100 Hz tick.
+  velocity_decay_factor: 0.8185668,
+  // Per-second visibility decay, roughly equivalent to the old per-frame values at 30 Hz.
+  visible_validity_exponential_decay_factor: 0.29385763,
 }
