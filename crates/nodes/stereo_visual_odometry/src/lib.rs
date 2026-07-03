@@ -13,7 +13,7 @@ use std::{
     future::{Future, ready},
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use color_eyre::{Result, eyre::WrapErr};
@@ -58,6 +58,26 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
     let feature_duration_pub = node
         .publisher::<Duration>("debug/visual_odometry/feature_extraction_duration")
+        .build()
+        .await?;
+    let feature_inference_duration_pub = node
+        .publisher::<Duration>("debug/visual_odometry/feature_inference_duration")
+        .build()
+        .await?;
+    let feature_matching_duration_pub = node
+        .publisher::<Duration>("debug/visual_odometry/feature_matching_duration")
+        .build()
+        .await?;
+    let triangulation_duration_pub = node
+        .publisher::<Duration>("debug/visual_odometry/triangulation_duration")
+        .build()
+        .await?;
+    let odometry_duration_pub = node
+        .publisher::<Duration>("debug/visual_odometry/odometry_duration")
+        .build()
+        .await?;
+    let process_duration_pub = node
+        .publisher::<Duration>("debug/visual_odometry/process_duration")
         .build()
         .await?;
 
@@ -105,11 +125,11 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
         let had_previous_image = previous_image_time.is_some();
         let pose_estimation_parameters = parameters.pose_estimation_parameters.clone();
-        let (returned_pipeline, odometry_result, duration) =
+        let (returned_pipeline, odometry_result, timings) =
             tokio::task::spawn_blocking(move || {
-                let start_time = Instant::now();
                 let odometry = pipeline.process(&stereo_image_pair, &pose_estimation_parameters);
-                (pipeline, odometry, start_time.elapsed())
+                let timings = pipeline.latest_timings();
+                (pipeline, odometry, timings)
             })
             .await
             .wrap_err("visual odometry task failed")?;
@@ -145,7 +165,22 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 })
                 .await?;
             feature_duration_pub
-                .publish_if_subscribed(|| ready(duration))
+                .publish_if_subscribed(|| ready(timings.feature_total))
+                .await?;
+            feature_inference_duration_pub
+                .publish_if_subscribed(|| ready(timings.feature_inference))
+                .await?;
+            feature_matching_duration_pub
+                .publish_if_subscribed(|| ready(timings.feature_matching))
+                .await?;
+            triangulation_duration_pub
+                .publish_if_subscribed(|| ready(timings.triangulation))
+                .await?;
+            odometry_duration_pub
+                .publish_if_subscribed(|| ready(timings.odometry))
+                .await?;
+            process_duration_pub
+                .publish_if_subscribed(|| ready(timings.total))
                 .await?;
             continue;
         }
@@ -177,7 +212,22 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 .await?;
         }
         feature_duration_pub
-            .publish_if_subscribed(|| ready(duration))
+            .publish_if_subscribed(|| ready(timings.feature_total))
+            .await?;
+        feature_inference_duration_pub
+            .publish_if_subscribed(|| ready(timings.feature_inference))
+            .await?;
+        feature_matching_duration_pub
+            .publish_if_subscribed(|| ready(timings.feature_matching))
+            .await?;
+        triangulation_duration_pub
+            .publish_if_subscribed(|| ready(timings.triangulation))
+            .await?;
+        odometry_duration_pub
+            .publish_if_subscribed(|| ready(timings.odometry))
+            .await?;
+        process_duration_pub
+            .publish_if_subscribed(|| ready(timings.total))
             .await?;
     }
 }

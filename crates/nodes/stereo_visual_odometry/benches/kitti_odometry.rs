@@ -15,14 +15,16 @@ use color_eyre::{
 use nalgebra as na;
 use ros2::sensor_msgs::{camera_info::CameraInfo, image::Image};
 use stereo_visual_odometry::{
-    OdometryDiagnostics, parameters::StereoVisualOdometryPoseEstimationParameters,
-    pipeline::VisualOdometryPipeline,
+    OdometryDiagnostics,
+    parameters::StereoVisualOdometryPoseEstimationParameters,
+    pipeline::{VisualOdometryPipeline, VisualOdometryTimings},
 };
 use types::{stereo_camera_info::StereoCameraInfo, stereo_image_pair::StereoImagePair};
 use zip::ZipArchive;
 
 const MODEL_WIDTH: u32 = 544;
 const MODEL_HEIGHT: u32 = 448;
+const SEGMENT_LENGTHS_METERS: [f32; 8] = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0];
 const DEFAULT_SEQUENCES: [&str; 11] = [
     "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10",
 ];
@@ -45,15 +47,20 @@ fn main() -> Result<()> {
         "timing note: PNG ZIP read/decode/resize/NV12 conversion is measured separately and excluded from visual_odometry_ms"
     );
 
-    let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../etc/neural_networks/xfeat-lighterglue.onnx");
+    let model_path = env::var_os("KITTI_MODEL_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../etc/neural_networks/xfeat-stereo-lighterglue-192-subsampled.onnx")
+        });
+    println!("model: {}", model_path.display());
 
     let pose_estimation_parameters = StereoVisualOdometryPoseEstimationParameters {
         minimum_pnp_correspondences: 8,
         ransac_reprojection_threshold_px: 6.0,
-        ransac_max_iterations: 100,
-        ransac_confidence: 0.99,
-        lm_max_iterations: 20,
+        ransac_max_iterations: env_usize("KITTI_RANSAC_MAX_ITERATIONS", 100)?,
+        ransac_confidence: env_f32("KITTI_RANSAC_CONFIDENCE", 0.99)?,
+        lm_max_iterations: env_usize("KITTI_LM_MAX_ITERATIONS", 20)?,
         lm_initial_lambda: 0.001,
         lm_min_lambda: 1e-7,
         lm_max_lambda: 1e9,
@@ -63,6 +70,10 @@ fn main() -> Result<()> {
         full_weight_disparity_px: 8.0,
         min_disparity_weight: 0.5,
         max_vertical_disparity_px: 3.0,
+        descriptor_match_min_score: env_f32("KITTI_DESCRIPTOR_MATCH_MIN_SCORE", 0.65)?,
+        descriptor_match_min_margin: env_f32("KITTI_DESCRIPTOR_MATCH_MIN_MARGIN", 0.0)?,
+        temporal_match_max_distance_px: env_f32("KITTI_TEMPORAL_MATCH_MAX_DISTANCE_PX", 128.0)?,
+        stereo_match_max_disparity_px: env_f32("KITTI_STEREO_MATCH_MAX_DISPARITY_PX", 256.0)?,
     };
     let mut aggregate = SequenceMetrics::new("all");
 
@@ -74,6 +85,30 @@ fn main() -> Result<()> {
 
     aggregate.print();
     Ok(())
+}
+
+fn env_usize(name: &str, default: usize) -> Result<usize> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .wrap_err_with(|| format!("failed to parse {name}"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn env_f32(name: &str, default: f32) -> Result<f32> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .wrap_err_with(|| format!("failed to parse {name}"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 struct BenchmarkConfig {
@@ -154,6 +189,10 @@ fn run_sequence(
         stereo_camera_info(&calibration, first_left_ref.width, first_left_ref.height);
     let mut pipeline = VisualOdometryPipeline::new(model_path, stereo_camera_info)?;
     let mut metrics = SequenceMetrics::new(sequence);
+    let mut estimated_poses = Vec::with_capacity(frame_count);
+    let mut estimated_epochs = Vec::with_capacity(frame_count);
+    let mut estimated_current_from_start = Some(na::Isometry3::identity());
+    let mut estimated_epoch = 0;
 
     for frame_index in 0..frame_count {
         let prepare_start = Instant::now();
@@ -175,20 +214,41 @@ fn run_sequence(
             pipeline.process(&stereo_image_pair, pose_estimation_parameters)?;
         let process_duration = process_start.elapsed();
         metrics.process_durations.push(process_duration);
+        metrics.add_timings(pipeline.latest_timings());
         black_box(&estimated_previous_to_current);
 
-        if frame_index > 0 {
+        if frame_index == 0 {
+            estimated_poses.push(estimated_current_from_start);
+            estimated_epochs.push(estimated_epoch);
+        } else {
             metrics.transitions += 1;
             metrics.add_diagnostics(pipeline.latest_odometry_diagnostics());
             match estimated_previous_to_current {
-                Some(estimated) => metrics.add_accuracy(
-                    estimated,
-                    ground_truth_previous_to_current(&poses[frame_index - 1], &poses[frame_index]),
-                ),
-                None => metrics.failed_odometry += 1,
+                Some(estimated) => {
+                    metrics.add_accuracy(
+                        estimated,
+                        ground_truth_previous_to_current(
+                            &poses[frame_index - 1],
+                            &poses[frame_index],
+                        ),
+                    );
+                    estimated_current_from_start = estimated_current_from_start
+                        .map(|previous_estimate| estimated * previous_estimate);
+                    estimated_poses.push(estimated_current_from_start);
+                    estimated_epochs.push(estimated_epoch);
+                }
+                None => {
+                    metrics.failed_odometry += 1;
+                    estimated_epoch += 1;
+                    estimated_current_from_start = Some(na::Isometry3::identity());
+                    estimated_poses.push(estimated_current_from_start);
+                    estimated_epochs.push(estimated_epoch);
+                }
             }
         }
     }
+
+    metrics.add_segment_accuracy(&poses[..frame_count], &estimated_poses, &estimated_epochs);
 
     Ok(metrics)
 }
@@ -454,6 +514,9 @@ struct SequenceMetrics {
     translation_errors_meters: Vec<f32>,
     translation_relative_errors: Vec<f32>,
     translation_scale_ratios: Vec<f32>,
+    segment_translation_errors: Vec<f32>,
+    segment_rotation_errors_deg_per_100m: Vec<f32>,
+    timings: PipelineTimingMetrics,
     diagnostics: DiagnosticsMetrics,
 }
 
@@ -469,6 +532,9 @@ impl SequenceMetrics {
             translation_errors_meters: Vec::new(),
             translation_relative_errors: Vec::new(),
             translation_scale_ratios: Vec::new(),
+            segment_translation_errors: Vec::new(),
+            segment_rotation_errors_deg_per_100m: Vec::new(),
+            timings: PipelineTimingMetrics::default(),
             diagnostics: DiagnosticsMetrics::default(),
         }
     }
@@ -492,6 +558,40 @@ impl SequenceMetrics {
         }
     }
 
+    fn add_segment_accuracy(
+        &mut self,
+        ground_truth_poses: &[na::Isometry3<f32>],
+        estimated_poses: &[Option<na::Isometry3<f32>>],
+        estimated_epochs: &[usize],
+    ) {
+        let distances = trajectory_distances(ground_truth_poses);
+
+        for start_index in 0..ground_truth_poses.len() {
+            for length in SEGMENT_LENGTHS_METERS {
+                let Some(end_index) = segment_end_index(&distances, start_index, length) else {
+                    continue;
+                };
+                let (Some(start_estimate), Some(end_estimate)) =
+                    (estimated_poses[start_index], estimated_poses[end_index])
+                else {
+                    continue;
+                };
+                if estimated_epochs[start_index] != estimated_epochs[end_index] {
+                    continue;
+                }
+
+                let ground_truth_delta =
+                    ground_truth_poses[end_index].inverse() * ground_truth_poses[start_index];
+                let estimated_delta = end_estimate * start_estimate.inverse();
+                let error = estimated_delta * ground_truth_delta.inverse();
+                self.segment_translation_errors
+                    .push(error.translation.vector.norm() / length);
+                self.segment_rotation_errors_deg_per_100m
+                    .push(error.rotation.angle().to_degrees() / length * 100.0);
+            }
+        }
+    }
+
     fn extend(&mut self, mut sequence: SequenceMetrics) {
         self.transitions += sequence.transitions;
         self.failed_odometry += sequence.failed_odometry;
@@ -507,11 +607,20 @@ impl SequenceMetrics {
             .append(&mut sequence.translation_relative_errors);
         self.translation_scale_ratios
             .append(&mut sequence.translation_scale_ratios);
+        self.segment_translation_errors
+            .append(&mut sequence.segment_translation_errors);
+        self.segment_rotation_errors_deg_per_100m
+            .append(&mut sequence.segment_rotation_errors_deg_per_100m);
+        self.timings.extend(sequence.timings);
         self.diagnostics.extend(sequence.diagnostics);
     }
 
     fn add_diagnostics(&mut self, diagnostics: OdometryDiagnostics) {
         self.diagnostics.add(diagnostics);
+    }
+
+    fn add_timings(&mut self, timings: VisualOdometryTimings) {
+        self.timings.add(timings);
     }
 
     fn print(&self) {
@@ -521,6 +630,9 @@ impl SequenceMetrics {
         let translation = FloatSummary::from(self.translation_errors_meters.as_slice());
         let translation_relative = FloatSummary::from(self.translation_relative_errors.as_slice());
         let scale_ratio = FloatSummary::from(self.translation_scale_ratios.as_slice());
+        let segment_translation = FloatSummary::from(self.segment_translation_errors.as_slice());
+        let segment_rotation =
+            FloatSummary::from(self.segment_rotation_errors_deg_per_100m.as_slice());
         let successes = self.rotation_errors_degrees.len();
         let success_rate = if self.transitions > 0 {
             successes as f32 / self.transitions as f32 * 100.0
@@ -573,7 +685,89 @@ impl SequenceMetrics {
             scale_ratio.p95,
             scale_ratio.p99,
         );
+        println!(
+            "  segment_drift translation avg={:.3}% median={:.3}% p95={:.3}% p99={:.3}%; rotation_deg_per_100m avg={:.3} median={:.3} p95={:.3} p99={:.3}",
+            segment_translation.average * 100.0,
+            segment_translation.median * 100.0,
+            segment_translation.p95 * 100.0,
+            segment_translation.p99 * 100.0,
+            segment_rotation.average,
+            segment_rotation.median,
+            segment_rotation.p95,
+            segment_rotation.p99,
+        );
+        self.timings.print();
         self.diagnostics.print();
+    }
+}
+
+fn trajectory_distances(poses: &[na::Isometry3<f32>]) -> Vec<f32> {
+    let mut distances = Vec::with_capacity(poses.len());
+    distances.push(0.0);
+    for index in 1..poses.len() {
+        let distance =
+            (poses[index].translation.vector - poses[index - 1].translation.vector).norm();
+        distances.push(distances[index - 1] + distance);
+    }
+    distances
+}
+
+fn segment_end_index(distances: &[f32], start_index: usize, length: f32) -> Option<usize> {
+    let target_distance = distances.get(start_index)? + length;
+    distances
+        .iter()
+        .enumerate()
+        .skip(start_index + 1)
+        .find_map(|(index, &distance)| (distance >= target_distance).then_some(index))
+}
+
+#[derive(Default)]
+struct PipelineTimingMetrics {
+    feature_inference: Vec<Duration>,
+    feature_matching: Vec<Duration>,
+    feature_total: Vec<Duration>,
+    triangulation: Vec<Duration>,
+    odometry: Vec<Duration>,
+    total: Vec<Duration>,
+}
+
+impl PipelineTimingMetrics {
+    fn add(&mut self, timings: VisualOdometryTimings) {
+        self.feature_inference.push(timings.feature_inference);
+        self.feature_matching.push(timings.feature_matching);
+        self.feature_total.push(timings.feature_total);
+        self.triangulation.push(timings.triangulation);
+        self.odometry.push(timings.odometry);
+        self.total.push(timings.total);
+    }
+
+    fn extend(&mut self, mut other: Self) {
+        self.feature_inference.append(&mut other.feature_inference);
+        self.feature_matching.append(&mut other.feature_matching);
+        self.feature_total.append(&mut other.feature_total);
+        self.triangulation.append(&mut other.triangulation);
+        self.odometry.append(&mut other.odometry);
+        self.total.append(&mut other.total);
+    }
+
+    fn print(&self) {
+        let feature_inference = DurationSummary::from(self.feature_inference.as_slice());
+        let feature_matching = DurationSummary::from(self.feature_matching.as_slice());
+        let triangulation = DurationSummary::from(self.triangulation.as_slice());
+        let odometry = DurationSummary::from(self.odometry.as_slice());
+        let total = DurationSummary::from(self.total.as_slice());
+        println!(
+            "  stage_ms inference avg={:.3} median={:.3} p95={:.3}; matching avg={:.3} median={:.3} p95={:.3}; triangulation avg={:.3}; odometry avg={:.3}; total avg={:.3}",
+            feature_inference.average_ms,
+            feature_inference.median_ms,
+            feature_inference.p95_ms,
+            feature_matching.average_ms,
+            feature_matching.median_ms,
+            feature_matching.p95_ms,
+            triangulation.average_ms,
+            odometry.average_ms,
+            total.average_ms,
+        );
     }
 }
 
@@ -589,6 +783,7 @@ struct DiagnosticsMetrics {
     lm_attempted_frames: usize,
     lm_success_frames: usize,
     lm_accepted_frames: usize,
+    lm_duration: Vec<Duration>,
     lm_delta_translation_m: Vec<f32>,
     lm_delta_rotation_deg: Vec<f32>,
     left_rmse_before_lm: Vec<f32>,
@@ -615,6 +810,7 @@ impl DiagnosticsMetrics {
         self.lm_attempted_frames += usize::from(diagnostics.lm_attempted);
         self.lm_success_frames += usize::from(diagnostics.lm_success);
         self.lm_accepted_frames += usize::from(diagnostics.lm_accepted);
+        push_some_duration(&mut self.lm_duration, diagnostics.lm_duration);
         push_some(
             &mut self.lm_delta_translation_m,
             diagnostics.lm_delta_translation_m,
@@ -673,6 +869,7 @@ impl DiagnosticsMetrics {
         self.lm_attempted_frames += other.lm_attempted_frames;
         self.lm_success_frames += other.lm_success_frames;
         self.lm_accepted_frames += other.lm_accepted_frames;
+        self.lm_duration.append(&mut other.lm_duration);
         self.lm_delta_translation_m
             .append(&mut other.lm_delta_translation_m);
         self.lm_delta_rotation_deg
@@ -703,6 +900,7 @@ impl DiagnosticsMetrics {
         let frames = self.frames.max(1) as f32;
         let lm_delta_translation = FloatSummary::from(self.lm_delta_translation_m.as_slice());
         let lm_delta_rotation = FloatSummary::from(self.lm_delta_rotation_deg.as_slice());
+        let lm_duration = DurationSummary::from(self.lm_duration.as_slice());
         let left_before = FloatSummary::from(self.left_rmse_before_lm.as_slice());
         let right_before = FloatSummary::from(self.right_rmse_before_lm.as_slice());
         let left_after = FloatSummary::from(self.left_rmse_after_lm.as_slice());
@@ -717,10 +915,13 @@ impl DiagnosticsMetrics {
             self.refit_used_frames,
         );
         println!(
-            "  stereo_lm attempted={} success={} accepted={} delta_t_m median={:.4} p95={:.4} delta_rot_deg median={:.4} p95={:.4}",
+            "  stereo_lm attempted={} success={} accepted={} duration_ms avg={:.3} median={:.3} p95={:.3} delta_t_m median={:.4} p95={:.4} delta_rot_deg median={:.4} p95={:.4}",
             self.lm_attempted_frames,
             self.lm_success_frames,
             self.lm_accepted_frames,
+            lm_duration.average_ms,
+            lm_duration.median_ms,
+            lm_duration.p95_ms,
             lm_delta_translation.median,
             lm_delta_translation.p95,
             lm_delta_rotation.median,
@@ -737,6 +938,12 @@ fn push_some(values: &mut Vec<f32>, value: Option<f32>) {
     if let Some(value) = value
         && value.is_finite()
     {
+        values.push(value);
+    }
+}
+
+fn push_some_duration(values: &mut Vec<Duration>, value: Option<Duration>) {
+    if let Some(value) = value {
         values.push(value);
     }
 }

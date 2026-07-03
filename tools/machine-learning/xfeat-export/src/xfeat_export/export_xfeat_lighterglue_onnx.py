@@ -30,12 +30,18 @@ class XFeatLighterGlueWrapper(nn.Module):
         keypoint_count: int,
         detection_threshold: float,
         min_confidence: float,
+        subsample: bool,
+        grid_rows: int,
+        grid_cols: int,
     ) -> None:
         super().__init__()
         self.extractor = XFeatNv12TopKWrapper(
             xfeat_weights_path,
             keypoint_count=keypoint_count,
             detection_threshold=detection_threshold,
+            subsample=subsample,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
         )
         self.matcher = LighterGlueFixedWrapper(
             lighterglue_weights_path,
@@ -117,11 +123,91 @@ class XFeatLighterGlueWrapper(nn.Module):
         )
 
 
+class XFeatStereoLighterGlueWrapper(nn.Module):
+    def __init__(
+        self,
+        xfeat_weights_path: Path,
+        lighterglue_weights_path: Path,
+        *,
+        keypoint_count: int,
+        detection_threshold: float,
+        min_confidence: float,
+        subsample: bool,
+        grid_rows: int,
+        grid_cols: int,
+    ) -> None:
+        super().__init__()
+        self.extractor = XFeatNv12TopKWrapper(
+            xfeat_weights_path,
+            keypoint_count=keypoint_count,
+            detection_threshold=detection_threshold,
+            subsample=subsample,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+        )
+        self.matcher = LighterGlueFixedWrapper(
+            lighterglue_weights_path,
+            min_confidence=min_confidence,
+        )
+
+    def forward(
+        self,
+        current_left: ByteTensor,
+        current_right: ByteTensor,
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+    ]:
+        current_left_rgb = self.extractor._preprocess(current_left)
+        current_right_rgb = self.extractor._preprocess(current_right)
+        rgb_images = torch.cat([current_left_rgb, current_right_rgb], dim=0)
+        keypoints, descriptors, _, valid = self.extractor.forward_rgb(
+            rgb_images
+        )
+
+        (
+            stereo_matches,
+            stereo_reverse_matches,
+            stereo_scores,
+            stereo_reverse_scores,
+        ) = self.matcher(
+            keypoints[0:1],
+            keypoints[1:2],
+            descriptors[0:1],
+            descriptors[1:2],
+            valid[0:1],
+            valid[1:2],
+        )
+
+        return (
+            keypoints[0],
+            descriptors[0],
+            valid[0],
+            keypoints[1],
+            descriptors[1],
+            valid[1],
+            stereo_matches.squeeze(0),
+            stereo_scores.squeeze(0),
+            stereo_reverse_matches.squeeze(0),
+            stereo_reverse_scores.squeeze(0),
+        )
+
+
 def validate_exported_model(
     export_path: Path,
     height: int,
     width: int,
     keypoint_count: int,
+    *,
+    stereo_only: bool,
 ) -> None:
     onnx.checker.check_model(onnx.load(export_path))
 
@@ -132,10 +218,23 @@ def validate_exported_model(
     expected_inputs = [
         ("current_left", "tensor(uint8)", image_shape),
         ("current_right", "tensor(uint8)", image_shape),
-        ("previous_left_keypoints", "tensor(float)", [keypoint_count, 2]),
-        ("previous_left_descriptors", "tensor(float)", [keypoint_count, 64]),
-        ("previous_left_valid", "tensor(bool)", [keypoint_count]),
     ]
+    if not stereo_only:
+        expected_inputs.extend(
+            [
+                (
+                    "previous_left_keypoints",
+                    "tensor(float)",
+                    [keypoint_count, 2],
+                ),
+                (
+                    "previous_left_descriptors",
+                    "tensor(float)",
+                    [keypoint_count, 64],
+                ),
+                ("previous_left_valid", "tensor(bool)", [keypoint_count]),
+            ]
+        )
     actual_inputs = [
         (input.name, input.type, input.shape) for input in session.get_inputs()
     ]
@@ -157,16 +256,19 @@ def validate_exported_model(
         previous_descriptors,
         previous_valid,
         keypoint_count,
+        stereo_only=stereo_only,
     )
-    run_validation_inference(
-        session,
-        current_left,
-        current_right,
-        outputs["current_left_keypoints"],
-        outputs["current_left_descriptors"],
-        outputs["current_left_valid"],
-        keypoint_count,
-    )
+    if not stereo_only:
+        run_validation_inference(
+            session,
+            current_left,
+            current_right,
+            outputs["current_left_keypoints"],
+            outputs["current_left_descriptors"],
+            outputs["current_left_valid"],
+            keypoint_count,
+            stereo_only=False,
+        )
 
 
 def run_validation_inference(
@@ -177,20 +279,26 @@ def run_validation_inference(
     previous_left_descriptors: np.ndarray,
     previous_left_valid: np.ndarray,
     keypoint_count: int,
+    *,
+    stereo_only: bool,
 ) -> dict[str, np.ndarray]:
+    inputs = {
+        "current_left": current_left,
+        "current_right": current_right,
+    }
+    if not stereo_only:
+        inputs.update(
+            {
+                "previous_left_keypoints": previous_left_keypoints,
+                "previous_left_descriptors": previous_left_descriptors,
+                "previous_left_valid": previous_left_valid,
+            }
+        )
+
     outputs = dict(
         zip(
             [output.name for output in session.get_outputs()],
-            session.run(
-                None,
-                {
-                    "current_left": current_left,
-                    "current_right": current_right,
-                    "previous_left_keypoints": previous_left_keypoints,
-                    "previous_left_descriptors": previous_left_descriptors,
-                    "previous_left_valid": previous_left_valid,
-                },
-            ),
+            session.run(None, inputs),
             strict=True,
         )
     )
@@ -205,11 +313,16 @@ def run_validation_inference(
         "stereo_scores": (np.float32, (keypoint_count,)),
         "stereo_reverse_matches": (np.int32, (keypoint_count,)),
         "stereo_reverse_scores": (np.float32, (keypoint_count,)),
-        "temporal_matches": (np.int32, (keypoint_count,)),
-        "temporal_scores": (np.float32, (keypoint_count,)),
-        "temporal_reverse_matches": (np.int32, (keypoint_count,)),
-        "temporal_reverse_scores": (np.float32, (keypoint_count,)),
     }
+    if not stereo_only:
+        expected_outputs.update(
+            {
+                "temporal_matches": (np.int32, (keypoint_count,)),
+                "temporal_scores": (np.float32, (keypoint_count,)),
+                "temporal_reverse_matches": (np.int32, (keypoint_count,)),
+                "temporal_reverse_scores": (np.float32, (keypoint_count,)),
+            }
+        )
     if set(outputs) != set(expected_outputs):
         raise RuntimeError(f"unexpected ONNX outputs: {sorted(outputs)}")
 
@@ -279,6 +392,30 @@ def run_validation_inference(
     help="Minimum match confidence.",
 )
 @click.option(
+    "--subsample/--full-resolution",
+    default=False,
+    show_default=True,
+    help="Use the chroma-resolution NV12 image instead of upsampling to full RGB resolution.",
+)
+@click.option(
+    "--stereo-only/--stereo-and-temporal",
+    default=False,
+    show_default=True,
+    help="Export only the current-frame stereo LighterGlue pass.",
+)
+@click.option(
+    "--grid-rows",
+    default=0,
+    show_default=True,
+    help="If >0 with --grid-cols, cap keypoints per grid row for spatial coverage.",
+)
+@click.option(
+    "--grid-cols",
+    default=0,
+    show_default=True,
+    help="If >0 with --grid-rows, cap keypoints per grid column for spatial coverage.",
+)
+@click.option(
     "--opset", default=20, show_default=True, help="ONNX opset version."
 )
 @click.option(
@@ -297,39 +434,41 @@ def main(
     keypoint_count: int,
     detection_threshold: float,
     min_confidence: float,
+    subsample: bool,
+    stereo_only: bool,
+    grid_rows: int,
+    grid_cols: int,
     opset: int,
     device: str,
 ) -> None:
     validate_image_size(height, width)
     if keypoint_count <= 0:
         raise click.BadParameter("--keypoints must be > 0")
+    if (grid_rows == 0) != (grid_cols == 0):
+        raise click.BadParameter("--grid-rows and --grid-cols must be set together")
+    if grid_rows < 0 or grid_cols < 0:
+        raise click.BadParameter("--grid-rows and --grid-cols must be >= 0")
 
-    wrapper = XFeatLighterGlueWrapper(
+    wrapper_class = (
+        XFeatStereoLighterGlueWrapper if stereo_only else XFeatLighterGlueWrapper
+    )
+    wrapper = wrapper_class(
         xfeat_weights or default_xfeat_weights_path(),
         lighterglue_weights or default_lighterglue_weights_path(),
         keypoint_count=keypoint_count,
         detection_threshold=detection_threshold,
         min_confidence=min_confidence,
+        subsample=subsample,
+        grid_rows=grid_rows,
+        grid_cols=grid_cols,
     ).to(device)
     wrapper.eval()
 
     image_shape = (height // 2, width // 2, 6)
     dummy_image = torch.zeros(image_shape, dtype=torch.uint8, device=device)
-    dummy_keypoints = torch.zeros(
-        (keypoint_count, 2), dtype=torch.float32, device=device
-    )
-    dummy_descriptors = torch.zeros(
-        (keypoint_count, 64), dtype=torch.float32, device=device
-    )
-    dummy_valid = torch.zeros(
-        (keypoint_count,), dtype=torch.bool, device=device
-    )
     input_names = [
         "current_left",
         "current_right",
-        "previous_left_keypoints",
-        "previous_left_descriptors",
-        "previous_left_valid",
     ]
     output_names = [
         "current_left_keypoints",
@@ -342,22 +481,45 @@ def main(
         "stereo_scores",
         "stereo_reverse_matches",
         "stereo_reverse_scores",
-        "temporal_matches",
-        "temporal_scores",
-        "temporal_reverse_matches",
-        "temporal_reverse_scores",
     ]
-
-    export_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        wrapper,
-        (
+    dummy_inputs: tuple[Tensor | ByteTensor, ...] = (dummy_image, dummy_image)
+    if not stereo_only:
+        dummy_keypoints = torch.zeros(
+            (keypoint_count, 2), dtype=torch.float32, device=device
+        )
+        dummy_descriptors = torch.zeros(
+            (keypoint_count, 64), dtype=torch.float32, device=device
+        )
+        dummy_valid = torch.zeros(
+            (keypoint_count,), dtype=torch.bool, device=device
+        )
+        input_names.extend(
+            [
+                "previous_left_keypoints",
+                "previous_left_descriptors",
+                "previous_left_valid",
+            ]
+        )
+        output_names.extend(
+            [
+                "temporal_matches",
+                "temporal_scores",
+                "temporal_reverse_matches",
+                "temporal_reverse_scores",
+            ]
+        )
+        dummy_inputs = (
             dummy_image,
             dummy_image,
             dummy_keypoints,
             dummy_descriptors,
             dummy_valid,
-        ),
+        )
+
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        dummy_inputs,
         export_path,
         input_names=input_names,
         output_names=output_names,
@@ -366,11 +528,16 @@ def main(
         external_data=False,
         dynamo=False,
     )
-    validate_exported_model(export_path, height, width, keypoint_count)
-
-    click.echo(
-        f"Exported fused XFeat/LighterGlue ONNX model to: {os.path.abspath(export_path)}"
+    validate_exported_model(
+        export_path,
+        height,
+        width,
+        keypoint_count,
+        stereo_only=stereo_only,
     )
+
+    mode = "stereo XFeat/LighterGlue" if stereo_only else "fused XFeat/LighterGlue"
+    click.echo(f"Exported {mode} ONNX model to: {os.path.abspath(export_path)}")
 
 
 if __name__ == "__main__":

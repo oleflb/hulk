@@ -28,6 +28,10 @@ pub struct StereoVisualOdometryPoseEstimationParameters {
     pub full_weight_disparity_px: f32,
     pub min_disparity_weight: f32,
     pub max_vertical_disparity_px: f32,
+    pub descriptor_match_min_score: f32,
+    pub descriptor_match_min_margin: f32,
+    pub temporal_match_max_distance_px: f32,
+    pub stereo_match_max_disparity_px: f32,
 }
 
 impl StereoVisualOdometryParameters {
@@ -113,6 +117,29 @@ impl StereoVisualOdometryPoseEstimationParameters {
 
         if !self.max_vertical_disparity_px.is_finite() || self.max_vertical_disparity_px < 0.0 {
             return Err("max_vertical_disparity_px must be finite and >= 0".to_string());
+        }
+
+        if !self.descriptor_match_min_score.is_finite()
+            || self.descriptor_match_min_score < -1.0
+            || self.descriptor_match_min_score > 1.0
+        {
+            return Err("descriptor_match_min_score must be finite and in [-1, 1]".to_string());
+        }
+
+        if !self.descriptor_match_min_margin.is_finite() || self.descriptor_match_min_margin < 0.0 {
+            return Err("descriptor_match_min_margin must be finite and >= 0".to_string());
+        }
+
+        if !self.temporal_match_max_distance_px.is_finite()
+            || self.temporal_match_max_distance_px < 0.0
+        {
+            return Err("temporal_match_max_distance_px must be finite and >= 0".to_string());
+        }
+
+        if !self.stereo_match_max_disparity_px.is_finite()
+            || self.stereo_match_max_disparity_px <= 0.0
+        {
+            return Err("stereo_match_max_disparity_px must be finite and > 0".to_string());
         }
 
         Ok(())

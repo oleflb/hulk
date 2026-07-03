@@ -3,6 +3,7 @@ use kornia_3d::pnp::{
 };
 use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
 use nalgebra as na;
+use std::time::{Duration, Instant};
 
 use crate::{
     feature_extractor::{CurrentLeft, FrameFeatures, Matches, NUM_KEYPOINTS, PreviousLeft},
@@ -45,6 +46,7 @@ pub struct OdometryDiagnostics {
     pub lm_attempted: bool,
     pub lm_success: bool,
     pub lm_accepted: bool,
+    pub lm_duration: Option<Duration>,
     pub lm_delta_translation_m: Option<f32>,
     pub lm_delta_rotation_deg: Option<f32>,
     pub left_rmse_before_lm: Option<f32>,
@@ -468,6 +470,7 @@ fn refine_pose(
     let initial_pose = with_stereo_rmse(initial_pose.clone(), initial_metrics);
     diagnostics.lm_attempted = true;
     fill_diagnostics_before_lm(diagnostics, initial_metrics);
+    let lm_start = Instant::now();
     let refined_pose = match refine_pose_lm_direct(
         correspondences,
         triangulator.intrinsics_f32(),
@@ -475,8 +478,12 @@ fn refine_pose(
         parameters,
         &initial_pose,
     ) {
-        Ok(refined_pose) => refined_pose,
+        Ok(refined_pose) => {
+            diagnostics.lm_duration = Some(lm_start.elapsed());
+            refined_pose
+        }
         Err(error) => {
+            diagnostics.lm_duration = Some(lm_start.elapsed());
             tracing::debug!(
                 error,
                 correspondences = correspondences.len(),

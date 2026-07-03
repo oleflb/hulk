@@ -42,11 +42,16 @@ class XFeatNv12TopKWrapper(nn.Module):
         *,
         keypoint_count: int,
         detection_threshold: float,
+        subsample: bool = False,
+        grid_rows: int = 0,
+        grid_cols: int = 0,
     ) -> None:
         super().__init__()
         self.keypoint_count = keypoint_count
         self.detection_threshold = detection_threshold
-        self.preprocessor = NV12ToRgb(subsample=False)
+        self.grid_rows = grid_rows
+        self.grid_cols = grid_cols
+        self.preprocessor = NV12ToRgb(subsample=subsample)
         self.xfeat = load_xfeat_model(weights_path)
 
     def forward(
@@ -101,10 +106,15 @@ class XFeatNv12TopKWrapper(nn.Module):
         chroma_subsampled = flat[:, width * height :].reshape(
             batch_size, half_height, half_width, 2
         )
-        chroma = chroma_subsampled.repeat_interleave(
-            2, dim=1
-        ).repeat_interleave(2, dim=2)
-        yuv = torch.concat([luminance, chroma], dim=-1)
+        if self.preprocessor.subsample:
+            yuv = torch.concat(
+                [luminance[:, ::2, ::2], chroma_subsampled], dim=-1
+            )
+        else:
+            chroma = chroma_subsampled.repeat_interleave(
+                2, dim=1
+            ).repeat_interleave(2, dim=2)
+            yuv = torch.concat([luminance, chroma], dim=-1)
         return torch.matmul(
             yuv - self.preprocessor.yuv_to_rgb_offset,
             self.preprocessor.yuv_to_rgb,
@@ -141,6 +151,9 @@ class XFeatNv12TopKWrapper(nn.Module):
         return torch.where(nms_mask, scores, torch.zeros_like(scores))
 
     def _topk_keypoints(self, score_map: Tensor) -> tuple[Tensor, Tensor]:
+        if self.grid_rows > 0 and self.grid_cols > 0:
+            return self._grid_topk_keypoints(score_map)
+
         _, _, _, width = score_map.shape
         topk_scores, indices = torch.topk(
             score_map.flatten(start_dim=1), k=self.keypoint_count, dim=-1
@@ -149,6 +162,45 @@ class XFeatNv12TopKWrapper(nn.Module):
         x = indices - y * width
         return torch.stack([x, y], dim=-1).to(
             dtype=score_map.dtype
+        ), topk_scores
+
+    def _grid_topk_keypoints(self, score_map: Tensor) -> tuple[Tensor, Tensor]:
+        batch_size, _, height, width = score_map.shape
+        keypoints_per_cell = (
+            self.keypoint_count + self.grid_rows * self.grid_cols - 1
+        ) // (self.grid_rows * self.grid_cols)
+        cell_keypoints = []
+        cell_scores = []
+
+        for row in range(self.grid_rows):
+            y0 = row * height // self.grid_rows
+            y1 = (row + 1) * height // self.grid_rows
+            for col in range(self.grid_cols):
+                x0 = col * width // self.grid_cols
+                x1 = (col + 1) * width // self.grid_cols
+                cell = score_map[:, :, y0:y1, x0:x1]
+                scores, indices = torch.topk(
+                    cell.flatten(start_dim=1),
+                    k=keypoints_per_cell,
+                    dim=-1,
+                )
+                cell_width = x1 - x0
+                y = torch.div(indices, cell_width, rounding_mode="floor") + y0
+                x = indices - (y - y0) * cell_width + x0
+                cell_keypoints.append(
+                    torch.stack([x, y], dim=-1).to(dtype=score_map.dtype)
+                )
+                cell_scores.append(scores)
+
+        candidate_keypoints = torch.cat(cell_keypoints, dim=1)
+        candidate_scores = torch.cat(cell_scores, dim=1)
+        topk_scores, indices = torch.topk(
+            candidate_scores, k=self.keypoint_count, dim=-1
+        )
+        gather_indices = indices.unsqueeze(-1).repeat(1, 1, 2)
+        topk_keypoints = torch.gather(candidate_keypoints, 1, gather_indices)
+        return topk_keypoints.reshape(
+            batch_size, self.keypoint_count, 2
         ), topk_scores
 
     @staticmethod
@@ -269,6 +321,24 @@ def dynamic_axes(batch_size: int | None) -> dict[str, dict[int, str]]:
     help="NMS detection threshold.",
 )
 @click.option(
+    "--subsample/--full-resolution",
+    default=False,
+    show_default=True,
+    help="Use the chroma-resolution NV12 image instead of upsampling to full RGB resolution.",
+)
+@click.option(
+    "--grid-rows",
+    default=0,
+    show_default=True,
+    help="If >0 with --grid-cols, cap keypoints per grid row for spatial coverage.",
+)
+@click.option(
+    "--grid-cols",
+    default=0,
+    show_default=True,
+    help="If >0 with --grid-rows, cap keypoints per grid column for spatial coverage.",
+)
+@click.option(
     "--opset", default=20, show_default=True, help="ONNX opset version."
 )
 @click.option(
@@ -293,6 +363,9 @@ def main(
     batch_size: int | None,
     keypoint_count: int,
     detection_threshold: float,
+    subsample: bool,
+    grid_rows: int,
+    grid_cols: int,
     opset: int,
     device: str,
     use_dynamic_axes: bool,
@@ -304,11 +377,18 @@ def main(
         raise click.BadParameter("--keypoints must be <= height * width")
     if batch_size is not None and batch_size <= 0:
         raise click.BadParameter("--batch-size must be > 0")
+    if (grid_rows == 0) != (grid_cols == 0):
+        raise click.BadParameter("--grid-rows and --grid-cols must be set together")
+    if grid_rows < 0 or grid_cols < 0:
+        raise click.BadParameter("--grid-rows and --grid-cols must be >= 0")
 
     wrapper = XFeatNv12TopKWrapper(
         weights_path or default_weights_path(),
         keypoint_count=keypoint_count,
         detection_threshold=detection_threshold,
+        subsample=subsample,
+        grid_rows=grid_rows,
+        grid_cols=grid_cols,
     ).to(device)
     wrapper.eval()
 

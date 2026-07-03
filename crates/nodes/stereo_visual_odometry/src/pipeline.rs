@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use crate::{
     feature_extractor::{FeatureExtractor, NUM_KEYPOINTS, PreviousFeatureState},
@@ -13,6 +13,7 @@ use types::{stereo_camera_info::StereoCameraInfo, stereo_image_pair::StereoImage
 
 use color_eyre::{Result, eyre::Report};
 use nalgebra as na;
+use std::time::Instant;
 
 /// Stateful stereo visual odometry pipeline.
 ///
@@ -27,6 +28,17 @@ pub struct VisualOdometryPipeline {
     current_points: Vec<crate::triangulator::StereoPoint>,
     current_left_camera_to_visual_odometer: na::Isometry3<f32>,
     odometry_scratch: OdometryScratch,
+    latest_timings: VisualOdometryTimings,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VisualOdometryTimings {
+    pub feature_inference: Duration,
+    pub feature_matching: Duration,
+    pub feature_total: Duration,
+    pub triangulation: Duration,
+    pub odometry: Duration,
+    pub total: Duration,
 }
 
 impl VisualOdometryPipeline {
@@ -43,6 +55,7 @@ impl VisualOdometryPipeline {
             current_points: Vec::with_capacity(NUM_KEYPOINTS),
             current_left_camera_to_visual_odometer: na::Isometry3::identity(),
             odometry_scratch: OdometryScratch::new(),
+            latest_timings: VisualOdometryTimings::default(),
         })
     }
 
@@ -56,15 +69,20 @@ impl VisualOdometryPipeline {
         parameters: &StereoVisualOdometryPoseEstimationParameters,
     ) -> Result<Option<na::Isometry3<f32>>> {
         parameters.validate().map_err(Report::msg)?;
+        let total_start = Instant::now();
 
-        let odometry = {
-            let features = self
-                .feature_extractor
-                .extract(stereo_image_pair, &self.previous_features)?;
+        let (odometry, feature_timings, triangulation, odometry_duration) = {
+            let features = self.feature_extractor.extract(
+                stereo_image_pair,
+                &self.previous_features,
+                parameters,
+            )?;
+            let feature_timings = features.timings();
             let current_left = features.current_left()?;
             let current_right = features.current_right()?;
             let stereo_matches = features.stereo_matches()?;
 
+            let triangulation_start = Instant::now();
             self.triangulator.triangulate_into(
                 current_left,
                 current_right,
@@ -72,9 +90,11 @@ impl VisualOdometryPipeline {
                 parameters.max_vertical_disparity_px,
                 &mut self.current_points,
             );
+            let triangulation = triangulation_start.elapsed();
 
             if let Some(previous_frame) = self.previous_frame.as_ref() {
                 let temporal_matches = features.temporal_matches()?;
+                let odometry_start = Instant::now();
                 let odometry = estimate_previous_to_current(
                     previous_frame,
                     &current_left,
@@ -84,11 +104,12 @@ impl VisualOdometryPipeline {
                     parameters,
                     &mut self.odometry_scratch,
                 );
+                let odometry_duration = odometry_start.elapsed();
                 features.copy_current_left_to(&mut self.previous_features)?;
-                odometry
+                (odometry, feature_timings, triangulation, odometry_duration)
             } else {
                 features.copy_current_left_to(&mut self.previous_features)?;
-                None
+                (None, feature_timings, triangulation, Duration::default())
             }
         };
 
@@ -101,6 +122,14 @@ impl VisualOdometryPipeline {
         if let Some(previous_to_current) = &odometry {
             self.current_left_camera_to_visual_odometer *= previous_to_current.inverse();
         }
+        self.latest_timings = VisualOdometryTimings {
+            feature_inference: feature_timings.inference,
+            feature_matching: feature_timings.matching,
+            feature_total: feature_timings.total,
+            triangulation,
+            odometry: odometry_duration,
+            total: total_start.elapsed(),
+        };
 
         Ok(odometry)
     }
@@ -117,11 +146,16 @@ impl VisualOdometryPipeline {
         self.odometry_scratch.diagnostics()
     }
 
+    pub fn latest_timings(&self) -> VisualOdometryTimings {
+        self.latest_timings
+    }
+
     pub fn reset_tracking(&mut self) {
         self.previous_features = PreviousFeatureState::new();
         self.previous_frame = None;
         self.current_points.clear();
         self.current_left_camera_to_visual_odometer = na::Isometry3::identity();
+        self.latest_timings = VisualOdometryTimings::default();
     }
 
     /// Return the stereo points triangulated from the most recently processed frame.
