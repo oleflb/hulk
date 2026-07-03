@@ -37,7 +37,10 @@ impl<'a> LocalizationPublishers<'a> {
         time: Time,
         localization: Option<Isometry3<Field, Robot>>,
         pose_3d: Option<Isometry3<Field, Robot>>,
-        source: AssociationPoseHintSource,
+        association_pose_hint_output: Option<(
+            Option<Isometry3<Field, Robot>>,
+            AssociationPoseHintSource,
+        )>,
     ) -> Result<()> {
         self.localization.publish(&localization).await?;
         self.pose_3d
@@ -46,9 +49,11 @@ impl<'a> LocalizationPublishers<'a> {
                 inner: pose_3d,
             })
             .await?;
-        self.association_pose_hint
-            .publish(&association_pose_hint(time, pose_3d, source))
-            .await?;
+        if let Some((pose, source)) = association_pose_hint_output {
+            self.association_pose_hint
+                .publish(&association_pose_hint(time, pose, source))
+                .await?;
+        }
         Ok(())
     }
 
@@ -57,11 +62,12 @@ impl<'a> LocalizationPublishers<'a> {
         time: Time,
         field_dimensions: &FieldDimensions,
     ) -> Result<()> {
+        let startup_prior = initial_localization_for_branch_hint(field_dimensions);
         self.publish_outputs(
             time,
             None,
-            initial_localization_for_branch_hint(field_dimensions),
-            AssociationPoseHintSource::StartupPrior,
+            startup_prior,
+            Some((startup_prior, AssociationPoseHintSource::StartupPrior)),
         )
         .await
     }

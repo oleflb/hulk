@@ -24,10 +24,6 @@ pub(crate) enum GlobalVisualLock {
 }
 
 impl GlobalVisualLock {
-    pub(crate) fn is_active(self) -> bool {
-        !matches!(self, Self::Unlocked)
-    }
-
     pub(crate) fn has_backend_result(self) -> bool {
         matches!(self, Self::Locked)
     }
@@ -36,7 +32,7 @@ impl GlobalVisualLock {
         !has_global_associations || self.has_backend_result()
     }
 
-    pub(crate) fn should_ingest_backend_reset(self) -> bool {
+    pub(crate) fn should_ingest_global_pose(self) -> bool {
         !matches!(self, Self::WaitingForBackend)
     }
 
@@ -45,11 +41,11 @@ impl GlobalVisualLock {
     }
 
     pub(crate) fn mark_backend_result(&mut self) -> bool {
-        if !self.is_active() {
-            return false;
+        if matches!(self, Self::WaitingForBackend) {
+            *self = Self::Locked;
+            return true;
         }
-        *self = Self::Locked;
-        true
+        false
     }
 
     pub(crate) fn reset_for_damping(&mut self) {
@@ -81,18 +77,20 @@ pub(crate) fn handle_visual_localization_frame(
     let VisualLocalizationFrame {
         robot_to_camera,
         associations,
-        backend_reset,
+        global_pose,
     } = inner;
 
-    if let Some(robot_to_field) = backend_reset {
-        if !global_visual_lock.should_ingest_backend_reset() {
+    if let Some(robot_to_field) = global_pose {
+        if !global_visual_lock.should_ingest_global_pose() {
             return Ok(());
         }
 
         frontend.ingest_global_pose(time.to_wallclock(), robot_to_field)?;
-        global_visual_lock.mark_waiting_for_backend();
-        live_localization.clear();
-        return Ok(());
+        if !global_visual_lock.has_backend_result() {
+            global_visual_lock.mark_waiting_for_backend();
+            live_localization.clear();
+            return Ok(());
+        }
     }
 
     if !global_visual_lock.accepts_association_frame(has_global_associations(&associations)) {
@@ -131,4 +129,36 @@ fn ingest_visual_localization_associations(
         associations,
         robot_to_camera,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalVisualLock;
+
+    #[test]
+    fn first_backend_result_after_global_pose_initializes_live_tracking() {
+        let mut lock = GlobalVisualLock::Unlocked;
+
+        assert!(lock.should_ingest_global_pose());
+        lock.mark_waiting_for_backend();
+
+        assert!(lock.mark_backend_result());
+        assert_eq!(lock, GlobalVisualLock::Locked);
+    }
+
+    #[test]
+    fn locked_backend_results_do_not_reinitialize_live_tracking() {
+        let mut lock = GlobalVisualLock::Locked;
+
+        assert!(!lock.mark_backend_result());
+        assert_eq!(lock, GlobalVisualLock::Locked);
+    }
+
+    #[test]
+    fn pending_global_pose_waits_for_one_backend_result() {
+        let lock = GlobalVisualLock::WaitingForBackend;
+
+        assert!(!lock.should_ingest_global_pose());
+        assert!(!lock.has_backend_result());
+    }
 }

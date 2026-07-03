@@ -19,7 +19,7 @@ use crate::{
 pub struct GlobalVisualLocalization {
     /// Debug payload for the best visual global localization result, if any.
     pub debug: Option<types::visual_localization::GlobalLocalizationDebug>,
-    /// Accepted global pose when global recovery should reset the backend state.
+    /// Accepted global pose observation for factor-based backend recovery.
     pub accepted_global_pose: Option<Isometry3<Robot, Field>>,
     /// Fixed associations selected by either global uniqueness or pose-hint fallback.
     pub associations: Vec<FieldMarkAssociation>,

@@ -32,6 +32,8 @@ fn imu_on_spline() {
             visual_feature_noise: Matrix2::identity() * 5.0,
             pose_hint_visual_feature_noise: Matrix2::identity() * 100.0,
             pose_hint_visual_huber_threshold: 2.0,
+            global_pose_noise: SMatrix::<f64, 6, 6>::identity() * 0.5,
+            global_pose_huber_threshold: 2.0,
             visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
             foot_ground_sigma: 0.01,
             field_containment: FieldContainmentConfiguration::default(),

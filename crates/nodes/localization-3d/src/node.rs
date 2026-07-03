@@ -255,10 +255,13 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     ).await?;
                     continue;
                 }
+                let localization_parameters = parameters.snapshot().typed().clone();
                 handle_optimization_result(
                     &mut frontend,
                     &mut live_localization,
                     &mut global_visual_lock,
+                    localization_parameters.live_correction_max_translation_step,
+                    localization_parameters.live_correction_max_rotation_step,
                     &visual_odometer_cache,
                     &camera_matrix_cache,
                     publishers,

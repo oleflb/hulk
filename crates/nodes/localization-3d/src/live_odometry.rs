@@ -69,6 +69,43 @@ impl LiveVisualOdometryLocalization {
         self.update_from_odometer(&latest, camera_matrix_cache)
     }
 
+    pub(crate) fn correct_towards_result(
+        &mut self,
+        result: &OptimizationResult,
+        visual_odometer_cache: &VisualOdometerCache,
+        camera_matrix_cache: &Cache<TimeWrapper<CameraMatrix>>,
+        max_translation_step: f64,
+        max_rotation_step: f64,
+    ) -> Option<Isometry3<Field, Robot>> {
+        let result_time = Time::from_wallclock(result.time);
+        let result_odometer = odometer_at(visual_odometer_cache, result_time)?;
+        if result_odometer.epoch != self.anchor.as_ref()?.odometer_epoch {
+            self.anchor = None;
+            return None;
+        }
+
+        let live_field_to_robot_at_result =
+            self.update_from_odometer(&result_odometer, camera_matrix_cache)?;
+        let live_robot_to_field_at_result = live_field_to_robot_at_result.inverse().inner.cast();
+        let corrected_robot_to_field = bounded_pose_step(
+            &live_robot_to_field_at_result,
+            &result.transform,
+            max_translation_step,
+            max_rotation_step,
+        );
+        let camera_matrix = fresh_camera_matrix(camera_matrix_cache, result_time)?;
+        self.anchor = Some(LiveVisualOdometryAnchor {
+            time: result_time,
+            odometer_epoch: result_odometer.epoch,
+            robot_to_field: corrected_robot_to_field,
+            left_camera_to_visual_odometer: result_odometer.current_left_camera_to_visual_odometer,
+            robot_to_camera: robot_to_camera(&camera_matrix.inner).inner,
+        });
+        self.pending_result = None;
+
+        self.field_to_robot_latest(visual_odometer_cache, camera_matrix_cache)
+    }
+
     pub(crate) fn update_from_odometer(
         &mut self,
         current_odometer: &VisualOdometer,
@@ -103,6 +140,33 @@ impl LiveVisualOdometryLocalization {
             &current_camera_matrix.inner.ground_to_robot,
         ))
     }
+}
+
+fn bounded_pose_step(
+    from: &nalgebra::Isometry3<f64>,
+    to: &nalgebra::Isometry3<f64>,
+    max_translation_step: f64,
+    max_rotation_step: f64,
+) -> nalgebra::Isometry3<f64> {
+    let translation_delta = to.translation.vector - from.translation.vector;
+    let translation_distance = translation_delta.norm();
+    let translation_step = if translation_distance > max_translation_step {
+        translation_delta * (max_translation_step / translation_distance)
+    } else {
+        translation_delta
+    };
+
+    let rotation_distance = from.rotation.angle_to(&to.rotation);
+    let rotation_interpolation = if rotation_distance > max_rotation_step {
+        max_rotation_step / rotation_distance
+    } else {
+        1.0
+    };
+
+    nalgebra::Isometry3::from_parts(
+        nalgebra::Translation3::from(from.translation.vector + translation_step),
+        from.rotation.slerp(&to.rotation, rotation_interpolation),
+    )
 }
 
 fn live_visual_odometry_anchor(
@@ -223,5 +287,19 @@ mod tests {
                 .abs()
                 < 1.0e-6
         );
+    }
+
+    #[test]
+    fn bounded_pose_step_limits_translation_and_rotation() {
+        let from = nalgebra::Isometry3::identity();
+        let to = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(10.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, 1.0),
+        );
+
+        let stepped = bounded_pose_step(&from, &to, 0.25, 0.1);
+
+        assert!((stepped.translation.vector.norm() - 0.25).abs() < 1.0e-9);
+        assert!((stepped.rotation.angle() - 0.1).abs() < 1.0e-9);
     }
 }

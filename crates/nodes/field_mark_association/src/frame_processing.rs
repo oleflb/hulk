@@ -171,7 +171,7 @@ async fn publish_localization_frame(
             inner: VisualLocalizationFrame {
                 robot_to_camera,
                 associations: localization.associations,
-                backend_reset: localization.accepted_global_pose,
+                global_pose: localization.accepted_global_pose,
             },
         })
         .await?;

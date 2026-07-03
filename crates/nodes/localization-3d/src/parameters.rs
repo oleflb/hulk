@@ -16,6 +16,16 @@ pub struct Localization3dParameters {
     pub pose_hint_visual_feature_noise_variance: f64,
     /// Huber threshold for pose-hint visual residuals in whitened residual units.
     pub pose_hint_visual_huber_threshold: f64,
+    /// Translation sigma in meters for global visual pose observations.
+    pub global_pose_translation_sigma: f64,
+    /// Rotation sigma in radians for global visual pose observations.
+    pub global_pose_rotation_sigma: f64,
+    /// Huber threshold for global visual pose observations in whitened residual units.
+    pub global_pose_huber_threshold: f64,
+    /// Maximum public-pose translation correction applied per backend result.
+    pub live_correction_max_translation_step: f64,
+    /// Maximum public-pose rotation correction applied per backend result.
+    pub live_correction_max_rotation_step: f64,
     /// Soft field containment sigma in meters outside field plus border strip.
     pub field_containment_sigma: f64,
 }
@@ -39,6 +49,28 @@ impl Localization3dParameters {
         {
             return Err("pose_hint_visual_huber_threshold must be finite and > 0".to_string());
         }
+        if !self.global_pose_translation_sigma.is_finite()
+            || self.global_pose_translation_sigma <= 0.0
+        {
+            return Err("global_pose_translation_sigma must be finite and > 0".to_string());
+        }
+        if !self.global_pose_rotation_sigma.is_finite() || self.global_pose_rotation_sigma <= 0.0 {
+            return Err("global_pose_rotation_sigma must be finite and > 0".to_string());
+        }
+        if !self.global_pose_huber_threshold.is_finite() || self.global_pose_huber_threshold <= 0.0
+        {
+            return Err("global_pose_huber_threshold must be finite and > 0".to_string());
+        }
+        if !self.live_correction_max_translation_step.is_finite()
+            || self.live_correction_max_translation_step <= 0.0
+        {
+            return Err("live_correction_max_translation_step must be finite and > 0".to_string());
+        }
+        if !self.live_correction_max_rotation_step.is_finite()
+            || self.live_correction_max_rotation_step <= 0.0
+        {
+            return Err("live_correction_max_rotation_step must be finite and > 0".to_string());
+        }
         if !self.field_containment_sigma.is_finite() || self.field_containment_sigma <= 0.0 {
             return Err("field_containment_sigma must be finite and > 0".to_string());
         }
@@ -54,6 +86,9 @@ pub(crate) fn backend_configuration_from_parameters_and_field_dimensions(
         parameters.visual_feature_noise_variance,
         parameters.pose_hint_visual_feature_noise_variance,
         parameters.pose_hint_visual_huber_threshold,
+        parameters.global_pose_translation_sigma,
+        parameters.global_pose_rotation_sigma,
+        parameters.global_pose_huber_threshold,
         parameters.field_containment_sigma,
         field_dimensions,
     )
@@ -63,10 +98,20 @@ fn backend_configuration_with_pose_hint(
     visual_feature_noise_variance: f64,
     pose_hint_visual_feature_noise_variance: f64,
     pose_hint_visual_huber_threshold: f64,
+    global_pose_translation_sigma: f64,
+    global_pose_rotation_sigma: f64,
+    global_pose_huber_threshold: f64,
     field_containment_sigma: f64,
     field_dimensions: &FieldDimensions,
 ) -> BackendConfiguration {
     let process_noise = Matrix3::identity() * 0.01;
+    let mut global_pose_noise = SMatrix::<f64, 6, 6>::zeros();
+    for index in 0..3 {
+        global_pose_noise[(index, index)] = global_pose_rotation_sigma.powi(2);
+    }
+    for index in 3..6 {
+        global_pose_noise[(index, index)] = global_pose_translation_sigma.powi(2);
+    }
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
         max_optimization_window: Duration::from_secs(2),
@@ -86,6 +131,8 @@ fn backend_configuration_with_pose_hint(
         pose_hint_visual_feature_noise: Matrix2::identity()
             * pose_hint_visual_feature_noise_variance,
         pose_hint_visual_huber_threshold,
+        global_pose_noise,
+        global_pose_huber_threshold,
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-2,
         foot_ground_sigma: 1e-2,

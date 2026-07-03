@@ -9,6 +9,7 @@ use crate::{
     factors::{
         field_containment::FieldContainmentFactor,
         foot_above_ground::{FootHeightMeasurement, IntervalFootAboveGroundFactor},
+        global_pose::GlobalPoseFactor,
         visual_odometry::{
             AdjacentVisualOdometryFactor, VisualOdometryFactor, VisualOdometryMeasurement,
         },
@@ -55,6 +56,8 @@ fn backend_configuration() -> BackendConfiguration {
         visual_feature_noise: Matrix2::identity() * 5.0,
         pose_hint_visual_feature_noise: Matrix2::identity() * 100.0,
         pose_hint_visual_huber_threshold: 2.0,
+        global_pose_noise: SMatrix::<f64, 6, 6>::identity() * 0.5,
+        global_pose_huber_threshold: 2.0,
         visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.05,
         foot_ground_sigma: 0.01,
         field_containment: FieldContainmentConfiguration::default(),
@@ -200,6 +203,14 @@ fn adjacent_visual_odometry_factor_dimensions(backend: &VinsBackend, state: Stat
                 .expect("adjacent visual odometry factor should have a dimension")
         })
         .collect()
+}
+
+fn global_pose_factor_count(backend: &VinsBackend, state: State) -> usize {
+    backend
+        .optimizer
+        .graph()
+        .factors_for_residual::<GlobalPoseFactor, _>((state, State(state.0 + 1)))
+        .count()
 }
 
 fn field_containment_factor_count(backend: &VinsBackend, state: State) -> usize {
@@ -569,7 +580,7 @@ fn invalid_visual_odometry_measurement_does_not_create_empty_factor() {
 }
 
 #[test]
-fn global_pose_measurement_resets_backend_state() {
+fn global_pose_measurement_adds_factor_without_resetting_backend_state() {
     let (measurement_sender, measurement_receiver) = tokio::sync::mpsc::unbounded_channel();
     let (result_sender, _result_receiver) = tokio::sync::watch::channel(None);
     let mut backend = VinsBackend::new(
@@ -595,13 +606,12 @@ fn global_pose_measurement_resets_backend_state() {
 
     let result = backend
         .solve_once()
-        .expect("reset solve should succeed")
-        .expect("reset should produce a result");
+        .expect("global pose solve should succeed")
+        .expect("global pose should produce a result");
 
     assert_eq!(result.time, reset_time);
-    assert!((result.latest_pose.xyz() - Vector3::new(1.0, 2.0, 0.45)).norm() < 1.0e-9);
-    assert!(result.latest_pose.uvw().norm() < 1.0e-9);
-    assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 0);
+    assert_eq!(visual_odometry_factor_count(&mut backend, State(0)), 1);
+    assert_eq!(global_pose_factor_count(&backend, State(5)), 1);
 }
 
 #[test]

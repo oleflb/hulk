@@ -17,6 +17,7 @@ mod configuration;
 mod diagnostics;
 mod error;
 mod foot_height;
+mod global_pose;
 mod graph;
 mod imu;
 mod interval_assigner;
@@ -171,25 +172,13 @@ impl VinsBackend {
         &mut self,
         mut new_measurements: IntervalMeasurements,
     ) -> Result<(), VinsBackendError> {
-        let latest_reset = new_measurements.latest_reset().cloned();
-        let latest_global_pose = new_measurements.latest_global_pose().cloned();
-        match (latest_reset, latest_global_pose) {
-            (Some(reset), Some(global_pose)) if reset.time >= global_pose.time => {
-                self.reset_to_initial_state(reset.initial_state, reset.time);
-                new_measurements.retain_at_or_after(reset.time);
-            }
-            (Some(_), Some(global_pose)) | (None, Some(global_pose)) => {
-                self.reset_to_global_pose(global_pose.clone());
-                new_measurements.retain_at_or_after(global_pose.time);
-            }
-            (Some(reset), None) => {
-                self.reset_to_initial_state(reset.initial_state, reset.time);
-                new_measurements.retain_at_or_after(reset.time);
-            }
-            (None, None) => {}
+        if let Some(reset) = new_measurements.latest_reset().cloned() {
+            self.reset_to_initial_state(reset.initial_state, reset.time);
+            new_measurements.retain_at_or_after(reset.time);
         }
 
         self.ingest_imu(new_measurements.imu);
+        self.ingest_global_poses(new_measurements.global_poses);
         self.ingest_visual(new_measurements.visual);
         self.ingest_pose_hint_visual(new_measurements.pose_hint_visual);
         self.ingest_visual_odometry(new_measurements.visual_odometry);

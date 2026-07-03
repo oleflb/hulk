@@ -81,10 +81,6 @@ impl IntervalMeasurements {
         });
     }
 
-    pub fn latest_global_pose(&self) -> Option<&GlobalPoseMeasurement> {
-        self.global_poses.last()
-    }
-
     pub fn latest_reset(&self) -> Option<&ResetMeasurement> {
         self.resets.last()
     }

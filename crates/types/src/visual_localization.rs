@@ -25,7 +25,7 @@ pub enum AssociationPoseHintSource {
 pub struct VisualLocalizationFrame {
     pub robot_to_camera: Isometry3<Robot, Camera>,
     pub associations: Vec<FieldMarkAssociation>,
-    pub backend_reset: Option<Isometry3<Robot, Field>>,
+    pub global_pose: Option<Isometry3<Robot, Field>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]

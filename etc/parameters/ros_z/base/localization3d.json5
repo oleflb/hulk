@@ -2,5 +2,10 @@
   visual_feature_noise_variance: 10000.0,
   pose_hint_visual_feature_noise_variance: 100000.0,
   pose_hint_visual_huber_threshold: 2.0,
+  global_pose_translation_sigma: 0.75,
+  global_pose_rotation_sigma: 0.35,
+  global_pose_huber_threshold: 2.0,
+  live_correction_max_translation_step: 0.05,
+  live_correction_max_rotation_step: 0.035,
   field_containment_sigma: 1.0,
 }

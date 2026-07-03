@@ -204,11 +204,11 @@ impl FieldMarkAssociationState {
         &mut self,
         robot_to_field: Isometry3<Robot, Field>,
         associations: Vec<FieldMarkAssociation>,
-        reset_backend: bool,
+        emit_global_pose: bool,
     ) -> AcceptedFieldMarkAssociations {
         self.has_global_lock = true;
         self.pending_global_recovery = None;
-        if reset_backend {
+        if emit_global_pose {
             AcceptedFieldMarkAssociations::global(robot_to_field, associations)
         } else {
             AcceptedFieldMarkAssociations::associations(associations)
@@ -320,7 +320,7 @@ mod tests {
         assert!(first.associations.is_empty());
         let recovered_pose = second
             .global_pose
-            .expect("stable same-branch recovery should reset backend");
+            .expect("stable same-branch recovery should emit a global pose observation");
         assert_eq!(
             recovered_pose.inner.translation.vector.x,
             global_pose.inner.translation.vector.x
