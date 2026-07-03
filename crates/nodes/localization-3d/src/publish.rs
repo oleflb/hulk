@@ -52,6 +52,20 @@ impl<'a> LocalizationPublishers<'a> {
         Ok(())
     }
 
+    pub(crate) async fn publish_pose_3d(
+        self,
+        time: Time,
+        pose_3d: Option<Isometry3<Field, Robot>>,
+    ) -> Result<()> {
+        self.pose_3d
+            .publish(&TimeWrapper {
+                time,
+                inner: pose_3d,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn publish_startup_prior(
         self,
         time: Time,
