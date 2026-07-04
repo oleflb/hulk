@@ -97,14 +97,14 @@ fn backend_configuration_with_pose_hint(
         ]),
         use_accelerometer_measurements: false,
         gyroscope_process_noise: process_noise,
-        roll_pitch_yaw_noise: Matrix3::from_diagonal(&Vector3::new(0.01, 0.01, 0.00001)),
+        roll_pitch_yaw_noise: Matrix3::from_diagonal(&Vector3::new(0.1, 0.1, 0.001)),
         accelerometer_process_noise: process_noise,
         visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
         pose_hint_visual_feature_noise: Matrix2::identity()
             * pose_hint_visual_feature_noise_variance,
         pose_hint_visual_huber_threshold,
         // factrs::SE3 tangent order is [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z].
-        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 1.0e-2,
+        visual_odometry_noise: SMatrix::<f64, 6, 6>::identity() * 0.1,
         odometer_noise: Matrix3::from_diagonal(&Vector3::new(
             odometer_translation_noise_variance,
             odometer_translation_noise_variance,

@@ -8,6 +8,7 @@ use ros_z_streams::{CreateFutureQueue, QueueEvent};
 use ros2::sensor_msgs::image::Image as RosImage;
 use tokio::runtime::Runtime;
 use types::{
+    field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
     time_wrapper::TimeWrapper,
 };
