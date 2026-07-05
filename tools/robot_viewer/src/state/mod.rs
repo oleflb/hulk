@@ -17,23 +17,19 @@ use types::{
 
 mod alignment;
 
-use alignment::{
-    exact_sample, has_new_overlay_for_displayed_anchor, latest_aligned_stream_time,
-    monotonic_anchor_time, nearest_sample,
-};
+use alignment::{exact_sample, nearest_sample};
 
 pub(crate) type SharedState = Arc<Mutex<ViewerState>>;
 
 const CAMERA_FRAME_BUFFER_CAPACITY: usize = 12;
 const STREAM_BUFFER_CAPACITY: usize = 64;
 const HIGH_RATE_STREAM_BUFFER_CAPACITY: usize = 1024;
-const MAX_ALIGNED_STREAM_AGE: Duration = Duration::from_secs(1);
 const MAX_NEAREST_SAMPLE_DISTANCE: Duration = Duration::from_millis(100);
 
 pub(crate) struct ViewerState {
     pub(crate) connection: ConnectionStatus,
     pub(crate) field_dimensions: Option<FieldDimensions>,
-    pub(crate) localization: Option<Isometry3<Field, Robot>>,
+    pub(crate) localizations: CacheInner<Option<Isometry3<Field, Robot>>>,
     pub(crate) visual_odometer: Option<nalgebra::Isometry3<f32>>,
     pub(crate) robot_kinematics: CacheInner<RobotKinematics>,
     pub(crate) camera_matrices: CacheInner<CameraMatrix>,
@@ -41,8 +37,7 @@ pub(crate) struct ViewerState {
     pub(crate) camera_frames: CacheInner<CameraFrame>,
     pub(crate) camera_sequence: u64,
     display_anchor_time: Option<Time>,
-    displayed_anchor_has_detected_objects: bool,
-    displayed_anchor_has_field_mark_associations: bool,
+    displayed_camera_frame: Option<TimeWrapper<Arc<CameraFrame>>>,
     pub(crate) detected_objects: CacheInner<Vec<Object<RobocupObjectLabel>>>,
     pub(crate) field_mark_associations: CacheInner<FieldMarkAssociations>,
     pub(crate) field_status: StreamStatus,
@@ -61,7 +56,7 @@ impl Default for ViewerState {
         Self {
             connection: ConnectionStatus::default(),
             field_dimensions: None,
-            localization: None,
+            localizations: CacheInner::new(HIGH_RATE_STREAM_BUFFER_CAPACITY),
             visual_odometer: None,
             robot_kinematics: CacheInner::new(HIGH_RATE_STREAM_BUFFER_CAPACITY),
             camera_matrices: CacheInner::new(HIGH_RATE_STREAM_BUFFER_CAPACITY),
@@ -69,8 +64,7 @@ impl Default for ViewerState {
             camera_frames: CacheInner::new(CAMERA_FRAME_BUFFER_CAPACITY),
             camera_sequence: 0,
             display_anchor_time: None,
-            displayed_anchor_has_detected_objects: false,
-            displayed_anchor_has_field_mark_associations: false,
+            displayed_camera_frame: None,
             detected_objects: CacheInner::new(STREAM_BUFFER_CAPACITY),
             field_mark_associations: CacheInner::new(STREAM_BUFFER_CAPACITY),
             field_status: StreamStatus::default(),
@@ -89,6 +83,10 @@ impl Default for ViewerState {
 impl ViewerState {
     pub(crate) fn push_camera_frame(&mut self, time: Time, frame: CameraFrame) {
         self.camera_frames.insert(time, frame);
+    }
+
+    pub(crate) fn push_localization(&mut self, time: Time, value: Option<Isometry3<Field, Robot>>) {
+        self.localizations.insert(time, value);
     }
 
     pub(crate) fn push_robot_kinematics(&mut self, time: Time, value: RobotKinematics) {
@@ -131,58 +129,47 @@ impl ViewerState {
 
     /// Builds the data snapshot rendered by the camera panel and 3D scene for a selected frame.
     ///
-    /// The anchor is the newest camera frame that has aligned field-mark associations, then the
-    /// newest camera frame that has aligned object detections, and finally the newest camera frame.
-    /// Object detections and field-mark associations are exact timestamp matches. Camera matrix and
-    /// kinematics are nearest samples within `MAX_NEAREST_SAMPLE_DISTANCE`; the UI may briefly reuse
-    /// the last valid render sample to avoid flicker from message-ordering jitter. Pose sources and
-    /// calibrated intrinsics remain latest-value streams because their current topics do not carry a
-    /// frame timestamp; the UI labels pose sources as latest for this reason.
+    /// The anchor only advances to a newer camera frame once all active, already-producing aligned
+    /// streams have a matching sample for it. Exact image outputs must match the image timestamp;
+    /// high-rate pose, matrix, and kinematics streams may use the nearest sample within
+    /// `MAX_NEAREST_SAMPLE_DISTANCE`. If no newer complete frame exists, the current frame remains
+    /// selected so the UI never clears the image while waiting for delayed inputs.
     pub(crate) fn aligned_snapshot(&mut self) -> AlignedViewerState {
         let latest_camera_time = self.camera_frames.latest_stamp();
-        let association_anchor_time = latest_aligned_stream_time(
-            &self.field_mark_associations,
-            &self.camera_frames,
-            latest_camera_time,
-        );
-        let detection_anchor_time = latest_aligned_stream_time(
-            &self.detected_objects,
-            &self.camera_frames,
-            latest_camera_time,
-        );
-        let wait_for_detected_objects =
-            self.objects_status.publisher_count > 0 && !self.detected_objects.is_empty();
-        let preferred_anchor_time =
-            association_anchor_time
-                .or(detection_anchor_time)
-                .or_else(|| {
-                    if wait_for_detected_objects && self.display_anchor_time.is_some() {
-                        self.display_anchor_time
-                    } else {
-                        latest_camera_time
-                    }
-                });
-        let latest_camera_time_for_monotonic =
-            if wait_for_detected_objects && detection_anchor_time <= self.display_anchor_time {
-                self.display_anchor_time
-            } else {
-                latest_camera_time
-            };
-        let anchor_time = monotonic_anchor_time(
-            preferred_anchor_time,
-            latest_camera_time_for_monotonic,
-            self.display_anchor_time,
-            has_new_overlay_for_displayed_anchor(
-                preferred_anchor_time,
-                association_anchor_time,
-                detection_anchor_time,
-                self.display_anchor_time,
-                self.displayed_anchor_has_field_mark_associations,
-                self.displayed_anchor_has_detected_objects,
-            ),
-        );
+        let complete_anchor_time =
+            latest_camera_time.and_then(|time| self.latest_complete_anchor_time(time));
+        let display_anchor_available = self.display_anchor_time.is_some_and(|time| {
+            self.camera_frames.get_exact(time).is_some()
+                || self
+                    .displayed_camera_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.time == time)
+        });
+        let anchor_time = match (complete_anchor_time, self.display_anchor_time) {
+            (Some(complete), Some(displayed))
+                if display_anchor_available && complete <= displayed =>
+            {
+                Some(displayed)
+            }
+            (Some(complete), _) => Some(complete),
+            (None, Some(displayed)) if display_anchor_available => Some(displayed),
+            (None, _) => latest_camera_time,
+        };
 
-        let camera_frame = anchor_time.and_then(|time| exact_sample(&self.camera_frames, time));
+        let camera_frame = anchor_time
+            .and_then(|time| exact_sample(&self.camera_frames, time))
+            .or_else(|| {
+                self.displayed_camera_frame
+                    .as_ref()
+                    .filter(|frame| Some(frame.time) == anchor_time)
+                    .cloned()
+            });
+        let localization = anchor_time
+            .and_then(|time| nearest_sample(&self.localizations, time, MAX_NEAREST_SAMPLE_DISTANCE))
+            .map(|sample| TimeWrapper {
+                time: sample.time,
+                inner: *sample.inner,
+            });
         let camera_matrix = anchor_time.and_then(|time| {
             nearest_sample(&self.camera_matrices, time, MAX_NEAREST_SAMPLE_DISTANCE)
         });
@@ -194,19 +181,15 @@ impl ViewerState {
         let field_mark_associations =
             anchor_time.and_then(|time| exact_sample(&self.field_mark_associations, time));
 
-        if anchor_time != self.display_anchor_time {
-            self.display_anchor_time = anchor_time;
-            self.displayed_anchor_has_detected_objects = detected_objects.is_some();
-            self.displayed_anchor_has_field_mark_associations = field_mark_associations.is_some();
-        } else {
-            self.displayed_anchor_has_detected_objects |= detected_objects.is_some();
-            self.displayed_anchor_has_field_mark_associations |= field_mark_associations.is_some();
+        self.display_anchor_time = anchor_time;
+        if let Some(camera_frame) = &camera_frame {
+            self.displayed_camera_frame = Some(camera_frame.clone());
         }
 
         AlignedViewerState {
             anchor_time,
             field_dimensions: self.field_dimensions,
-            latest_localization: self.localization,
+            localization,
             latest_visual_odometer: self.visual_odometer,
             robot_kinematics,
             camera_matrix,
@@ -216,6 +199,38 @@ impl ViewerState {
             field_mark_associations,
         }
     }
+
+    fn latest_complete_anchor_time(&self, latest_camera_time: Time) -> Option<Time> {
+        let mut candidate_time = Some(latest_camera_time);
+        while let Some(time) = candidate_time {
+            if self.has_required_samples(time) {
+                return Some(time);
+            }
+            candidate_time = self.camera_frames.latest_stamp_before(time);
+        }
+        None
+    }
+
+    fn has_required_samples(&self, time: Time) -> bool {
+        (!requires_stream(&self.objects_status, &self.detected_objects)
+            || self.detected_objects.get_exact(time).is_some())
+            && (!requires_stream(
+                &self.field_mark_associations_status,
+                &self.field_mark_associations,
+            ) || self.field_mark_associations.get_exact(time).is_some())
+            && (!requires_stream(&self.localization_status, &self.localizations)
+                || nearest_sample(&self.localizations, time, MAX_NEAREST_SAMPLE_DISTANCE).is_some())
+            && (!requires_stream(&self.camera_matrix_status, &self.camera_matrices)
+                || nearest_sample(&self.camera_matrices, time, MAX_NEAREST_SAMPLE_DISTANCE)
+                    .is_some())
+            && (!requires_stream(&self.robot_kinematics_status, &self.robot_kinematics)
+                || nearest_sample(&self.robot_kinematics, time, MAX_NEAREST_SAMPLE_DISTANCE)
+                    .is_some())
+    }
+}
+
+fn requires_stream<T>(status: &StreamStatus, cache: &CacheInner<T>) -> bool {
+    status.publisher_count > 0 && !cache.is_empty()
 }
 
 #[derive(Clone, Default)]
@@ -240,7 +255,7 @@ pub(crate) struct ViewerStatusSnapshot {
 pub(crate) struct AlignedViewerState {
     pub(crate) anchor_time: Option<Time>,
     pub(crate) field_dimensions: Option<FieldDimensions>,
-    pub(crate) latest_localization: Option<Isometry3<Field, Robot>>,
+    pub(crate) localization: Option<TimeWrapper<Option<Isometry3<Field, Robot>>>>,
     pub(crate) latest_visual_odometer: Option<nalgebra::Isometry3<f32>>,
     pub(crate) robot_kinematics: Option<TimeWrapper<Arc<RobotKinematics>>>,
     pub(crate) camera_matrix: Option<TimeWrapper<Arc<CameraMatrix>>>,

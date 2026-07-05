@@ -455,7 +455,7 @@ fn draw_projected_field_lines(
     state: &AlignedViewerState,
 ) {
     let (Some(field_to_robot), Some(camera_matrix)) = (
-        state.latest_localization,
+        state.localization.as_ref().and_then(|sample| sample.inner),
         state
             .camera_matrix
             .as_ref()

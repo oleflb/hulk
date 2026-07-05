@@ -3,76 +3,6 @@ use std::{sync::Arc, time::Duration};
 use ros_z::{cache::CacheInner, time::Time};
 use types::time_wrapper::TimeWrapper;
 
-use super::{CameraFrame, MAX_ALIGNED_STREAM_AGE};
-
-pub(super) fn monotonic_anchor_time(
-    preferred_anchor_time: Option<Time>,
-    latest_camera_time: Option<Time>,
-    display_anchor_time: Option<Time>,
-    has_new_overlay_for_displayed_anchor: bool,
-) -> Option<Time> {
-    let Some(display_anchor_time) = display_anchor_time else {
-        return preferred_anchor_time;
-    };
-    let preferred_anchor_time = preferred_anchor_time?;
-    if preferred_anchor_time >= display_anchor_time {
-        if preferred_anchor_time == display_anchor_time
-            && let Some(latest_camera_time) = latest_camera_time
-            && latest_camera_time > display_anchor_time
-        {
-            if has_new_overlay_for_displayed_anchor {
-                return Some(preferred_anchor_time);
-            }
-            return Some(latest_camera_time);
-        }
-        return Some(preferred_anchor_time);
-    }
-
-    latest_camera_time
-        .filter(|latest_camera_time| *latest_camera_time >= display_anchor_time)
-        .or(Some(display_anchor_time))
-}
-
-pub(super) fn has_new_overlay_for_displayed_anchor(
-    preferred_anchor_time: Option<Time>,
-    association_anchor_time: Option<Time>,
-    detection_anchor_time: Option<Time>,
-    display_anchor_time: Option<Time>,
-    displayed_anchor_has_field_mark_associations: bool,
-    displayed_anchor_has_detected_objects: bool,
-) -> bool {
-    let Some(display_anchor_time) = display_anchor_time else {
-        return false;
-    };
-    if preferred_anchor_time != Some(display_anchor_time) {
-        return false;
-    }
-
-    let has_new_associations = association_anchor_time == Some(display_anchor_time)
-        && !displayed_anchor_has_field_mark_associations;
-    let has_new_detections = detection_anchor_time == Some(display_anchor_time)
-        && !displayed_anchor_has_detected_objects;
-    has_new_associations || has_new_detections
-}
-
-pub(super) fn latest_aligned_stream_time<T>(
-    stream: &CacheInner<T>,
-    camera_frames: &CacheInner<CameraFrame>,
-    latest_camera_time: Option<Time>,
-) -> Option<Time> {
-    let latest_camera_time = latest_camera_time?;
-    let mut stream_time = stream.latest_stamp_at_or_before(latest_camera_time)?;
-    loop {
-        if latest_camera_time.abs_diff(stream_time) > MAX_ALIGNED_STREAM_AGE {
-            return None;
-        }
-        if camera_frames.get_exact(stream_time).is_some() {
-            return Some(stream_time);
-        }
-        stream_time = stream.latest_stamp_before(stream_time)?;
-    }
-}
-
 pub(super) fn exact_sample<T>(cache: &CacheInner<T>, time: Time) -> Option<TimeWrapper<Arc<T>>> {
     cache
         .get_exact(time)
@@ -93,7 +23,7 @@ pub(super) fn nearest_sample<T>(
 
 #[cfg(test)]
 mod tests {
-    use coordinate_systems::{Camera, Robot};
+    use coordinate_systems::{Camera, Field, Robot};
     use kinematics::robot_kinematics::RobotKinematics;
     use linear_algebra::Isometry3;
     use projection::camera_matrix::CameraMatrix;
@@ -104,7 +34,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::state::{MAX_NEAREST_SAMPLE_DISTANCE, ViewerState};
+    use crate::state::{
+        CAMERA_FRAME_BUFFER_CAPACITY, CameraFrame, MAX_NEAREST_SAMPLE_DISTANCE, ViewerState,
+    };
 
     fn empty_associations() -> FieldMarkAssociations {
         FieldMarkAssociations {
@@ -119,6 +51,10 @@ mod tests {
             time,
             inner: Vec::new(),
         }
+    }
+
+    fn localization() -> Option<Isometry3<Field, Robot>> {
+        Some(Isometry3::<Field, Robot>::identity())
     }
 
     #[test]
@@ -151,11 +87,13 @@ mod tests {
     }
 
     #[test]
-    fn aligned_snapshot_prefers_associations_over_newer_detections() {
+    fn aligned_snapshot_waits_for_all_required_exact_streams() {
         let mut state = ViewerState::default();
         let association_time = Time::from_nanos(1_000_000_000);
         let detection_time = Time::from_nanos(1_100_000_000);
 
+        state.objects_status.update_publishers(1);
+        state.field_mark_associations_status.update_publishers(1);
         state.push_camera_frame(association_time, CameraFrame::default());
         state.push_camera_frame(detection_time, CameraFrame::default());
         state.push_field_mark_associations(association_time, empty_associations());
@@ -163,9 +101,16 @@ mod tests {
 
         let aligned = state.aligned_snapshot();
 
-        assert_eq!(aligned.anchor_time, Some(association_time));
+        assert_eq!(aligned.anchor_time, Some(detection_time));
+        assert!(aligned.field_mark_associations.is_none());
+        assert!(aligned.detected_objects.is_some());
+
+        state.push_field_mark_associations(detection_time, empty_associations());
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(detection_time));
         assert!(aligned.field_mark_associations.is_some());
-        assert!(aligned.detected_objects.is_none());
+        assert!(aligned.detected_objects.is_some());
     }
 
     #[test]
@@ -174,6 +119,7 @@ mod tests {
         let association_time = Time::from_nanos(1_000_000_000);
         let latest_camera_time = Time::from_nanos(1_100_000_000);
 
+        state.field_mark_associations_status.update_publishers(1);
         state.push_camera_frame(association_time, CameraFrame::default());
         state.push_camera_frame(latest_camera_time, CameraFrame::default());
         state.push_field_mark_associations(association_time, empty_associations());
@@ -220,11 +166,12 @@ mod tests {
     }
 
     #[test]
-    fn aligned_snapshot_advances_past_displayed_association_when_newer_camera_exists() {
+    fn aligned_snapshot_keeps_displayed_association_until_next_required_sample() {
         let mut state = ViewerState::default();
         let association_time = Time::from_nanos(1_000_000_000);
         let latest_camera_time = Time::from_nanos(1_100_000_000);
 
+        state.field_mark_associations_status.update_publishers(1);
         state.push_camera_frame(association_time, CameraFrame::default());
         state.push_field_mark_associations(association_time, empty_associations());
         assert_eq!(state.aligned_snapshot().anchor_time, Some(association_time));
@@ -232,8 +179,14 @@ mod tests {
         state.push_camera_frame(latest_camera_time, CameraFrame::default());
         let aligned = state.aligned_snapshot();
 
+        assert_eq!(aligned.anchor_time, Some(association_time));
+        assert!(aligned.field_mark_associations.is_some());
+
+        state.push_field_mark_associations(latest_camera_time, empty_associations());
+        let aligned = state.aligned_snapshot();
+
         assert_eq!(aligned.anchor_time, Some(latest_camera_time));
-        assert!(aligned.field_mark_associations.is_none());
+        assert!(aligned.field_mark_associations.is_some());
     }
 
     #[test]
@@ -242,6 +195,7 @@ mod tests {
         let displayed_time = Time::from_nanos(1_000_000_000);
         let latest_camera_time = Time::from_nanos(1_100_000_000);
 
+        state.objects_status.update_publishers(1);
         state.push_camera_frame(displayed_time, CameraFrame::default());
         assert_eq!(state.aligned_snapshot().anchor_time, Some(displayed_time));
 
@@ -253,8 +207,13 @@ mod tests {
         assert!(aligned.detected_objects.is_some());
 
         let aligned = state.aligned_snapshot();
+        assert_eq!(aligned.anchor_time, Some(displayed_time));
+        assert!(aligned.detected_objects.is_some());
+
+        state.push_detected_objects(empty_detected_objects(latest_camera_time));
+        let aligned = state.aligned_snapshot();
         assert_eq!(aligned.anchor_time, Some(latest_camera_time));
-        assert!(aligned.detected_objects.is_none());
+        assert!(aligned.detected_objects.is_some());
     }
 
     #[test]
@@ -279,5 +238,100 @@ mod tests {
 
         assert_eq!(aligned.anchor_time, Some(second_time));
         assert!(aligned.detected_objects.is_some());
+    }
+
+    #[test]
+    fn aligned_snapshot_keeps_current_frame_while_waiting_for_localization() {
+        let mut state = ViewerState::default();
+        let first_time = Time::from_nanos(1_000_000_000);
+        let second_time = Time::from_nanos(1_300_000_000);
+
+        state.localization_status.update_publishers(1);
+        state.push_camera_frame(first_time, CameraFrame::default());
+        state.push_localization(first_time, localization());
+        assert_eq!(state.aligned_snapshot().anchor_time, Some(first_time));
+
+        state.push_camera_frame(second_time, CameraFrame::default());
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(first_time));
+        assert_eq!(
+            aligned.localization.as_ref().map(|sample| sample.time),
+            Some(first_time)
+        );
+
+        state.push_localization(second_time, localization());
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(second_time));
+        assert_eq!(
+            aligned.localization.as_ref().map(|sample| sample.time),
+            Some(second_time)
+        );
+    }
+
+    #[test]
+    fn aligned_snapshot_uses_localization_for_displayed_image_not_latest() {
+        let mut state = ViewerState::default();
+        let displayed_time = Time::from_nanos(1_000_000_000);
+        let latest_time = Time::from_nanos(1_300_000_000);
+
+        state.objects_status.update_publishers(1);
+        state.localization_status.update_publishers(1);
+        state.push_camera_frame(displayed_time, CameraFrame::default());
+        state.push_detected_objects(empty_detected_objects(displayed_time));
+        state.push_localization(displayed_time, localization());
+        assert_eq!(state.aligned_snapshot().anchor_time, Some(displayed_time));
+
+        state.push_camera_frame(latest_time, CameraFrame::default());
+        state.push_localization(latest_time, None);
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(displayed_time));
+        assert_eq!(
+            aligned.localization.as_ref().map(|sample| sample.time),
+            Some(displayed_time)
+        );
+        assert!(
+            aligned
+                .localization
+                .and_then(|sample| sample.inner)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn aligned_snapshot_keeps_displayed_camera_frame_after_cache_eviction() {
+        let mut state = ViewerState::default();
+        let displayed_time = Time::from_nanos(0);
+
+        state.objects_status.update_publishers(1);
+        state.push_camera_frame(
+            displayed_time,
+            CameraFrame {
+                sequence: 42,
+                ..Default::default()
+            },
+        );
+        state.push_detected_objects(empty_detected_objects(displayed_time));
+        assert_eq!(state.aligned_snapshot().anchor_time, Some(displayed_time));
+
+        for index in 1..=(CAMERA_FRAME_BUFFER_CAPACITY + 1) {
+            state.push_camera_frame(
+                Time::from_nanos(index as i64 * 100_000_000),
+                CameraFrame::default(),
+            );
+        }
+
+        let aligned = state.aligned_snapshot();
+
+        assert_eq!(aligned.anchor_time, Some(displayed_time));
+        assert_eq!(
+            aligned
+                .camera_frame
+                .as_ref()
+                .map(|frame| frame.inner.sequence),
+            Some(42)
+        );
     }
 }

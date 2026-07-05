@@ -83,7 +83,7 @@ fn backend_configuration_with_pose_hint(
     field_containment_sigma: f64,
     field_dimensions: &FieldDimensions,
 ) -> BackendConfiguration {
-    let process_noise = Matrix3::identity() * 0.01;
+    let process_noise = Matrix3::identity() * 1.0;
     BackendConfiguration {
         knot_spacing: Duration::from_millis(200),
         max_optimization_window: Duration::from_secs(2),
@@ -97,7 +97,7 @@ fn backend_configuration_with_pose_hint(
         ]),
         use_accelerometer_measurements: false,
         gyroscope_process_noise: process_noise,
-        roll_pitch_yaw_noise: Matrix3::from_diagonal(&Vector3::new(0.1, 0.1, 0.001)),
+        roll_pitch_yaw_noise: Matrix3::from_diagonal(&Vector3::new(0.0001, 0.0001, 0.005)),
         accelerometer_process_noise: process_noise,
         visual_feature_noise: Matrix2::identity() * visual_feature_noise_variance,
         pose_hint_visual_feature_noise: Matrix2::identity()
@@ -110,7 +110,7 @@ fn backend_configuration_with_pose_hint(
             odometer_translation_noise_variance,
             odometer_yaw_noise_variance,
         )),
-        foot_ground_sigma: 1e-3,
+        foot_ground_sigma: 1e-2,
         field_containment: FieldContainmentConfiguration::from_field_dimensions(
             field_dimensions,
             field_containment_sigma,

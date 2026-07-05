@@ -30,7 +30,7 @@ use super::topics::{
 };
 
 pub(super) struct DebugSubscriptions {
-    localization: TopicObservation<Option<Isometry3<Field, Robot>>>,
+    localization: WindowedDebugStream<Option<Isometry3<Field, Robot>>>,
     visual_odometer: TopicObservation<VisualOdometer>,
     robot_kinematics: WindowedDebugStream<RobotKinematics>,
     camera_matrix: WindowedDebugStream<CameraMatrix>,
@@ -50,9 +50,14 @@ impl DebugSubscriptions {
         )?;
 
         Ok(Self {
-            localization: observer
-                .observe_typed::<Option<Isometry3<Field, Robot>>>(LOCALIZATION_TOPIC)?
-                .spawn(),
+            localization: WindowedDebugStream::new(
+                observer
+                    .observe_typed::<TimeWrapper<Option<Isometry3<Field, Robot>>>>(
+                        LOCALIZATION_TOPIC,
+                    )?
+                    .retention(high_rate_history)
+                    .spawn(),
+            ),
             visual_odometer: observer
                 .observe_typed::<VisualOdometer>(VISUAL_ODOMETER_TOPIC)?
                 .spawn(),
@@ -83,13 +88,15 @@ impl DebugSubscriptions {
     }
 
     pub(super) fn refresh(&mut self, state: &mut ViewerState) {
-        if let Some(record) = self.localization.latest() {
-            state.localization = record.value;
+        for record in self.localization.drain_new() {
+            state.push_localization(record.value.time, record.value.inner);
         }
         update_debug_status(
             &mut state.localization_status,
-            &self.localization,
-            state.localization.is_some(),
+            self.localization.observation(),
+            self.localization
+                .latest()
+                .is_some_and(|record| record.value.inner.is_some()),
         );
 
         if let Some(record) = self.visual_odometer.latest() {

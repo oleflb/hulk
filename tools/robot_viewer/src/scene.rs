@@ -77,7 +77,7 @@ impl ViewerData {
         Self {
             pose_source,
             field_dimensions: state.field_dimensions,
-            localization: state.latest_localization,
+            localization: state.localization.and_then(|sample| sample.inner),
             visual_odometer: state.latest_visual_odometer,
             robot_kinematics: state.robot_kinematics.map(|sample| sample.inner),
             camera_matrix,

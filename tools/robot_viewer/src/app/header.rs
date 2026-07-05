@@ -56,7 +56,7 @@ impl RobotViewerApp {
 
 fn pose_source_label(pose_source: PoseSource) -> &'static str {
     match pose_source {
-        PoseSource::Localization => "localization latest",
+        PoseSource::Localization => "localization aligned",
         PoseSource::VisualOdometer => "visual odometer latest",
     }
 }

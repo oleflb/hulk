@@ -3,7 +3,7 @@ use std::time::Duration;
 pub(crate) const CAMERA_IMAGE_TOPIC: &str = "inputs/left_image";
 
 pub(super) const FIELD_DIMENSIONS_TOPIC: &str = "field_dimensions";
-pub(super) const LOCALIZATION_TOPIC: &str = "localization";
+pub(super) const LOCALIZATION_TOPIC: &str = types::visual_localization::LOCALIZATION_POSE_3D_TOPIC;
 pub(super) const VISUAL_ODOMETER_TOPIC: &str =
     "visual_odometry/current_left_camera_to_visual_odometer";
 pub(super) const ROBOT_KINEMATICS_TOPIC: &str = "robot_kinematics";
