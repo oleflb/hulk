@@ -118,6 +118,7 @@ members = [
   "tools/twix",
   "tools/twix-legacy",
   "tools/widget_gallery",
+  "tools/intrinsic-calibration"
 ]
 resolver = "2"
 # services are built independently by yocto
