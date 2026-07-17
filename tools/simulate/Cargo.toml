@@ -1,0 +1,9 @@
+[package]
+name = "simulate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+mujoco-rs = { version = "5.0.0", features = ["auto-download-mujoco"] }
