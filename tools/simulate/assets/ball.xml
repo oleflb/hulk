@@ -2,8 +2,8 @@
   <compiler angle="radian" meshdir="meshes/" />
 
   <asset>
-    <texture name="ball_rgb" type="2d" file="football_base_color.png" />
-    <texture name="ball_normal" type="2d" file="football_normal.png" />
+    <texture name="ball_rgb" type="2d" file="textures/football_base_color.png" />
+    <texture name="ball_normal" type="2d" file="textures/football_normal.png" />
 
     <material name="ball">
       <layer texture="ball_rgb" role="rgb" />

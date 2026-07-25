@@ -7,3 +7,6 @@ homepage.workspace = true
 
 [dependencies]
 mujoco-rs = { version = "5.0.0", features = ["auto-download-mujoco"] }
+color-eyre = { workspace = true }
+bevy = { workspace = true, features = ["3d", "ui", "free_camera", "bevy_dev_tools"] }
+types = { workspace = true }

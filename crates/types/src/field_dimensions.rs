@@ -63,7 +63,7 @@ impl FieldDimensions {
         goal_inner_width: 1.5,
         goal_post_diameter: 0.1,
         goal_depth: 0.5,
-        corner_arc_radius: 0.0,
+        corner_arc_radius: 0.3,
     };
 }
 
