@@ -10633,8 +10633,12 @@ name = "simulate"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "clap",
  "color-eyre",
  "mujoco-rs",
+ "ros-z",
+ "serde",
+ "tokio",
  "types",
 ]
 

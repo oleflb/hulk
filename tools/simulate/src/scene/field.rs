@@ -5,28 +5,35 @@ use bevy::{
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
-use mujoco_rs::{prelude::MjtGeom, wrappers::SpecItem};
 use types::{
     field_dimensions::FieldDimensions,
     field_marks::{FieldMark, field_marks_from_field_dimensions},
 };
 
-use crate::bevy_mujoco::MujocoWorld;
+use super::{goal, visual::ObjectVisualAssets};
+use crate::{
+    bevy_mujoco::MujocoWorld, parameters::CurrentSimulatorParameters,
+    scene::SceneParameterUpdateSet,
+};
 
 #[derive(Debug, Component)]
-pub struct Field {
-    pub dimensions: FieldDimensions,
-}
+pub struct Field;
+
+#[derive(Component)]
+struct FieldGoal(usize);
 
 #[derive(Component)]
 struct FieldMarkings;
+
+#[derive(Component)]
+pub struct FieldDropTarget;
 
 pub struct FieldPlugin;
 
 impl Plugin for FieldPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_field)
-            .add_systems(Update, update_field);
+            .add_systems(PreUpdate, update_field.in_set(SceneParameterUpdateSet));
     }
 }
 
@@ -34,33 +41,27 @@ fn spawn_field(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut mujoco: ResMut<MujocoWorld>,
+    object_assets: Res<ObjectVisualAssets>,
+    parameters: Res<CurrentSimulatorParameters>,
 ) {
-    let dimensions = FieldDimensions::SPL_2025;
-
-    mujoco
-        .spec()
-        .world_body_mut()
-        .add_geom()
-        .with_name("field_ground")
-        .with_type(MjtGeom::mjGEOM_PLANE)
-        .with_size([0.0, 0.0, 0.1]);
-    mujoco.recompile();
+    let dimensions = parameters.parameters.field_dimensions;
 
     commands.spawn((
-        Field { dimensions },
+        FieldDropTarget,
+        Pickable::default(),
+        Field,
         Mesh3d(meshes.add(Plane3d::default().mesh().size(1.0, 1.0))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.04, 0.34, 0.13),
             perceptual_roughness: 0.95,
             ..default()
         })),
-        Transform::default(),
+        Transform::from_scale(field_scale(&dimensions)),
     ));
 
     commands.spawn((
         FieldMarkings,
-        Mesh3d(meshes.add(FieldMesh::default().finish())),
+        Mesh3d(meshes.add(field_mesh(&dimensions))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::WHITE,
             unlit: true,
@@ -69,26 +70,56 @@ fn spawn_field(
             ..default()
         })),
     ));
+
+    for (index, transform) in goal_transforms(&dimensions).into_iter().enumerate() {
+        let entity = goal::spawn(&mut commands, &object_assets.goal, transform);
+        commands.entity(entity).insert(FieldGoal(index));
+    }
+}
+
+fn goal_transforms(dimensions: &FieldDimensions) -> [Transform; 2] {
+    let half_length = dimensions.length / 2.0;
+    [
+        Transform::from_xyz(-half_length, 0.0, 0.0),
+        Transform::from_xyz(half_length, 0.0, 0.0).with_rotation(Quat::from_rotation_y(PI)),
+    ]
 }
 
 fn update_field(
-    mut field: Query<(&Field, &mut Transform), Changed<Field>>,
+    parameters: Res<CurrentSimulatorParameters>,
+    mut field: Single<&mut Transform, (With<Field>, Without<FieldGoal>)>,
     markings: Single<&Mesh3d, With<FieldMarkings>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut goals: Query<(Entity, &FieldGoal, &mut Transform), Without<Field>>,
+    mut mujoco: ResMut<MujocoWorld>,
 ) {
-    let Ok((field, mut transform)) = field.single_mut() else {
+    if !parameters.is_changed() {
         return;
-    };
-    let dimensions = &field.dimensions;
+    }
+    let dimensions = &parameters.parameters.field_dimensions;
 
-    transform.scale = Vec3::new(
-        dimensions.length + 2.0 * dimensions.border_strip_width,
-        1.0,
-        dimensions.width + 2.0 * dimensions.border_strip_width,
-    );
+    field.scale = field_scale(dimensions);
     meshes
         .insert(markings.id(), field_mesh(dimensions))
         .expect("field markings mesh should exist");
+
+    let transforms = goal_transforms(dimensions);
+    for (entity, goal, mut transform) in &mut goals {
+        *transform = transforms[goal.0];
+        if mujoco.contains_object(entity) {
+            mujoco
+                .set_object_pose(entity, *transform)
+                .unwrap_or_else(|error| warn!("failed to move field goal: {error}"));
+        }
+    }
+}
+
+fn field_scale(dimensions: &FieldDimensions) -> Vec3 {
+    Vec3::new(
+        dimensions.length + 2.0 * dimensions.border_strip_width,
+        1.0,
+        dimensions.width + 2.0 * dimensions.border_strip_width,
+    )
 }
 
 fn field_mesh(dimensions: &FieldDimensions) -> Mesh {
@@ -184,4 +215,25 @@ impl FieldMesh {
 fn point_on_arc(center: Vec2, radius: f32, angle: f32) -> Vec2 {
     let (sin, cos) = angle.sin_cos();
     center + radius * Vec2::new(cos, sin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goals_are_placed_on_goal_lines_and_face_outward() {
+        let [negative, positive] = goal_transforms(&FieldDimensions::SPL_2025);
+
+        assert_eq!(negative.translation, Vec3::new(-4.5, 0.0, 0.0));
+        assert_eq!(positive.translation, Vec3::new(4.5, 0.0, 0.0));
+        assert!(
+            (negative.rotation * Vec3::NEG_X).abs_diff_eq(Vec3::NEG_X, 1e-6),
+            "negative-X goal net should extend toward negative X"
+        );
+        assert!(
+            (positive.rotation * Vec3::NEG_X).abs_diff_eq(Vec3::X, 1e-6),
+            "positive-X goal net should extend toward positive X"
+        );
+    }
 }
