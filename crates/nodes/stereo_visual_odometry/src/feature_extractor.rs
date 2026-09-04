@@ -5,8 +5,11 @@ use color_eyre::{
     eyre::{ContextCompat, bail, ensure},
 };
 
+#[cfg(feature = "ort-webgpu")]
+use ort::execution_providers::WebGPUExecutionProvider;
+#[cfg(feature = "ort-cuda-tensorrt")]
+use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
 use ort::{
-    execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     inputs,
     session::{
         HasSelectedOutputs, RunOptions, Session, SessionOutputs, builder::GraphOptimizationLevel,
@@ -67,16 +70,27 @@ pub struct Matches<'a, From, To> {
 
 impl FeatureExtractor {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        ort::init().commit()?;
+        #[cfg(feature = "ort-cuda-tensorrt")]
         let parent = path.as_ref().parent().wrap_err("failed to find parent")?;
+        #[cfg(feature = "ort-cuda-tensorrt")]
         let tensorrt = TensorRTExecutionProvider::default()
             .with_device_id(0)
             .with_fp16(true)
             .with_engine_cache(true)
             .with_engine_cache_path(parent.display())
             .build();
+        #[cfg(feature = "ort-cuda-tensorrt")]
         let cuda = CUDAExecutionProvider::default().build();
-        let session = Session::builder()?
-            .with_execution_providers([tensorrt, cuda])?
+        let session = Session::builder()?;
+        #[cfg(feature = "ort-cuda-tensorrt")]
+        let session = session.with_execution_providers([tensorrt, cuda])?;
+        #[cfg(feature = "ort-webgpu")]
+        let session = session.with_execution_providers([WebGPUExecutionProvider::default()
+            .with_device_id(0)
+            .build()
+            .error_on_failure()])?;
+        let session = session
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(2)?
             .commit_from_file(path)?;
@@ -371,4 +385,41 @@ fn ensure_same_shape(left: &Image, right: &Image, left_name: &str, right_name: &
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "ort-webgpu"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    #[ignore = "requires ONNX Runtime WebGPU"]
+    fn webgpu_extracts_one_stereo_frame() {
+        let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../etc/neural_networks/xfeat-lighterglue.onnx");
+        let mut extractor = FeatureExtractor::new(model).unwrap();
+        let image = Image {
+            height: 448,
+            width: 544,
+            encoding: "nv12".to_string(),
+            step: 544,
+            data: Arc::from(vec![128; 544 * 448 * 3 / 2]),
+            ..Default::default()
+        };
+        let pair = StereoImagePair {
+            frame_identifier: 0,
+            left: image.clone(),
+            right: image,
+        };
+
+        let output = extractor
+            .extract(&pair, &PreviousFeatureState::new())
+            .unwrap();
+        assert!(output.current_left().is_ok());
+        let mut previous = PreviousFeatureState::new();
+        output.copy_current_left_to(&mut previous).unwrap();
+        drop(output);
+        assert!(extractor.extract(&pair, &previous).is_ok());
+    }
 }
