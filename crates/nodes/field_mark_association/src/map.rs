@@ -5,19 +5,6 @@ use coordinate_systems::Field;
 
 use crate::features::{FEATURE_CLASSES, VisualFeatureClass};
 
-const SYMMETRY_EPSILON: f32 = 1.0e-4;
-const FIELD_HALVES: usize = 2;
-const FIELD_SIDES: usize = 2;
-const L_SPOTS_PER_QUADRANT: usize = 3;
-const T_SPOTS_PER_PENALTY_BOX: usize = 2;
-const GOALPOST_COUNT: usize = FIELD_HALVES * FIELD_SIDES;
-const T_SPOT_COUNT: usize = FIELD_SIDES + FIELD_HALVES * FIELD_SIDES * T_SPOTS_PER_PENALTY_BOX;
-const X_SPOT_COUNT: usize = 1 + FIELD_SIDES;
-const PENALTY_SPOT_COUNT: usize = FIELD_HALVES;
-pub(crate) const MAX_LANDMARKS_PER_CLASS: usize = FIELD_HALVES * FIELD_SIDES * L_SPOTS_PER_QUADRANT;
-pub(crate) const FIELD_LANDMARK_COUNT: usize =
-    GOALPOST_COUNT + MAX_LANDMARKS_PER_CLASS + T_SPOT_COUNT + X_SPOT_COUNT + PENALTY_SPOT_COUNT;
-
 #[derive(Clone, Debug)]
 pub(crate) struct LandmarkMap {
     pub landmarks: Vec<Landmark>,
@@ -33,17 +20,10 @@ pub(crate) struct Landmark {
 }
 
 impl LandmarkMap {
-    pub fn new(field: &FieldDimensions) -> Self {
+    pub fn new(field: &FieldDimensions, symmetry_epsilon: f32) -> Self {
         let mut landmarks = candidate_landmarks(field);
-        fill_symmetric_ids(&mut landmarks);
+        fill_symmetric_ids(&mut landmarks, symmetry_epsilon);
         let landmarks_by_class = landmarks_by_class(&landmarks);
-        assert!(
-            landmarks_by_class
-                .iter()
-                .all(|landmarks| landmarks.len() <= MAX_LANDMARKS_PER_CLASS),
-            "generated landmark class exceeds assignment capacity"
-        );
-        assert_eq!(landmarks.len(), FIELD_LANDMARK_COUNT);
         let class_rarity_weight = class_rarity_weights(&landmarks_by_class);
 
         Self {
@@ -95,10 +75,8 @@ fn candidate_landmarks(field: &FieldDimensions) -> Vec<Landmark> {
         .collect()
 }
 
-pub(crate) fn candidate_points(
-    field: &FieldDimensions,
-) -> Vec<(VisualFeatureClass, Point2<Field>)> {
-    let mut points = Vec::with_capacity(FIELD_LANDMARK_COUNT);
+pub fn candidate_points(field: &FieldDimensions) -> Vec<(VisualFeatureClass, Point2<Field>)> {
+    let mut points = Vec::new();
     for half in [Half::Opponent, Half::Own] {
         for side in [Side::Left, Side::Right] {
             points.push((VisualFeatureClass::GoalPost, field.goal_post(half, side)));
@@ -139,13 +117,13 @@ pub(crate) fn candidate_points(
     points
 }
 
-fn fill_symmetric_ids(landmarks: &mut [Landmark]) {
+fn fill_symmetric_ids(landmarks: &mut [Landmark], symmetry_epsilon: f32) {
     for index in 0..landmarks.len() {
         let landmark = landmarks[index];
-        if let Some((partner_id, _)) = landmarks.iter().enumerate().find(|(_, candidate)| {
+        if let Some(partner_id) = landmarks.iter().position(|candidate| {
             candidate.class == landmark.class
-                && (candidate.xy.x() + landmark.xy.x()).abs() <= SYMMETRY_EPSILON
-                && (candidate.xy.y() + landmark.xy.y()).abs() <= SYMMETRY_EPSILON
+                && (candidate.xy.x() + landmark.xy.x()).abs() <= symmetry_epsilon
+                && (candidate.xy.y() + landmark.xy.y()).abs() <= symmetry_epsilon
         }) {
             landmarks[index].symmetric_id = partner_id;
         }
@@ -157,8 +135,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn symmetry_tolerance_controls_partner_matching() {
+        let mut landmarks = [
+            Landmark {
+                symmetric_id: 0,
+                class: VisualFeatureClass::LSpot,
+                xy: linear_algebra::point![1.0, 2.0],
+            },
+            Landmark {
+                symmetric_id: 1,
+                class: VisualFeatureClass::LSpot,
+                xy: linear_algebra::point![-1.001, -2.0],
+            },
+        ];
+        fill_symmetric_ids(
+            &mut landmarks,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
+        assert_eq!(landmarks[0].symmetric_id, 0);
+        fill_symmetric_ids(&mut landmarks, 0.002);
+        assert_eq!(landmarks[0].symmetric_id, 1);
+        assert_eq!(landmarks[1].symmetric_id, 0);
+    }
+
+    #[test]
     fn candidate_sets_match_field_feature_classes() {
-        let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
+        assert_eq!(
+            map.landmarks.len(),
+            candidate_points(&FieldDimensions::SPL_2025).len()
+        );
+        for (id, landmark) in map.landmarks.iter().enumerate() {
+            let partner = &map.landmarks[landmark.symmetric_id];
+            assert_eq!(partner.symmetric_id, id);
+            assert_eq!(partner.class, landmark.class);
+            assert!((partner.xy.coords().inner + landmark.xy.coords().inner).norm() < 1.0e-4);
+        }
 
         assert_eq!(
             map.landmarks_for_class(VisualFeatureClass::GoalPost).len(),

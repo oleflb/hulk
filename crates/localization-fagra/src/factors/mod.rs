@@ -54,7 +54,6 @@
 //!         bias_walks: ImuBiasWalk<R>,
 //!         motion: MotionPrior<R>,
 //!         imu: ImuKinematics<R>,
-//!         tilt: RollPitchPrior<R>,
 //!         yaw: RelativeYaw<R>,
 //!         feet: Batch<FootGround<R>, FootObservation<R>>,
 //!         containment: FieldContainment<R>,
@@ -84,7 +83,7 @@ mod tests;
 
 pub use field_containment::FieldContainment;
 pub use ground::{FootGround, FootObservation};
-pub use imu::{ImuKinematics, RelativeYaw, RollPitchPrior};
+pub use imu::{ImuKinematics, RelativeYaw};
 pub use imu_bias::{ImuBiasPrior, ImuBiasWalk};
 pub use kinematic_odometry::{AdjacentKinematicOdometry, KinematicOdometry};
 pub use motion::MotionPrior;

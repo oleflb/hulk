@@ -9,14 +9,10 @@ use ros2::{
 };
 use serde::Serialize;
 use stereo_visual_odometry::{
-    OdometryDiagnostics, PoseEvaluationDiagnostics, VisualOdometryPipeline,
+    OdometryDiagnostics, PoseEvaluationDiagnostics, TrackingOutcome, VisualOdometryPipeline,
     parameters::StereoVisualOdometryParameters,
 };
-use types::{
-    stereo_camera_info::StereoCameraInfo,
-    stereo_image_pair::StereoImagePair,
-    visual_odometry::{VisualOdometer, VisualOdometryDelta},
-};
+use types::{stereo_camera_info::StereoCameraInfo, stereo_image_pair::StereoImagePair};
 
 use crate::{
     sensors::VisualOdometryMeasurement,
@@ -57,9 +53,7 @@ pub(crate) struct ProductionVisualOdometry {
     renderer: StereoRenderer,
     pipeline: VisualOdometryPipeline,
     parameters: StereoVisualOdometryParameters,
-    previous_time: Option<Time>,
     previous_left_camera_to_field: Option<Isometry3<f32>>,
-    epoch: u64,
     frame_identifier: u32,
 }
 
@@ -76,9 +70,7 @@ impl ProductionVisualOdometry {
             renderer: StereoRenderer::new(),
             pipeline,
             parameters,
-            previous_time: None,
             previous_left_camera_to_field: None,
-            epoch: 0,
             frame_identifier: 0,
         })
     }
@@ -96,58 +88,33 @@ impl ProductionVisualOdometry {
         let pair = stereo_pair(self.frame_identifier, time, right_reported_time, rendered);
         self.frame_identifier = self.frame_identifier.wrapping_add(1);
 
-        let had_previous = self.previous_time.is_some();
         let started = Instant::now();
-        let estimate = self
+        let output = self
             .pipeline
             .process(&pair, &self.parameters.pose_estimation_parameters);
         let processing_seconds = started.elapsed().as_secs_f64();
         let odometry_diagnostics = self.pipeline.latest_odometry_diagnostics();
         let triangulated = self.pipeline.triangulated_feature_count();
-        let estimated_evaluation = estimate
+        let estimated_evaluation = output
+            .previous_to_current()
             .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
             .and_then(|pose| self.pipeline.evaluate_previous_to_current(pose));
         let truth_evaluation = self.previous_left_camera_to_field.and_then(|previous| {
             self.pipeline
                 .evaluate_previous_to_current(&(left_camera_to_field.inverse() * previous))
         });
 
-        let (estimate, status) = match estimate {
-            Ok(Some(estimate)) => (Some(estimate), ProductionVoStatus::Estimated),
-            Ok(None) if !had_previous => (None, ProductionVoStatus::Initializing),
-            Ok(None) | Err(_) => {
-                self.epoch = self.epoch.wrapping_add(1);
-                self.previous_time = None;
-                self.previous_left_camera_to_field = None;
-                self.pipeline.reset_tracking();
-                (None, ProductionVoStatus::Reset)
-            }
+        let status = match output.outcome {
+            TrackingOutcome::Estimated => ProductionVoStatus::Estimated,
+            TrackingOutcome::Initializing => ProductionVoStatus::Initializing,
+            TrackingOutcome::Reset { .. } => ProductionVoStatus::Reset,
         };
-
-        let delta = self.previous_time.zip(estimate).map(
-            |(previous_time, previous_left_camera_to_current_left_camera)| VisualOdometryDelta {
-                previous_time,
-                current_left_camera_to_previous_left_camera:
-                    previous_left_camera_to_current_left_camera.inverse(),
-            },
-        );
-        if !matches!(status, ProductionVoStatus::Reset) {
-            self.previous_time = Some(time);
-            self.previous_left_camera_to_field = Some(*left_camera_to_field);
-        }
+        self.previous_left_camera_to_field =
+            (!matches!(status, ProductionVoStatus::Reset)).then_some(*left_camera_to_field);
 
         VisualOdometryMeasurement {
-            delta: delta.clone(),
-            odometer: VisualOdometer {
-                time,
-                epoch: self.epoch,
-                delta,
-                current_left_camera_to_visual_odometer: self
-                    .pipeline
-                    .current_left_camera_to_visual_odometer(),
-            },
+            delta: output.odometer.delta.clone(),
+            odometer: output.odometer,
             production_diagnostics: Some(diagnostics(
                 status,
                 processing_seconds,

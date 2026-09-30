@@ -1,6 +1,6 @@
 use crate::Localization;
 use booster::ImuState;
-use color_eyre::Result;
+use color_eyre::{Result, eyre::OptionExt as _};
 use kinematics::robot_kinematics::RobotKinematics;
 use ros_z::{
     cache::Cache,
@@ -9,12 +9,10 @@ use ros_z::{
     time::Time,
 };
 use std::num::NonZeroUsize;
-use types::camera_geometry::{CAMERA_GEOMETRY_TOPIC, CameraGeometry, camera_geometry_at};
+use types::camera_geometry::{CameraGeometry, camera_geometry_at};
 use types::{
-    odometry::{KINEMATIC_ODOMETRY_TOPIC, KinematicOdometryDelta},
-    time_wrapper::TimeWrapper,
-    visual_localization::{VISUAL_LOCALIZATION_TOPIC, VisualLocalizationFrame},
-    visual_odometry::VisualOdometer,
+    odometry::KinematicOdometryDelta, time_wrapper::TimeWrapper,
+    visual_localization::VisualLocalizationFrame, visual_odometry::VisualOdometer,
 };
 
 pub(crate) enum Measurement {
@@ -48,47 +46,65 @@ pub(crate) struct Inputs {
 }
 
 impl Inputs {
-    pub(crate) async fn new(node: &Node) -> Result<Self> {
+    pub(crate) async fn new(
+        node: &Node,
+        parameters: &crate::parameters::InputParameters,
+    ) -> Result<Self> {
         Ok(Self {
             kinematic_odometry: node
-                .subscriber(KINEMATIC_ODOMETRY_TOPIC)
-                .queue_capacity(NonZeroUsize::new(60).unwrap())
+                .subscriber("odometry/kinematic_delta")
+                .queue_capacity(
+                    NonZeroUsize::new(parameters.kinematic_odometry_queue)
+                        .ok_or_eyre("inputs.kinematic_odometry_queue must be > 0")?,
+                )
                 .queue_overflow_reporting(QueueOverflowReporting::Warn)
                 .build()
                 .await?,
             imu: node
                 .subscriber("inputs/imu_state")
-                .queue_capacity(NonZeroUsize::new(500).unwrap())
+                .queue_capacity(
+                    NonZeroUsize::new(parameters.imu_queue)
+                        .ok_or_eyre("inputs.imu_queue must be > 0")?,
+                )
                 .queue_overflow_reporting(QueueOverflowReporting::Warn)
                 .build()
                 .await?,
             kinematics: node
                 .subscriber("robot_kinematics")
-                .queue_capacity(NonZeroUsize::new(500).unwrap())
+                .queue_capacity(
+                    NonZeroUsize::new(parameters.kinematics_queue)
+                        .ok_or_eyre("inputs.kinematics_queue must be > 0")?,
+                )
                 .queue_overflow_reporting(QueueOverflowReporting::Warn)
                 .build()
                 .await?,
             visual: node
-                .subscriber(VISUAL_LOCALIZATION_TOPIC)
-                .queue_capacity(NonZeroUsize::new(60).unwrap())
+                .subscriber("field_mark_association/visual_localization_local")
+                .queue_capacity(
+                    NonZeroUsize::new(parameters.visual_queue)
+                        .ok_or_eyre("inputs.visual_queue must be > 0")?,
+                )
                 .queue_overflow_reporting(QueueOverflowReporting::Warn)
                 .build()
                 .await?,
             odometry: node
                 .subscriber("visual_odometry/current_left_camera_to_visual_odometer")
-                .queue_capacity(NonZeroUsize::new(60).unwrap())
+                .queue_capacity(
+                    NonZeroUsize::new(parameters.visual_odometry_queue)
+                        .ok_or_eyre("inputs.visual_odometry_queue must be > 0")?,
+                )
                 .queue_overflow_reporting(QueueOverflowReporting::Warn)
                 .build()
                 .await?,
             cameras: node
-                .subscriber::<TimeWrapper<CameraGeometry>>(CAMERA_GEOMETRY_TOPIC)
-                .cache(1500)
+                .subscriber::<TimeWrapper<CameraGeometry>>("camera_geometry")
+                .cache(parameters.camera_cache)
                 .with_stamp(|v| v.time)
                 .build()
                 .await?,
             robot_kinematics: node
                 .subscriber::<TimeWrapper<RobotKinematics>>("robot_kinematics")
-                .cache(1000)
+                .cache(parameters.kinematics_cache)
                 .with_stamp(|v| v.time)
                 .build()
                 .await?,
@@ -152,11 +168,15 @@ impl Inputs {
             Measurement::Visual(v) => localization.ingest_visual_localization_frame(v),
             Measurement::KinematicOdometry(v) => localization.ingest_kinematic_odometry(v),
             Measurement::Odometry(v) => {
-                let previous = v
-                    .delta
-                    .as_ref()
-                    .and_then(|d| camera_geometry_at(&self.cameras, d.previous_time));
-                let current = camera_geometry_at(&self.cameras, v.time);
+                let previous = v.delta.as_ref().and_then(|d| {
+                    camera_geometry_at(
+                        &self.cameras,
+                        d.previous_time,
+                        localization.max_camera_gap(),
+                    )
+                });
+                let current =
+                    camera_geometry_at(&self.cameras, v.time, localization.max_camera_gap());
                 localization.ingest_visual_odometry(v, previous.as_ref(), current.as_ref())
             }
         }

@@ -1,7 +1,5 @@
 use coordinate_systems::Robot;
-use fagra::{
-    BlockId, EvaluationError, Factor, JacobianBlock, LinearizationSink, StateKey, StateStore,
-};
+use fagra::{BlockId, EvaluationError, Factor, LinearizationSink, StateKey, StateStore};
 use linear_algebra::Vector3;
 use nalgebra::{Matrix3, RealField, SMatrix, SVector, UnitQuaternion};
 
@@ -9,7 +7,7 @@ use super::common;
 use crate::variables::{ImuBias, PoseControl};
 
 fn validate_bias_tau<R: RealField + Copy>(tau: R) -> Result<(), EvaluationError> {
-    if tau.is_finite() && tau >= R::zero() && tau <= R::one() {
+    if tau >= R::zero() && tau <= R::one() {
         Ok(())
     } else {
         Err(EvaluationError::InvalidEvaluation)
@@ -33,7 +31,9 @@ pub struct ImuKinematics<R: RealField + Copy = f64> {
     pub bias_tau: R,
     /// Angular velocity in Robot axes, rad/s.
     pub angular_velocity: Vector3<Robot, R>,
-    /// SDK attitude's up direction in Robot axes.
+    /// SDK attitude's unit up direction in Robot axes. Comparing all three
+    /// components of Rᵀ*[0,0,1] distinguishes inversion without observing yaw.
+    /// The exact antipode is a stationary maximum.
     pub measured_up: Option<Vector3<Robot, R>>,
     pub gyroscope_information_root: Matrix3<R>,
     pub tilt_information_root: Matrix3<R>,
@@ -76,7 +76,7 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>> + StateStore<ImuBias<R>>
         if let Some(k) = k {
             cost += common::cost(
                 &(self.gyroscope_information_root
-                    * (k.angular_velocity.inner + gyro_bias - self.angular_velocity.inner)),
+                    * (k.inner + gyro_bias - self.angular_velocity.inner)),
             )?;
         }
         if let Some((measured, pose)) = self.measured_up.zip(pose.as_ref()) {
@@ -117,7 +117,7 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>> + StateStore<ImuBias<R>>
         };
         if let Some(k) = k {
             let residual = self.gyroscope_information_root
-                * (k.kinematics.angular_velocity.inner + gyro_bias - self.angular_velocity.inner);
+                * (k.angular_velocity.inner + gyro_bias - self.angular_velocity.inner);
             let jacobians = k
                 .angular_velocity_jacobians
                 .map(|j| self.gyroscope_information_root * j);
@@ -127,7 +127,14 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>> + StateStore<ImuBias<R>>
                     .copy_from(&(self.gyroscope_information_root * weight));
                 j
             });
-            self.emit(sink, &residual, &jacobians, &gyro_jacobians)?;
+            common::emit_pose_and_bias(
+                sink,
+                &self.controls,
+                &self.biases,
+                &residual,
+                &jacobians,
+                &gyro_jacobians,
+            )?;
         }
         if let Some((measured, pose)) = self.measured_up.zip(pose.as_ref()) {
             let residual = tilt(
@@ -147,26 +154,6 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>> + StateStore<ImuBias<R>>
 }
 
 impl<R: RealField + Copy> ImuKinematics<R> {
-    fn emit<L: LinearizationSink<Scalar = R>>(
-        &self,
-        sink: &mut L,
-        residual: &nalgebra::Vector3<R>,
-        pose: &[SMatrix<R, 3, 6>; 4],
-        bias: &[SMatrix<R, 3, 6>; 2],
-    ) -> Result<(), EvaluationError> {
-        common::emit_blocks(
-            sink,
-            residual,
-            [
-                JacobianBlock::new(self.controls[0], &pose[0]),
-                JacobianBlock::new(self.controls[1], &pose[1]),
-                JacobianBlock::new(self.controls[2], &pose[2]),
-                JacobianBlock::new(self.controls[3], &pose[3]),
-                JacobianBlock::new(self.biases[0], &bias[0]),
-                JacobianBlock::new(self.biases[1], &bias[1]),
-            ],
-        )
-    }
     fn validate(&self) -> Result<(), EvaluationError> {
         validate_bias_tau(self.tau)?;
         validate_bias_tau(self.bias_tau)?;
@@ -194,59 +181,6 @@ fn tilt_jacobian<R: RealField + Copy>(
     root: &Matrix3<R>,
 ) -> Matrix3<R> {
     root * common::up(rotation).cross_matrix()
-}
-
-/// Up-direction constraint on the evaluated spline, independent of absolute IMU yaw.
-///
-/// Residual: `W * (Rᵀ * [0, 0, 1] - measured_up)`, where `R` maps Robot to Local.
-/// All three components distinguish upright from inverted attitudes while imposing
-/// only two rotational constraints. The exact antipode is a stationary maximum.
-#[derive(Clone, Debug)]
-pub struct RollPitchPrior<R: RealField + Copy = f64> {
-    pub controls: [StateKey<PoseControl<R>>; 4],
-    pub duration: R,
-    pub tau: R,
-    /// Finite unit up direction from IMU attitude, expressed in the robot frame.
-    pub measured_up: Vector3<Robot, R>,
-    /// Whitens dimensionless robot-frame up-vector errors, not Euler angles.
-    /// Angular measurement covariance must be mapped into these coordinates upstream.
-    pub information_root: Matrix3<R>,
-}
-
-impl<R: RealField + Copy, S: StateStore<PoseControl<R>>> Factor<S> for RollPitchPrior<R> {
-    type Scalar = R;
-
-    fn visit_variables(&self, mut visitor: impl FnMut(BlockId)) {
-        for key in self.controls {
-            visitor(key.block_id());
-        }
-    }
-
-    fn cost(&self, states: &S) -> Result<R, EvaluationError> {
-        let pose = common::spline(states, &self.controls, self.duration)?.pose(self.tau)?;
-        common::cost(&tilt(
-            &pose.inner.rotation,
-            &self.measured_up,
-            &self.information_root,
-        )?)
-    }
-
-    fn linearize<L: LinearizationSink<Scalar = R>>(
-        &self,
-        states: &S,
-        sink: &mut L,
-    ) -> Result<(), EvaluationError> {
-        let spline = common::spline(states, &self.controls, self.duration)?;
-        let pose = spline.linearize()?.pose(self.tau)?;
-        let residual = tilt(
-            &pose.pose.inner.rotation,
-            &self.measured_up,
-            &self.information_root,
-        )?;
-        let h = tilt_jacobian(&pose.pose.inner.rotation, &self.information_root);
-        let jacobians = pose.jacobians.map(|j| h * j.fixed_rows::<3>(0));
-        common::emit(sink, &self.controls, &residual, &jacobians)
-    }
 }
 
 /// Scalar change in evaluated yaw from segment start to `end_tau`, without an absolute yaw anchor.

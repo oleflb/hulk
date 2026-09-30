@@ -4,7 +4,7 @@ use nalgebra::Matrix2;
 use ros_z::time::Time;
 use types::odometry::KinematicOdometryDelta;
 
-use super::{Estimator, HUBER_THRESHOLD, WINDOW_NS, recovery::MotionRecord, seconds_per_knot};
+use super::{Estimator, recovery::MotionRecord};
 
 impl Estimator {
     pub(crate) fn ingest_kinematic_odometry(
@@ -29,7 +29,7 @@ impl Estimator {
                     .latest_time
                     .max(sample.time)
                     .as_nanos()
-                    .saturating_sub(WINDOW_NS)
+                    .saturating_sub(self.parameters.timing.window_ns())
         {
             return Ok(false);
         }
@@ -83,22 +83,22 @@ impl Estimator {
         if a == b {
             self.graph.add_factor(KinematicOdometry {
                 controls: first,
-                duration: seconds_per_knot(),
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
                 previous_tau,
                 current_tau,
                 translation,
                 information_root,
-                huber_threshold: HUBER_THRESHOLD,
+                huber_threshold: self.parameters.model.huber_threshold,
             })?;
         } else {
             self.graph.add_factor(AdjacentKinematicOdometry {
                 controls: [first[0], first[1], first[2], first[3], second[3]],
-                duration: seconds_per_knot(),
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
                 previous_tau,
                 current_tau,
                 translation,
                 information_root,
-                huber_threshold: HUBER_THRESHOLD,
+                huber_threshold: self.parameters.model.huber_threshold,
             })?;
         }
         *self.measurements.entry(a).or_default() += 1;

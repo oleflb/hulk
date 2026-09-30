@@ -10,7 +10,6 @@ use ros_z::time::Time;
 use serde::Deserialize;
 use types::{
     field_dimensions::FieldDimensions,
-    localization::LocalizationState3D,
     object_detection::{Object, RobocupObjectLabel},
     visual_localization::AssociationGeometry,
 };
@@ -98,13 +97,11 @@ fn real_recording_tracking_fixtures_match_all_expected_landmarks() {
     for fixture in fixtures() {
         let features = find_detected_visual_features(&fixture.detections);
         let (geometry, metrics) = geometry_oracle::expected_geometry(&fixture);
-        let LocalizationState3D::Tracking { estimate, .. } = geometry.state else {
-            unreachable!("oracle supplies a tracking prior");
-        };
+        let estimate = geometry.estimate;
         let covariance = estimate.covariance;
         assert!((covariance - covariance.transpose()).norm() < 1.0e-7);
         assert!(covariance.symmetric_eigen().eigenvalues.min() > -1.0e-7);
-        let rotation = estimate.robot_to_field.inner.rotation.to_rotation_matrix();
+        let rotation = estimate.pose.inner.rotation.to_rotation_matrix();
         let field_rotation_covariance =
             rotation.matrix() * covariance.fixed_view::<3, 3>(0, 0) * rotation.matrix().transpose();
         let field_translation_covariance =
@@ -161,14 +158,4 @@ fn robot_to_camera(camera: &CameraMatrix) -> Isometry3<Robot, Camera> {
 // This historical frame uses Ground as Local: both have the same horizontal plane.
 fn robot_to_local(camera: &CameraMatrix) -> Isometry3<Robot, Local> {
     camera.ground_to_robot.inverse().inner.framed_transform()
-}
-
-fn fixture_geometry(camera: &CameraMatrix) -> AssociationGeometry {
-    AssociationGeometry {
-        epoch: 0,
-        generation: 0,
-        state: LocalizationState3D::Startup,
-        robot_to_local: robot_to_local(camera),
-        local_to_field: None,
-    }
 }

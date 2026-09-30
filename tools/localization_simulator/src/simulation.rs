@@ -14,7 +14,7 @@ use ros_z::time::Time;
 use types::camera_geometry::CameraGeometry;
 use types::{
     field_dimensions::FieldDimensions,
-    localization::{LocalizationState, LocalizationState3D},
+    localization::{LocalizationEstimate, LocalizationState},
     time_wrapper::TimeWrapper,
     visual_localization::{AssociationGeometry, FieldMarkAssociation, VisualLocalizationFrame},
     visual_odometry::VisualOdometryDelta,
@@ -71,8 +71,8 @@ pub struct SimulationHistorySample {
     pub live_robot_to_field: Option<FramedIsometry3<Robot, Field>>,
     /// Global visual lock state at this tick.
     pub global_visual_lock: GlobalVisualLock,
-    /// Authoritative localization lifecycle state, including the last trusted estimate after loss.
-    pub state: LocalizationState3D,
+    /// Authoritative localization lifecycle state.
+    pub state: LocalizationState,
     /// Diagnostics from the latest backend solve.
     pub diagnostics: Option<SolveDiagnostics>,
     /// Field-mark counts when this tick emitted a field-mark frame.
@@ -91,8 +91,7 @@ pub struct LocalizationSimulation {
     config: SimulationConfig,
     history: Vec<SimulationHistorySample>,
     localization: Localization,
-    initial_geometry: TimeWrapper<AssociationGeometry>,
-    tracking_reference: Option<types::localization::LocalizationEstimate>,
+    latest_estimate: Option<LocalizationEstimate>,
     sensors: SyntheticSensors,
     field_dimensions: FieldDimensions,
     association_parameters: FieldMarkAssociationParameters,
@@ -145,17 +144,7 @@ impl LocalizationSimulation {
             step_index: 0,
             previous_camera_geometry: None,
             latest_diagnostics: None,
-            tracking_reference: None,
-            initial_geometry: TimeWrapper {
-                time: Time::from_nanos(0),
-                inner: AssociationGeometry {
-                    epoch: 0,
-                    generation: 0,
-                    state: LocalizationState3D::Startup,
-                    robot_to_local: initial_robot_to_local,
-                    local_to_field: None,
-                },
-            },
+            latest_estimate: None,
             production_visual_odometry,
         })
     }
@@ -182,22 +171,15 @@ impl LocalizationSimulation {
     }
 
     fn association_geometry(&self) -> Option<TimeWrapper<AssociationGeometry>> {
-        match self.localization.estimate() {
-            Some(estimate) => Some(TimeWrapper {
-                time: estimate.time,
-                inner: AssociationGeometry::from_estimate(
-                    &estimate,
-                    &self.localization.status(),
-                    self.tracking_reference.as_ref(),
-                )?,
-            }),
-            None => Some(self.initial_geometry.clone()),
-        }
+        let estimate = self.latest_estimate.as_ref()?;
+        Some(TimeWrapper {
+            time: estimate.time,
+            inner: AssociationGeometry::from_estimate(estimate, &self.localization.status())?,
+        })
     }
 
-    fn state(&self) -> LocalizationState3D {
-        self.association_geometry()
-            .map_or(LocalizationState3D::Startup, |g| g.inner.state)
+    fn state(&self) -> LocalizationState {
+        self.localization.status().state
     }
 
     /// Resets and deterministically runs the complete scenario.
@@ -338,25 +320,24 @@ impl LocalizationSimulation {
             }
         }
 
-        self.latest_diagnostics = Some(self.localization.solve(time).diagnostics);
-        if self.localization.status().state == LocalizationState::Tracking {
-            self.tracking_reference = self.localization.estimate();
+        let output = self.localization.solve(time);
+        self.latest_diagnostics = Some(output.diagnostics);
+        if let Some(estimate) = output.estimate {
+            self.latest_estimate = Some(estimate);
         }
         let live_robot_to_field = self
-            .localization
-            .estimate()
+            .latest_estimate
             .and_then(|estimate| estimate.robot_to_field)
             .map(|field| field.pose)
             .map(|pose| pose.inner.cast().framed_transform());
 
         let sample = SimulationHistorySample {
             time,
-            estimate_time: self.localization.estimate().map(|estimate| estimate.time),
+            estimate_time: self.latest_estimate.map(|estimate| estimate.time),
             imu,
             truth_robot_to_field: robot_to_field,
             raw_backend_robot_to_field: self
-                .localization
-                .estimate()
+                .latest_estimate
                 .and_then(|estimate| estimate.robot_to_field)
                 .map(|field| field.pose),
             live_robot_to_field,
@@ -557,7 +538,7 @@ mod tests {
         count_at: impl Fn(i64) -> usize,
     ) -> LocalizationSimulation {
         let mut simulation = LocalizationSimulation::new(scenario, config).unwrap();
-        assert_eq!(simulation.state(), LocalizationState3D::Startup);
+        assert_eq!(simulation.state(), LocalizationState::Startup);
         while simulation
             .step_with_observation_filter(|time, observations| {
                 // Restrict the emitted sensor frame, not the associator's output or its pose prior.
@@ -599,21 +580,17 @@ mod tests {
         let mut maximum_rotation_error = 0.0_f32;
         for sample in simulation.history() {
             let state = match sample.state {
-                LocalizationState3D::Startup => "Startup",
-                LocalizationState3D::Tracking { .. } => "Tracking",
-                LocalizationState3D::LostTrack { .. } => "LostTrack",
+                LocalizationState::Startup => "Startup",
+                LocalizationState::Tracking => "Tracking",
+                LocalizationState::LostTrack => "LostTrack",
             };
             if transitions
                 .last()
                 .is_none_or(|&(_, previous)| previous != state)
             {
                 transitions.push((sample.time.as_nanos(), state));
-                if let LocalizationState3D::Tracking {
-                    last_successful_solve,
-                    ..
-                } = sample.state
-                {
-                    assert_eq!(last_successful_solve, sample.time);
+                if sample.state == LocalizationState::Tracking {
+                    assert_eq!(sample.estimate_time, Some(sample.time));
                     assert!(sample.diagnostics.as_ref().unwrap().measurement_count >= 3);
                 }
             }
@@ -670,22 +647,10 @@ mod tests {
                 (9_000_000_000, "Tracking"),
             ]
         );
-        let mut trusted = None;
         for sample in simulation.history() {
-            match sample.state {
-                LocalizationState3D::Tracking {
-                    estimate,
-                    last_successful_solve,
-                } => {
-                    trusted = Some((estimate, last_successful_solve));
-                }
-                LocalizationState3D::LostTrack {
-                    last_known_estimate,
-                    last_successful_solve,
-                } => {
-                    assert_eq!(Some((last_known_estimate, last_successful_solve)), trusted);
-                }
-                LocalizationState3D::Startup => {}
+            if sample.state == LocalizationState::LostTrack {
+                assert_eq!(sample.global_visual_lock, GlobalVisualLock::Unlocked);
+                assert_eq!(sample.estimate_time, Some(sample.time));
             }
         }
     }
@@ -725,15 +690,12 @@ mod tests {
                 .iter()
                 .filter(|sample| sample.time.as_nanos() >= 4_000_000_000)
             {
-                let estimate = match sample.state {
-                    LocalizationState3D::Tracking { estimate, .. } => estimate,
-                    LocalizationState3D::LostTrack {
-                        last_known_estimate,
-                        ..
-                    } => last_known_estimate,
-                    LocalizationState3D::Startup => panic!("recovery must not restart globally"),
-                };
-                assert!(estimate.robot_to_field.translation().x() > 0.0);
+                assert_ne!(
+                    sample.state,
+                    LocalizationState::Startup,
+                    "recovery must not restart globally"
+                );
+                assert!(sample.raw_backend_robot_to_field.unwrap().translation().x() > 0.0);
             }
         }
     }
@@ -797,7 +759,7 @@ mod tests {
             .unwrap();
         assert_eq!(boundary.landmark_frame.as_ref().unwrap().associated, 0);
         assert!(
-            matches!(boundary.state, LocalizationState3D::LostTrack { .. }),
+            boundary.state == LocalizationState::LostTrack,
             "shared dispatch requires exposure after the loss boundary"
         );
     }
@@ -956,7 +918,7 @@ mod tests {
             simulation
                 .history
                 .iter()
-                .all(|sample| sample.state == LocalizationState3D::Startup
+                .all(|sample| sample.state == LocalizationState::Startup
                     && sample.live_robot_to_field.is_none())
         );
         for counts in simulation
@@ -1039,15 +1001,8 @@ mod tests {
         assert_eq!(counts.emitted_detections, 0);
         assert_eq!(counts.associated, 0);
         assert!(counts.associations.is_empty());
-        assert!(
-            simulation
-                .association_geometry()
-                .unwrap()
-                .inner
-                .local_to_field
-                .is_none()
-        );
-        assert_eq!(simulation.state(), LocalizationState3D::Startup);
+        assert!(simulation.association_geometry().is_none());
+        assert_eq!(simulation.state(), LocalizationState::Startup);
     }
 
     #[test]
@@ -1063,23 +1018,21 @@ mod tests {
         )
         .unwrap();
         // The provisional localizer height must not determine startup projection scale.
-        simulation
-            .initial_geometry
-            .inner
-            .robot_to_local
-            .inner
-            .translation
-            .vector
-            .z = 6.0;
         let truth =
             robot_to_field_from_camera_to_field(&simulation.scenario.sample_camera_to_field(0.0));
+        let (roll, pitch, _) = truth.inner.rotation.euler_angles();
+        let initial_pose = Isometry3::from_parts(
+            Translation3::new(0.0, 0.0, 6.0),
+            UnitQuaternion::from_euler_angles(roll, pitch, 0.0),
+        )
+        .framed_transform();
         simulation.localization = Localization::new(
             Time::from_nanos(0),
             0,
             &production_localization_parameters().unwrap(),
             &simulation.field_dimensions,
             &CameraGeometry::from(&camera_matrix(&truth)),
-            simulation.initial_geometry.inner.robot_to_local,
+            initial_pose,
         )
         .unwrap();
         assert_eq!(
@@ -1096,10 +1049,11 @@ mod tests {
             .association_geometry()
             .unwrap()
             .inner
-            .robot_to_local
+            .estimate
+            .pose
             .translation()
             .z();
-        assert!((fitted_height - truth.translation().z()).abs() < 0.01);
+        assert!((fitted_height - f64::from(truth.translation().z())).abs() < 0.01);
         assert!(counts.associated >= 3);
     }
 

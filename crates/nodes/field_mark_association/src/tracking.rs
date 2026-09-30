@@ -1,14 +1,11 @@
-use coordinate_systems::{Field, Local, Pixel, Robot};
+use coordinate_systems::{Field, Pixel, Robot};
 use linear_algebra::{Isometry3, Point2, Point3};
 use linear_sum_assignment::{AssignmentSolver, Objective};
 use nalgebra::{
     Matrix2, Matrix2x3, Matrix2x6, Matrix3, Matrix3x6, Matrix6, SMatrix, SVector, Vector3,
 };
 use ndarray::Array2;
-use types::{
-    localization::{LocalizationEstimate3D, LocalizationState3D},
-    visual_localization::FieldMarkAssociation,
-};
+use types::{localization::PoseEstimate, visual_localization::FieldMarkAssociation};
 
 use crate::{
     AssociationResult, DetectedVisualFeature, DetectedVisualFeatures,
@@ -17,23 +14,14 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-struct TrackingPrior {
-    anchor_estimate: LocalizationEstimate3D,
-    predicted_robot_to_field: Isometry3<Robot, Field>,
-    age: f32,
-}
-
-#[derive(Clone, Copy)]
 struct Prediction {
     pixel: Point2<Pixel>,
     covariance: Matrix2<f64>,
-    anchor_jacobian: Matrix2x6<f64>,
-    current_jacobian: Matrix2x6<f64>,
+    jacobian: Matrix2x6<f64>,
 }
 
 struct PredictionNoise {
-    anchor: Matrix6<f64>,
-    current: Matrix6<f64>,
+    pose: Matrix6<f64>,
     pixel_variance: f64,
 }
 
@@ -41,8 +29,11 @@ pub(crate) fn associate(
     input: AssociationInput<'_>,
     parameters: &FieldMarkAssociationParameters,
 ) -> Option<AssociationResult> {
-    let prior = validated_prior(input, parameters)?;
-    let map = LandmarkMap::new(input.field_dimensions);
+    let age = validated_age(input, parameters)?;
+    let map = LandmarkMap::new(
+        input.field_dimensions,
+        parameters.global_localizer.symmetry_epsilon,
+    );
     if map
         .landmarks
         .iter()
@@ -55,32 +46,28 @@ pub(crate) fn associate(
     if detections.len() < config.min_inliers {
         return None;
     }
-    let current_covariance =
-        process_covariance(input.geometry.robot_to_local, prior.age, parameters);
+    let estimate = input.geometry.estimate;
     let noise = PredictionNoise {
-        anchor: prior.anchor_estimate.covariance.cast::<f64>(),
-        current: current_covariance.cast::<f64>(),
+        pose: estimate.covariance + process_covariance(estimate.pose, age, parameters),
         pixel_variance: f64::from(config.detection_pixel_sigma).powi(2),
     };
-    let predictions = project_predictions(input, &map, prior, &noise);
+    let predictions = map
+        .landmarks
+        .iter()
+        .map(|point| project_landmark(point.xy.extend(0.0), input, &noise))
+        .collect::<Vec<_>>();
     match_predictions(&detections, &map, &predictions, &noise, parameters)
 }
 
-fn validated_prior(
+fn validated_age(
     input: AssociationInput<'_>,
     parameters: &FieldMarkAssociationParameters,
-) -> Option<TrackingPrior> {
+) -> Option<f32> {
     let tracking = parameters.tracking;
-    let LocalizationState3D::Tracking {
-        estimate,
-        last_successful_solve,
-    } = input.geometry.state
-    else {
-        return None;
-    };
-    let alignment = input.geometry.local_to_field?;
+    let estimate = input.geometry.estimate;
+    let last_successful_solve = input.geometry.last_successful_solve;
     if !valid_geometry(input, estimate, parameters.global_localizer)
-        || !valid_covariance(estimate.covariance)
+        || !valid_covariance(estimate.covariance, tracking)
     {
         return None;
     }
@@ -91,106 +78,73 @@ fn validated_prior(
     if age > tracking.max_age {
         return None;
     }
-    Some(TrackingPrior {
-        anchor_estimate: estimate,
-        predicted_robot_to_field: alignment.to_3d() * input.geometry.robot_to_local,
-        age: age.as_secs_f32(),
-    })
+    Some(age.as_secs_f32())
 }
 
 fn valid_geometry(
     input: AssociationInput<'_>,
-    estimate: LocalizationEstimate3D,
+    estimate: PoseEstimate<Robot, Field>,
     config: crate::GlobalLocalizerParameters,
 ) -> bool {
-    let Some(alignment) = input.geometry.local_to_field else {
-        return false;
-    };
     let intrinsic = input.camera_intrinsic;
-    if !alignment
-        .inner
-        .to_homogeneous()
-        .iter()
-        .all(|x| x.is_finite())
-        || [
-            estimate.robot_to_field.inner.to_homogeneous(),
-            input.geometry.robot_to_local.inner.to_homogeneous(),
-            input.robot_to_camera.inner.to_homogeneous(),
-        ]
-        .iter()
-        .any(|matrix| matrix.iter().any(|x| !x.is_finite()))
-        || !intrinsic.is_valid()
-        || input.visual_features.supported_feature_count() > config.max_input_detections
-    {
-        return false;
-    }
-    true
+    [
+        estimate.pose.inner.to_homogeneous(),
+        input.robot_to_camera.inner.to_homogeneous().cast::<f64>(),
+    ]
+    .iter()
+    .all(|matrix| matrix.iter().all(|x| x.is_finite()))
+        && intrinsic.is_valid()
+        && input.visual_features.supported_feature_count() <= config.max_input_detections
 }
 
-fn valid_covariance(covariance: Matrix6<f32>) -> bool {
+fn valid_covariance(
+    covariance: Matrix6<f64>,
+    parameters: crate::TrackingAssociationParameters,
+) -> bool {
     if !covariance.iter().all(|x| x.is_finite())
-        || (covariance - covariance.transpose()).amax() > 1.0e-5
+        || (covariance - covariance.transpose()).amax()
+            > f64::from(parameters.covariance_symmetry_tolerance)
     {
         return false;
     }
     covariance
-        .try_symmetric_eigen(f32::EPSILON, 64)
+        .try_symmetric_eigen(f64::EPSILON, parameters.covariance_eigen_max_iterations)
         .is_some_and(|eigen| {
-            eigen
-                .eigenvalues
-                .iter()
-                .all(|value| value.is_finite() && *value >= -1.0e-6)
+            eigen.eigenvalues.iter().all(|value| {
+                value.is_finite() && *value >= -f64::from(parameters.covariance_psd_tolerance)
+            })
         })
 }
 
 fn process_covariance(
-    robot_to_local: Isometry3<Robot, Local>,
+    robot_to_field: Isometry3<Robot, Field, f64>,
     age: f32,
     parameters: &FieldMarkAssociationParameters,
-) -> Matrix6<f32> {
+) -> Matrix6<f64> {
     let config = parameters.global_localizer;
     let tracking = parameters.tracking;
-    // Process growth and calibrated local tilt/height floors live at the current pose, not the anchor.
-    let local_to_robot = robot_to_local.inner.rotation.inverse().to_rotation_matrix();
+    // Horizontal isotropy makes these floors invariant to the Local-to-Field yaw.
+    let field_to_robot = robot_to_field.inner.rotation.inverse().to_rotation_matrix();
     let rotation_noise = Matrix3::from_diagonal(&Vector3::new(
-        config.imu_tilt_sigma.powi(2),
-        config.imu_tilt_sigma.powi(2),
-        (age * tracking.yaw_sigma_per_second).powi(2),
+        f64::from(config.imu_tilt_sigma).powi(2),
+        f64::from(config.imu_tilt_sigma).powi(2),
+        (f64::from(age) * f64::from(tracking.yaw_sigma_per_second)).powi(2),
     ));
-    let position_variance = (age * tracking.position_sigma_per_second).powi(2);
+    let position_variance =
+        (f64::from(age) * f64::from(tracking.position_sigma_per_second)).powi(2);
     let translation_noise = Matrix3::from_diagonal(&Vector3::new(
         position_variance,
         position_variance,
-        position_variance + config.height_sigma.powi(2),
+        position_variance + f64::from(config.height_sigma).powi(2),
     ));
     let mut current_covariance = Matrix6::zeros();
     current_covariance.fixed_view_mut::<3, 3>(0, 0).copy_from(
-        &(local_to_robot.matrix() * rotation_noise * local_to_robot.matrix().transpose()),
+        &(field_to_robot.matrix() * rotation_noise * field_to_robot.matrix().transpose()),
     );
     current_covariance.fixed_view_mut::<3, 3>(3, 3).copy_from(
-        &(local_to_robot.matrix() * translation_noise * local_to_robot.matrix().transpose()),
+        &(field_to_robot.matrix() * translation_noise * field_to_robot.matrix().transpose()),
     );
     current_covariance
-}
-
-fn project_predictions(
-    input: AssociationInput<'_>,
-    map: &LandmarkMap,
-    prior: TrackingPrior,
-    noise: &PredictionNoise,
-) -> Vec<Option<Prediction>> {
-    map.landmarks
-        .iter()
-        .map(|point| {
-            project_landmark(
-                point.xy.extend(0.0),
-                input,
-                prior.anchor_estimate,
-                prior.predicted_robot_to_field,
-                noise,
-            )
-        })
-        .collect()
 }
 
 fn filter_detections(
@@ -236,46 +190,38 @@ fn match_predictions(
         predictions,
         parameters.global_localizer.mahalanobis_gate,
     )?;
-    if (3..=5).contains(&detections.len()) {
-        let pairs = match detections.len() {
-            3 => {
-                joint_assignment::<6>(detections, predictions, &log_likelihoods, noise, parameters)
+    let pairs = match detections.len() {
+        3 => joint_assignment::<6>(detections, predictions, &log_likelihoods, noise, parameters),
+        4 => joint_assignment::<8>(detections, predictions, &log_likelihoods, noise, parameters),
+        5 => joint_assignment::<10>(detections, predictions, &log_likelihoods, noise, parameters),
+        _ => {
+            // ponytail: more than five features retain marginal assignment, not a joint likelihood.
+            // Extend joint search only with a measured real-time bound. Row normalization bounds weights.
+            let mut benefits = log_likelihoods;
+            let m = map.landmarks.len();
+            for (row, (_, detection)) in detections.iter().enumerate() {
+                let maximum = benefits
+                    .row(row)
+                    .iter()
+                    .take(m)
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                for column in 0..benefits.ncols() {
+                    let likelihood = benefits[(row, column)];
+                    benefits[(row, column)] = if column < m && likelihood.is_finite() {
+                        detection.confidence * (likelihood - maximum).exp()
+                    } else {
+                        0.0
+                    };
+                }
             }
-            4 => {
-                joint_assignment::<8>(detections, predictions, &log_likelihoods, noise, parameters)
-            }
-            5 => {
-                joint_assignment::<10>(detections, predictions, &log_likelihoods, noise, parameters)
-            }
-            _ => unreachable!(),
-        }?;
-        return certify(detections, map, predictions, &pairs, parameters);
-    }
-    // ponytail: more than five features retain marginal assignment, not a joint likelihood.
-    // Extend joint search only with a measured real-time bound. Row normalization bounds weights.
-    let mut benefits = log_likelihoods;
-    let m = map.landmarks.len();
-    for (row, (_, detection)) in detections.iter().enumerate() {
-        let maximum = benefits
-            .row(row)
-            .iter()
-            .take(m)
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        for column in 0..benefits.ncols() {
-            let likelihood = benefits[(row, column)];
-            benefits[(row, column)] = if column < m && likelihood.is_finite() {
-                detection.confidence * (likelihood - maximum).exp()
-            } else {
-                0.0
-            };
+            unique_assignment(
+                &mut benefits,
+                map.landmarks.len(),
+                parameters.tracking.score_ratio,
+            )
         }
-    }
-    let pairs = unique_assignment(
-        &mut benefits,
-        map.landmarks.len(),
-        parameters.tracking.score_ratio,
-    )?;
+    }?;
     certify(detections, map, predictions, &pairs, parameters)
 }
 
@@ -304,8 +250,7 @@ fn prediction_log_likelihoods(
             let error = (prediction.pixel - detection.pixel).inner.cast::<f64>();
             let mahalanobis = error.dot(&(information * error));
             // The hard output distance must not hide a statistically plausible rival.
-            if mahalanobis.is_finite() && (0.0..f64::from(mahalanobis_gate)).contains(&mahalanobis)
-            {
+            if (0.0..f64::from(mahalanobis_gate)).contains(&mahalanobis) {
                 log_likelihoods[(row, landmark)] = (-0.5 * (mahalanobis + log_determinant)) as f32;
             }
         }
@@ -366,15 +311,13 @@ fn joint_assignment<const D: usize>(
         }
         columns[depth] = column;
         let prediction = predictions[column]?;
-        let anchor = prediction.anchor_jacobian * noise.anchor;
-        let current = prediction.current_jacobian * noise.current;
+        let projected_covariance = prediction.jacobian * noise.pose;
         // Reuse the prefix covariance when extending/backtracking. Only the new row and column
-        // change: C_ij = Ja_i P Ja_j^T + Jq_i Q Jq_j^T, with the pixel floor on diagonal blocks.
+        // change: C_ij = J_i (P + Q) J_j^T, with the pixel floor on diagonal blocks.
         // This is covariance caching, not pruning; every admitted distinct rival is still scored.
         for (row, &other) in columns[..depth].iter().enumerate() {
             let other = predictions[other]?;
-            let block = anchor * other.anchor_jacobian.transpose()
-                + current * other.current_jacobian.transpose();
+            let block = projected_covariance * other.jacobian.transpose();
             covariance
                 .fixed_view_mut::<2, 2>(2 * depth, 2 * row)
                 .copy_from(&block);
@@ -515,13 +458,12 @@ fn certify(
 fn project_landmark(
     point: Point3<Field>,
     input: AssociationInput<'_>,
-    estimate: LocalizationEstimate3D,
-    prediction: Isometry3<Robot, Field>,
     noise: &PredictionNoise,
 ) -> Option<Prediction> {
-    let point_anchor = (estimate.robot_to_field.inverse() * point).coords().inner;
-    let point_current = prediction.inverse() * point;
-    let camera = input.robot_to_camera * point_current;
+    let point_robot = Isometry3::<Robot, Field>::wrap(input.geometry.estimate.pose.inner.cast())
+        .inverse()
+        * point;
+    let camera = input.robot_to_camera * point_robot;
     if camera.z() <= 0.0 || !camera.coords().inner.iter().all(|x| x.is_finite()) {
         return None;
     }
@@ -545,35 +487,23 @@ fn project_landmark(
             -Vector3::z(),
         ])
     };
-    // T_pred = T_anchor * delta. Hold delta fixed when perturbing the anchor on the right:
-    // J_camera = R_rc R_delta^-1 [skew(point_anchor), -I]. No pose is fitted here.
-    let anchor_to_camera = input.robot_to_camera * prediction.inverse() * estimate.robot_to_field;
-    let anchor_jacobian = projection
-        * anchor_to_camera
-            .inner
-            .rotation
-            .to_rotation_matrix()
-            .matrix()
-        * inverse_point(point_anchor);
-    let current_jacobian = projection
+    // Right-local pose perturbation: J_camera = R_rc [skew(point_robot), -I].
+    let jacobian = projection
         * input
             .robot_to_camera
             .inner
             .rotation
             .to_rotation_matrix()
             .matrix()
-        * inverse_point(point_current.coords().inner);
-    let anchor_jacobian = anchor_jacobian.cast::<f64>();
-    let current_jacobian = current_jacobian.cast::<f64>();
-    let covariance = anchor_jacobian * noise.anchor * anchor_jacobian.transpose()
-        + current_jacobian * noise.current * current_jacobian.transpose()
-        + Matrix2::identity() * noise.pixel_variance;
+        * inverse_point(point_robot.coords().inner);
+    let jacobian = jacobian.cast::<f64>();
+    let covariance =
+        jacobian * noise.pose * jacobian.transpose() + Matrix2::identity() * noise.pixel_variance;
     (pixel.coords().inner.iter().all(|x| x.is_finite()) && covariance.iter().all(|x| x.is_finite()))
         .then_some(Prediction {
             pixel,
             covariance,
-            anchor_jacobian,
-            current_jacobian,
+            jacobian,
         })
 }
 
@@ -596,7 +526,7 @@ fn unique_assignment(
         .collect::<Vec<_>>();
     let score = pairs.iter().map(|&(r, c)| benefits[(r, c)]).sum::<f32>();
     // Every distinct assignment omits at least one winning edge. This checks all alternatives
-    // with at most 32 additional bounded assignment solves, without fitting candidate poses.
+    // with one additional bounded assignment solve per winning edge, without fitting candidate poses.
     for &(row, column) in &pairs {
         let saved = benefits[(row, column)];
         // With one zero-benefit dummy per row, zeroing this edge has the same
@@ -621,8 +551,61 @@ fn unique_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covariance_numerical_tolerances_are_applied() {
+        let mut parameters = crate::TrackingAssociationParameters::default();
+        let mut covariance = Matrix6::identity();
+        covariance[(0, 1)] = 5.0e-5;
+        assert!(!valid_covariance(covariance, parameters));
+        parameters.covariance_symmetry_tolerance = 1.0e-4;
+        assert!(valid_covariance(covariance, parameters));
+        covariance = Matrix6::identity();
+        covariance[(0, 0)] = -5.0e-6;
+        assert!(!valid_covariance(covariance, parameters));
+        parameters.covariance_psd_tolerance = 1.0e-5;
+        assert!(valid_covariance(covariance, parameters));
+    }
+
+    #[test]
+    fn retained_detection_limit_can_exceed_the_old_ceiling() {
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
+        let features = DetectedVisualFeatures {
+            penalty_spots: (0..33)
+                .map(|index| DetectedVisualFeature {
+                    pixel: linear_algebra::point![index as f32 * 10.0, 100.0],
+                    confidence: 1.0,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut config = crate::GlobalLocalizerParameters::default();
+        assert!(filter_detections(&features, &map, config).is_none());
+        config.max_retained_detections = 33;
+        config.validate().unwrap();
+        assert_eq!(
+            filter_detections(&features, &map, config).unwrap().len(),
+            33
+        );
+    }
     use linear_algebra::point;
     use ndarray::array;
+
+    fn detection(
+        class: VisualFeatureClass,
+        pixel: Point2<Pixel>,
+    ) -> (VisualFeatureClass, DetectedVisualFeature) {
+        (
+            class,
+            DetectedVisualFeature {
+                pixel,
+                confidence: 0.95,
+            },
+        )
+    }
 
     fn prediction(
         pixel: Point2<Pixel>,
@@ -631,10 +614,9 @@ mod tests {
     ) -> Prediction {
         Prediction {
             pixel,
-            covariance: jacobian * (noise.anchor + noise.current) * jacobian.transpose()
+            covariance: jacobian * noise.pose * jacobian.transpose()
                 + Matrix2::identity() * noise.pixel_variance,
-            anchor_jacobian: jacobian,
-            current_jacobian: jacobian,
+            jacobian,
         }
     }
 
@@ -682,25 +664,19 @@ mod tests {
 
     #[test]
     fn joint_residual_uses_dimension_calibration_without_losing_its_absolute_gate() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::zeros(),
-            current: Matrix6::zeros(),
+            pose: Matrix6::zeros(),
             pixel_variance: 4.0,
         };
         let parameters = FieldMarkAssociationParameters::default();
         let class = VisualFeatureClass::LSpot;
         for n in 3..=5 {
             let detections = (0..n)
-                .map(|row| {
-                    (
-                        class,
-                        DetectedVisualFeature {
-                            pixel: point![30.0 * row as f32, 0.0],
-                            confidence: 0.95,
-                        },
-                    )
-                })
+                .map(|row| detection(class, point![30.0 * row as f32, 0.0]))
                 .collect::<Vec<_>>();
             let marginal_gate = parameters.global_localizer.mahalanobis_gate;
             let joint_gate = joint_mahalanobis_gate(marginal_gate, n);
@@ -743,11 +719,13 @@ mod tests {
 
     #[test]
     fn covariance_volume_does_not_reward_a_distant_plausible_rival() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let mut predictions = vec![None; map.landmarks.len()];
         let noise = PredictionNoise {
-            anchor: Matrix6::identity(),
-            current: Matrix6::zeros(),
+            pose: Matrix6::identity(),
             pixel_variance: 4.0,
         };
         let mut detections = Vec::with_capacity(3);
@@ -765,13 +743,7 @@ mod tests {
                 Matrix2x6::zeros(),
                 &noise,
             ));
-            detections.push((
-                class,
-                DetectedVisualFeature {
-                    pixel,
-                    confidence: 0.95,
-                },
-            ));
+            detections.push(detection(class, pixel));
         }
         // Its Mahalanobis error (0.02) is smaller than the correct match's (0.5), solely
         // because of its enormous covariance. Gaussian uncertainty volume must penalize it.
@@ -800,10 +772,12 @@ mod tests {
 
     #[test]
     fn joint_triples_distinguish_inconsistent_neighbors_but_reject_shared_ambiguity() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::identity() * 6000.0,
-            current: Matrix6::identity() * 4000.0,
+            pose: Matrix6::identity() * 10000.0,
             pixel_variance: 4.0,
         };
         let classes = [
@@ -811,15 +785,8 @@ mod tests {
             VisualFeatureClass::TSpot,
             VisualFeatureClass::PenaltySpot,
         ];
-        let detections = classes.map(|class| {
-            (
-                class,
-                DetectedVisualFeature {
-                    pixel: point![100.0 * class.index() as f32, 100.0],
-                    confidence: 0.95,
-                },
-            )
-        });
+        let detections =
+            classes.map(|class| detection(class, point![100.0 * class.index() as f32, 100.0]));
         let parameters = FieldMarkAssociationParameters::default();
         let mut predictions = vec![None; map.landmarks.len()];
         for (row, &(class, feature)) in detections.iter().enumerate() {
@@ -834,27 +801,6 @@ mod tests {
                 &noise,
             ));
         }
-        let mut marginals =
-            prediction_log_likelihoods(&detections, &map, &predictions, 9.21).unwrap();
-        // The old independent-edge comparison sees almost tied neighbors on every row.
-        for row in 0..3 {
-            let maximum = marginals
-                .row(row)
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            for value in marginals.row_mut(row) {
-                *value = (*value - maximum).exp();
-            }
-        }
-        assert!(
-            unique_assignment(
-                &mut marginals,
-                map.landmarks.len(),
-                parameters.tracking.score_ratio
-            )
-            .is_none()
-        );
         let result =
             match_predictions(&detections, &map, &predictions, &noise, &parameters).unwrap();
         for (association, class) in result.associations.iter().zip(classes) {
@@ -919,24 +865,18 @@ mod tests {
 
     #[test]
     fn joint_assignments_require_distinct_landmarks() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::zeros(),
-            current: Matrix6::zeros(),
+            pose: Matrix6::zeros(),
             pixel_variance: 4.0,
         };
         let class = VisualFeatureClass::LSpot;
         for n in 3..=5 {
             let mut detections = (0..n - 1)
-                .map(|row| {
-                    (
-                        class,
-                        DetectedVisualFeature {
-                            pixel: point![20.0 * row as f32, 0.0],
-                            confidence: 0.95,
-                        },
-                    )
-                })
+                .map(|row| detection(class, point![20.0 * row as f32, 0.0]))
                 .collect::<Vec<_>>();
             let mut predictions = vec![None; map.landmarks.len()];
             for (row, &(_, feature)) in detections.iter().enumerate() {
@@ -963,10 +903,12 @@ mod tests {
 
     #[test]
     fn four_and_five_shared_features_resolve_repeated_class_neighbors_not_coherent_rivals() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::identity() * 6000.0,
-            current: Matrix6::identity() * 4000.0,
+            pose: Matrix6::identity() * 10000.0,
             pixel_variance: 4.0,
         };
         let class = VisualFeatureClass::LSpot;
@@ -974,15 +916,7 @@ mod tests {
         let parameters = FieldMarkAssociationParameters::default();
         for n in [4, 5] {
             let detections = (0..n)
-                .map(|row| {
-                    (
-                        class,
-                        DetectedVisualFeature {
-                            pixel: point![40.0 * row as f32, 100.0],
-                            confidence: 0.95,
-                        },
-                    )
-                })
+                .map(|row| detection(class, point![40.0 * row as f32, 100.0]))
                 .collect::<Vec<_>>();
             let mut predictions = vec![None; map.landmarks.len()];
             for (row, &(_, feature)) in detections.iter().enumerate() {
@@ -1034,25 +968,19 @@ mod tests {
 
     #[test]
     fn joint_work_exhaustion_after_a_winner_rejects_until_every_rival_is_scored() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::zeros(),
-            current: Matrix6::zeros(),
+            pose: Matrix6::zeros(),
             pixel_variance: 4.0,
         };
         let class = VisualFeatureClass::LSpot;
         let ids = map.landmarks_for_class(class);
         for n in 3..=5 {
             let detections = (0..n)
-                .map(|row| {
-                    (
-                        class,
-                        DetectedVisualFeature {
-                            pixel: point![20.0 * row as f32, 0.0],
-                            confidence: 0.95,
-                        },
-                    )
-                })
+                .map(|row| detection(class, point![20.0 * row as f32, 0.0]))
                 .collect::<Vec<_>>();
             let mut predictions = vec![None; map.landmarks.len()];
             for (row, &(_, feature)) in detections.iter().enumerate() {
@@ -1085,7 +1013,7 @@ mod tests {
                 n
             );
             // Scoring an unusable rival also fails closed rather than retaining the earlier winner.
-            predictions[ids[n]].as_mut().unwrap().anchor_jacobian[(0, 0)] = f64::NAN;
+            predictions[ids[n]].as_mut().unwrap().jacobian[(0, 0)] = f64::NAN;
             assert!(
                 match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none()
             );
@@ -1094,23 +1022,17 @@ mod tests {
 
     #[test]
     fn five_feature_dense_budget_cannot_return_an_early_unique_winner() {
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::identity() * 6000.0,
-            current: Matrix6::identity() * 4000.0,
+            pose: Matrix6::identity() * 10000.0,
             pixel_variance: 4.0,
         };
         let class = VisualFeatureClass::LSpot;
         let ids = map.landmarks_for_class(class);
-        let detections = [0.0, 40.0, 80.0, 120.0, 160.0].map(|x| {
-            (
-                class,
-                DetectedVisualFeature {
-                    pixel: point![x, 0.0],
-                    confidence: 0.95,
-                },
-            )
-        });
+        let detections = [0.0, 40.0, 80.0, 120.0, 160.0].map(|x| detection(class, point![x, 0.0]));
         let mut predictions = vec![None; map.landmarks.len()];
         for (&column, x) in ids.iter().zip([
             0.0, 40.0, 80.0, 120.0, 160.0, 17.0, 68.0, 111.0, 145.0, 206.0, 251.0, 299.0,
@@ -1151,22 +1073,16 @@ mod tests {
     fn joint_dense_runtime_characterization() {
         use std::{hint::black_box, time::Instant};
 
-        let map = LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025);
+        let map = LandmarkMap::new(
+            &types::field_dimensions::FieldDimensions::SPL_2025,
+            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
+        );
         let noise = PredictionNoise {
-            anchor: Matrix6::identity() * 6000.0,
-            current: Matrix6::identity() * 4000.0,
+            pose: Matrix6::identity() * 10000.0,
             pixel_variance: 4.0,
         };
         let class = VisualFeatureClass::LSpot;
-        let detections = [0.0, 2.0, 4.0, 6.0, 8.0].map(|x| {
-            (
-                class,
-                DetectedVisualFeature {
-                    pixel: point![x, 0.0],
-                    confidence: 0.95,
-                },
-            )
-        });
+        let detections = [0.0, 2.0, 4.0, 6.0, 8.0].map(|x| detection(class, point![x, 0.0]));
         let mut predictions = vec![None; map.landmarks.len()];
         for &column in map.landmarks_for_class(class) {
             predictions[column] = Some(prediction(point![0.0, 0.0], Matrix2x6::identity(), &noise));
@@ -1231,8 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn full_anchor_and_current_covariances_match_right_tangent_finite_differences() {
-        use linear_algebra::{Isometry2, point};
+    fn single_prior_covariance_matches_finite_differences_and_coherent_two_pose_model() {
         use nalgebra::{Matrix2x6, Translation3, UnitQuaternion};
         use types::{field_dimensions::FieldDimensions, visual_localization::AssociationGeometry};
 
@@ -1242,9 +1157,9 @@ mod tests {
                 UnitQuaternion::from_euler_angles(angles[0], angles[1], angles[2]),
             )
         };
-        let anchor = pose([-1.0, 0.5, 0.7], [0.1, -0.15, 0.6]);
-        let delta = pose([0.7, -0.2, -0.03], [0.03, -0.04, 0.5]);
-        let prediction = anchor * delta;
+        let local = pose([-1.0, 0.5, 0.7], [0.1, -0.15, 0.6]);
+        let alignment = pose([0.7, -0.2, 0.0], [0.0, 0.0, 0.5]);
+        let field_pose = alignment * local;
         let factor = Matrix6::from_fn(|r, c| {
             if r == c {
                 0.02 + r as f32 * 0.005
@@ -1255,17 +1170,15 @@ mod tests {
             }
         });
         let covariance = factor * factor.transpose();
-        let estimate = LocalizationEstimate3D {
-            robot_to_field: Isometry3::wrap(anchor),
-            covariance,
+        let estimate = PoseEstimate {
+            pose: Isometry3::wrap(field_pose.cast()),
+            covariance: covariance.cast(),
         };
-        let current_covariance = covariance * 0.3;
         let geometry = AssociationGeometry {
             generation: 0,
             epoch: 0,
-            state: LocalizationState3D::Startup,
-            robot_to_local: Isometry3::wrap(prediction),
-            local_to_field: Some(Isometry2::identity()),
+            estimate,
+            last_successful_solve: ros_z::time::Time::zero(),
         };
         let features = crate::DetectedVisualFeatures::default();
         let input = AssociationInput {
@@ -1280,89 +1193,98 @@ mod tests {
             time: ros_z::time::Time::zero(),
         };
         let point = point![0.5, -0.3, 0.0];
+        let parameters = FieldMarkAssociationParameters::default();
+        let process = process_covariance(estimate.pose, 0.7, &parameters);
         let noise = PredictionNoise {
-            anchor: covariance.cast::<f64>() * 1.7_f64.powi(2),
-            current: current_covariance.cast::<f64>() * 1.7_f64.powi(2),
+            pose: covariance.cast::<f64>() + process,
             pixel_variance: 2.3_f64.powi(2),
         };
-        let projected =
-            project_landmark(point, input, estimate, Isometry3::wrap(prediction), &noise).unwrap();
+        let projected = project_landmark(point, input, &noise).unwrap();
         let pixel = projected.pixel;
-        let actual = projected.covariance.cast::<f32>();
+        let actual = projected.covariance;
         let project = |pose: nalgebra::Isometry3<f64>| {
             let p = input.robot_to_camera.inner.cast::<f64>()
                 * pose.inverse()
                 * point.inner.cast::<f64>();
             nalgebra::vector![430.0 * p.x / p.z + 320.0, 520.0 * p.y / p.z + 240.0]
         };
-        let numerical_jacobian = |at_anchor| {
-            Matrix2x6::<f64>::from_columns(&std::array::from_fn::<_, 6, _>(|axis| {
-                let sample = |step| {
-                    let mut tangent = Vector3::<f64>::zeros();
-                    tangent[axis % 3] = step;
-                    let perturbation = if axis < 3 {
-                        nalgebra::Isometry3::rotation(tangent)
-                    } else {
-                        nalgebra::Isometry3::translation(tangent.x, tangent.y, tangent.z)
-                    };
-                    project(if at_anchor {
-                        anchor.cast::<f64>() * perturbation * delta.cast::<f64>()
-                    } else {
-                        prediction.cast::<f64>() * perturbation
-                    })
+        let jacobian = Matrix2x6::<f64>::from_columns(&std::array::from_fn::<_, 6, _>(|axis| {
+            let sample = |step| {
+                let mut tangent = Vector3::<f64>::zeros();
+                tangent[axis % 3] = step;
+                let perturbation = if axis < 3 {
+                    nalgebra::Isometry3::rotation(tangent)
+                } else {
+                    nalgebra::Isometry3::translation(tangent.x, tangent.y, tangent.z)
                 };
-                (sample(1.0e-5) - sample(-1.0e-5)) / 2.0e-5
-            }))
-            .cast::<f32>()
-        };
-        let anchor_jacobian = numerical_jacobian(true);
-        let current_jacobian = numerical_jacobian(false);
+                project(field_pose.cast::<f64>() * perturbation)
+            };
+            (sample(1.0e-5) - sample(-1.0e-5)) / 2.0e-5
+        }));
+        assert!((projected.jacobian - jacobian).norm() < projected.jacobian.norm() * 0.0002);
+        let expected = jacobian * noise.pose * jacobian.transpose()
+            + Matrix2::identity() * noise.pixel_variance;
         assert!(
-            (projected.anchor_jacobian - anchor_jacobian.cast::<f64>()).norm()
-                < projected.anchor_jacobian.norm() * 0.0002
-        );
-        assert!(
-            (projected.current_jacobian - current_jacobian.cast::<f64>()).norm()
-                < projected.current_jacobian.norm() * 0.0002
-        );
-        let expected = 1.7_f32.powi(2)
-            * (anchor_jacobian * covariance * anchor_jacobian.transpose()
-                + current_jacobian * current_covariance * current_jacobian.transpose())
-            + Matrix2::identity() * 2.3_f32.powi(2);
-        assert!(
-            (pixel.coords().inner - project(prediction.cast::<f64>()).cast::<f32>()).norm() < 0.001
+            (pixel.coords().inner - project(field_pose.cast::<f64>()).cast::<f32>()).norm() < 0.001
         );
         assert!(
             (actual - expected).norm() < expected.norm() * 0.0002,
             "actual {actual}, expected {expected}"
         );
-        let without_correlations = 1.7_f32.powi(2)
-            * (anchor_jacobian
-                * Matrix6::from_diagonal(&covariance.diagonal())
-                * anchor_jacobian.transpose()
-                + current_jacobian
-                    * Matrix6::from_diagonal(&current_covariance.diagonal())
-                    * current_jacobian.transpose())
-            + Matrix2::identity() * 2.3_f32.powi(2);
+        let without_correlations =
+            jacobian * Matrix6::from_diagonal(&noise.pose.diagonal()) * jacobian.transpose()
+                + Matrix2::identity() * noise.pixel_variance;
         assert!((actual - without_correlations).norm() > expected.norm() * 0.01);
 
-        // Height of the anchor cannot inflate yaw-only uncertainty: rotation about z has no z lever arm.
-        let mut yaw_only = estimate;
-        yaw_only.covariance = Matrix6::zeros();
-        yaw_only.covariance[(2, 2)] = 0.0016;
-        let noise = PredictionNoise {
-            anchor: yaw_only.covariance.cast::<f64>(),
-            current: Matrix6::zeros(),
-            pixel_variance: 4.0,
-        };
-        let before =
-            project_landmark(point, input, yaw_only, Isometry3::wrap(prediction), &noise).unwrap();
-        yaw_only.robot_to_field.inner.translation.vector +=
-            anchor.rotation * Vector3::new(0.0, 0.0, 15.0);
-        let after =
-            project_landmark(point, input, yaw_only, Isometry3::wrap(prediction), &noise).unwrap();
-        assert_eq!(before.pixel, after.pixel);
-        assert!((before.covariance - after.covariance).norm() < before.covariance.norm() * 1.0e-4);
+        // Reconstruct the old coherent snapshot: both poses denote the same transform,
+        // but the process floor was rotated from Local rather than Field.
+        let old_process = process_covariance(Isometry3::wrap(local.cast()), 0.7, &parameters);
+        assert!((process - old_process).norm() < process.norm() * 1.0e-6);
+        let points = [point, point![0.2, 0.4, 0.0]];
+        let projections = points.map(|p| project_landmark(p, input, &noise).unwrap());
+        let old_jacobians = points.map(|p| {
+            let robot = (field_pose.inverse() * p.inner).coords;
+            let camera = input.robot_to_camera.inner * nalgebra::Point3::from(robot);
+            let projection = Matrix2x3::new(
+                430.0 / camera.z,
+                0.0,
+                -430.0 * camera.x / camera.z.powi(2),
+                0.0,
+                520.0 / camera.z,
+                -520.0 * camera.y / camera.z.powi(2),
+            );
+            let action = Matrix3x6::from_fn(|r, c| {
+                if c < 3 {
+                    robot.cross_matrix()[(r, c)]
+                } else if r == c - 3 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            });
+            let anchor_to_camera =
+                input.robot_to_camera.inner * (alignment * local).inverse() * field_pose;
+            let ja = projection * anchor_to_camera.rotation.to_rotation_matrix().matrix() * action;
+            let jc = projection
+                * input
+                    .robot_to_camera
+                    .inner
+                    .rotation
+                    .to_rotation_matrix()
+                    .matrix()
+                * action;
+            (ja.cast::<f64>(), jc.cast::<f64>())
+        });
+        for i in 0..2 {
+            for j in 0..2 {
+                let old =
+                    old_jacobians[i].0 * covariance.cast::<f64>() * old_jacobians[j].0.transpose()
+                        + old_jacobians[i].1 * old_process * old_jacobians[j].1.transpose();
+                let combined =
+                    projections[i].jacobian * noise.pose * projections[j].jacobian.transpose();
+                assert!((old - combined).norm() < old.norm() * 1.0e-5);
+            }
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{Estimator, recovery::MotionRecord, seconds_per_knot};
+use super::{Estimator, recovery::MotionRecord};
 use booster::ImuState;
 use color_eyre::Result;
 use coordinate_systems::{ImuReference, Robot};
@@ -89,8 +89,8 @@ impl Estimator {
         let batch = *self.foot_batches.entry(segment).or_insert_with(|| {
             self.graph.add_batch(FootGround {
                 controls,
-                duration: seconds_per_knot(),
-                sigma: 1.0e-2,
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
+                sigma: self.parameters.model.foot_sigma,
             })
         });
         self.graph.add_factor_to(

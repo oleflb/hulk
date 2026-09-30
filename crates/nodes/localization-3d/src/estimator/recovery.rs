@@ -3,13 +3,11 @@ use coordinate_systems::Robot;
 use linear_algebra::{IntoTransform, Isometry3, Point3, Vector3};
 use localization_fagra::variables::{FieldAlignment, PoseControl, TrajectoryState};
 use nalgebra::{Matrix2, UnitQuaternion};
+use projection::intrinsic::Intrinsic;
 use ros_z::time::Time;
-use types::{
-    camera_geometry::CameraGeometry, time_wrapper::TimeWrapper,
-    visual_localization::VisualLocalizationFrame,
-};
+use types::{time_wrapper::TimeWrapper, visual_localization::VisualLocalizationFrame};
 
-use super::{Estimator, KNOT_SPACING_NS, WINDOW_NS, control_keys};
+use super::{Estimator, control_keys};
 use crate::{
     alignment::{seed_alignment, seed_recovery_alignment, valid_visual_frame},
     heading::HeadingReference,
@@ -102,9 +100,9 @@ impl Estimator {
     pub(super) fn accept_motion(&mut self, record: MotionRecord) -> Result<bool> {
         record.clone().insert(self)?;
         self.commit_time(record.end());
-        let latest_segment = self.segment_and_tau(self.latest_time)?.0;
-        let first = (latest_segment - WINDOW_NS / KNOT_SPACING_NS - 1).max(0);
-        let start = Time::from_nanos(self.origin.as_nanos() + first * KNOT_SPACING_NS);
+        let first = (self.oldest_window_segment() - 1).max(0);
+        let start =
+            Time::from_nanos(self.origin.as_nanos() + first * self.parameters.timing.knot_ns());
         if start > self.history_start {
             self.motion_history.retain(|record| record.start() >= start);
             // Preserve the source sample needed to interpolate the left boundary.
@@ -129,7 +127,7 @@ impl Estimator {
         };
         if frame.inner.epoch != self.epoch
             || frame.inner.generation != self.generation
-            || !valid_visual_frame(&frame.inner)
+            || !valid_visual_frame(&frame.inner, &self.parameters.visual)
             || frame.time > self.latest_time
         {
             return Ok(None);
@@ -154,6 +152,7 @@ impl Estimator {
                     expected: heading.expected(attitude),
                     max_error: self.parameters.max_heading_error,
                 },
+                &self.parameters.visual,
             ),
             None => seed_alignment(
                 robot_to_local,
@@ -161,6 +160,7 @@ impl Estimator {
                 frame.inner.camera_intrinsic,
                 &mut frame.inner.associations,
                 true,
+                &self.parameters.visual,
             ),
         };
         let Some((pose, seed)) = seed else {
@@ -169,10 +169,6 @@ impl Estimator {
         let alignment = FieldAlignment {
             local_to_field: seed.inner.cast().framed_transform(),
         };
-        let camera = CameraGeometry {
-            robot_to_camera: frame.inner.robot_to_camera,
-            intrinsics: frame.inner.camera_intrinsic,
-        };
         let correction = pose.inner.cast::<f64>() * old.pose.inner.inverse();
         let mut candidate = self.rebuild_motion(
             frame.time,
@@ -180,7 +176,7 @@ impl Estimator {
                 pose: linear_algebra::Framed::wrap(pose.inner.cast()),
                 velocity: Vector3::wrap(correction.rotation * old.velocity.inner),
             },
-            &camera,
+            &frame.inner.camera_intrinsic,
             None,
         )?;
         candidate.generation = self.generation.wrapping_add(1);
@@ -220,27 +216,28 @@ impl Estimator {
             + self.parameters.initial_velocity_sigma.powi(2) * elapsed.powi(2)
             + self.parameters.accelerometer_process_noise_variance * elapsed.powi(3) / 3.0)
             .sqrt();
-        let camera = CameraGeometry {
-            robot_to_camera: frame.inner.robot_to_camera,
-            intrinsics: frame.inner.camera_intrinsic,
-        };
-        self.rebuild_motion(time, anchor, &camera, Some(height_sigma))
-            .map(Some)
+        self.rebuild_motion(
+            time,
+            anchor,
+            &frame.inner.camera_intrinsic,
+            Some(height_sigma),
+        )
+        .map(Some)
     }
 
     fn rebuild_motion(
         &self,
         time: Time,
         anchor: TrajectoryState,
-        camera: &CameraGeometry,
+        intrinsics: &Intrinsic,
         height_sigma: Option<f64>,
     ) -> Result<Self> {
         let mut candidate = Self::empty(
             self.origin,
             self.epoch,
-            camera,
+            intrinsics,
             self.parameters.clone(),
-            &self.field,
+            self.field_half_extents,
         )?;
         candidate.options = self.options;
         candidate.generation = self.generation;
@@ -253,7 +250,7 @@ impl Estimator {
         let yaw_offset =
             anchor.pose.inner.rotation.euler_angles().2 - reference_attitude.euler_angles().2;
         for index in first - 1..=last + 2 {
-            let stamp = self.origin.as_nanos() + index * KNOT_SPACING_NS;
+            let stamp = self.origin.as_nanos() + index * self.parameters.timing.knot_ns();
             let sample_time = Time::from_nanos(stamp);
             let attitude = self.attitude_at(sample_time).unwrap_or_else(|| {
                 self.attitudes

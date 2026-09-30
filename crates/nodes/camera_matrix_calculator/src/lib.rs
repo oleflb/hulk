@@ -11,9 +11,7 @@ use ros_z::prelude::*;
 use ros_z::qos::QosDurability;
 use ros2::sensor_msgs::camera_info::CameraInfo;
 use types::{
-    camera_geometry::{CAMERA_GEOMETRY_TOPIC, CameraGeometry, MAX_CAMERA_GEOMETRY_GAP},
-    parameters::CameraMatrixParameters,
-    time_wrapper::TimeWrapper,
+    camera_geometry::CameraGeometry, parameters::CameraMatrixParameters, time_wrapper::TimeWrapper,
 };
 
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
@@ -25,13 +23,30 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
     let parameters =
         node.bind_parameter_as::<CameraMatrixParameters>("camera_matrix_calculator")?;
+    let capacities = parameters.snapshot().typed.synchronization.clone();
+    let startup = capacities.clone();
+    parameters.add_validation_hook(move |candidate| {
+        let p = &candidate.synchronization;
+        if p.max_ground_time_distance.is_zero()
+            || p.ground_cache_capacity == 0
+            || p.camera_info_cache_capacity == 0
+        {
+            return Err("camera synchronization gap and capacities must be positive".into());
+        }
+        if p.ground_cache_capacity != startup.ground_cache_capacity
+            || p.camera_info_cache_capacity != startup.camera_info_cache_capacity
+        {
+            return Err("camera cache capacity changes require restart".into());
+        }
+        Ok(())
+    })?;
     let robot_kinematics_sub = node
         .subscriber::<TimeWrapper<RobotKinematics>>("robot_kinematics")
         .build()
         .await?;
     let robot_to_ground_cache = node
         .subscriber::<TimeWrapper<Option<Isometry3<Robot, Ground>>>>("robot_to_ground")
-        .cache(32)
+        .cache(capacities.ground_cache_capacity)
         .with_stamp(|w| w.time)
         .build()
         .await?;
@@ -41,7 +56,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             durability: QosDurability::TransientLocal,
             ..Default::default()
         })
-        .cache(1)
+        .cache(capacities.camera_info_cache_capacity)
         .build()
         .await?;
 
@@ -50,7 +65,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let camera_geometry_pub = node
-        .publisher::<TimeWrapper<CameraGeometry>>(CAMERA_GEOMETRY_TOPIC)
+        .publisher::<TimeWrapper<CameraGeometry>>("camera_geometry")
         .build()
         .await?;
 
@@ -65,7 +80,10 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         };
         let ground = robot_to_ground_cache
             .get_nearest(time_stamp)
-            .filter(|ground| ground.time.abs_diff(time_stamp) <= MAX_CAMERA_GEOMETRY_GAP);
+            .filter(|ground| {
+                ground.time.abs_diff(time_stamp)
+                    <= parameters.synchronization.max_ground_time_distance
+            });
         let (geometry, matrix) = compute_cameras(
             parameters,
             &timed_robot_kinematics.inner,
@@ -165,6 +183,7 @@ mod tests {
             camera_to_head_pitch: 0.0,
             correction_in_robot: vector![0.1, -0.2, 0.3],
             correction_in_camera: vector![-0.4, 0.5, -0.6],
+            ..Default::default()
         };
         let robot_kinematics = RobotKinematics::default();
         let robot_to_ground = Isometry3::identity();

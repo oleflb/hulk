@@ -1,4 +1,4 @@
-use super::{Estimator, KNOT_SPACING_NS, WINDOW_NS, control_keys, seconds_per_knot};
+use super::{Estimator, control_keys};
 use color_eyre::{Result, eyre::eyre};
 use fagra::StateKey;
 use localization_fagra::{
@@ -15,7 +15,11 @@ impl Estimator {
         sensor: &'static str,
     ) -> Result<Option<(i64, f64)>> {
         if time < self.origin
-            || time.as_nanos() < self.latest_time.as_nanos().saturating_sub(WINDOW_NS)
+            || time.as_nanos()
+                < self
+                    .latest_time
+                    .as_nanos()
+                    .saturating_sub(self.parameters.timing.window_ns())
         {
             tracing::warn!(
                 sensor,
@@ -38,8 +42,9 @@ impl Estimator {
             .filter(|elapsed| *elapsed >= 0)
             .ok_or_else(|| eyre!("timestamp outside trajectory domain"))?;
         Ok((
-            elapsed / KNOT_SPACING_NS,
-            (elapsed % KNOT_SPACING_NS) as f64 / KNOT_SPACING_NS as f64,
+            elapsed / self.parameters.timing.knot_ns(),
+            (elapsed % self.parameters.timing.knot_ns()) as f64
+                / self.parameters.timing.knot_ns() as f64,
         ))
     }
 
@@ -50,7 +55,7 @@ impl Estimator {
             .ok_or_else(|| eyre!("empty trajectory"))?
             .0;
         let next_segment = self.segments().end;
-        let gap = segment - next_segment >= 5;
+        let gap = segment - next_segment >= self.parameters.model.prediction_gap_segments;
         for index in largest + 1..=segment + 2 {
             let previous = self.graph.get(self.controls[&(index - 1)])?;
             let before = self.graph.get(self.controls[&(index - 2)])?;
@@ -73,13 +78,17 @@ impl Estimator {
 
     pub(super) fn add_motion_prior(&mut self, segment: i64, gap: bool) -> Result<()> {
         let root = MotionPrior::information_root(
-            seconds_per_knot(),
-            0.01,
+            self.parameters.timing.trajectory_spacing.as_secs_f64(),
+            self.parameters.model.rotation_process_variance,
             self.parameters.accelerometer_process_noise_variance,
-        )? / if gap { 10.0_f64.sqrt() } else { 1.0 };
+        )? / if gap {
+            self.parameters.model.gap_uncertainty_multiplier.sqrt()
+        } else {
+            1.0
+        };
         self.graph.add_factor(MotionPrior {
             controls: control_keys(&self.controls, segment)?,
-            duration: seconds_per_knot(),
+            duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
             information_root: root,
             use_start_velocity: !gap,
         })?;
@@ -90,8 +99,8 @@ impl Estimator {
         if let Some(alignment) = self.alignment {
             self.graph.add_factor(FieldContainment {
                 controls: control_keys(&self.controls, segment)?,
-                duration: seconds_per_knot(),
-                tau: 0.5,
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
+                tau: self.parameters.model.containment_tau,
                 alignment,
                 half_extents: self.field_half_extents,
                 sigma: self.parameters.field_containment_sigma,
@@ -108,13 +117,12 @@ impl Estimator {
                 self.graph.get(controls[2])?,
                 self.graph.get(controls[3])?,
             ],
-            seconds_per_knot(),
+            self.parameters.timing.trajectory_spacing.as_secs_f64(),
         )?)
     }
 
     pub(super) fn retire_old_segments(&mut self) -> Result<()> {
-        let (latest_segment, _) = self.segment_and_tau(self.latest_time)?;
-        let oldest = (latest_segment - WINDOW_NS / KNOT_SPACING_NS).max(0);
+        let oldest = self.oldest_window_segment();
         let mut old_states: Vec<_> = self
             .controls
             .range(..oldest - 1)
@@ -123,7 +131,8 @@ impl Estimator {
         if old_states.is_empty() {
             return Ok(());
         }
-        let oldest_bias = oldest * KNOT_SPACING_NS / super::bias::BIAS_KNOT_SPACING_NS;
+        let oldest_bias =
+            oldest * self.parameters.timing.knot_ns() / self.parameters.timing.bias_ns();
         old_states.extend(
             self.biases
                 .range(..oldest_bias)
@@ -135,21 +144,17 @@ impl Estimator {
         self.measurements.retain(|index, _| *index >= oldest);
         self.yaw_factors.retain(|index, _| *index >= oldest);
         self.retire_preintegration(oldest);
-        while self
-            .foot_batches
-            .first_key_value()
-            .is_some_and(|(index, _)| *index < oldest)
-        {
-            let (_, batch) = self.foot_batches.pop_first().unwrap();
-            self.graph.remove_batch(batch)?;
+        while let Some(entry) = self.foot_batches.first_entry() {
+            if *entry.key() >= oldest {
+                break;
+            }
+            self.graph.remove_batch(entry.remove())?;
         }
-        while self
-            .odometry_batches
-            .first_key_value()
-            .is_some_and(|(index, _)| *index < oldest)
-        {
-            let (_, batch) = self.odometry_batches.pop_first().unwrap();
-            self.graph.remove_batch(batch)?;
+        while let Some(entry) = self.odometry_batches.first_entry() {
+            if *entry.key() >= oldest {
+                break;
+            }
+            self.graph.remove_batch(entry.remove())?;
         }
         for &(index, batch) in &self.reprojection_batches {
             if index < oldest {
@@ -159,5 +164,14 @@ impl Estimator {
         self.reprojection_batches
             .retain(|(index, _)| *index >= oldest);
         Ok(())
+    }
+
+    pub(super) fn oldest_window_segment(&self) -> i64 {
+        // Round the actual cutoff down, not the window duration. A fractional
+        // window can still admit measurements in the preceding segment.
+        (self.latest_time.as_nanos() - self.origin.as_nanos())
+            .saturating_sub(self.parameters.timing.window_ns())
+            .div_euclid(self.parameters.timing.knot_ns())
+            .max(0)
     }
 }

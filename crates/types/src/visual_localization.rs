@@ -1,12 +1,7 @@
-use coordinate_systems::{Camera, Field, Local, Pixel, Robot};
-use linear_algebra::{IntoTransform, Isometry2, Isometry3, Point2, Point3};
+use coordinate_systems::{Camera, Field, Pixel, Robot};
+use linear_algebra::{Isometry3, Point2, Point3};
 use ros_z::Message;
 use serde::{Deserialize, Serialize};
-
-pub const VISUAL_LOCALIZATION_TOPIC: &str = "field_mark_association/visual_localization_local";
-pub const GLOBAL_LOCALIZATION_DEBUG_TOPIC: &str = "debug/global_localization";
-pub const MIN_CERTIFIED_VISUAL_ASSOCIATIONS: usize = 3;
-pub const MAX_CERTIFIED_VISUAL_ASSOCIATIONS: usize = 32;
 
 /// How associations were obtained. Global recovery must preserve the existing
 /// field-symmetry branch before its correspondences enter localization.
@@ -17,15 +12,13 @@ pub enum VisualAssociationSource {
     Global,
 }
 
-/// Internal association input assembled from estimate and lifecycle messages.
+/// Tracking-only association input assembled from a coherent estimate and status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssociationGeometry {
     pub epoch: u64,
     pub generation: u64,
-    /// The tracking prior stays anchored during loss while local poses continue updating.
-    pub state: crate::localization::LocalizationState3D,
-    pub robot_to_local: Isometry3<Robot, Local>,
-    pub local_to_field: Option<Isometry2<Local, Field>>,
+    pub estimate: crate::localization::PoseEstimate<Robot, Field>,
+    pub last_successful_solve: ros_z::time::Time,
 }
 
 impl AssociationGeometry {
@@ -34,48 +27,19 @@ impl AssociationGeometry {
     pub fn from_estimate(
         estimate: &crate::localization::LocalizationEstimate,
         status: &crate::localization::LocalizationStatus,
-        tracking_reference: Option<&crate::localization::LocalizationEstimate>,
     ) -> Option<Self> {
-        use crate::localization::{LocalizationEstimate3D, LocalizationState, LocalizationState3D};
-        if estimate.epoch != status.epoch || estimate.generation != status.generation {
+        use crate::localization::LocalizationState;
+        if status.state != LocalizationState::Tracking
+            || estimate.epoch != status.epoch
+            || estimate.generation != status.generation
+        {
             return None;
         }
-        let field = estimate.robot_to_field.map(|field| LocalizationEstimate3D {
-            robot_to_field: field.pose.inner.cast().framed_transform(),
-            covariance: field.covariance.cast(),
-        });
-        let state = match status.state {
-            LocalizationState::Startup => LocalizationState3D::Startup,
-            LocalizationState::Tracking => LocalizationState3D::Tracking {
-                estimate: field?,
-                last_successful_solve: estimate.time,
-            },
-            LocalizationState::LostTrack => LocalizationState3D::LostTrack {
-                last_known_estimate: {
-                    let prior = tracking_reference
-                        .filter(|p| p.epoch == status.epoch && p.generation == status.generation)?
-                        .robot_to_field?;
-                    LocalizationEstimate3D {
-                        robot_to_field: prior.pose.inner.cast().framed_transform(),
-                        covariance: prior.covariance.cast(),
-                    }
-                },
-                last_successful_solve: tracking_reference?.time,
-            },
-        };
-        let local_to_field = estimate.robot_to_field.map(|field| {
-            let alignment = field.pose * estimate.robot_to_local.pose.inverse();
-            let (_, _, yaw) = alignment.inner.rotation.euler_angles();
-            nalgebra::Isometry2::new(alignment.inner.translation.vector.xy(), yaw)
-                .cast()
-                .framed_transform()
-        });
         Some(Self {
             epoch: estimate.epoch,
             generation: estimate.generation,
-            state,
-            robot_to_local: estimate.robot_to_local.pose.inner.cast().framed_transform(),
-            local_to_field,
+            estimate: estimate.robot_to_field?,
+            last_successful_solve: estimate.time,
         })
     }
 }
@@ -106,14 +70,13 @@ pub struct GlobalLocalizationDebug {
 mod tests {
     use super::*;
     use crate::localization::{
-        LocalizationEstimate, LocalizationState, LocalizationState3D, LocalizationStatus,
-        PoseEstimate,
+        LocalizationEstimate, LocalizationState, LocalizationStatus, PoseEstimate,
     };
     use ros_z::time::Time;
 
     #[test]
-    fn association_rejects_mixed_epochs_and_keeps_recovery_prior_frozen() {
-        let prior = LocalizationEstimate {
+    fn tracking_geometry_requires_matching_state_epoch_generation_and_field_pose() {
+        let mut estimate = LocalizationEstimate {
             generation: 0,
             time: Time::from_nanos(10),
             epoch: 3,
@@ -126,10 +89,11 @@ mod tests {
                 covariance: nalgebra::SMatrix::identity(),
             }),
         };
-        let mut current = prior;
-        current.time = Time::from_nanos(30);
-        current.robot_to_local.pose.inner.translation.vector.x = 2.0;
-        current.robot_to_field.as_mut().unwrap().covariance *= 5.0;
+        estimate.robot_to_local.pose.inner.translation.vector.x = 2.0;
+        let field = estimate.robot_to_field.as_mut().unwrap();
+        field.covariance[(0, 3)] = 0.125 + f64::EPSILON;
+        field.covariance[(3, 0)] = 0.125 + f64::EPSILON;
+        field.pose.inner.translation.x = 1.0 + f64::EPSILON;
         let mut status = LocalizationStatus {
             generation: 0,
             time: Time::from_nanos(20),
@@ -137,28 +101,20 @@ mod tests {
             state: LocalizationState::LostTrack,
             heading: None,
         };
-        let geometry = AssociationGeometry::from_estimate(&current, &status, Some(&prior)).unwrap();
-        assert_eq!(geometry.robot_to_local.translation().x(), 2.0);
-        let LocalizationState3D::LostTrack {
-            last_known_estimate,
-            last_successful_solve,
-        } = geometry.state
-        else {
-            panic!("expected recovery prior");
-        };
-        assert_eq!(last_successful_solve, prior.time);
-        assert_eq!(
-            last_known_estimate.covariance,
-            nalgebra::SMatrix::<f32, 6, 6>::identity()
-        );
-        status.epoch = 4;
-        assert!(AssociationGeometry::from_estimate(&current, &status, Some(&prior)).is_none());
-        status.epoch = current.epoch;
-        status.generation += 1;
-        assert!(AssociationGeometry::from_estimate(&current, &status, Some(&prior)).is_none());
-        current.generation = status.generation;
-        assert!(AssociationGeometry::from_estimate(&current, &status, Some(&prior)).is_none());
+        assert!(AssociationGeometry::from_estimate(&estimate, &status).is_none());
+        status.state = LocalizationState::Startup;
+        assert!(AssociationGeometry::from_estimate(&estimate, &status).is_none());
         status.state = LocalizationState::Tracking;
-        assert!(AssociationGeometry::from_estimate(&current, &status, None).is_some());
+        let geometry = AssociationGeometry::from_estimate(&estimate, &status).unwrap();
+        assert_eq!(geometry.last_successful_solve, estimate.time);
+        assert_eq!(geometry.estimate, estimate.robot_to_field.unwrap());
+        status.epoch = 4;
+        assert!(AssociationGeometry::from_estimate(&estimate, &status).is_none());
+        status.epoch = estimate.epoch;
+        status.generation += 1;
+        assert!(AssociationGeometry::from_estimate(&estimate, &status).is_none());
+        status.generation = estimate.generation;
+        estimate.robot_to_field = None;
+        assert!(AssociationGeometry::from_estimate(&estimate, &status).is_none());
     }
 }

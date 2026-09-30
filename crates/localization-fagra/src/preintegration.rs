@@ -102,7 +102,6 @@ impl ImuPreintegrator {
     ) -> Result<(), EvaluationError> {
         if !dt.is_finite()
             || dt <= 0.0
-            || !bias_tau.is_finite()
             || !(0.0..=1.0).contains(&bias_tau)
             || !noise.gyroscope.is_finite()
             || noise.gyroscope <= 0.0

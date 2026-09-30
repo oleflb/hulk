@@ -1,20 +1,17 @@
 use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc};
 
-use color_eyre::Result;
+use color_eyre::{Result, eyre::OptionExt as _};
 use ros_z::{
     context::Context,
     parameter::NodeParametersExt,
     qos::{QosDurability, QosHistory, QosProfile},
 };
 use types::{
-    camera_geometry::{CAMERA_GEOMETRY_TOPIC, CameraGeometry},
+    camera_geometry::CameraGeometry,
     field_dimensions::FieldDimensions,
     object_detection::{Object, RobocupObjectLabel},
     time_wrapper::TimeWrapper,
-    visual_localization::{
-        GLOBAL_LOCALIZATION_DEBUG_TOPIC, GlobalLocalizationDebug, VISUAL_LOCALIZATION_TOPIC,
-        VisualLocalizationFrame,
-    },
+    visual_localization::{GlobalLocalizationDebug, VisualLocalizationFrame},
 };
 
 use crate::{
@@ -33,11 +30,12 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("field_mark_association").build().await?;
     let parameters =
         node.bind_parameter_as::<FieldMarkAssociationParameters>("field_mark_association")?;
-    parameters.add_validation_hook(FieldMarkAssociationParameters::validate)?;
+    let capacities = parameters.snapshot().typed.capacities;
+    parameters.add_validation_hook(move |candidate| candidate.validate_update(capacities))?;
 
     let camera_geometry_cache = node
-        .subscriber::<TimeWrapper<CameraGeometry>>(CAMERA_GEOMETRY_TOPIC)
-        .cache(1500)
+        .subscriber::<TimeWrapper<CameraGeometry>>("camera_geometry")
+        .cache(capacities.camera_geometry)
         .with_stamp(|message| message.time)
         .build()
         .await?;
@@ -48,27 +46,23 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             durability: QosDurability::TransientLocal,
             ..Default::default()
         })
-        .cache(1)
+        .cache(capacities.field_dimensions)
         .build()
         .await?;
 
     let estimates = node
-        .subscriber::<types::localization::LocalizationEstimate>(
-            types::localization::LOCALIZATION_ESTIMATE_TOPIC,
-        )
-        .cache(128)
+        .subscriber::<types::localization::LocalizationEstimate>("localization/estimate")
+        .cache(capacities.estimates)
         .with_stamp(|message| message.time)
         .build()
         .await?;
     let status = node
-        .subscriber::<types::localization::LocalizationStatus>(
-            types::localization::LOCALIZATION_STATUS_TOPIC,
-        )
+        .subscriber::<types::localization::LocalizationStatus>("localization/status")
         .qos(QosProfile {
             durability: QosDurability::TransientLocal,
             ..Default::default()
         })
-        .cache(1)
+        .cache(capacities.status)
         .build()
         .await?;
 
@@ -76,18 +70,23 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let detected_objects = node
         .subscriber::<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>("detected_objects")
         .qos(QosProfile {
-            history: QosHistory::KeepLast(NonZeroUsize::MIN),
+            history: QosHistory::KeepLast(
+                NonZeroUsize::new(capacities.detections_queue)
+                    .ok_or_eyre("field_mark_association.capacities.detections_queue must be > 0")?,
+            ),
             ..Default::default()
         })
         .build()
         .await?;
 
     let associations_publisher = node
-        .publisher::<TimeWrapper<VisualLocalizationFrame>>(VISUAL_LOCALIZATION_TOPIC)
+        .publisher::<TimeWrapper<VisualLocalizationFrame>>(
+            "field_mark_association/visual_localization_local",
+        )
         .build()
         .await?;
     let global_localization_publisher = node
-        .publisher::<Option<GlobalLocalizationDebug>>(GLOBAL_LOCALIZATION_DEBUG_TOPIC)
+        .publisher::<Option<GlobalLocalizationDebug>>("debug/global_localization")
         .build()
         .await?;
     let processing_context = DetectionProcessingContext {
@@ -96,14 +95,17 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         field_dimensions_cache: &field_dimensions_cache,
         estimates: &estimates,
         status: &status,
-        attitudes: std::sync::Mutex::new(ros_z::cache::CacheInner::new(1500)),
+        attitudes: std::sync::Mutex::new(ros_z::cache::CacheInner::new(capacities.attitudes)),
         associations_publisher: Arc::new(associations_publisher),
         global_localization_publisher: Arc::new(global_localization_publisher),
         clock: node.clock(),
     };
     let imu = node
         .subscriber::<booster::ImuState>("inputs/imu_state")
-        .queue_capacity(NonZeroUsize::new(500).unwrap())
+        .queue_capacity(
+            NonZeroUsize::new(capacities.imu_queue)
+                .ok_or_eyre("field_mark_association.capacities.imu_queue must be > 0")?,
+        )
         .build()
         .await?;
     let mut pending_frame = None;

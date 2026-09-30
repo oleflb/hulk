@@ -171,8 +171,8 @@ fn run_sequence(
         metrics.prepare_durations.push(prepare_start.elapsed());
 
         let process_start = Instant::now();
-        let estimated_previous_to_current =
-            pipeline.process(&stereo_image_pair, pose_estimation_parameters)?;
+        let output = pipeline.process(&stereo_image_pair, pose_estimation_parameters);
+        let estimated_previous_to_current = output.previous_to_current();
         let process_duration = process_start.elapsed();
         metrics.process_durations.push(process_duration);
         black_box(&estimated_previous_to_current);

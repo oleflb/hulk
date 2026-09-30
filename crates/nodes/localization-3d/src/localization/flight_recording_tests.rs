@@ -102,10 +102,14 @@ fn recorded_divergence_window_remains_bounded_without_contact() {
     inputs.sort_by_key(|(delivery, _)| *delivery);
     let initial = initial.expect("pre-incident pose");
     let reference = reference.expect("pre-incident heading reference");
+    let parameters: Localization3dParameters = json5::from_str(include_str!(
+        "../../../../../etc/parameters/base/localization3d.json5"
+    ))
+    .unwrap();
     let camera_at = |time: Time| -> Option<CameraGeometry> {
         let (_, before) = cameras.range(..=time).next_back()?;
         let (_, after) = cameras.range(time..).next()?;
-        interpolate_camera_geometry(before, after, time)
+        interpolate_camera_geometry(before, after, time, parameters.timing.max_camera_gap)
     };
     let (origin, first_imu) = inputs
         .iter()
@@ -114,10 +118,6 @@ fn recorded_divergence_window_remains_bounded_without_contact() {
             _ => None,
         })
         .unwrap();
-    let parameters: Localization3dParameters = json5::from_str(include_str!(
-        "../../../../../etc/parameters/base/localization3d.json5"
-    ))
-    .unwrap();
     let mut field = FieldDimensions::SPL_2025;
     field.length = 8.92;
     field.width = 5.94;

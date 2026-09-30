@@ -8,11 +8,6 @@ use linear_algebra::{Isometry2, Isometry3, Orientation2, Rotation2};
 
 use crate::multivariate_normal_distribution::MultivariateNormalDistribution;
 
-pub const LOCALIZATION_ESTIMATE_TOPIC: &str = "localization/estimate";
-pub const LOCALIZATION_STATUS_TOPIC: &str = "localization/status";
-/// Maximum source-time gap for IMU attitude interpolation and heading validation.
-pub const MAX_IMU_ATTITUDE_GAP: std::time::Duration = std::time::Duration::from_millis(20);
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PoseEstimate<From, To> {
     pub pose: Isometry3<From, To, f64>,
@@ -81,10 +76,7 @@ pub struct HeadingConstraint {
 
 impl HeadingConstraint {
     pub fn is_valid(&self) -> bool {
-        self.expected.inner.re.is_finite()
-            && self.expected.inner.im.is_finite()
-            && (self.expected.inner.norm_sqr() - 1.0).abs() < 1e-6
-            && self.max_error.is_finite()
+        (self.expected.inner.norm_sqr() - 1.0).abs() < 1e-6
             && self.max_error > 0.0
             && self.max_error < std::f64::consts::FRAC_PI_2
     }
@@ -123,27 +115,6 @@ pub struct LocalizationStatus {
     pub generation: u64,
     pub state: LocalizationState,
     pub heading: Option<FieldHeadingReference>,
-}
-
-/// Pose prior used by the field-association algorithm (not a node output).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-pub struct LocalizationEstimate3D {
-    pub robot_to_field: Isometry3<Robot, Field>,
-    pub covariance: SMatrix<f32, 6, 6>,
-}
-
-/// Association's pose prior and freshness anchor, assembled by its consumer.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-pub enum LocalizationState3D {
-    Startup,
-    Tracking {
-        estimate: LocalizationEstimate3D,
-        last_successful_solve: Time,
-    },
-    LostTrack {
-        last_known_estimate: LocalizationEstimate3D,
-        last_successful_solve: Time,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Message)]

@@ -8,19 +8,40 @@ use types::localization::HeadingConstraint;
 use types::visual_localization::FieldMarkAssociation;
 use types::visual_localization::VisualLocalizationFrame;
 
-const MIN_REPROJECTION_DEPTH: f64 = 0.01;
-const MIN_DETECTION_SEPARATION_PX: f32 = 1.0;
-const MIN_LANDMARK_SEPARATION_M: f32 = 1.0e-4;
-const MAX_VISUAL_RMS_PX: f64 = 10.0;
+use crate::parameters::VisualParameters;
 
-pub(crate) fn valid_visual_rms(rms: Option<f64>) -> bool {
-    rms.is_some_and(|rms| rms.is_finite() && rms <= MAX_VISUAL_RMS_PX)
+pub(crate) fn valid_visual_rms(rms: Option<f64>, parameters: &VisualParameters) -> bool {
+    rms.is_some_and(|rms| rms.is_finite() && rms <= parameters.max_rms_px)
+}
+
+pub(crate) fn reprojection_rms(
+    associations: &[FieldMarkAssociation],
+    field_to_camera: &nalgebra::Isometry3<f64>,
+    focals: nalgebra::Vector2<f64>,
+    optical_center: nalgebra::Point2<f64>,
+    parameters: &VisualParameters,
+) -> Option<f64> {
+    let mut squared = 0.0;
+    for observation in associations {
+        let p = field_to_camera * observation.field_point.inner.cast::<f64>();
+        if p.z <= parameters.min_reprojection_depth {
+            return None;
+        }
+        let pixel = nalgebra::Vector2::new(
+            focals.x * p.x / p.z + optical_center.x,
+            focals.y * p.y / p.z + optical_center.y,
+        );
+        squared += (pixel - observation.detection.inner.coords.cast::<f64>()).norm_squared();
+    }
+    let rms = (squared / associations.len() as f64).sqrt();
+    rms.is_finite().then_some(rms)
 }
 
 pub(crate) fn seed_recovery_alignment(
     frame: &mut VisualLocalizationFrame,
     robot_to_local: Rotation3<Robot, Local>,
     heading: HeadingConstraint,
+    parameters: &VisualParameters,
 ) -> Option<(Isometry3<Robot, Local>, Isometry2<Local, Field>)> {
     let (pose, mut alignment) = seed_alignment(
         robot_to_local,
@@ -28,6 +49,7 @@ pub(crate) fn seed_recovery_alignment(
         frame.camera_intrinsic,
         &mut frame.associations,
         false,
+        parameters,
     )?;
     let field_heading = Orientation2::new(
         (alignment.to_3d().inner.rotation * pose.inner.rotation)
@@ -63,11 +85,10 @@ pub(crate) fn seed_recovery_alignment(
 
 pub(crate) fn valid_visual_frame(
     frame: &types::visual_localization::VisualLocalizationFrame,
+    parameters: &VisualParameters,
 ) -> bool {
     let associations = &frame.associations;
-    (types::visual_localization::MIN_CERTIFIED_VISUAL_ASSOCIATIONS
-        ..=types::visual_localization::MAX_CERTIFIED_VISUAL_ASSOCIATIONS)
-        .contains(&associations.len())
+    (parameters.min_associations..=parameters.max_associations).contains(&associations.len())
         && frame.camera_intrinsic.is_valid()
         && frame
             .robot_to_camera
@@ -85,9 +106,10 @@ pub(crate) fn valid_visual_frame(
         })
         && associations.iter().enumerate().all(|(index, association)| {
             associations[index + 1..].iter().all(|other| {
-                (association.detection - other.detection).inner.norm() > MIN_DETECTION_SEPARATION_PX
+                (association.detection - other.detection).inner.norm()
+                    > parameters.min_detection_separation_px
                     && (association.field_point - other.field_point).inner.norm()
-                        > MIN_LANDMARK_SEPARATION_M
+                        > parameters.min_landmark_separation_m
             })
         })
 }
@@ -100,6 +122,7 @@ pub(crate) fn seed_alignment(
     intrinsic: Intrinsic,
     associations: &mut [FieldMarkAssociation],
     canonicalize: bool,
+    parameters: &VisualParameters,
 ) -> Option<(Isometry3<Robot, Local>, Isometry2<Local, Field>)> {
     let rotation: Rotation3<Robot, Local, f64> = Rotation3::wrap(robot_to_local.inner.cast());
     let camera_to_robot: Isometry3<Camera, Robot, f64> =
@@ -109,7 +132,7 @@ pub(crate) fn seed_alignment(
     for a in associations.iter() {
         let ray =
             camera_rotation * Vector3::wrap(intrinsic.bearing(a.detection).inner.cast::<f64>());
-        if !ray.inner.iter().all(|v| v.is_finite()) || ray.z() >= -1e-6 {
+        if !ray.inner.iter().all(|v| v.is_finite()) || ray.z() >= -parameters.min_downward_ray {
             return None;
         }
         points.push((
@@ -137,20 +160,16 @@ pub(crate) fn seed_alignment(
     let field_to_camera = robot_to_camera.inner.cast::<f64>()
         * pose.inner.cast::<f64>().inverse()
         * framed_alignment.to_3d().inner.inverse();
-    let mut squared = 0.0;
-    for a in associations.iter() {
-        let p = field_to_camera * a.field_point.inner.cast::<f64>();
-        if p.z <= MIN_REPROJECTION_DEPTH {
-            return None;
-        }
-        let pixel = nalgebra::Vector2::new(
-            intrinsic.focals.x as f64 * p.x / p.z + intrinsic.optical_center.x() as f64,
-            intrinsic.focals.y as f64 * p.y / p.z + intrinsic.optical_center.y() as f64,
-        );
-        squared += (pixel - a.detection.inner.coords.cast::<f64>()).norm_squared();
-    }
-    let rms = (squared / associations.len() as f64).sqrt();
-    if !valid_visual_rms(Some(rms)) {
+    if !valid_visual_rms(
+        reprojection_rms(
+            associations,
+            &field_to_camera,
+            intrinsic.focals.cast(),
+            intrinsic.optical_center.inner.cast(),
+            parameters,
+        ),
+        parameters,
+    ) {
         return None;
     }
     if canonicalize && alignment.translation.vector.x > 0.0 {
@@ -167,4 +186,59 @@ pub(crate) fn seed_alignment(
         .iter()
         .all(|value| value.is_finite())
         .then(|| (pose, alignment.framed_transform()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use linear_algebra::point;
+
+    #[test]
+    fn visual_gates_change_admission_and_pixel_validation() {
+        let mut parameters = VisualParameters::default();
+        let frame = VisualLocalizationFrame {
+            epoch: 0,
+            generation: 0,
+            source: types::visual_localization::VisualAssociationSource::Tracking,
+            robot_to_camera: Isometry3::identity(),
+            camera_intrinsic: Intrinsic::default(),
+            associations: vec![
+                FieldMarkAssociation {
+                    field_point: point![0.0, 0.0, 2.0],
+                    detection: point![0.0, 0.0],
+                },
+                FieldMarkAssociation {
+                    field_point: point![4.0, 0.0, 2.0],
+                    detection: point![2.0, 0.0],
+                },
+                FieldMarkAssociation {
+                    field_point: point![0.0, 4.0, 2.0],
+                    detection: point![0.0, 2.0],
+                },
+            ],
+        };
+        assert!(valid_visual_frame(&frame, &parameters));
+        parameters.min_associations = 4;
+        assert!(!valid_visual_frame(&frame, &parameters));
+        parameters.min_associations = 3;
+        parameters.min_detection_separation_px = 2.1;
+        assert!(!valid_visual_frame(&frame, &parameters));
+        parameters.min_detection_separation_px = 1.0;
+        parameters.min_landmark_separation_m = 4.1;
+        assert!(!valid_visual_frame(&frame, &parameters));
+        let rms = |parameters: &VisualParameters| {
+            reprojection_rms(
+                &frame.associations,
+                &nalgebra::Isometry3::identity(),
+                nalgebra::Vector2::repeat(1.0),
+                nalgebra::Point2::new(1.0, 0.0),
+                parameters,
+            )
+        };
+        assert!(valid_visual_rms(rms(&parameters), &parameters));
+        parameters.max_rms_px = 0.5;
+        assert!(!valid_visual_rms(rms(&parameters), &parameters));
+        parameters.min_reprojection_depth = 2.1;
+        assert!(rms(&parameters).is_none());
+    }
 }

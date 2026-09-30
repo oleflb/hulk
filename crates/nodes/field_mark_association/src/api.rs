@@ -5,7 +5,7 @@ use ros_z::time::Time;
 pub use types::localization::HeadingConstraint;
 use types::{
     field_dimensions::FieldDimensions,
-    localization::{LocalizationState, LocalizationState3D, LocalizationStatus},
+    localization::{LocalizationState, LocalizationStatus},
     visual_localization::{
         AssociationGeometry, FieldMarkAssociation, GlobalLocalizationDebug, VisualAssociationSource,
     },
@@ -71,13 +71,11 @@ pub fn associate_visual_features(
     }
     if input.status.state == LocalizationState::Tracking {
         let Some(geometry) = input.tracking.filter(|geometry| {
-            geometry.epoch == input.status.epoch
-                && geometry.generation == input.status.generation
-                && matches!(geometry.state, LocalizationState3D::Tracking { .. })
+            geometry.epoch == input.status.epoch && geometry.generation == input.status.generation
         }) else {
             return AssociationResult::default();
         };
-        return associate_tracking_visual_features(
+        return tracking::associate(
             TrackingAssociationInput {
                 geometry,
                 visual_features: input.visual_features,
@@ -87,7 +85,8 @@ pub fn associate_visual_features(
                 time: input.time,
             },
             parameters,
-        );
+        )
+        .unwrap_or_default();
     }
     let Some(attitude) = input.attitude else {
         return AssociationResult::default();

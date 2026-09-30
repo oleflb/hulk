@@ -4,7 +4,7 @@ use nalgebra::{Matrix3, RealField, SMatrix, SVector, UnitQuaternion, Vector3};
 use crate::{
     spline::PoseSpline,
     variables::{
-        PoseControl,
+        ImuBias, PoseControl,
         rotation::{self, scalar},
     },
 };
@@ -101,6 +101,32 @@ pub(super) fn emit<
     emit_blocks(sink, r, blocks)
 }
 
+pub(super) fn emit_pose_and_bias<
+    R: RealField + Copy,
+    L: LinearizationSink<Scalar = R>,
+    const M: usize,
+>(
+    sink: &mut L,
+    controls: &[StateKey<PoseControl<R>>; 4],
+    biases: &[StateKey<ImuBias<R>>; 2],
+    residual: &SVector<R, M>,
+    pose: &[SMatrix<R, M, 6>; 4],
+    bias: &[SMatrix<R, M, 6>; 2],
+) -> Result<(), EvaluationError> {
+    emit_blocks(
+        sink,
+        residual,
+        [
+            JacobianBlock::new(controls[0], &pose[0]),
+            JacobianBlock::new(controls[1], &pose[1]),
+            JacobianBlock::new(controls[2], &pose[2]),
+            JacobianBlock::new(controls[3], &pose[3]),
+            JacobianBlock::new(biases[0], &bias[0]),
+            JacobianBlock::new(biases[1], &bias[1]),
+        ],
+    )
+}
+
 /// Omit exactly-zero blocks without allocating or dropping constant residual
 /// cost. Nonfinite blocks remain present so the sink still rejects them.
 pub(super) fn emit_blocks<
@@ -134,7 +160,6 @@ pub(super) fn rotation_log<R: RealField + Copy>(
 }
 
 pub(super) fn validate_up<R: RealField + Copy>(up: &Vector3<R>) -> Result<(), EvaluationError> {
-    finite(up.iter())?;
     if (up.norm_squared() - R::one()).abs() <= scalar(1e-5) {
         Ok(())
     } else {

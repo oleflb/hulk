@@ -1,4 +1,4 @@
-use super::{Estimator, KNOT_SPACING_NS, control_keys, seconds_per_knot};
+use super::{Estimator, control_keys};
 use color_eyre::Result;
 use coordinate_systems::ImuReference;
 use linear_algebra::Orientation3;
@@ -10,8 +10,10 @@ impl Estimator {
     /// carry no absolute-yaw anchor. Rebuilding the small active set handles late samples.
     pub(super) fn prepare_attitude(&mut self) -> Result<()> {
         for segment in self.segments() {
-            let start = Time::from_nanos(self.origin.as_nanos() + segment * KNOT_SPACING_NS);
-            let end = Time::from_nanos(start.as_nanos() + KNOT_SPACING_NS);
+            let start = Time::from_nanos(
+                self.origin.as_nanos() + segment * self.parameters.timing.knot_ns(),
+            );
+            let end = Time::from_nanos(start.as_nanos() + self.parameters.timing.knot_ns());
             let Some(a) = self.attitude_at(start) else {
                 continue;
             };
@@ -23,25 +25,27 @@ impl Estimator {
             }
             let key = self.graph.add_factor(RelativeYaw {
                 controls: control_keys(&self.controls, segment)?,
-                duration: seconds_per_knot(),
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
                 end_tau: 1.0,
                 measured_yaw_change: yaw_change(a, b),
-                information_root: (2.0e-5_f64).sqrt().recip(),
+                information_root: self.parameters.model.relative_yaw_variance.sqrt().recip(),
             })?;
             self.yaw_factors.insert(segment, key);
         }
         if let Some((&time, &orientation)) = self.attitudes.last_key_value() {
             let (segment, tau) = self.segment_and_tau(time)?;
-            let start = Time::from_nanos(self.origin.as_nanos() + segment * KNOT_SPACING_NS);
+            let start = Time::from_nanos(
+                self.origin.as_nanos() + segment * self.parameters.timing.knot_ns(),
+            );
             if tau > 0.0
                 && let Some(anchor) = self.attitude_at(start)
             {
                 self.current_yaw = Some(self.graph.add_factor(RelativeYaw {
                     controls: control_keys(&self.controls, segment)?,
-                    duration: seconds_per_knot(),
+                    duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
                     end_tau: tau,
                     measured_yaw_change: yaw_change(anchor, orientation),
-                    information_root: (2.0e-5_f64).sqrt().recip(),
+                    information_root: self.parameters.model.relative_yaw_variance.sqrt().recip(),
                 })?);
             }
         }
@@ -54,7 +58,7 @@ impl Estimator {
             return Some(*a);
         }
         let (&after, b) = self.attitudes.range(time..).next()?;
-        if after.duration_since(before) > types::localization::MAX_IMU_ATTITUDE_GAP {
+        if after.duration_since(before) > self.parameters.timing.max_imu_gap {
             return None;
         }
         let fraction = (time.as_nanos() - before.as_nanos()) as f64

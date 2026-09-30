@@ -1,7 +1,5 @@
 use coordinate_systems::{Local, Robot};
-use fagra::{
-    BlockId, EvaluationError, Factor, JacobianBlock, LinearizationSink, StateKey, StateStore,
-};
+use fagra::{BlockId, EvaluationError, Factor, LinearizationSink, StateKey, StateStore};
 use linear_algebra::Vector3;
 use nalgebra::{Matrix3, RealField, SMatrix, SVector};
 
@@ -63,7 +61,7 @@ impl<R: RealField + Copy> PreintegratedImu<R> {
         }
         let (mut pose, k) = spline.pose_and_kinematics(tau)?;
         let robot_to_local = pose.orientation().rotation::<Robot>();
-        let arm_velocity = Vector3::wrap(k.angular_velocity.inner.cross(&self.position.inner));
+        let arm_velocity = Vector3::wrap(k.inner.cross(&self.position.inner));
         pose.inner.translation.vector += (robot_to_local * self.position).inner;
         Ok(TrajectoryState {
             pose,
@@ -81,11 +79,7 @@ impl<R: RealField + Copy> PreintegratedImu<R> {
         }
         let (pose, k) = spline.pose_and_kinematics(tau)?;
         let mut sample = LinearizedState::from_pose_and_velocity(pose, spline.velocity(tau)?)?;
-        let arm_velocity = k
-            .kinematics
-            .angular_velocity
-            .inner
-            .cross(&self.position.inner);
+        let arm_velocity = k.angular_velocity.inner.cross(&self.position.inner);
         let r_cross = self.position.inner.cross_matrix();
         for (j, w) in sample
             .jacobians
@@ -104,27 +98,6 @@ impl<R: RealField + Copy> PreintegratedImu<R> {
         sample.state.pose.inner.translation.vector += (robot_to_local * self.position).inner;
         sample.state.velocity += robot_to_local * Vector3::wrap(arm_velocity);
         Ok(sample)
-    }
-
-    fn emit<L: LinearizationSink<Scalar = R>, const N: usize>(
-        &self,
-        sink: &mut L,
-        residual: &SVector<R, N>,
-        pose: &[SMatrix<R, N, 6>; 4],
-        bias: &[SMatrix<R, N, 6>; 2],
-    ) -> Result<(), EvaluationError> {
-        common::emit_blocks(
-            sink,
-            residual,
-            [
-                JacobianBlock::new(self.controls[0], &pose[0]),
-                JacobianBlock::new(self.controls[1], &pose[1]),
-                JacobianBlock::new(self.controls[2], &pose[2]),
-                JacobianBlock::new(self.controls[3], &pose[3]),
-                JacobianBlock::new(self.biases[0], &bias[0]),
-                JacobianBlock::new(self.biases[1], &bias[1]),
-            ],
-        )
     }
 }
 
@@ -230,7 +203,14 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>> + StateStore<ImuBias<R>>
                     .bias_jacobians
                     .each_ref()
                     .map(|j| root * bias * j.fixed_rows::<3>(0));
-                self.emit(sink, &(root * error), &pose, &biases)
+                common::emit_pose_and_bias(
+                    sink,
+                    &self.controls,
+                    &self.biases,
+                    &(root * error),
+                    &pose,
+                    &biases,
+                )
             }
             PreintegrationInformation::Full(root) => {
                 let a = self.sensor_linearized(&linearized, self.start_tau)?;
@@ -285,7 +265,14 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>> + StateStore<ImuBias<R>>
                         .copy_from(&(rotation_bias * j.fixed_rows::<3>(0)));
                     root * result
                 });
-                self.emit(sink, &(root * error), &pose, &biases)
+                common::emit_pose_and_bias(
+                    sink,
+                    &self.controls,
+                    &self.biases,
+                    &(root * error),
+                    &pose,
+                    &biases,
+                )
             }
         }
     }

@@ -23,9 +23,12 @@ pub type AdjacentKinematicOdometry<R = f64> = KinematicOdometry<R, 5>;
 
 impl<R: RealField + Copy, const N: usize> KinematicOdometry<R, N> {
     fn validate(&self) -> Result<(), EvaluationError> {
-        if !(N == 4 || N == 5)
-            || self.current_tau + R::from_usize(N - 4).unwrap() <= self.previous_tau
-        {
+        let offset = match N {
+            4 => R::zero(),
+            5 => R::one(),
+            _ => return Err(EvaluationError::InvalidEvaluation),
+        };
+        if self.current_tau + offset <= self.previous_tau {
             return Err(EvaluationError::InvalidEvaluation);
         }
         common::unique(&self.controls)?;
@@ -65,18 +68,26 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>, const N: usize> Factor<
 
     fn cost(&self, states: &S) -> Result<R, EvaluationError> {
         self.validate()?;
-        let a = common::spline(
+        let first = common::spline(
             states,
-            self.controls[..4].try_into().unwrap(),
+            self.controls
+                .first_chunk::<4>()
+                .ok_or(EvaluationError::InvalidEvaluation)?,
             self.duration,
-        )?
-        .pose(self.previous_tau)?;
-        let b = common::spline(
-            states,
-            self.controls[N - 4..].try_into().unwrap(),
-            self.duration,
-        )?
-        .pose(self.current_tau)?;
+        )?;
+        let a = first.pose(self.previous_tau)?;
+        let b = if N == 4 {
+            first.pose(self.current_tau)?
+        } else {
+            common::spline(
+                states,
+                self.controls
+                    .last_chunk::<4>()
+                    .ok_or(EvaluationError::InvalidEvaluation)?,
+                self.duration,
+            )?
+            .pose(self.current_tau)?
+        };
         let (prediction, _) = self.prediction(&a.inner, &b.inner)?;
         Ok(common::huber(
             &(self.information_root * (prediction - self.translation.inner)),
@@ -91,20 +102,28 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>, const N: usize> Factor<
         sink: &mut L,
     ) -> Result<(), EvaluationError> {
         self.validate()?;
-        let a = common::spline(
+        let first = common::spline(
             states,
-            self.controls[..4].try_into().unwrap(),
+            self.controls
+                .first_chunk::<4>()
+                .ok_or(EvaluationError::InvalidEvaluation)?,
             self.duration,
-        )?
-        .linearize()?
-        .pose(self.previous_tau)?;
-        let b = common::spline(
-            states,
-            self.controls[N - 4..].try_into().unwrap(),
-            self.duration,
-        )?
-        .linearize()?
-        .pose(self.current_tau)?;
+        )?;
+        let linearized = first.linearize()?;
+        let a = linearized.pose(self.previous_tau)?;
+        let b = if N == 4 {
+            linearized.pose(self.current_tau)?
+        } else {
+            common::spline(
+                states,
+                self.controls
+                    .last_chunk::<4>()
+                    .ok_or(EvaluationError::InvalidEvaluation)?,
+                self.duration,
+            )?
+            .linearize()?
+            .pose(self.current_tau)?
+        };
         let (prediction, rotation) = self.prediction(&a.pose.inner, &b.pose.inner)?;
         let residual = self.information_root * (prediction - self.translation.inner);
         let scale = common::huber(&residual, self.huber_threshold)?.1;

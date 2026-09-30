@@ -15,12 +15,9 @@ use ros_z::{
 use ros_z_debug::{ObservationPolicy, SampleRecord};
 use types::{
     field_dimensions::{FieldDimensions, Half, Side},
-    localization::{
-        LOCALIZATION_ESTIMATE_TOPIC, LOCALIZATION_STATUS_TOPIC, LocalizationEstimate,
-        LocalizationStatus,
-    },
+    localization::{LocalizationEstimate, LocalizationStatus},
     time_wrapper::TimeWrapper,
-    visual_localization::{VISUAL_LOCALIZATION_TOPIC, VisualLocalizationFrame},
+    visual_localization::VisualLocalizationFrame,
 };
 
 use super::super::image_overlay::{
@@ -58,10 +55,13 @@ impl ImageOverlay for ProjectedFieldLinesOverlay {
         });
         Ok(Self {
             camera_matrix: OverlayObservation::new(context, "camera_matrix")?,
-            localization: OverlayObservation::new(context, LOCALIZATION_ESTIMATE_TOPIC)?,
-            status: OverlayObservation::with_policy(context, LOCALIZATION_STATUS_TOPIC, latched)?,
+            localization: OverlayObservation::new(context, "localization/estimate")?,
+            status: OverlayObservation::with_policy(context, "localization/status", latched)?,
             dimensions: OverlayObservation::with_policy(context, "field_dimensions", latched)?,
-            associations: OverlayObservation::new(context, VISUAL_LOCALIZATION_TOPIC)?,
+            associations: OverlayObservation::new(
+                context,
+                "field_mark_association/visual_localization_local",
+            )?,
         })
     }
 
@@ -166,10 +166,14 @@ impl ProjectedFieldLinesOverlay {
         use super::super::image_overlay::tests::observation;
         Self {
             camera_matrix: observation(context, Arc::clone(&node), "camera_matrix"),
-            localization: observation(context, Arc::clone(&node), LOCALIZATION_ESTIMATE_TOPIC),
-            status: observation(context, Arc::clone(&node), LOCALIZATION_STATUS_TOPIC),
+            localization: observation(context, Arc::clone(&node), "localization/estimate"),
+            status: observation(context, Arc::clone(&node), "localization/status"),
             dimensions: observation(context, Arc::clone(&node), "field_dimensions"),
-            associations: observation(context, node, VISUAL_LOCALIZATION_TOPIC),
+            associations: observation(
+                context,
+                node,
+                "field_mark_association/visual_localization_local",
+            ),
         }
     }
 

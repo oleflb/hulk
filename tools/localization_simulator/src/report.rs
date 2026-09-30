@@ -531,7 +531,7 @@ mod tests {
             raw_backend_robot_to_field: None,
             live_robot_to_field: None,
             global_visual_lock: GlobalLock::Unlocked,
-            state: types::localization::LocalizationState3D::Startup,
+            state: types::localization::LocalizationState::Startup,
             diagnostics: None,
             landmark_frame: None,
             noisy_cumulative_camera_to_visual_odometer: Isometry3::identity(),

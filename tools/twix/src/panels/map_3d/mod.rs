@@ -111,7 +111,7 @@ impl Observations {
             )?,
             localization: Observation::new(
                 context,
-                types::localization::LOCALIZATION_ESTIMATE_TOPIC,
+                "localization/estimate",
                 1,
                 Default::default(),
             )?,
@@ -123,7 +123,7 @@ impl Observations {
             )?,
             localization_status: Observation::new(
                 context,
-                types::localization::LOCALIZATION_STATUS_TOPIC,
+                "localization/status",
                 1,
                 ObservationPolicy::default().with_subscriber_qos(QosProfile {
                     durability: QosDurability::TransientLocal,

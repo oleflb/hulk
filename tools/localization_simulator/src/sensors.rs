@@ -1,7 +1,6 @@
 use coordinate_systems::{Camera, Field, Pixel};
 use field_mark_association::{
-    DetectedVisualFeature, DetectedVisualFeatures, FieldFeatureLandmark, VisualFeatureClass,
-    field_feature_landmarks,
+    DetectedVisualFeature, DetectedVisualFeatures, VisualFeatureClass, candidate_points,
 };
 use linear_algebra::{
     Isometry3 as FramedIsometry3, Point2 as FramedPoint2, Point3 as FramedPoint3,
@@ -42,7 +41,7 @@ pub(crate) struct SyntheticSensors {
     previous_time: Option<Time>,
     current_camera_to_visual_odometer: Isometry3<f32>,
     transition_index: usize,
-    landmarks: Vec<FieldFeatureLandmark>,
+    landmarks: Vec<(VisualFeatureClass, FramedPoint2<Field>)>,
 }
 
 impl SyntheticSensors {
@@ -55,7 +54,7 @@ impl SyntheticSensors {
             previous_time: None,
             current_camera_to_visual_odometer: Isometry3::identity(),
             transition_index: 0,
-            landmarks: field_feature_landmarks(field_dimensions),
+            landmarks: candidate_points(field_dimensions),
         }
     }
 
@@ -124,8 +123,8 @@ impl SyntheticSensors {
     ) -> LandmarkObservations {
         let field_to_camera = camera_to_field.inverse();
         let mut observations = LandmarkObservations::default();
-        for landmark in &self.landmarks {
-            let field_point = landmark.position.extend(0.0);
+        for &(class, position) in &self.landmarks {
+            let field_point = position.extend(0.0);
             let camera_point = field_to_camera * field_point;
             let Some(ideal_pixel) = project_in_bounds(camera_point, camera_matrix) else {
                 continue;
@@ -144,7 +143,7 @@ impl SyntheticSensors {
             }
             push_detection(
                 &mut observations.detections,
-                landmark.class,
+                class,
                 DetectedVisualFeature {
                     pixel,
                     confidence: 1.0,

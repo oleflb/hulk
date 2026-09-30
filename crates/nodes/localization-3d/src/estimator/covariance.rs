@@ -56,8 +56,7 @@ impl Estimator {
         }
         let variance = (j * covariance * j.transpose())[(0, 0)];
         let height = sample.pose.inner.translation.z;
-        (height.is_finite() && variance.is_finite() && variance > 0.0)
-            .then_some(HeightPrediction { height, variance })
+        (variance.is_finite() && variance > 0.0).then_some(HeightPrediction { height, variance })
     }
 
     pub(super) fn estimate_covariance_blocks(
@@ -80,7 +79,11 @@ impl Estimator {
         covariance: &EstimateCovariance,
         diagnostics: &mut crate::diagnostics::SolveDiagnostics,
     ) -> Result<LocalizationEstimate> {
-        let (_, fraction) = super::bias::bias_segment_and_tau(self.origin, self.latest_time);
+        let (_, fraction) = super::bias::bias_segment_and_tau(
+            self.origin,
+            self.latest_time,
+            self.parameters.timing.bias_ns(),
+        );
         let bias = self.bias_at(self.latest_time)?;
         let bias_offset = 24 + usize::from(self.alignment.is_some()) * 3;
         // Preserve cross-correlations between all controls and field alignment.

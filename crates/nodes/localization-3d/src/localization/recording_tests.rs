@@ -31,8 +31,6 @@ struct RecordedFrame {
     time: i64,
     camera_translation: [f32; 3],
     camera_quaternion: [f32; 4],
-    local_translation: [f32; 3],
-    local_quaternion: [f32; 4],
     intrinsics: [f32; 4],
     imu: [ImuSample; 2],
     detections: Vec<Detection>,
@@ -64,7 +62,7 @@ struct RecordedVisualFrame {
     epoch: u64,
     source: VisualAssociationSource,
     robot_to_camera: Isometry3<Robot, Camera>,
-    robot_to_local: Isometry3<Robot, Local>,
+    _robot_to_local: Isometry3<Robot, Local>,
     camera_intrinsic: Intrinsic,
     associations: Vec<FieldMarkAssociation>,
 }
@@ -98,15 +96,8 @@ impl RecordedFrame {
         )
     }
 
-    fn leveling(&self, exposure_tilt: bool) -> Rotation3<Robot, Ground> {
-        let (roll, pitch, _) = if exposure_tilt {
-            self.exposure_attitude().euler_angles()
-        } else {
-            pose(self.local_translation, self.local_quaternion)
-                .rotation
-                .cast::<f64>()
-                .euler_angles()
-        };
+    fn leveling(&self) -> Rotation3<Robot, Ground> {
+        let (roll, pitch, _) = self.exposure_attitude().euler_angles();
         Rotation3::from_euler_angles(roll as f32, pitch as f32, 0.0)
     }
 
@@ -168,10 +159,10 @@ fn verify_recording(recording: Recording) {
     for recorded in &recording.frames {
         assert!(recorded.time > recording.reference.time);
         let features = recorded.features();
-        let associate = |frame: &VisualLocalizationFrame, exposure_tilt, heading| {
+        let associate = |frame: &VisualLocalizationFrame, heading| {
             associate_global_visual_features(GlobalAssociationInput {
                 visual_features: &features,
-                robot_to_ground: recorded.leveling(exposure_tilt),
+                robot_to_ground: recorded.leveling(),
                 robot_to_camera: frame.robot_to_camera,
                 camera_intrinsic: frame.camera_intrinsic,
                 field_dimensions: &recording.field,
@@ -179,30 +170,15 @@ fn verify_recording(recording: Recording) {
                 heading,
             })
         };
-        let stale = associate(&recorded.visual(), false, None);
-        assert_eq!(
-            stale.associations.len(),
-            recorded.associations.len(),
-            "{}: reproduce old certification",
-            recorded.sequence
-        );
-        for a in &stale.associations {
-            assert!(recorded.associations.iter().any(|old| {
-                (a.detection.inner.coords - nalgebra::Vector2::from(old.pixel)).norm() < 1e-4
-                    && (a.field_point.inner.coords.xy() - nalgebra::Vector2::from(old.field)).norm()
-                        < 1e-4
-            }));
-        }
         let mut corrected = recorded.visual();
-        let unconstrained = associate(&corrected, true, None);
+        let unconstrained = associate(&corrected, None);
         let expected = reference.expected(recorded.exposure_attitude());
         let heading = types::localization::HeadingConstraint {
             expected,
             max_error: parameters.max_heading_error,
         };
         // This isolated seed test defines Local's yaw gauge at exposure.
-        let robot_to_local: Rotation3<Robot, Local> =
-            Rotation3::wrap(recorded.leveling(true).inner);
+        let robot_to_local: Rotation3<Robot, Local> = Rotation3::wrap(recorded.leveling().inner);
         if recorded.sequence < 3737 {
             assert!(
                 unconstrained.associations.is_empty(),
@@ -214,6 +190,7 @@ fn verify_recording(recording: Recording) {
                     &mut corrected.clone(),
                     robot_to_local,
                     heading,
+                    &parameters.visual,
                 )
                 .is_none(),
                 "{} must also reject the old ~90-degree hypothesis downstream",
@@ -222,7 +199,6 @@ fn verify_recording(recording: Recording) {
         }
         let associated = associate(
             &corrected,
-            true,
             Some(types::localization::HeadingConstraint {
                 expected,
                 max_error: parameters.max_heading_error,
@@ -237,8 +213,12 @@ fn verify_recording(recording: Recording) {
         corrected.associations = associated.associations;
         let selected = corrected.associations.clone();
         {
-            let seed =
-                crate::alignment::seed_recovery_alignment(&mut corrected, robot_to_local, heading);
+            let seed = crate::alignment::seed_recovery_alignment(
+                &mut corrected,
+                robot_to_local,
+                heading,
+                &parameters.visual,
+            );
             let (pose, alignment) =
                 seed.expect("later recorded geometry has the correct half-turn");
             let field = Orientation2::<Field, f64>::new(
@@ -456,8 +436,6 @@ fn recorded_flip_from_mcap() {
         assert_eq!(frame.source, VisualAssociationSource::Global);
         recorded.camera_translation = frame.robot_to_camera.inner.translation.vector.into();
         recorded.camera_quaternion = frame.robot_to_camera.inner.rotation.coords.into();
-        recorded.local_translation = frame.robot_to_local.inner.translation.vector.into();
-        recorded.local_quaternion = frame.robot_to_local.inner.rotation.coords.into();
         recorded.intrinsics = [
             frame.camera_intrinsic.focals.x,
             frame.camera_intrinsic.focals.y,

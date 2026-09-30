@@ -41,16 +41,6 @@ pub struct PoseSpline<R: RealField + Copy = f64> {
     /// Local position polynomial, in ascending powers of tau.
     position: [Vector<R>; 4],
     inverse_duration: R,
-    inverse_duration_squared: R,
-}
-
-/// Physical time derivatives in explicitly tagged frames.
-#[derive(Debug)]
-pub struct SplineKinematics<R: RealField + Copy = f64> {
-    /// Time-varying body angular velocity in rad/s.
-    pub angular_velocity: Vector3<Robot, R>,
-    /// Local translational acceleration in m/s², excluding gravity compensation.
-    pub linear_acceleration: Vector3<Local, R>,
 }
 
 /// Pose and four control Jacobians in control-array order.
@@ -114,9 +104,9 @@ impl<R: RealField + Copy> LinearizedState<R> {
 /// Kinematics and vector-component derivatives with respect to all four controls.
 #[derive(Debug)]
 pub struct LinearizedKinematics<R: RealField + Copy = f64> {
-    pub kinematics: SplineKinematics<R>,
+    /// Time-varying body angular velocity in Robot axes, rad/s.
+    pub angular_velocity: Vector3<Robot, R>,
     pub angular_velocity_jacobians: [SMatrix<R, 3, 6>; 4],
-    pub linear_acceleration_jacobians: [SMatrix<R, 3, 6>; 4],
 }
 
 /// Control-dependent derivative preparation, shared across observations in a batch.
@@ -183,7 +173,6 @@ impl<R: RealField + Copy> PoseSpline<R> {
             smooth_rotation,
             position,
             inverse_duration,
-            inverse_duration_squared,
         })
     }
 
@@ -213,44 +202,41 @@ impl<R: RealField + Copy> PoseSpline<R> {
         })
     }
 
-    pub fn kinematics(&self, tau: R) -> Result<SplineKinematics<R>, EvaluationError> {
+    /// Body angular velocity in the evaluated Robot axes, rad/s.
+    pub fn kinematics(&self, tau: R) -> Result<Vector3<Robot, R>, EvaluationError> {
         validate_tau(tau)?;
         let basis = Basis::new(tau);
         let increments = self.increments(&basis);
-        self.kinematics_from_increments(tau, &basis, &increments)
+        self.kinematics_from_increments(&basis, &increments)
     }
 
-    /// Shared value evaluation for accelerometer observations: compute the three
+    /// Shared value evaluation for gyro/tilt and mounting offsets: compute the three
     /// rotational exponentials once for both pose and kinematics.
     pub fn pose_and_kinematics(
         &self,
         tau: R,
-    ) -> Result<(Pose3<Local, R>, SplineKinematics<R>), EvaluationError> {
+    ) -> Result<(Pose3<Local, R>, Vector3<Robot, R>), EvaluationError> {
         validate_tau(tau)?;
         let basis = Basis::new(tau);
         let increments = self.increments(&basis);
         Ok((
             self.pose_from_increments(tau, &increments)?,
-            self.kinematics_from_increments(tau, &basis, &increments)?,
+            self.kinematics_from_increments(&basis, &increments)?,
         ))
     }
 
     fn kinematics_from_increments(
         &self,
-        tau: R,
         basis: &Basis<R>,
         increments: &[UnitQuaternion<R>; 3],
-    ) -> Result<SplineKinematics<R>, EvaluationError> {
+    ) -> Result<Vector3<Robot, R>, EvaluationError> {
         let mut omega = Vector::zeros();
         for (i, increment) in increments.iter().enumerate() {
             omega = increment.inverse() * omega
                 + self.rotation_deltas[i] * (basis.cumulative_first[i] * self.inverse_duration);
         }
         finite(omega.iter())?;
-        Ok(SplineKinematics {
-            angular_velocity: Vector3::wrap(omega),
-            linear_acceleration: self.acceleration(tau)?,
-        })
+        Ok(Vector3::wrap(omega))
     }
 
     /// Prepare analytical right-control Jacobians. Rejects any consecutive rotation
@@ -299,14 +285,6 @@ impl<R: RealField + Copy> PoseSpline<R> {
             position.into(),
             rotation,
         )))
-    }
-
-    fn acceleration(&self, tau: R) -> Result<Vector3<Local, R>, EvaluationError> {
-        let acceleration = (self.position[3] * (scalar::<R>(6.0) * tau)
-            + self.position[2] * scalar::<R>(2.0))
-            * self.inverse_duration_squared;
-        finite(acceleration.iter())?;
-        Ok(Vector3::wrap(acceleration))
     }
 }
 
@@ -380,7 +358,7 @@ impl<R: RealField + Copy> LinearizedPoseSpline<'_, R> {
         validate_tau(tau)?;
         let basis = Basis::new(tau);
         let increments = self.spline.increments(&basis);
-        self.kinematics_from_increments(tau, &basis, &increments, &self.increment_jacobians(&basis))
+        self.kinematics_from_increments(&basis, &increments, &self.increment_jacobians(&basis))
     }
 
     /// Share rotational exponentials and exponential Jacobians for joint IMU evaluation.
@@ -394,13 +372,12 @@ impl<R: RealField + Copy> LinearizedPoseSpline<'_, R> {
         let jacobians = self.increment_jacobians(&basis);
         Ok((
             self.pose_from_increments(tau, &basis, &increments, &jacobians)?,
-            self.kinematics_from_increments(tau, &basis, &increments, &jacobians)?,
+            self.kinematics_from_increments(&basis, &increments, &jacobians)?,
         ))
     }
 
     fn kinematics_from_increments(
         &self,
-        tau: R,
         basis: &Basis<R>,
         increments: &[UnitQuaternion<R>; 3],
         increment_jacobians: &[Matrix3<R>; 3],
@@ -434,18 +411,9 @@ impl<R: RealField + Copy> LinearizedPoseSpline<'_, R> {
                 .iter()
                 .chain(angular_velocity_jacobians.iter().flat_map(|j| j.iter())),
         )?;
-        let linear_acceleration_jacobians = self.translation_jacobians(
-            basis
-                .second
-                .map(|x| x * self.spline.inverse_duration_squared),
-        )?;
         Ok(LinearizedKinematics {
-            kinematics: SplineKinematics {
-                angular_velocity: Vector3::wrap(omega),
-                linear_acceleration: self.spline.acceleration(tau)?,
-            },
+            angular_velocity: Vector3::wrap(omega),
             angular_velocity_jacobians,
-            linear_acceleration_jacobians,
         })
     }
 
@@ -468,7 +436,6 @@ impl<R: RealField + Copy> LinearizedPoseSpline<'_, R> {
 struct Basis<R> {
     value: [R; 4],
     first: [R; 4],
-    second: [R; 4],
     cumulative: [R; 3],
     cumulative_first: [R; 3],
 }
@@ -494,7 +461,6 @@ impl<R: RealField + Copy> Basis<R> {
         Self {
             value,
             first,
-            second: [one_minus, c(3.0) * u - c(2.0), R::one() - c(3.0) * u, u],
             cumulative: [R::one() - value[0], value[2] + value[3], value[3]],
             cumulative_first: [-first[0], first[2] + first[3], first[3]],
         }
@@ -502,7 +468,7 @@ impl<R: RealField + Copy> Basis<R> {
 }
 
 fn validate_tau<R: RealField + Copy>(tau: R) -> Result<(), EvaluationError> {
-    if tau.is_finite() && tau >= R::zero() && tau <= R::one() {
+    if tau >= R::zero() && tau <= R::one() {
         Ok(())
     } else {
         Err(EvaluationError::InvalidEvaluation)

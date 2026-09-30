@@ -344,14 +344,9 @@ pub fn estimate_previous_to_current(
         &mut scratch.pnp_image_points,
     );
 
-    let pose =
-        if let Some(pose) = estimate_identity_initialized_pose(triangulator, parameters, scratch) {
-            pose
-        } else if let Some(pose) = estimate_outlier_free_pose(triangulator, parameters, scratch) {
-            pose
-        } else {
-            estimate_ransac_pose(triangulator, parameters, scratch)?
-        };
+    let pose = estimate_identity_initialized_pose(triangulator, parameters, scratch)
+        .or_else(|| estimate_outlier_free_pose(triangulator, parameters, scratch))
+        .or_else(|| estimate_ransac_pose(triangulator, parameters, scratch))?;
 
     Some(pnp_pose_to_isometry(&pose))
 }
@@ -438,19 +433,15 @@ fn estimate_outlier_free_pose(
     parameters: &StereoVisualOdometryPoseEstimationParameters,
     scratch: &mut OdometryScratch,
 ) -> Option<PnPResult> {
-    let pose = match solve_pnp(
+    let pose = solve_pnp(
         &scratch.pnp_world_points,
         &scratch.pnp_image_points,
         triangulator.intrinsics_f32(),
         None,
         PnPMethod::EPnPDefault,
-    ) {
-        Ok(pose) => pose,
-        Err(error) => {
-            tracing::trace!(?error, "all-correspondence PnP failed");
-            return None;
-        }
-    };
+    )
+    .inspect_err(|error| tracing::trace!(?error, "all-correspondence PnP failed"))
+    .ok()?;
 
     if !pose
         .reproj_rmse
@@ -485,24 +476,22 @@ fn estimate_ransac_pose(
         random_seed: None,
         refine: false,
     };
-    let result = match solve_pnp_ransac(
+    let result = solve_pnp_ransac(
         &scratch.pnp_world_points,
         &scratch.pnp_image_points,
         triangulator.intrinsics_f32(),
         None,
         PnPMethod::EPnPDefault,
         &params,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            tracing::debug!(
-                ?error,
-                correspondences = scratch.correspondences.len(),
-                "left PnP RANSAC failed"
-            );
-            return None;
-        }
-    };
+    )
+    .inspect_err(|error| {
+        tracing::debug!(
+            ?error,
+            correspondences = scratch.correspondences.len(),
+            "left PnP RANSAC failed"
+        );
+    })
+    .ok()?;
 
     if result.inliers.len() < parameters.minimum_pnp_correspondences {
         return None;
@@ -565,11 +554,12 @@ fn estimate_ransac_pose(
 
 fn collect_left_inlier_correspondences(result: &PnPRansacResult, scratch: &mut OdometryScratch) {
     scratch.inlier_correspondences.clear();
-    for &index in &result.inliers {
-        if let Some(correspondence) = scratch.correspondences.get(index).copied() {
-            scratch.inlier_correspondences.push(correspondence);
-        }
-    }
+    scratch.inlier_correspondences.extend(
+        result
+            .inliers
+            .iter()
+            .filter_map(|&index| scratch.correspondences.get(index).copied()),
+    );
 }
 
 fn refine_pose(
@@ -617,36 +607,27 @@ fn refine_pose(
         triangulator.baseline(),
     );
 
-    match refined_metrics {
-        Some(refined_metrics)
-            if is_refinement_better(initial_metrics, refined_metrics)
-                && passes_soft_stereo_validation(
-                    refined_metrics,
-                    parameters.minimum_pnp_correspondences,
-                ) =>
-        {
-            diagnostics.lm_success = true;
+    if let Some(metrics) = refined_metrics {
+        let accepted = is_refinement_better(initial_metrics, metrics)
+            && passes_soft_stereo_validation(metrics, parameters.minimum_pnp_correspondences);
+        diagnostics.lm_success = true;
+        if accepted {
             diagnostics.lm_accepted = true;
-            fill_diagnostics_after_lm(diagnostics, refined_metrics);
-            fill_lm_delta(diagnostics, &initial_pose, &refined_pose);
-            Some(with_stereo_rmse(refined_pose, refined_metrics))
         }
-        refined_metrics => {
-            if let Some(refined_metrics) = refined_metrics {
-                diagnostics.lm_success = true;
-                fill_diagnostics_after_lm(diagnostics, refined_metrics);
-                fill_lm_delta(diagnostics, &initial_pose, &refined_pose);
-            }
-            tracing::debug!(
-                initial_left_rmse = initial_metrics.left_rmse(),
-                initial_stereo_rmse = initial_metrics.stereo_rmse(),
-                refined_left_rmse = refined_metrics.and_then(|metrics| metrics.left_rmse()),
-                refined_stereo_rmse = refined_metrics.and_then(|metrics| metrics.stereo_rmse()),
-                "stereo LM failed validation or worsened accepted reprojection metrics"
-            );
-            allow_initial_fallback.then_some(initial_pose)
+        fill_diagnostics_after_lm(diagnostics, metrics);
+        fill_lm_delta(diagnostics, &initial_pose, &refined_pose);
+        if accepted {
+            return Some(with_stereo_rmse(refined_pose, metrics));
         }
     }
+    tracing::debug!(
+        initial_left_rmse = initial_metrics.left_rmse(),
+        initial_stereo_rmse = initial_metrics.stereo_rmse(),
+        refined_left_rmse = refined_metrics.and_then(|metrics| metrics.left_rmse()),
+        refined_stereo_rmse = refined_metrics.and_then(|metrics| metrics.stereo_rmse()),
+        "stereo LM failed validation or worsened accepted reprojection metrics"
+    );
+    allow_initial_fallback.then_some(initial_pose)
 }
 
 fn disparity_weight(

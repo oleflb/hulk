@@ -8,7 +8,7 @@ use super::{Observation, ObservationContext};
 use projection::Projection;
 use ros_z_debug::SampleRecord;
 use std::sync::Arc;
-use types::{time_wrapper::TimeWrapper, visual_localization::VISUAL_LOCALIZATION_TOPIC};
+use types::time_wrapper::TimeWrapper;
 
 pub(super) struct Observations {
     frames: Observation<TimeWrapper<FieldMarkAssociations>>,
@@ -17,7 +17,12 @@ pub(super) struct Observations {
 impl Observations {
     pub(super) fn new(context: &impl ObservationContext) -> color_eyre::Result<Self> {
         Ok(Self {
-            frames: Observation::new(context, VISUAL_LOCALIZATION_TOPIC, 64, Default::default())?,
+            frames: Observation::new(
+                context,
+                "field_mark_association/visual_localization_local",
+                64,
+                Default::default(),
+            )?,
         })
     }
 

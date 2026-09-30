@@ -1,8 +1,5 @@
-use super::{
-    Estimator, HUBER_THRESHOLD, MIN_LANDMARK_RANGE, MIN_REPROJECTION_DEPTH, WINDOW_NS,
-    control_keys, recovery::MotionRecord, seconds_per_knot,
-};
-use crate::alignment::{valid_visual_frame, valid_visual_rms};
+use super::{Estimator, control_keys, recovery::MotionRecord};
+use crate::alignment::{reprojection_rms, valid_visual_frame, valid_visual_rms};
 use crate::heading::HeadingReference;
 use color_eyre::{Result, eyre::eyre};
 use coordinate_systems::{Field, Robot};
@@ -42,14 +39,8 @@ impl Estimator {
         ))
     }
 
-    pub(crate) fn visual_rms(&self) -> Option<f64> {
-        let frame = self
-            .pending_visuals
-            .iter()
-            .map(|p| &p.frame)
-            .chain(self.latest_visual_frame.iter())
-            .max_by_key(|f| f.time)?;
-        self.frame_rms(frame)
+    pub(crate) fn accepted_visual_rms(&self) -> Option<f64> {
+        self.frame_rms(self.latest_visual_frame.as_ref()?)
     }
 
     fn frame_rms(&self, frame: &TimeWrapper<VisualLocalizationFrame>) -> Option<f64> {
@@ -64,20 +55,13 @@ impl Estimator {
         let transform = frame.inner.robot_to_camera.inner.cast::<f64>()
             * pose.inner.inverse()
             * alignment.local_to_field.to_3d().inner.inverse();
-        let mut squared = 0.0;
-        for observation in &frame.inner.associations {
-            let p = transform * observation.field_point.inner.cast::<f64>();
-            if p.z <= MIN_REPROJECTION_DEPTH {
-                return None;
-            }
-            let pixel = nalgebra::Vector2::new(
-                camera.focal_lengths.x() * p.x / p.z + camera.optical_center.x(),
-                camera.focal_lengths.y() * p.y / p.z + camera.optical_center.y(),
-            );
-            squared += (pixel - observation.detection.inner.coords.cast::<f64>()).norm_squared();
-        }
-        let rms = (squared / frame.inner.associations.len() as f64).sqrt();
-        rms.is_finite().then_some(rms)
+        reprojection_rms(
+            &frame.inner.associations,
+            &transform,
+            camera.focal_lengths.inner,
+            camera.optical_center.inner,
+            &self.parameters.visual,
+        )
     }
 
     /// Validate before either publication or marginalization can retain a bad field update.
@@ -87,7 +71,7 @@ impl Estimator {
             .range(..=self.latest_time)
             .next_back()
             .ok_or_else(|| eyre!("missing IMU heading"))?;
-        if self.latest_time.duration_since(time) > types::localization::MAX_IMU_ATTITUDE_GAP {
+        if self.latest_time.duration_since(time) > self.parameters.timing.max_imu_gap {
             return Err(eyre!("stale IMU heading"));
         }
         for time in std::iter::once(time).chain(self.pending_visuals.iter().map(|p| p.frame.time)) {
@@ -126,11 +110,10 @@ impl Estimator {
     }
 
     pub(super) fn validate_pending_visuals(&self) -> Result<()> {
-        if self
-            .pending_visuals
-            .iter()
-            .any(|pending| !valid_visual_rms(self.frame_rms(&pending.frame)))
-        {
+        if self.pending_visuals.iter().any(|pending| {
+            !valid_visual_frame(&pending.frame.inner, &self.parameters.visual)
+                || !valid_visual_rms(self.frame_rms(&pending.frame), &self.parameters.visual)
+        }) {
             return Err(eyre!("visual update failed pixel validation"));
         }
         Ok(())
@@ -138,6 +121,8 @@ impl Estimator {
 
     pub(super) fn accept_visuals(&mut self) {
         for pending in self.pending_visuals.drain(..) {
+            self.reprojection_batches
+                .push((pending.segment, pending.batch));
             if self
                 .latest_visual_frame
                 .as_ref()
@@ -154,8 +139,6 @@ impl Estimator {
                 self.graph.remove_factor(*key)?;
             }
             self.graph.remove_batch(pending.batch)?;
-            self.reprojection_batches
-                .retain(|(_, batch)| *batch != pending.batch);
             *self.measurements.entry(pending.segment).or_default() -= pending.factors.len();
         }
         Ok(())
@@ -172,7 +155,7 @@ impl Estimator {
         let frame = frame.inner;
         if frame.epoch != self.epoch
             || frame.generation != self.generation
-            || !valid_visual_frame(&frame)
+            || !valid_visual_frame(&frame, &self.parameters.visual)
         {
             return Ok(false);
         }
@@ -187,7 +170,8 @@ impl Estimator {
             * alignment.local_to_field.to_3d().inner.inverse();
         if frame.associations.iter().any(|a| {
             let p = field_to_camera * a.field_point.inner.cast::<f64>();
-            !p.iter().all(|v| v.is_finite()) || p.coords.norm() <= MIN_LANDMARK_RANGE
+            !p.iter().all(|v| v.is_finite())
+                || p.coords.norm() <= self.parameters.model.min_landmark_range
         }) {
             tracing::warn!(?time, "discarding visual frame with invalid landmark range");
             return Ok(false);
@@ -196,7 +180,7 @@ impl Estimator {
             controls,
             alignment: alignment_key,
             intrinsics: self.intrinsics,
-            duration: seconds_per_knot(),
+            duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
             tau,
             robot_to_camera: frame.robot_to_camera.inner.cast().framed_transform(),
             // Fixed calibration-based conversion; do not let optimized focal lengths
@@ -205,8 +189,8 @@ impl Estimator {
                 * f64::from(frame.camera_intrinsic.focals.y))
             .sqrt()
                 / self.parameters.visual_feature_noise_variance.sqrt(),
-            huber_threshold: HUBER_THRESHOLD,
-            min_range: MIN_LANDMARK_RANGE,
+            huber_threshold: self.parameters.model.huber_threshold,
+            min_range: self.parameters.model.min_landmark_range,
         });
         let mut factors = Vec::with_capacity(frame.associations.len());
         for association in &frame.associations {
@@ -219,7 +203,6 @@ impl Estimator {
             )?);
             *self.measurements.entry(segment).or_default() += 1;
         }
-        self.reprojection_batches.push((segment, batch));
         self.pending_visuals.push(PendingVisual {
             segment,
             batch,
@@ -278,7 +261,7 @@ impl Estimator {
                 .latest_time
                 .max(sample.time)
                 .as_nanos()
-                .saturating_sub(WINDOW_NS)
+                .saturating_sub(self.parameters.timing.window_ns())
         {
             tracing::warn!("discarding visual odometry outside optimization window");
             return Ok(false);
@@ -312,7 +295,7 @@ impl Estimator {
             current_tau,
             current_to_previous: transform,
         };
-        let information_root = SMatrix::identity() * 10.0;
+        let information_root = SMatrix::identity() / self.parameters.model.visual_odometry_sigma;
         if previous_segment == current_segment {
             let controls = self.ensure_segment(current_segment)?;
             let batch = *self
@@ -321,9 +304,9 @@ impl Estimator {
                 .or_insert_with(|| {
                     self.graph.add_batch(VisualOdometry {
                         controls,
-                        duration: seconds_per_knot(),
+                        duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
                         information_root,
-                        huber_threshold: HUBER_THRESHOLD,
+                        huber_threshold: self.parameters.model.huber_threshold,
                     })
                 });
             self.graph.add_factor_to(batch, observation)?;
@@ -332,10 +315,10 @@ impl Estimator {
             let b = self.ensure_segment(current_segment)?;
             self.graph.add_factor(AdjacentVisualOdometry {
                 controls: [a[0], a[1], a[2], a[3], b[3]],
-                duration: seconds_per_knot(),
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
                 observation,
                 information_root,
-                huber_threshold: HUBER_THRESHOLD,
+                huber_threshold: self.parameters.model.huber_threshold,
             })?;
         }
         *self.measurements.entry(previous_segment).or_default() += 1;

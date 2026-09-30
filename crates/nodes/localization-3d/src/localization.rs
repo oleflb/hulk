@@ -1,9 +1,7 @@
 use color_eyre::{Result, eyre::eyre};
 
 use crate::{
-    diagnostics::SolveDiagnostics,
-    estimator::{Estimator, OPTIMIZATION_WINDOW},
-    heading::HeadingReference,
+    diagnostics::SolveDiagnostics, estimator::Estimator, heading::HeadingReference,
     parameters::Localization3dParameters,
 };
 use booster::ImuState;
@@ -38,7 +36,6 @@ pub struct Localization {
     estimator: Estimator,
     parameters: Localization3dParameters,
     status: LocalizationStatus,
-    latest: Option<LocalizationEstimate>,
     latest_visual: Option<Time>,
     pending_visual: Option<Time>,
     last_solve: Option<Time>,
@@ -51,7 +48,7 @@ impl Localization {
         time > self
             .estimator
             .latest_time()
-            .saturating_add(OPTIMIZATION_WINDOW)
+            .saturating_add(self.parameters.timing.optimization_window)
     }
     pub fn new(
         time: Time,
@@ -76,7 +73,7 @@ impl Localization {
                 time,
                 epoch,
                 initial_pose,
-                camera,
+                &camera.intrinsics,
                 parameters.clone(),
                 field,
             )?,
@@ -88,7 +85,6 @@ impl Localization {
                 state: LocalizationState::Startup,
                 heading: None,
             },
-            latest: None,
             latest_visual: None,
             pending_visual: None,
             last_solve: None,
@@ -105,15 +101,17 @@ impl Localization {
             ..self.status
         }
     }
-    pub fn estimate(&self) -> Option<LocalizationEstimate> {
-        self.latest
+    pub fn set_parameters(&mut self, parameters: &Localization3dParameters) -> Result<()> {
+        self.parameters
+            .validate_update(parameters)
+            .map_err(|message| eyre!(message))?;
+        self.estimator.update_parameters(parameters.clone())?;
+        self.parameters = parameters.clone();
+        Ok(())
     }
 
-    pub fn set_parameters(&mut self, parameters: &Localization3dParameters) -> Result<()> {
-        parameters.validate().map_err(|message| eyre!(message))?;
-        self.parameters = parameters.clone();
-        self.estimator.update_parameters(parameters.clone());
-        Ok(())
+    pub(crate) fn max_camera_gap(&self) -> std::time::Duration {
+        self.parameters.timing.max_camera_gap
     }
 
     pub fn deadline(&self) -> Option<Time> {
@@ -191,7 +189,10 @@ impl Localization {
                 LocalizationState::LostTrack | LocalizationState::Startup => {
                     if (self.status.state == LocalizationState::LostTrack
                         && self.heading_reference.is_none())
-                        || !crate::alignment::valid_visual_frame(&frame.inner)
+                        || !crate::alignment::valid_visual_frame(
+                            &frame.inner,
+                            &self.parameters.visual,
+                        )
                         || self
                             .pending_bootstrap
                             .as_ref()
@@ -241,7 +242,10 @@ impl Localization {
             // An initialization candidate is not field localization until the
             // optimized frame agrees with its actual pixel observations.
             let field_valid = estimate.robot_to_field.is_some()
-                && crate::alignment::valid_visual_rms(self.estimator.visual_rms())
+                && crate::alignment::valid_visual_rms(
+                    self.estimator.accepted_visual_rms(),
+                    &self.parameters.visual,
+                )
                 && visual_time.is_some_and(|time| self.estimator.attitude_at(time).is_some());
             if solved.converged && visual_valid && field_valid {
                 let continuing_tracking = self.status.state == LocalizationState::Tracking;
@@ -280,7 +284,6 @@ impl Localization {
             if solved.converged {
                 self.last_solve = Some(estimate.time);
             }
-            self.latest = Some(estimate);
             estimate
         });
         self.advance_time(now);
@@ -314,20 +317,19 @@ impl Localization {
             .estimator
             .bootstrap_candidate(frame, self.heading_reference.as_ref());
         let predicted_height = self.estimator.height_prediction(time);
-        let mut candidate = match candidate {
-            Ok(candidate) => candidate?,
-            Err(error) => {
-                tracing::warn!(%error, "discarding recovery candidate");
-                return None;
-            }
-        };
+        let mut candidate = candidate
+            .inspect_err(|error| tracing::warn!(%error, "discarding recovery candidate"))
+            .ok()??;
         let solved = candidate.solve_with_heading(self.heading_reference.as_ref());
         if !solved.converged
             || solved
                 .estimate
                 .as_ref()
                 .is_none_or(|estimate| estimate.robot_to_field.is_none())
-            || !crate::alignment::valid_visual_rms(candidate.visual_rms())
+            || !crate::alignment::valid_visual_rms(
+                candidate.accepted_visual_rms(),
+                &self.parameters.visual,
+            )
         {
             return None;
         }
@@ -350,13 +352,11 @@ impl Localization {
     }
 
     fn rebuild_local_motion(&mut self, now: Time) -> Option<crate::estimator::SolveResult> {
-        let mut candidate = match self.estimator.motion_candidate() {
-            Ok(candidate) => candidate?,
-            Err(error) => {
-                tracing::warn!(%error, "motion reconstruction failed");
-                return None;
-            }
-        };
+        let mut candidate = self
+            .estimator
+            .motion_candidate()
+            .inspect_err(|error| tracing::warn!(%error, "motion reconstruction failed"))
+            .ok()??;
         let mut solved = candidate.solve_with_heading(None);
         solved.estimate.as_ref()?;
         self.estimator = candidate;

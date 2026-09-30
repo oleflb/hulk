@@ -78,13 +78,11 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>> FactorBatch<S> for Foot
                 sink.factor(id, |_| Ok(()))?;
                 continue;
             }
-            if linearized.is_none() {
-                linearized = Some(spline.linearize()?);
-            }
-            let pose = linearized
-                .as_ref()
-                .expect("initialized for active constraint")
-                .pose(observation.tau)?;
+            let prepared = match linearized {
+                Some(ref prepared) => prepared,
+                None => linearized.insert(spline.linearize()?),
+            };
+            let pose = prepared.pose(observation.tau)?;
             let rotation = pose.pose.inner.rotation.to_rotation_matrix().into_inner();
             let mut h = SMatrix::<R, 2, 6>::zeros();
             for (row, sole) in [observation.left_sole, observation.right_sole]

@@ -8,16 +8,11 @@ use localization_fagra::{
 use nalgebra::SMatrix;
 use ros_z::time::Time;
 
-/// Independent of the trajectory spline, but aligned to its knot grid so an IMU
-/// batch never spans a bias boundary. Two bracketing knots, linear interpolation.
-pub(super) const BIAS_KNOT_SPACING_NS: i64 = 5_000_000_000;
-const _: () = assert!(BIAS_KNOT_SPACING_NS % super::KNOT_SPACING_NS == 0);
-
-pub(super) fn bias_segment_and_tau(origin: Time, time: Time) -> (i64, f64) {
+pub(super) fn bias_segment_and_tau(origin: Time, time: Time, spacing_ns: i64) -> (i64, f64) {
     let elapsed = time.as_nanos() - origin.as_nanos();
     (
-        elapsed.div_euclid(BIAS_KNOT_SPACING_NS),
-        elapsed.rem_euclid(BIAS_KNOT_SPACING_NS) as f64 / BIAS_KNOT_SPACING_NS as f64,
+        elapsed.div_euclid(spacing_ns),
+        elapsed.rem_euclid(spacing_ns) as f64 / spacing_ns as f64,
     )
 }
 
@@ -33,7 +28,7 @@ fn root(gyro_sigma: f64, accel_sigma: f64) -> SMatrix<f64, 6, 6> {
 
 impl Estimator {
     pub(super) fn initialize_biases(&mut self, time: Time, guess: ImuBias) -> Result<()> {
-        let (index, _) = bias_segment_and_tau(self.origin, time);
+        let (index, _) = bias_segment_and_tau(self.origin, time, self.parameters.timing.bias_ns());
         let key = self.graph.add(guess);
         self.biases.insert(index, key);
         // Recovery resets confidence, not the initial guess. Never feed a tight
@@ -57,17 +52,17 @@ impl Estimator {
     }
 
     pub(super) fn ensure_biases(&mut self, time: Time) -> Result<([StateKey<ImuBias>; 2], f64)> {
-        let (index, tau) = bias_segment_and_tau(self.origin, time);
-        let last = *self
+        let (index, tau) =
+            bias_segment_and_tau(self.origin, time, self.parameters.timing.bias_ns());
+        let (&last, &last_key) = self
             .biases
             .last_key_value()
-            .ok_or_else(|| eyre!("missing IMU bias anchor"))?
-            .0;
+            .ok_or_else(|| eyre!("missing IMU bias anchor"))?;
+        let mut previous = last_key;
         for next in last + 1..=index + 1 {
-            let previous = self.biases[&(next - 1)];
             let key = self.graph.add(self.graph.get(previous)?.clone());
             self.biases.insert(next, key);
-            let seconds = BIAS_KNOT_SPACING_NS as f64 * 1e-9;
+            let seconds = self.parameters.timing.bias_spacing.as_secs_f64();
             let p = &self.parameters.imu_bias;
             self.graph.add_factor(ImuBiasWalk {
                 biases: [previous, key],
@@ -76,6 +71,7 @@ impl Estimator {
                     p.accelerometer_random_walk * seconds.sqrt(),
                 ),
             })?;
+            previous = key;
         }
         Ok((
             [
@@ -90,7 +86,8 @@ impl Estimator {
     }
 
     pub(super) fn bias_at(&self, time: Time) -> Result<ImuBias> {
-        let (index, tau) = bias_segment_and_tau(self.origin, time);
+        let (index, tau) =
+            bias_segment_and_tau(self.origin, time, self.parameters.timing.bias_ns());
         let Some((&_, &left)) = self.biases.range(..=index).next_back() else {
             return Ok(self
                 .graph

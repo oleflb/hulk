@@ -1,5 +1,8 @@
 {
   global_localizer: {
+    symmetry_epsilon: 0.0001,
+    min_pair_distance: 0.000001,
+    min_triangle_denominator: 0.000000000001,
     max_input_detections: 128,
     max_retained_detections: 32,
     seed_pool_size: 8,
@@ -16,10 +19,13 @@
     mahalanobis_gate: 9.21,
     geometric_tolerance: 0.03,
     min_reprojection_depth: 0.01,
-    // Global search only; exhaustion rejects even if a candidate was already found.
+    // Global and joint tracking search; exhaustion rejects even after finding a candidate.
     max_work: 100000,
   },
   tracking: {
+    covariance_symmetry_tolerance: 0.00001,
+    covariance_psd_tolerance: 0.000001,
+    covariance_eigen_max_iterations: 64,
     // Output limit only; statistically plausible rivals beyond it still enter scoring.
     max_pixel_distance: 80.0,
     position_sigma_per_second: 0.15,
@@ -29,4 +35,16 @@
     score_ratio: 1.05,
   },
   max_pose_hint_age: { nanos: 250000000, secs: 0 },
+  max_imu_gap: { nanos: 20000000, secs: 0 },
+  max_camera_gap: { nanos: 20000000, secs: 0 },
+  // Allocated at initialization. Live changes are rejected; restart to apply.
+  capacities: {
+    camera_geometry: 1500,
+    field_dimensions: 1,
+    estimates: 128,
+    status: 1,
+    attitudes: 1500,
+    imu_queue: 500,
+    detections_queue: 1,
+  },
 }

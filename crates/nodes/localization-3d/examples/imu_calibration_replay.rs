@@ -118,18 +118,18 @@ fn main() -> color_eyre::Result<()> {
         }
     }
     inputs.sort_by_key(|(delivery, _)| *delivery);
+    let parameters: Localization3dParameters = json5::from_str(include_str!(
+        "../../../../etc/parameters/base/localization3d.json5"
+    ))?;
     let camera_at = |time| {
         let (_, a) = cameras.range(..=time).next_back()?;
         let (_, b) = cameras.range(time..).next()?;
-        interpolate_camera_geometry(a, b, time)
+        interpolate_camera_geometry(a, b, time, parameters.timing.max_camera_gap)
     };
     let initial = initial.ok_or_else(|| color_eyre::eyre::eyre!("missing initial estimate"))?;
     let origin = initial.time;
     let camera =
         camera_at(origin).ok_or_else(|| color_eyre::eyre::eyre!("missing camera bracket"))?;
-    let parameters: Localization3dParameters = json5::from_str(include_str!(
-        "../../../../etc/parameters/base/localization3d.json5"
-    ))?;
     let mut reference = nalgebra::Vector3::<f64>::zeros();
     let mut count = 0;
     for (_, input) in &inputs {

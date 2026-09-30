@@ -954,8 +954,7 @@ pub(super) mod tests {
         use ros2::sensor_msgs::image::Image;
         use types::{
             localization::{
-                LOCALIZATION_ESTIMATE_TOPIC, LOCALIZATION_STATUS_TOPIC, LocalizationEstimate,
-                LocalizationState, LocalizationStatus, PoseEstimate,
+                LocalizationEstimate, LocalizationState, LocalizationStatus, PoseEstimate,
             },
             object_detection::{Object, RobocupObjectLabel},
         };
@@ -999,12 +998,12 @@ pub(super) mod tests {
             .await
             .unwrap();
         let pose_pub = node
-            .publisher::<LocalizationEstimate>(LOCALIZATION_ESTIMATE_TOPIC)
+            .publisher::<LocalizationEstimate>("localization/estimate")
             .build()
             .await
             .unwrap();
         let geometry_pub = node
-            .publisher::<LocalizationStatus>(LOCALIZATION_STATUS_TOPIC)
+            .publisher::<LocalizationStatus>("localization/status")
             .build()
             .await
             .unwrap();

@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::{Estimator, bias::bias_segment_and_tau};
+use crate::parameters::TimingParameters;
 use color_eyre::{Result, eyre::WrapErr};
 use coordinate_systems::{ImuReference, Robot};
 use fagra::FactorKey;
+use itertools::Itertools;
 use linear_algebra::Vector3;
 use localization_fagra::{
     factors::{ImuKinematics, PreintegratedImu},
@@ -11,16 +14,6 @@ use localization_fagra::{
 };
 use nalgebra::Matrix3;
 use ros_z::time::Time;
-use types::localization::MAX_IMU_ATTITUDE_GAP;
-
-use super::{
-    Estimator, KNOT_SPACING_NS,
-    bias::{BIAS_KNOT_SPACING_NS, bias_segment_and_tau},
-    seconds_per_knot,
-};
-
-const INTERVAL_NS: i64 = 100_000_000;
-const _: () = assert!(KNOT_SPACING_NS % INTERVAL_NS == 0);
 
 #[derive(Clone, Copy)]
 struct Sample {
@@ -96,11 +89,9 @@ mod tests {
         assert_eq!(pieces[2].2.delta.velocity, Vector3::zeros()); // Flight, not missing data.
         let mut parameters = estimator.parameters.clone();
         parameters.accelerometer = None;
-        estimator.update_parameters(parameters);
+        assert!(estimator.update_parameters(parameters).is_err());
         estimator.prepare_preintegration().unwrap();
-        let pieces = &estimator.preintegration.intervals[&0].pieces;
-        assert_eq!(pieces.len(), 1);
-        assert!(!pieces[0].2.acceleration);
+        assert_eq!(estimator.preintegration.intervals[&0].pieces.len(), 3);
     }
 
     #[test]
@@ -150,7 +141,7 @@ mod tests {
         }
         let mut parameters = estimator.parameters.clone();
         parameters.accelerometer.as_mut().unwrap().scale.z = 2.0;
-        estimator.update_parameters(parameters);
+        assert!(estimator.update_parameters(parameters).is_err());
         estimator.prepare_preintegration().unwrap();
         assert!(
             (estimator.preintegration.intervals[&50].pieces[0]
@@ -158,7 +149,7 @@ mod tests {
                 .delta
                 .velocity
                 .z()
-                - (2.0 * 9.81_f32 as f64 - 0.2) * 0.05)
+                - (9.81_f32 as f64 - 0.2) * 0.05)
                 .abs()
                 < 1e-12
         );
@@ -169,13 +160,14 @@ struct Interval {
     factors: Vec<FactorKey<PreintegratedImu>>,
     boundaries: Vec<FactorKey<ImuKinematics>>,
     reference_biases: [ImuBias; 2],
-    end: Option<Time>,
     pieces: Vec<(Time, Time, ImuPreintegrator)>,
     reusable: bool,
 }
 
-#[derive(Default)]
 pub(super) struct ImuIntervals {
+    // Keep the original partition with the cache, including during recovery replay.
+    interval_ns: i64,
+    max_gap: std::time::Duration,
     samples: BTreeMap<Time, Sample>,
     intervals: BTreeMap<i64, Interval>,
     dirty: BTreeSet<i64>,
@@ -183,6 +175,16 @@ pub(super) struct ImuIntervals {
 }
 
 impl ImuIntervals {
+    pub(super) fn new(timing: &TimingParameters) -> Self {
+        Self {
+            interval_ns: timing.interval_ns(),
+            max_gap: timing.max_imu_gap,
+            samples: BTreeMap::new(),
+            intervals: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+            terminal: None,
+        }
+    }
     pub(super) fn restore_boundary(&mut self, origin: Time, start: Time, source: &Self) {
         if let Some((&time, &sample)) = source.samples.range(..start).next_back() {
             self.insert(origin, time, sample.gyro, sample.force);
@@ -192,13 +194,6 @@ impl ImuIntervals {
     pub(super) fn interval_count(&self) -> usize {
         self.intervals.len()
     }
-    pub(super) fn invalidate(&mut self) {
-        self.dirty.extend(self.intervals.keys().copied());
-        for interval in self.intervals.values_mut() {
-            interval.reusable = false;
-        }
-    }
-
     pub(super) fn insert(
         &mut self,
         origin: Time,
@@ -219,25 +214,25 @@ impl ImuIntervals {
             .last_key_value()
             .is_some_and(|(&latest, _)| time <= latest)
         {
-            let first = (before.unwrap_or(time).as_nanos() - origin.as_nanos()) / INTERVAL_NS;
-            let last = (after.unwrap_or(time).as_nanos() - origin.as_nanos()) / INTERVAL_NS;
+            let first = (before.unwrap_or(time).as_nanos() - origin.as_nanos()) / self.interval_ns;
+            let last = (after.unwrap_or(time).as_nanos() - origin.as_nanos()) / self.interval_ns;
             for (_, interval) in self.intervals.range_mut(first..=last) {
                 interval.reusable = false;
             }
         }
         self.samples.insert(time, Sample { gyro, force });
         self.dirty
-            .insert((time.as_nanos() - origin.as_nanos()) / INTERVAL_NS);
+            .insert((time.as_nanos() - origin.as_nanos()) / self.interval_ns);
         for (a, b) in before
             .map(|a| (a, time))
             .into_iter()
             .chain(after.map(|b| (time, b)))
         {
             self.dirty
-                .insert((a.as_nanos() - origin.as_nanos()) / INTERVAL_NS);
-            if b.duration_since(a) <= MAX_IMU_ATTITUDE_GAP {
-                let first = (a.as_nanos() - origin.as_nanos()) / INTERVAL_NS;
-                let last = (b.as_nanos() - origin.as_nanos() - 1) / INTERVAL_NS;
+                .insert((a.as_nanos() - origin.as_nanos()) / self.interval_ns);
+            if b.duration_since(a) <= self.max_gap {
+                let first = (a.as_nanos() - origin.as_nanos()) / self.interval_ns;
+                let last = (b.as_nanos() - origin.as_nanos() - 1) / self.interval_ns;
                 self.dirty.extend(first..=last);
             }
         }
@@ -248,7 +243,8 @@ impl Estimator {
     pub(super) fn prepare_preintegration(&mut self) -> Result<()> {
         let p = &self.parameters.imu_preintegration;
         for (&index, interval) in &mut self.preintegration.intervals {
-            let knot = index * INTERVAL_NS / BIAS_KNOT_SPACING_NS;
+            let knot =
+                index * self.parameters.timing.interval_ns() / self.parameters.timing.bias_ns();
             for (offset, reference) in interval.reference_biases.iter().enumerate() {
                 let bias = self.graph.get(self.biases[&(knot + offset as i64)])?;
                 if (bias.gyroscope - reference.gyroscope).norm()
@@ -261,7 +257,8 @@ impl Estimator {
                 }
             }
         }
-        let oldest = self.segments().start * KNOT_SPACING_NS / INTERVAL_NS;
+        let oldest = self.segments().start * self.parameters.timing.knot_ns()
+            / self.parameters.timing.interval_ns();
         while let Some(&index) = self.preintegration.dirty.first() {
             if index >= oldest {
                 self.rebuild_imu_interval(index)?;
@@ -280,7 +277,7 @@ impl Estimator {
                 .preintegration
                 .intervals
                 .values()
-                .any(|i| i.end == Some(time) && !i.boundaries.is_empty());
+                .any(|i| i.pieces.last().is_some_and(|(_, end, _)| *end == time));
             let tilt = if has_tilt {
                 0.0
             } else {
@@ -302,8 +299,9 @@ impl Estimator {
     }
 
     fn rebuild_imu_interval(&mut self, index: i64) -> Result<()> {
-        let start = Time::from_nanos(self.origin.as_nanos() + index * INTERVAL_NS);
-        let end = Time::from_nanos(start.as_nanos() + INTERVAL_NS);
+        let start =
+            Time::from_nanos(self.origin.as_nanos() + index * self.parameters.timing.interval_ns());
+        let end = Time::from_nanos(start.as_nanos() + self.parameters.timing.interval_ns());
         let before = self
             .preintegration
             .samples
@@ -343,12 +341,13 @@ impl Estimator {
         let mut pieces = cached.map_or_else(Vec::new, |i| i.pieces.clone());
         let resume = pieces.last().map_or(start, |(_, end, _)| *end);
         let mut gap_boundaries = Vec::new();
-        let mut samples = self.preintegration.samples.range(before..=after).peekable();
-        while let Some((&a, sample)) = samples.next() {
-            let Some((&b, _)) = samples.peek().copied() else {
-                break;
-            };
-            if b.duration_since(a) > MAX_IMU_ATTITUDE_GAP {
+        for ((&a, sample), (&b, _)) in self
+            .preintegration
+            .samples
+            .range(before..=after)
+            .tuple_windows()
+        {
+            if b.duration_since(a) > self.parameters.timing.max_imu_gap {
                 if a >= start && a < end {
                     gap_boundaries.push((a, sample.gyro));
                 }
@@ -379,8 +378,9 @@ impl Estimator {
             }
             let (_, last, integrated) = pieces.last_mut().unwrap();
             // Midpoint quadrature preserves the independent linearly varying bias.
-            let tau = bias_segment_and_tau(self.origin, left).1
-                + (right.as_nanos() - left.as_nanos()) as f64 * 0.5 / BIAS_KNOT_SPACING_NS as f64;
+            let tau = bias_segment_and_tau(self.origin, left, self.parameters.timing.bias_ns()).1
+                + (right.as_nanos() - left.as_nanos()) as f64 * 0.5
+                    / self.parameters.timing.bias_ns() as f64;
             integrated
                 .integrate(
                     sample.gyro,
@@ -395,31 +395,37 @@ impl Estimator {
             *last = right;
         }
         // Prepare all numerical work before replacing graph factors.
-        let segment = index * INTERVAL_NS / KNOT_SPACING_NS;
+        let segment =
+            index * self.parameters.timing.interval_ns() / self.parameters.timing.knot_ns();
         let controls = self.ensure_segment(segment)?;
         let position = self
             .parameters
             .accelerometer
             .as_ref()
             .map_or(Vector3::zeros(), |p| p.position);
-        let segment_start = self.origin.as_nanos() + segment * KNOT_SPACING_NS;
+        let segment_start = self.origin.as_nanos() + segment * self.parameters.timing.knot_ns();
         let mut factors = Vec::new();
         let mut covered = 0.0;
-        let mut last = None;
+        let last = pieces.last().map(|(_, end, _)| *end);
         for (a, b, integrated) in &pieces {
             covered += integrated.delta.duration;
-            last = Some(*b);
             factors.push(PreintegratedImu {
                 controls,
                 biases: bias_keys,
-                duration: seconds_per_knot(),
-                start_tau: (a.as_nanos() - segment_start) as f64 / KNOT_SPACING_NS as f64,
-                end_tau: (b.as_nanos() - segment_start) as f64 / KNOT_SPACING_NS as f64,
+                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
+                start_tau: (a.as_nanos() - segment_start) as f64
+                    / self.parameters.timing.knot_ns() as f64,
+                end_tau: (b.as_nanos() - segment_start) as f64
+                    / self.parameters.timing.knot_ns() as f64,
                 information: integrated.information().wrap_err_with(|| {
                     format!("IMU covariance whitening in interval {index}, {a:?}..{b:?}")
                 })?,
                 delta: integrated.delta.clone(),
-                gravity_compensation: Vector3::wrap(nalgebra::Vector3::new(0.0, 0.0, 9.81)),
+                gravity_compensation: Vector3::wrap(nalgebra::Vector3::new(
+                    0.0,
+                    0.0,
+                    self.parameters.model.gravity,
+                )),
                 position,
             });
         }
@@ -437,13 +443,22 @@ impl Estimator {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut boundaries = Vec::new();
         if let Some(time) = last {
-            boundaries.push(self.add_imu_boundary(
-                time,
-                Vector3::zeros(),
-                0.0,
-                (covered / 0.1).sqrt() / self.parameters.imu_preintegration.tilt_sigma,
-                true,
-            )?);
+            boundaries.push(
+                self.add_imu_boundary(
+                    time,
+                    Vector3::zeros(),
+                    0.0,
+                    (covered
+                        / self
+                            .parameters
+                            .imu_preintegration
+                            .reference_duration
+                            .as_secs_f64())
+                    .sqrt()
+                        / self.parameters.imu_preintegration.tilt_sigma,
+                    true,
+                )?,
+            );
         }
         for (time, gyro) in gap_boundaries {
             // No held span consumes this gyro reading. Keep its instantaneous
@@ -456,7 +471,11 @@ impl Estimator {
                         .imu_preintegration
                         .terminal_gyroscope_sigma
                         .recip(),
-                    if last == Some(time) { 0.0 } else { 10.0 },
+                    if last == Some(time) {
+                        0.0
+                    } else {
+                        self.parameters.model.gap_tilt_sigma.recip()
+                    },
                     false,
                 )?,
             );
@@ -467,7 +486,6 @@ impl Estimator {
                 factors,
                 boundaries,
                 reference_biases,
-                end: last,
                 pieces,
                 reusable: true,
             },
@@ -491,12 +509,14 @@ impl Estimator {
             time
         };
         let (segment, _) = self.segment_and_tau(query)?;
-        let tau = (time.as_nanos() - self.origin.as_nanos() - segment * KNOT_SPACING_NS) as f64
-            / KNOT_SPACING_NS as f64;
+        let tau = (time.as_nanos()
+            - self.origin.as_nanos()
+            - segment * self.parameters.timing.knot_ns()) as f64
+            / self.parameters.timing.knot_ns() as f64;
         let controls = self.ensure_segment(segment)?;
         let (biases, bias_tau) = self.ensure_biases(query)?;
-        let bias_tau =
-            bias_tau + (time.as_nanos() - query.as_nanos()) as f64 / BIAS_KNOT_SPACING_NS as f64;
+        let bias_tau = bias_tau
+            + (time.as_nanos() - query.as_nanos()) as f64 / self.parameters.timing.bias_ns() as f64;
         let measured_up = self
             .attitude_at(time)
             .filter(|_| tilt_root != 0.0)
@@ -504,7 +524,7 @@ impl Estimator {
         Ok(self.graph.add_factor(ImuKinematics {
             controls,
             biases,
-            duration: seconds_per_knot(),
+            duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
             gyroscope_information_root: Matrix3::identity() * gyro_root,
             tilt_information_root: Matrix3::identity() * tilt_root,
             tau,
@@ -515,7 +535,8 @@ impl Estimator {
     }
 
     pub(super) fn retire_preintegration(&mut self, oldest: i64) {
-        let first = oldest * KNOT_SPACING_NS / INTERVAL_NS;
+        let first =
+            oldest * self.parameters.timing.knot_ns() / self.parameters.timing.interval_ns();
         // Endpoint and boundary factors were removed by marginalization.
         self.preintegration
             .intervals
@@ -528,7 +549,8 @@ impl Estimator {
         {
             self.preintegration.terminal = None;
         }
-        let start = Time::from_nanos(self.origin.as_nanos() + oldest * KNOT_SPACING_NS);
+        let start =
+            Time::from_nanos(self.origin.as_nanos() + oldest * self.parameters.timing.knot_ns());
         let before = self
             .preintegration
             .samples

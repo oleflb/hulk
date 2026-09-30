@@ -11,6 +11,7 @@ booster.workspace = true
 color-eyre = { workspace = true }
 coordinate_systems = { workspace = true }
 fagra = { workspace = true }
+itertools.workspace = true
 kinematics = { workspace = true }
 linear_algebra = { workspace = true }
 localization-fagra = { workspace = true }

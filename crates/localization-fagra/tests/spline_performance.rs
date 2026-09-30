@@ -187,12 +187,13 @@ mod factor_workload {
     fagra::factors! { Factors<R> {
         trajectory: TrajectoryPrior<R>, calibration: CameraIntrinsicsPrior<R>, motion: MotionPrior<R>,
         bias_prior: ImuBiasPrior<R>, bias_walk: ImuBiasWalk<R>,
-        tilt: RollPitchPrior<R>, yaw: RelativeYaw<R>, containment: FieldContainment<R>,
+        yaw: RelativeYaw<R>, containment: FieldContainment<R>,
         imu: ImuKinematics<R>,
         preintegrated_imu: PreintegratedImu<R>,
         feet: Batch<FootGround<R>, FootObservation<R>>,
         pixels: Batch<FrameReprojections<R>, ReprojectionObservation<R>>,
         odometry: Batch<VisualOdometry<R>, VisualOdometryObservation<R>>, adjacent: AdjacentVisualOdometry<R>,
+        kinematic: KinematicOdometry<R>, adjacent_kinematic: AdjacentKinematicOdometry<R>,
     } }
 
     fn graph<R: fagra::Real>() -> fagra::Solver<States<R>, Factors<R>> {
@@ -228,15 +229,6 @@ mod factor_workload {
                 duration: c(0.2),
                 information_root: SMatrix::identity(),
                 use_start_velocity: true,
-            })
-            .unwrap();
-        graph
-            .add_factor(RollPitchPrior {
-                controls,
-                duration: c(0.2),
-                tau: c(0.4),
-                measured_up: Framed::wrap(Vector3::z()),
-                information_root: Matrix3::identity(),
             })
             .unwrap();
         graph
@@ -281,6 +273,28 @@ mod factor_workload {
             })
             .unwrap();
         let biases = std::array::from_fn(|_| graph.add(ImuBias::identity()));
+        graph
+            .add_factor(KinematicOdometry {
+                controls,
+                duration: c(0.2),
+                previous_tau: c(0.2),
+                current_tau: c(0.8),
+                translation: Framed::wrap(nalgebra::Vector2::zeros()),
+                information_root: nalgebra::Matrix2::identity(),
+                huber_threshold: c(2.0),
+            })
+            .unwrap();
+        graph
+            .add_factor(AdjacentKinematicOdometry {
+                controls: [controls[0], controls[1], controls[2], controls[3], fifth],
+                duration: c(0.2),
+                previous_tau: c(0.8),
+                current_tau: c(0.2),
+                translation: Framed::wrap(nalgebra::Vector2::zeros()),
+                information_root: nalgebra::Matrix2::identity(),
+                huber_threshold: c(2.0),
+            })
+            .unwrap();
         for information in [
             PreintegrationInformation::Rotation(Matrix3::identity()),
             PreintegrationInformation::Full(SMatrix::identity()),
@@ -433,7 +447,7 @@ mod factor_workload {
             gradient_tolerance: 1e30,
             ..Default::default()
         };
-        measure("138-factor pass (f64)", |_| {
+        measure("factor workload (f64)", |_| {
             graph.optimize_with(&mut method, &options).unwrap()
         });
     }

@@ -41,8 +41,7 @@ fn stationary_and_known_polynomial_motion() {
         );
         assert!(spline.velocity(tau).unwrap().inner.norm() < 1e-12);
         let k = spline.kinematics(tau).unwrap();
-        assert!(k.angular_velocity.inner.norm() < 1e-12);
-        assert!(k.linear_acceleration.inner.norm() < 1e-12);
+        assert!(k.inner.norm() < 1e-12);
     }
 
     let duration = 0.7;
@@ -77,8 +76,7 @@ fn stationary_and_known_polynomial_motion() {
             );
             assert!((sample.velocity.inner - velocity - acceleration * t).norm() < 1e-12);
             let k = spline.kinematics(tau).unwrap();
-            assert!((k.angular_velocity.inner - omega).norm() < 1e-12);
-            assert!((k.linear_acceleration.inner - acceleration).norm() < 1e-12);
+            assert!((k.inner - omega).norm() < 1e-12);
         }
     }
 }
@@ -130,20 +128,9 @@ fn continuity<R: TestScalar>() {
     let ka = left.kinematics(R::one()).unwrap();
     let kb = right.kinematics(R::zero()).unwrap();
     for i in 0..3 {
-        assert_close(
-            ka.angular_velocity.inner[i],
-            kb.angular_velocity.inner[i],
-            tolerance,
-            "C1 rotation",
-        );
-        assert_close(
-            ka.linear_acceleration.inner[i],
-            kb.linear_acceleration.inner[i],
-            tolerance,
-            "C2 position",
-        );
+        assert_close(ka.inner[i], kb.inner[i], tolerance, "C1 rotation");
     }
-    // C2 rotation: body angular acceleration agrees on the two sides too.
+    // Time AD verifies C2 continuity without a production acceleration API.
     let dual = controls.each_ref().map(TestVariable::to_dual);
     let dl = PoseSpline::new([&dual[0], &dual[1], &dual[2], &dual[3]], dt.dual(0.0)).unwrap();
     let dr = PoseSpline::new([&dual[1], &dual[2], &dual[3], &dual[4]], dt.dual(0.0)).unwrap();
@@ -151,10 +138,15 @@ fn continuity<R: TestScalar>() {
     let b = dr
         .kinematics(R::zero().dual(1.0 / dt.test_value()))
         .unwrap();
+    let va = dl.velocity(R::one().dual(1.0 / dt.test_value())).unwrap();
+    let vb = dr.velocity(R::zero().dual(1.0 / dt.test_value())).unwrap();
     for i in 0..3 {
-        let (_, da) = R::parts(a.angular_velocity.inner[i]);
-        let (_, db) = R::parts(b.angular_velocity.inner[i]);
+        let (_, da) = R::parts(a.inner[i]);
+        let (_, db) = R::parts(b.inner[i]);
         assert!(tolerance.close(da, db), "C2 rotation: {da} != {db}");
+        let (_, da) = R::parts(va.inner[i]);
+        let (_, db) = R::parts(vb.inner[i]);
+        assert!(tolerance.close(da, db), "C2 position: {da} != {db}");
     }
 }
 
@@ -192,8 +184,7 @@ fn duration_scaling_and_quaternion_sign() {
         );
         let f = fast.kinematics(tau).unwrap();
         let s = slow.kinematics(tau).unwrap();
-        assert!((f.angular_velocity.inner - s.angular_velocity.inner * 2.0).norm() < 1e-12);
-        assert!((f.linear_acceleration.inner - s.linear_acceleration.inner * 4.0).norm() < 1e-12);
+        assert!((f.inner - s.inner * 2.0).norm() < 1e-12);
     }
 }
 
@@ -231,8 +222,8 @@ fn check_derivatives<R: TestScalar>(controls: &[PoseControl<R>; 4], duration: R,
     }
     for i in 0..3 {
         assert_close(
-            value_kinematics.angular_velocity.inner[i],
-            shared_kinematics.kinematics.angular_velocity.inner[i],
+            value_kinematics.inner[i],
+            shared_kinematics.angular_velocity.inner[i],
             tolerance,
             "shared gyro value",
         );
@@ -255,16 +246,10 @@ fn check_derivatives<R: TestScalar>(controls: &[PoseControl<R>; 4], duration: R,
     let value_kinematics = spline.kinematics(tau).unwrap();
     for row in 0..3 {
         assert_close(
-            kinematics.kinematics.angular_velocity.inner[row],
-            value_kinematics.angular_velocity.inner[row],
+            kinematics.angular_velocity.inner[row],
+            value_kinematics.inner[row],
             velocity_tolerance,
             "value/linearized omega",
-        );
-        assert_close(
-            kinematics.kinematics.linear_acceleration.inner[row],
-            value_kinematics.linear_acceleration.inner[row],
-            acceleration_tolerance,
-            "value/linearized acceleration",
         );
     }
     for control in 0..4 {
@@ -311,15 +296,9 @@ fn check_derivatives<R: TestScalar>(controls: &[PoseControl<R>; 4], duration: R,
                     ),
                     (
                         "angular velocity",
-                        dual_kinematics.angular_velocity.inner[row],
+                        dual_kinematics.inner[row],
                         &kinematics.angular_velocity_jacobians,
                         velocity_tolerance,
-                    ),
-                    (
-                        "acceleration",
-                        dual_kinematics.linear_acceleration.inner[row],
-                        &kinematics.linear_acceleration_jacobians,
-                        acceleration_tolerance,
                     ),
                 ] {
                     let (_, derivative) = R::parts(value);
@@ -338,6 +317,11 @@ fn check_derivatives<R: TestScalar>(controls: &[PoseControl<R>; 4], duration: R,
     let dual = PoseSpline::new(dual_controls.each_ref(), duration.dual(0.0)).unwrap();
     let time = tau.dual(duration.test_value().recip());
     let dual_state = dual.state(time).unwrap();
+    let p = controls.each_ref().map(|c| c.pose.inner.translation.vector);
+    let two = R::from_test_value(2.0);
+    let acceleration = ((p[2] - p[1] * two + p[0]) * (R::one() - tau)
+        + (p[3] - p[2] * two + p[1]) * tau)
+        / (duration * duration);
     let local_pose = base_pose.local(&PoseControl {
         pose: dual_state.pose,
     });
@@ -352,13 +336,13 @@ fn check_derivatives<R: TestScalar>(controls: &[PoseControl<R>; 4], duration: R,
             (
                 "v_dot",
                 dual_state.velocity.inner[row],
-                kinematics.kinematics.linear_acceleration.inner[row],
+                acceleration[row],
                 acceleration_tolerance,
             ),
             (
                 "R_dot",
                 local_pose[row],
-                kinematics.kinematics.angular_velocity.inner[row],
+                kinematics.angular_velocity.inner[row],
                 velocity_tolerance,
             ),
         ] {
@@ -476,12 +460,7 @@ fn jacobians_match_independent_central_differences() {
                             - minus_pose.inner.translation.vector)
                         / (2.0 * h);
                     let v = (plus_velocity.inner - minus_velocity.inner) / (2.0 * h);
-                    let omega = (plus_kinematics.angular_velocity.inner
-                        - minus_kinematics.angular_velocity.inner)
-                        / (2.0 * h);
-                    let acceleration = (plus_kinematics.linear_acceleration.inner
-                        - minus_kinematics.linear_acceleration.inner)
-                        / (2.0 * h);
+                    let omega = (plus_kinematics.inner - minus_kinematics.inner) / (2.0 * h);
                     for row in 0..3 {
                         assert_close(
                             pose.jacobians[index][(row, column)],
@@ -510,15 +489,6 @@ fn jacobians_match_independent_central_differences() {
                             omega[row],
                             velocity_tolerance,
                             "finite-difference omega",
-                        );
-                        assert_close(
-                            kinematics.linear_acceleration_jacobians[index][(row, column)],
-                            acceleration[row],
-                            Tolerance {
-                                absolute: tolerance.absolute / (duration * duration),
-                                ..tolerance
-                            },
-                            "finite-difference acceleration",
                         );
                     }
                 }

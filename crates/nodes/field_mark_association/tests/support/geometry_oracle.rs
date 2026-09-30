@@ -1,8 +1,8 @@
-use linear_algebra::{IntoTransform, Isometry3, point};
-use nalgebra::{Isometry2, Translation3, UnitComplex, UnitQuaternion, Vector2, Vector3};
-use types::localization::{LocalizationEstimate3D, LocalizationState3D};
+use linear_algebra::{Isometry3, point};
+use nalgebra::{Translation3, UnitComplex, UnitQuaternion, Vector2, Vector3};
+use types::localization::PoseEstimate;
 
-use super::{AssociationFixture, AssociationGeometry, Time, fixture_geometry, robot_to_camera};
+use super::{AssociationFixture, AssociationGeometry, Time, robot_to_camera, robot_to_local};
 
 pub struct FitMetrics {
     pub camera_height: f64,
@@ -15,8 +15,8 @@ pub struct FitMetrics {
 /// Fit translation/yaw with measured height and tilt fixed; scale is diagnostic only.
 pub fn expected_geometry(fixture: &AssociationFixture) -> (AssociationGeometry, FitMetrics) {
     let camera = &fixture.camera_matrix;
-    let mut geometry = fixture_geometry(camera);
-    let camera_to_local = (geometry.robot_to_local * robot_to_camera(camera).inverse())
+    let robot_to_local = robot_to_local(camera);
+    let camera_to_local = (robot_to_local * robot_to_camera(camera).inverse())
         .inner
         .cast::<f64>();
     let origin = camera_to_local.translation.vector;
@@ -55,7 +55,6 @@ pub fn expected_geometry(fixture: &AssociationFixture) -> (AssociationGeometry, 
     let yaw = cross.atan2(dot);
     let rotation = UnitComplex::new(yaw);
     let translation = field_mean - rotation * local_mean;
-    let alignment = Isometry2::from_parts(translation.into(), rotation);
     let metric_rms = (local
         .iter()
         .zip(&field)
@@ -96,17 +95,10 @@ pub fn expected_geometry(fixture: &AssociationFixture) -> (AssociationGeometry, 
         variance / count,
         variance / norm,
     ]);
-    let robot_to_field = alignment_3d * geometry.robot_to_local.inner.cast::<f64>();
+    let robot_to_field = alignment_3d * robot_to_local.inner.cast::<f64>();
     let field_to_robot = robot_to_field.rotation.inverse();
-    let lever = rotation
-        * (geometry
-            .robot_to_local
-            .inner
-            .translation
-            .vector
-            .xy()
-            .cast::<f64>()
-            - local_mean);
+    let lever =
+        rotation * (robot_to_local.inner.translation.vector.xy().cast::<f64>() - local_mean);
     let mut tangent_jacobian = nalgebra::SMatrix::<f64, 6, 3>::zeros();
     for axis in 0..2 {
         tangent_jacobian
@@ -120,11 +112,12 @@ pub fn expected_geometry(fixture: &AssociationFixture) -> (AssociationGeometry, 
         .fixed_view_mut::<3, 1>(3, 2)
         .copy_from(&(field_to_robot * Vector3::new(-lever.y, lever.x, 0.0)));
     let covariance = tangent_jacobian * centered_covariance * tangent_jacobian.transpose();
-    geometry.local_to_field = Some(alignment.cast::<f32>().framed_transform());
-    geometry.state = LocalizationState3D::Tracking {
-        estimate: LocalizationEstimate3D {
-            robot_to_field: Isometry3::wrap(robot_to_field.cast::<f32>()),
-            covariance: covariance.cast::<f32>(),
+    let geometry = AssociationGeometry {
+        epoch: 0,
+        generation: 0,
+        estimate: PoseEstimate {
+            pose: Isometry3::wrap(robot_to_field),
+            covariance,
         },
         last_successful_solve: Time::from_nanos(0),
     };

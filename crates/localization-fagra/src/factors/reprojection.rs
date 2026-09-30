@@ -274,7 +274,6 @@ impl<R: RealField + Copy> Geometry<R> {
         let local = nalgebra::Vector3::new(xy.x, xy.y, observation.field_point.inner.z);
         let robot = (self.local_to_robot * nalgebra::Point3::from(local)).coords;
         let camera = (self.robot_to_camera * nalgebra::Point3::from(robot)).coords;
-        common::finite(camera.iter())?;
         let range = camera.norm();
         if !range.is_finite() || range <= min_range {
             return Err(EvaluationError::InvalidEvaluation);

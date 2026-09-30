@@ -17,12 +17,8 @@ use std::{
     time::Duration,
 };
 use types::{
-    camera_geometry::MAX_CAMERA_GEOMETRY_GAP,
     field_dimensions::FieldDimensions,
-    localization::{
-        LOCALIZATION_ESTIMATE_TOPIC, LOCALIZATION_STATUS_TOPIC, LocalizationEstimate,
-        LocalizationState, LocalizationStatus,
-    },
+    localization::{LocalizationEstimate, LocalizationState, LocalizationStatus},
     primary_state::PrimaryState,
 };
 
@@ -33,9 +29,13 @@ pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> +
 pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("localization3d").build().await?;
     let parameters = node.bind_parameter_as::<Localization3dParameters>("localization3d")?;
-    parameters.add_validation_hook(Localization3dParameters::validate)?;
+    let startup = parameters.snapshot().typed().clone();
+    let baseline = startup.clone();
+    // Hooks run under the ROSZ commit lock before storage/publication. Rejection
+    // leaves both the node snapshot and its subscribers at the previous revision.
+    parameters.add_validation_hook(move |candidate| baseline.validate_update(candidate))?;
     let mut updates = parameters.subscribe();
-    let inputs = Inputs::new(&node).await?;
+    let inputs = Inputs::new(&node, &startup.inputs).await?;
     let latched = QosProfile {
         durability: QosDurability::TransientLocal,
         history: QosHistory::KeepLast(NonZeroUsize::MIN),
@@ -49,15 +49,15 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let field = node
         .subscriber::<FieldDimensions>("field_dimensions")
         .qos(latched)
-        .cache(1)
+        .cache(startup.inputs.field_cache)
         .build()
         .await?;
     let estimates = node
-        .publisher::<LocalizationEstimate>(LOCALIZATION_ESTIMATE_TOPIC)
+        .publisher::<LocalizationEstimate>("localization/estimate")
         .build()
         .await?;
     let statuses = node
-        .publisher::<LocalizationStatus>(LOCALIZATION_STATUS_TOPIC)
+        .publisher::<LocalizationStatus>("localization/status")
         .qos(latched)
         .build()
         .await?;
@@ -94,7 +94,10 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             changed = updates.changed() => {
                 changed.wrap_err("localization parameters closed")?;
                 let snapshot = updates.borrow_and_update().clone();
-                if let Some(active) = active.as_mut() { active.set_parameters(snapshot.typed())?; }
+                if let Some(active) = active.as_mut()
+                    && let Err(error) = active.set_parameters(snapshot.typed()) {
+                    tracing::error!(%error, "parameter update rejected; retaining active localization");
+                }
                 continue;
             }
             _ = async { match deadline { Some(t) => node.clock().sleep_until(t).await, None => pending().await } } => {
@@ -149,14 +152,14 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 let Some(camera) = inputs
                     .cameras
                     .get_nearest(time)
-                    .filter(|camera| camera.time.abs_diff(time) <= MAX_CAMERA_GEOMETRY_GAP)
+                    .filter(|camera| camera.time.abs_diff(time) <= startup.timing.max_camera_gap)
                 else {
                     continue;
                 };
                 let Some(kinematics) = inputs.robot_kinematics.get_nearest(time) else {
                     continue;
                 };
-                if kinematics.time.abs_diff(time) > Duration::from_millis(100) {
+                if kinematics.time.abs_diff(time) > startup.timing.startup_kinematics_freshness {
                     continue;
                 }
                 let Some(field) = field.get_latest() else {
@@ -206,5 +209,105 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             tracing::warn!(%error, "localization solve failed");
         }
         diagnostics.publish(&output.diagnostics).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ros_z::{context::ContextBuilder, time::Time};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn rejected_update_preserves_node_revision_and_running_estimator() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "localization-parameters-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(
+            root.join("localization3d.json5"),
+            include_str!("../../../../etc/parameters/base/localization3d.json5"),
+        )?;
+        let context = ContextBuilder::default()
+            .with_mode("peer")
+            .disable_multicast_scouting()
+            .with_parameter_layers([root.clone()])
+            .build()
+            .await?;
+        let node = context
+            .create_node("localization_parameter_test")
+            .build()
+            .await?;
+        let parameters = node.bind_parameter_as::<Localization3dParameters>("localization3d")?;
+        let original = parameters.snapshot();
+        let baseline = original.typed().clone();
+        parameters.add_validation_hook(move |candidate| baseline.validate_update(candidate))?;
+        let mut updates = parameters.subscribe();
+        let origin = Time::from_nanos(1_000_000_000);
+        let mut active = Localization::new(
+            origin,
+            7,
+            original.typed(),
+            &FieldDimensions::SPL_2025,
+            &types::camera_geometry::CameraGeometry::default(),
+            linear_algebra::Isometry3::identity(),
+        )?;
+        for millis in (0..=100).step_by(2) {
+            active.ingest_imu(
+                origin + Duration::from_millis(millis),
+                booster::ImuState::default(),
+            )?;
+        }
+        assert!(
+            active
+                .solve(origin + Duration::from_millis(100))
+                .estimate
+                .is_some()
+        );
+        let status = active.status();
+        for (path, value) in [
+            (
+                "timing.trajectory_spacing",
+                serde_json::json!({"secs":0,"nanos":100000000}),
+            ),
+            ("model.foot_sigma", serde_json::json!(0.02)),
+            ("inputs.imu_queue", serde_json::json!(1000)),
+            ("visual.min_associations", serde_json::json!(2)),
+        ] {
+            assert!(
+                parameters
+                    .set_json(path, value, root.to_string_lossy().into_owned())
+                    .is_err()
+            );
+            assert_eq!(parameters.snapshot().revision, original.revision);
+            assert_eq!(parameters.snapshot().typed(), original.typed());
+            assert!(!updates.has_changed()?);
+        }
+        let mut incompatible = original.typed().clone();
+        incompatible.timing.trajectory_spacing = Duration::from_millis(100);
+        assert!(active.set_parameters(&incompatible).is_err());
+        assert_eq!(active.status(), status);
+        parameters.set_json(
+            "solver.max_iterations",
+            serde_json::json!(12),
+            root.to_string_lossy().into_owned(),
+        )?;
+        updates.changed().await?;
+        active.set_parameters(updates.borrow_and_update().typed())?;
+        assert_eq!(parameters.snapshot().typed().solver.max_iterations, 12);
+        let time = origin + Duration::from_millis(102);
+        active.ingest_imu(time, booster::ImuState::default())?;
+        let estimate = active
+            .solve(time)
+            .estimate
+            .expect("rejected updates must leave motion running");
+        assert_eq!(estimate.time, time);
+        assert_eq!(estimate.epoch, 7);
+        assert_eq!(estimate.generation, status.generation);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

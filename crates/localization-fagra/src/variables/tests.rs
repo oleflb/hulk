@@ -80,22 +80,7 @@ impl<R: TestScalar> TestVariable for TrajectoryState<R> {
 
     fn to_dual(&self) -> Self::Dual {
         Self::Dual {
-            pose: Framed::wrap(Isometry3::from_parts(
-                self.pose
-                    .inner
-                    .translation
-                    .vector
-                    .map(|x| x.dual(0.0))
-                    .into(),
-                UnitQuaternion::new_unchecked(nalgebra::Quaternion::from_vector(
-                    self.pose
-                        .inner
-                        .rotation
-                        .quaternion()
-                        .coords
-                        .map(|x| x.dual(0.0)),
-                )),
-            )),
+            pose: PoseControl { pose: self.pose }.to_dual().pose,
             velocity: Framed::wrap(self.velocity.inner.map(|x| x.dual(0.0))),
         }
     }

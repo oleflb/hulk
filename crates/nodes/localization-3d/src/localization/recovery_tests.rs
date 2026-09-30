@@ -125,8 +125,12 @@ fn ingest_motion(localization: &mut Localization, index: u64, with_vo: bool) {
 }
 
 fn new_localization() -> Localization {
-    let initial = frame(0.0, false);
     let parameters = Localization3dParameters {
+        timing: Default::default(),
+        model: Default::default(),
+        solver: Default::default(),
+        visual: Default::default(),
+        inputs: Default::default(),
         imu_preintegration: Default::default(),
         imu_bias: Default::default(),
         kinematic_odometry_noise: Some(Default::default()),
@@ -143,10 +147,15 @@ fn new_localization() -> Localization {
         tracking_timeout: Duration::from_secs(2),
         visual_tracking_timeout: Duration::from_secs(2),
     };
+    new_localization_with_parameters(&parameters)
+}
+
+fn new_localization_with_parameters(parameters: &Localization3dParameters) -> Localization {
+    let initial = frame(0.0, false);
     Localization::new(
         initial.time,
         7,
-        &parameters,
+        parameters,
         &FieldDimensions::SPL_2025,
         &camera(),
         nalgebra::Isometry3::from_parts(
@@ -161,12 +170,11 @@ fn new_localization() -> Localization {
 #[test]
 #[ignore = "release timing benchmark, run with --ignored --nocapture"]
 fn benchmark_tracking_estimation() {
-    let mut localization = new_localization();
     let parameters = json5::from_str(include_str!(
         "../../../../../etc/parameters/base/localization3d.json5"
     ))
     .unwrap();
-    localization.set_parameters(&parameters).unwrap();
+    let mut localization = new_localization_with_parameters(&parameters);
     let camera = camera();
     let mut cycles = Vec::new();
     let mut ingestion = Duration::ZERO;
@@ -252,8 +260,9 @@ fn benchmark_tracking_estimation() {
     assert!(fields > cycle_count * 9 / 10, "{fields} field estimates");
 }
 
-fn lost_localization(with_vo: bool) -> Localization {
+fn lost_localization(with_vo: bool) -> (Localization, LocalizationEstimate) {
     let mut localization = new_localization();
+    let mut latest = None;
     assert!(
         localization
             .ingest_visual_localization_frame(frame(0.0, false))
@@ -265,13 +274,14 @@ fn lost_localization(with_vo: bool) -> Localization {
             let time = Time::from_nanos(1_000_000_000) + Duration::from_millis(index * 10);
             let solved = localization.solve(time);
             assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+            latest = solved.estimate;
             if index == 20 {
                 assert_eq!(localization.status.state, LocalizationState::Tracking);
             }
         }
     }
     assert_eq!(localization.status.state, LocalizationState::LostTrack);
-    localization
+    (localization, latest.unwrap())
 }
 
 #[test]
@@ -332,18 +342,18 @@ fn startup_preserves_delayed_imu_brackets_and_waits_for_missing_samples() {
 #[test]
 fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
     for with_vo in [false, true] {
-        let mut localization = lost_localization(with_vo);
+        let (mut localization, before) = lost_localization(with_vo);
         // Between IMU samples, and inside both odometry intervals. The turn ends
         // before delivery, so later zero-rate IMU readings cannot reconstruct it.
         let recovery = frame(3.375, true);
-        let before = localization.estimate().unwrap();
         assert!(
             localization
                 .ingest_visual_localization_frame(recovery.clone())
                 .unwrap()
         );
         assert_eq!(localization.status.state, LocalizationState::LostTrack);
-        assert_eq!(localization.estimate().unwrap().time, before.time);
+        assert_eq!(localization.estimator.latest_time(), before.time);
+        assert_eq!(localization.status().generation, before.generation);
         ingest_motion(&mut localization, 361, with_vo);
         let now = Time::from_nanos(4_610_000_000);
         let solved = localization.solve(now);
@@ -404,9 +414,9 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
 
 #[test]
 fn rejected_recovery_does_not_replace_the_active_trajectory() {
-    let mut localization = lost_localization(false);
-    let now = localization.estimate().unwrap().time;
-    let before = localization.estimate().unwrap().robot_to_local.pose.inner;
+    let (mut localization, estimate) = lost_localization(false);
+    let now = estimate.time;
+    let before = estimate.robot_to_local.pose.inner;
     let mut recovery = frame(3.375, true);
     recovery.inner.associations[0].detection.inner.x += 200.0;
     assert!(
@@ -442,7 +452,7 @@ fn rejected_recovery_does_not_replace_the_active_trajectory() {
 
 #[test]
 fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization() {
-    let mut localization = lost_localization(false);
+    let (mut localization, _) = lost_localization(false);
     let now = Time::from_nanos(4_600_000_000);
     localization
         .ingest_visual_localization_frame(frame(3.375, true))
@@ -508,7 +518,7 @@ fn double_flight_fuses_zero_specific_force_without_ground_contact() {
     });
     parameters.kinematic_odometry_noise = None;
     parameters.visual_feature_noise_variance = 4.0;
-    localization.set_parameters(&parameters).unwrap();
+    localization = new_localization_with_parameters(&parameters);
     let flying_pose = |t: f64| {
         let mut pose = truth(t);
         pose.translation.z = 0.55 + 2.0 * t - 0.5 * 9.81 * t * t;
@@ -602,8 +612,7 @@ fn double_flight_fuses_zero_specific_force_without_ground_contact() {
 
 #[test]
 fn field_inconsistency_does_not_stop_local_motion_or_forget_heading() {
-    let mut localization = lost_localization(true);
-    let before = localization.estimate().unwrap();
+    let (mut localization, before) = lost_localization(true);
     // Simulate a field solution inconsistent with the independent reference.
     let reference = HeadingReference::new(
         before.time,

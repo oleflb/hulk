@@ -6,14 +6,13 @@ use linear_algebra::{IntoTransform, Isometry2, Isometry3};
 use ros_z::{
     cache::Cache,
     context::Context,
+    parameter::NodeParametersExt,
     qos::{QosDurability, QosProfile},
     time::Time,
 };
 use types::{
-    localization::{
-        LOCALIZATION_ESTIMATE_TOPIC, LOCALIZATION_STATUS_TOPIC, LocalizationEstimate,
-        LocalizationStatus, ground_to_field_from_field_to_robot,
-    },
+    localization::{LocalizationEstimate, LocalizationStatus, ground_to_field_from_field_to_robot},
+    parameters::Localization2dParameters,
     time_wrapper::TimeWrapper,
 };
 
@@ -21,28 +20,43 @@ pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> +
     Box::pin(run(ctx))
 }
 
-const MAX_ROBOT_TO_GROUND_TIME_DISTANCE: Duration = Duration::from_millis(100);
-
 pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("localization2d").build().await?;
+    let parameters = node.bind_parameter_as::<Localization2dParameters>("localization2d")?;
+    let capacities = parameters.snapshot().typed.clone();
+    let startup = capacities.clone();
+    parameters.add_validation_hook(move |candidate| {
+        if candidate.max_ground_time_distance.is_zero()
+            || candidate.ground_cache_capacity == 0
+            || candidate.status_cache_capacity == 0
+        {
+            return Err("localization2d gap and capacities must be positive".into());
+        }
+        if candidate.ground_cache_capacity != startup.ground_cache_capacity
+            || candidate.status_cache_capacity != startup.status_cache_capacity
+        {
+            return Err("localization2d cache capacity changes require restart".into());
+        }
+        Ok(())
+    })?;
 
     let localization_subscriber = node
-        .subscriber::<LocalizationEstimate>(LOCALIZATION_ESTIMATE_TOPIC)
+        .subscriber::<LocalizationEstimate>("localization/estimate")
         .build()
         .await?;
     let robot_to_ground_cache = node
         .subscriber::<TimeWrapper<Option<Isometry3<Robot, Ground>>>>("robot_to_ground")
-        .cache(128)
+        .cache(capacities.ground_cache_capacity)
         .with_stamp(|wrapper| wrapper.time)
         .build()
         .await?;
     let status = node
-        .subscriber::<LocalizationStatus>(LOCALIZATION_STATUS_TOPIC)
+        .subscriber::<LocalizationStatus>("localization/status")
         .qos(QosProfile {
             durability: QosDurability::TransientLocal,
             ..Default::default()
         })
-        .cache(1)
+        .cache(capacities.status_cache_capacity)
         .build()
         .await?;
 
@@ -63,7 +77,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             continue;
         };
 
-        let Some(robot_to_ground) = fresh_robot_to_ground_at(&robot_to_ground_cache, time) else {
+        let max_age = parameters.snapshot().typed.max_ground_time_distance;
+        let Some(robot_to_ground) = fresh_robot_to_ground_at(&robot_to_ground_cache, time, max_age)
+        else {
             continue;
         };
 
@@ -84,13 +100,10 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 fn fresh_robot_to_ground_at(
     robot_to_ground_cache: &Cache<TimeWrapper<Option<Isometry3<Robot, Ground>>>>,
     time: Time,
+    max_age: Duration,
 ) -> Option<Isometry3<Robot, Ground>> {
     robot_to_ground_cache
         .get_nearest_with_stamp(time)
-        .filter(|(stamp, _)| time_distance(*stamp, time) <= MAX_ROBOT_TO_GROUND_TIME_DISTANCE)
+        .filter(|(stamp, _)| stamp.abs_diff(time) <= max_age)
         .and_then(|(_, transform)| transform.inner)
-}
-
-fn time_distance(a: Time, b: Time) -> Duration {
-    Duration::from_nanos(a.as_nanos().abs_diff(b.as_nanos()))
 }

@@ -55,7 +55,7 @@ pub(crate) fn preprocess(
     {
         return None;
     }
-    let map = LandmarkMap::new(input.field_dimensions);
+    let map = LandmarkMap::new(input.field_dimensions, config.symmetry_epsilon);
     if map
         .landmarks
         .iter()
@@ -167,7 +167,8 @@ fn select_seed(detections: &[Detection], config: GlobalAssociationConfig) -> Opt
             for c in b + 1..detections.len().min(config.seed_pool_size) {
                 let u = detections[b].xy - detections[a].xy;
                 let v = detections[c].xy - detections[a].xy;
-                let quality = cross(u, v).abs() / (u.norm_squared() + v.norm_squared()).max(1e-12);
+                let quality = cross(u, v).abs()
+                    / (u.norm_squared() + v.norm_squared()).max(config.min_triangle_denominator);
                 if quality > best.max(config.min_seed_quality) {
                     best = quality;
                     seed = Some([a, b, c]);
@@ -200,9 +201,9 @@ impl Search<'_> {
         pairs: &[(usize, usize)],
         mut scale: (f32, f32),
     ) -> Option<Option<(f32, f32)>> {
-        let &(d, m) = pairs.last()?;
+        let (&(d, m), previous) = pairs.split_last()?;
         let config = *self.input.parameters;
-        for &(e, n) in &pairs[..pairs.len() - 1] {
+        for &(e, n) in previous {
             self.spend()?;
             if m == n {
                 return Some(None);
@@ -211,7 +212,7 @@ impl Search<'_> {
             let b = &self.detections[e];
             let edge = a.xy - b.xy;
             let distance = edge.norm();
-            if distance < 1e-6 {
+            if distance < config.min_pair_distance {
                 return Some(None);
             }
             let direction = edge / distance;

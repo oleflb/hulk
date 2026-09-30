@@ -8,10 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::time_wrapper::TimeWrapper;
 
-pub const CAMERA_GEOMETRY_TOPIC: &str = "camera_geometry";
-/// Reject interpolation across missing kinematics; never extrapolate head motion.
-pub const MAX_CAMERA_GEOMETRY_GAP: Duration = Duration::from_millis(20);
-
 /// Calibrated camera geometry relative to the body, independent of ground contact.
 /// Published with the kinematics timestamp, not the publication time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, ros_z::Message)]
@@ -32,10 +28,11 @@ impl From<&CameraMatrix> for CameraGeometry {
 pub fn camera_geometry_at(
     cameras: &Cache<TimeWrapper<CameraGeometry>>,
     time: Time,
+    max_gap: Duration,
 ) -> Option<CameraGeometry> {
     let before = cameras.get_before(time)?;
     let after = cameras.get_after(time)?;
-    interpolate_camera_geometry(&before, &after, time)
+    interpolate_camera_geometry(&before, &after, time, max_gap)
 }
 
 /// Interpolate a validated source-time bracket without extrapolating head motion.
@@ -43,12 +40,13 @@ pub fn interpolate_camera_geometry(
     before: &TimeWrapper<CameraGeometry>,
     after: &TimeWrapper<CameraGeometry>,
     time: Time,
+    max_gap: Duration,
 ) -> Option<CameraGeometry> {
     if time < before.time || time > after.time {
         return None;
     }
     let gap = after.time.duration_since(before.time);
-    if gap > MAX_CAMERA_GEOMETRY_GAP || before.inner.intrinsics != after.inner.intrinsics {
+    if gap > max_gap || before.inner.intrinsics != after.inner.intrinsics {
         return None;
     }
     for camera in [&before.inner, &after.inner] {
@@ -106,8 +104,10 @@ mod tests {
         };
         let before = sample(0, 0.0);
         let after = sample(10_000_000, 0.2);
+        let max_gap = Duration::from_millis(20);
         let middle =
-            interpolate_camera_geometry(&before, &after, Time::from_nanos(5_000_000)).unwrap();
+            interpolate_camera_geometry(&before, &after, Time::from_nanos(5_000_000), max_gap)
+                .unwrap();
         let expected = sample(5_000_000, 0.1);
         assert!(
             (middle.robot_to_camera.inner.to_homogeneous()
@@ -125,24 +125,45 @@ mod tests {
             * middle.robot_to_camera.inner;
         assert!((body_delta.to_homogeneous() - nalgebra::Matrix4::identity()).norm() < 1e-6);
         assert!(
-            interpolate_camera_geometry(&before, &after, Time::from_nanos(11_000_000)).is_none()
+            interpolate_camera_geometry(&before, &after, Time::from_nanos(11_000_000), max_gap)
+                .is_none()
         );
         assert!(
             interpolate_camera_geometry(
                 &before,
                 &sample(30_000_000, 0.2),
-                Time::from_nanos(5_000_000)
+                Time::from_nanos(5_000_000),
+                max_gap,
             )
             .is_none()
         );
         assert_eq!(
-            interpolate_camera_geometry(&before, &before, before.time),
+            interpolate_camera_geometry(&before, &before, before.time, max_gap),
             Some(before.inner)
         );
-        let mut changed = after;
+        let mut changed = after.clone();
         changed.inner.intrinsics.focals.x += 1.0;
         assert!(
-            interpolate_camera_geometry(&before, &changed, Time::from_nanos(5_000_000)).is_none()
+            interpolate_camera_geometry(&before, &changed, Time::from_nanos(5_000_000), max_gap)
+                .is_none()
+        );
+        assert!(
+            interpolate_camera_geometry(
+                &before,
+                &after,
+                Time::from_nanos(5_000_000),
+                Duration::from_millis(9),
+            )
+            .is_none()
+        );
+        assert!(
+            interpolate_camera_geometry(
+                &before,
+                &sample(30_000_000, 0.2),
+                Time::from_nanos(5_000_000),
+                Duration::from_millis(30),
+            )
+            .is_some()
         );
     }
 }

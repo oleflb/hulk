@@ -168,15 +168,6 @@ ordinary_case!(MotionCase, MotionPrior, |input, states| {
         use_start_velocity: !input.bridge,
     }
 });
-ordinary_case!(TiltCase, RollPitchPrior, |input, states| {
-    RollPitchPrior {
-        controls: input.controls(states),
-        duration: c(0.25),
-        tau: c(0.37),
-        measured_up: input.measured_up(),
-        information_root: root(),
-    }
-});
 ordinary_case!(YawCase, RelativeYaw, |input, states| {
     RelativeYaw {
         controls: input.controls(states),
@@ -531,8 +522,6 @@ fagra::factor_tests!(intrinsics_f64, IntrinsicsCase, f64);
 fagra::factor_tests!(intrinsics_f32, IntrinsicsCase, f32);
 fagra::factor_tests!(motion_f64, MotionCase, f64);
 fagra::factor_tests!(motion_f32, MotionCase, f32);
-fagra::factor_tests!(tilt_f64, TiltCase, f64);
-fagra::factor_tests!(tilt_f32, TiltCase, f32);
 fagra::factor_tests!(yaw_f64, YawCase, f64);
 fagra::factor_tests!(yaw_f32, YawCase, f32);
 fagra::factor_tests!(containment_f64, ContainmentCase, f64);
@@ -581,7 +570,7 @@ fn huber_cost_and_frozen_weight_reference() {
 fagra::states! { States { poses: PoseControl, alignments: FieldAlignment, intrinsics: CameraIntrinsics, biases: ImuBias } }
 fagra::factors! { Factors {
     trajectory: TrajectoryPrior, calibration: CameraIntrinsicsPrior, motion: MotionPrior,
-    tilt: RollPitchPrior, yaw: RelativeYaw, containment: FieldContainment,
+    yaw: RelativeYaw, containment: FieldContainment,
     imu: ImuKinematics, feet: Batch<FootGround, FootObservation>,
     pixels: Batch<FrameReprojections, ReprojectionObservation>,
     odometry: Batch<VisualOdometry, VisualOdometryObservation>, adjacent: AdjacentVisualOdometry,
@@ -614,6 +603,19 @@ impl Scene {
             self.controls[2],
             self.controls[3],
         ]
+    }
+    fn tilt(&mut self) -> ImuKinematics {
+        ImuKinematics {
+            controls: self.segment(),
+            biases: std::array::from_fn(|_| self.graph.add(ImuBias::identity())),
+            duration: 0.25,
+            tau: 0.5,
+            bias_tau: 0.5,
+            angular_velocity: Framed::wrap(Vector3::zeros()),
+            measured_up: Some(Framed::wrap(Vector3::z())),
+            gyroscope_information_root: nalgebra::Matrix3::zeros(),
+            tilt_information_root: nalgebra::Matrix3::identity(),
+        }
     }
     fn reprojections(&self) -> FrameReprojections {
         FrameReprojections {
@@ -708,12 +710,10 @@ fn shared_imu_tilt_has_the_same_objective_as_separate_factors() {
     };
     let with_tilt = combined.cost(&scene).unwrap();
     combined.measured_up = None;
-    let tilt = RollPitchPrior {
-        controls,
-        duration: 0.25,
-        tau: 0.4,
-        measured_up: up,
-        information_root: root,
+    let tilt = ImuKinematics {
+        gyroscope_information_root: nalgebra::Matrix3::zeros(),
+        measured_up: Some(up),
+        ..combined.clone()
     };
     let separate = combined.cost(&scene).unwrap() + tilt.cost(&scene).unwrap();
     assert!((with_tilt - separate).abs() < 1e-10);
@@ -737,13 +737,7 @@ fn exact_static_measurements_and_one_sided_constraints() {
     trajectory
         .linearize(&scene, &mut Capture::default())
         .unwrap();
-    let tilt = RollPitchPrior {
-        controls,
-        duration: 0.25,
-        tau: 0.5,
-        measured_up: Framed::wrap(Vector3::z()),
-        information_root: nalgebra::Matrix3::identity(),
-    };
+    let tilt = scene.tilt();
     assert_eq!(tilt.cost(&scene).unwrap(), 0.0);
     tilt.linearize(&scene, &mut Capture::default()).unwrap();
     let current = RelativeYaw {
@@ -850,12 +844,9 @@ fn exact_static_measurements_and_one_sided_constraints() {
 fn tilt_distinguishes_inversion_without_observing_yaw() {
     let mut scene = Scene::new();
     let measured = UnitQuaternion::from_euler_angles(0.0, 0.03, 0.0);
-    let factor = RollPitchPrior {
-        controls: scene.segment(),
-        duration: 0.25,
-        tau: 0.5,
-        measured_up: Framed::wrap(measured.inverse() * Vector3::z()),
-        information_root: nalgebra::Matrix3::identity(),
+    let factor = ImuKinematics {
+        measured_up: Some(Framed::wrap(measured.inverse() * Vector3::z())),
+        ..scene.tilt()
     };
     for yaw in [0.0, 1.7] {
         for key in scene.controls {
@@ -1064,21 +1055,45 @@ fn odometry_irls_curvature_and_shared_control_blocks() {
 }
 
 #[test]
+fn kinematic_odometry_rejects_unsupported_control_counts() {
+    fn check<const N: usize>() {
+        let mut scene = Scene::new();
+        let factor = KinematicOdometry {
+            controls: std::array::from_fn::<_, N, _>(|_| scene.graph.add(PoseControl::identity())),
+            duration: 0.2,
+            previous_tau: 0.4,
+            current_tau: 0.7,
+            translation: linear_algebra::Vector2::zeros(),
+            information_root: nalgebra::Matrix2::identity(),
+            huber_threshold: 1.0,
+        };
+        assert!(matches!(
+            factor.cost(&scene),
+            Err(fagra::EvaluationError::InvalidEvaluation)
+        ));
+        assert!(matches!(
+            factor.linearize(&scene, &mut Capture::default()),
+            Err(fagra::EvaluationError::InvalidEvaluation)
+        ));
+    }
+    check::<0>();
+    check::<3>();
+    check::<6>();
+}
+
+#[test]
 fn invalid_inputs_and_yaw_wrapping() {
     let mut scene = Scene::new();
-    let mut prior = RollPitchPrior {
-        controls: scene.segment(),
-        duration: 0.25,
-        tau: 0.5,
-        measured_up: Framed::wrap(Vector3::z()),
-        information_root: nalgebra::Matrix3::identity(),
-    };
+    let mut prior = scene.tilt();
     prior.controls[1] = prior.controls[0];
     assert!(prior.cost(&scene).is_err());
     assert!(prior.linearize(&scene, &mut Capture::default()).is_err());
     prior.controls = scene.segment();
-    prior.measured_up.inner *= 2.0;
-    assert!(prior.cost(&scene).is_err());
+    for z in [2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+        prior.measured_up = Some(Framed::wrap(Vector3::new(0.0, 0.0, z)));
+        assert!(prior.cost(&scene).is_err());
+        assert!(prior.linearize(&scene, &mut Capture::default()).is_err());
+    }
     let start = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::PI - 0.1);
     let end = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), -std::f64::consts::PI + 0.1);
     assert!(common::yaw_error(&start, &end, 0.2).unwrap().abs() < 1e-12);
@@ -1088,7 +1103,7 @@ fn invalid_inputs_and_yaw_wrapping() {
     for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert!(common::huber(&nalgebra::Vector2::new(1.0, 0.0), bad).is_err());
     }
-    prior.measured_up = Framed::wrap(Vector3::z());
+    prior.measured_up = Some(Framed::wrap(Vector3::z()));
     let mut seam = PoseControl::identity();
     seam.pose.inner.rotation =
         UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::PI - 1e-7);
