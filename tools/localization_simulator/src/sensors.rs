@@ -20,20 +20,20 @@ use types::{
 use crate::{config::SimulationConfig, production_vo::ProductionVoDiagnostics};
 
 #[derive(Clone, Debug)]
-pub struct VisualOdometryMeasurement {
+pub(crate) struct VisualOdometryMeasurement {
     pub delta: Option<VisualOdometryDelta>,
     pub odometer: VisualOdometer,
     pub production_diagnostics: Option<ProductionVoDiagnostics>,
 }
 
 #[derive(Debug, Default)]
-pub struct LandmarkObservations {
+pub(crate) struct LandmarkObservations {
     pub detections: DetectedVisualFeatures,
     pub true_associations: Vec<FieldMarkAssociation>,
     pub ideal_visible_count: usize,
 }
 
-pub struct SyntheticSensors {
+pub(crate) struct SyntheticSensors {
     config: SimulationConfig,
     vo_rng: ChaCha8Rng,
     landmark_rng: ChaCha8Rng,
@@ -45,7 +45,7 @@ pub struct SyntheticSensors {
 }
 
 impl SyntheticSensors {
-    pub fn new(config: &SimulationConfig, field_dimensions: &FieldDimensions) -> Self {
+    pub(crate) fn new(config: &SimulationConfig, field_dimensions: &FieldDimensions) -> Self {
         Self {
             config: config.clone(),
             vo_rng: ChaCha8Rng::seed_from_u64(config.seed ^ 0x564f_5f52_4e47),
@@ -58,7 +58,7 @@ impl SyntheticSensors {
         }
     }
 
-    pub fn measure_visual_odometry(
+    pub(crate) fn measure_visual_odometry(
         &mut self,
         time: Time,
         camera_to_field: &FramedIsometry3<Camera, Field>,
@@ -116,7 +116,7 @@ impl SyntheticSensors {
         ) * exact
     }
 
-    pub fn observe_landmarks(
+    pub(crate) fn observe_landmarks(
         &mut self,
         camera_to_field: &FramedIsometry3<Camera, Field>,
         camera_matrix: &CameraMatrix,
