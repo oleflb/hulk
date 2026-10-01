@@ -159,6 +159,25 @@ impl ImageOverlay for ProjectedFieldLinesOverlay {
 }
 
 impl ProjectedFieldLinesOverlay {
+    #[cfg(test)]
+    pub(in crate::panels::image) fn for_test(
+        context: &crate::panel::PanelCreationContext<'_>,
+        node: Arc<ros_z::node::Node>,
+    ) -> Self {
+        use super::super::image_overlay::tests::observation;
+        Self {
+            camera_matrix: observation(context, Arc::clone(&node), "camera_matrix"),
+            localization: observation(context, Arc::clone(&node), "localization/estimate"),
+            status: observation(context, Arc::clone(&node), "localization/status"),
+            dimensions: observation(context, Arc::clone(&node), "field_dimensions"),
+            associations: observation(
+                context,
+                node,
+                "field_mark_association/visual_localization_local",
+            ),
+        }
+    }
+
     pub(in crate::panels::image) fn unavailable(&self, time: Time) -> bool {
         let Some(status) = self.status.latest() else {
             return false;
