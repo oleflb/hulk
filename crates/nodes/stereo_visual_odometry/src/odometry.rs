@@ -8,7 +8,8 @@ use crate::{
     feature_extractor::{CurrentLeft, FrameFeatures, Matches, NUM_KEYPOINTS, PreviousLeft},
     parameters::StereoVisualOdometryPoseEstimationParameters,
     pose_refinement::{
-        matrix3_from_mat3a, refine_pose_lm_direct, residual_with_x_offset, vector3_from_vec3a,
+        mat3a_from_matrix3, matrix3_from_mat3a, refine_pose_lm_direct, residual_with_x_offset,
+        vec3a_from_vector3, vector3_from_vec3a,
     },
     triangulator::{StereoPoint, StereoTriangulator},
 };
@@ -57,6 +58,10 @@ pub(crate) struct PoseCorrespondence {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OdometryDiagnostics {
     pub correspondences: usize,
+    pub previous_disparity_mean: Option<f32>,
+    pub previous_disparity_below_4px: usize,
+    pub previous_disparity_below_6px: usize,
+    pub previous_disparity_below_8px: usize,
     pub left_ransac_inliers: usize,
     pub used_identity_initialization: bool,
     pub right_observations: usize,
@@ -72,6 +77,15 @@ pub struct OdometryDiagnostics {
     pub right_rmse_before_lm: Option<f32>,
     pub left_rmse_after_lm: Option<f32>,
     pub right_rmse_after_lm: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoseEvaluationDiagnostics {
+    pub left_rmse: Option<f32>,
+    pub right_rmse: Option<f32>,
+    pub left_inliers_1px: usize,
+    pub left_inliers_2px: usize,
+    pub left_inliers_6px: usize,
 }
 
 pub struct PreviousFrame {
@@ -105,6 +119,49 @@ impl OdometryScratch {
 
     pub fn reset_diagnostics(&mut self) {
         self.diagnostics = OdometryDiagnostics::default();
+    }
+
+    pub fn evaluate_pose(
+        &self,
+        pose: &na::Isometry3<f32>,
+        triangulator: &StereoTriangulator,
+    ) -> Option<PoseEvaluationDiagnostics> {
+        let rotation = pose.rotation.to_rotation_matrix();
+        let rotation = rotation.matrix();
+        let pose = PnPResult {
+            rotation: mat3a_from_matrix3(rotation),
+            translation: vec3a_from_vector3(pose.translation.vector),
+            rvec: Vec3AF32::new(0.0, 0.0, 0.0),
+            reproj_rmse: None,
+            num_iterations: None,
+            converged: None,
+        };
+        let metrics = reprojection_metrics(
+            &RelativePose::from(&pose),
+            &self.correspondences,
+            triangulator.intrinsics_f32(),
+            triangulator.baseline(),
+        )?;
+        let mut diagnostics = PoseEvaluationDiagnostics {
+            left_rmse: metrics.left_rmse(),
+            right_rmse: metrics.right_rmse(),
+            ..Default::default()
+        };
+        for correspondence in &self.correspondences {
+            let camera_point =
+                vector3_from_vec3a(pose.rotation * correspondence.world_point + pose.translation);
+            let error = residual_with_x_offset(
+                camera_point,
+                correspondence.image_point,
+                triangulator.intrinsics_f32(),
+                0.0,
+            )?
+            .norm();
+            diagnostics.left_inliers_1px += (error <= 1.0) as usize;
+            diagnostics.left_inliers_2px += (error <= 2.0) as usize;
+            diagnostics.left_inliers_6px += (error <= 6.0) as usize;
+        }
+        Some(diagnostics)
     }
 }
 
@@ -271,6 +328,26 @@ pub fn estimate_previous_to_current(
     }
 
     scratch.diagnostics.correspondences = scratch.correspondences.len();
+    let disparities =
+        temporal_matches
+            .matched_pairs()
+            .filter_map(|(previous_index, current_index)| {
+                current_left
+                    .is_valid(current_index)
+                    .then(|| previous.point(previous_index).map(|point| point.disparity))
+                    .flatten()
+            });
+    let mut disparity_sum = 0.0;
+    let mut disparity_count = 0;
+    for disparity in disparities {
+        disparity_sum += disparity;
+        disparity_count += 1;
+        scratch.diagnostics.previous_disparity_below_4px += (disparity < 4.0) as usize;
+        scratch.diagnostics.previous_disparity_below_6px += (disparity < 6.0) as usize;
+        scratch.diagnostics.previous_disparity_below_8px += (disparity < 8.0) as usize;
+    }
+    scratch.diagnostics.previous_disparity_mean =
+        (disparity_count > 0).then(|| disparity_sum / disparity_count as f32);
     scratch.diagnostics.right_observations = scratch
         .correspondences
         .iter()
