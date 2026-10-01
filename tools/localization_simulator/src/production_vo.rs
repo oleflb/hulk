@@ -49,7 +49,7 @@ pub struct ProductionVoDiagnostics {
     pub truth_left_inliers_6px: usize,
 }
 
-pub struct ProductionVisualOdometry {
+pub(crate) struct ProductionVisualOdometry {
     renderer: StereoRenderer,
     pipeline: VisualOdometryPipeline,
     parameters: StereoVisualOdometryParameters,
@@ -58,7 +58,7 @@ pub struct ProductionVisualOdometry {
 }
 
 impl ProductionVisualOdometry {
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let parameters: StereoVisualOdometryParameters = json5::from_str(include_str!(
             "../../../etc/parameters/base/stereo_visual_odometry.json5"
         ))
@@ -75,7 +75,7 @@ impl ProductionVisualOdometry {
         })
     }
 
-    pub fn measure(
+    pub(crate) fn measure(
         &mut self,
         time: Time,
         right_reported_time: Time,
