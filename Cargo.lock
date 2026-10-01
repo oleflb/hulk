@@ -10911,6 +10911,7 @@ version = "0.19.1"
 dependencies = [
  "ball_filter",
  "behavior_node",
+ "bevy",
  "chrono",
  "clap",
  "color-eyre",
@@ -10918,6 +10919,7 @@ dependencies = [
  "coordinate_systems",
  "dirs",
  "eframe",
+ "egui_bevy",
  "egui_extras",
  "egui_material_icons",
  "egui_plot",
@@ -10925,6 +10927,7 @@ dependencies = [
  "geometry",
  "hulk_widgets",
  "image",
+ "kinematics",
  "linear_algebra",
  "log",
  "nalgebra 0.34.2",

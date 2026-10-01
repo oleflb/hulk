@@ -1,8 +1,4 @@
-use std::{
-    f32::consts::{FRAC_PI_2, PI, TAU},
-    sync::Arc,
-    time::Duration,
-};
+use std::{f32::consts::TAU, sync::Arc, time::Duration};
 
 use color_eyre::Report;
 use coordinate_systems::{Camera, Field, Pixel};
@@ -29,6 +25,7 @@ use super::super::{
     image_overlay::ImageOverlay,
     inputs::{OverlayInput, OverlayInputs},
 };
+use crate::panels::field_markings;
 use twix_visualization::twix_painter::TwixPainter;
 
 const NEAR_Z: f32 = 1.0e-4;
@@ -169,7 +166,7 @@ impl ImageOverlay for ProjectedFieldLinesOverlay {
         Ok(())
     }
 
-    fn paint(&self, painter: &TwixPainter<Pixel>) {
+    fn image_overlay(&self, painter: &TwixPainter<Pixel>) {
         let Some(sample) = &self.sample else {
             return;
         };
@@ -247,53 +244,25 @@ impl FieldProjection {
                 painter.line_segment(a, b, FIELD_STROKE);
             }
         };
-        line(d.t_crossing(Side::Left), d.t_crossing(Side::Right));
-        for side in [Side::Left, Side::Right] {
-            line(d.corner(Half::Own, side), d.corner(Half::Opponent, side));
+        for [start, end] in field_markings::field_segments(d) {
+            line(start, end);
         }
-        self.arc(
-            painter,
-            d.center(),
-            d.center_circle_diameter / 2.0,
-            0.0,
-            TAU,
-        );
+        let (center, radius, start, end) = field_markings::center_circle(d);
+        self.arc(painter, center, radius, start, end);
         for half in [Half::Own, Half::Opponent] {
-            line(d.corner(half, Side::Left), d.corner(half, Side::Right));
-            line(
-                d.goal_box_corner(half, Side::Left),
-                d.goal_box_corner(half, Side::Right),
-            );
-            line(
-                d.penalty_box_corner(half, Side::Left),
-                d.penalty_box_corner(half, Side::Right),
-            );
+            for [start, end] in field_markings::half_segments(d, half) {
+                line(start, end);
+            }
             let spot = d.penalty_spot(half);
             let r = d.penalty_marker_size / 2.0;
             line(point![spot.x() - r, 0.0], point![spot.x() + r, 0.0]);
             line(point![spot.x(), -r], point![spot.x(), r]);
             for side in [Side::Left, Side::Right] {
-                line(
-                    d.goal_box_corner(half, side),
-                    d.goal_box_goal_line_intersection(half, side),
-                );
-                line(
-                    d.penalty_box_corner(half, side),
-                    d.penalty_box_goal_line_intersection(half, side),
-                );
-                let start = match (half, side) {
-                    (Half::Own, Side::Left) => -FRAC_PI_2,
-                    (Half::Own, Side::Right) => 0.0,
-                    (Half::Opponent, Side::Left) => PI,
-                    (Half::Opponent, Side::Right) => FRAC_PI_2,
-                };
-                self.arc(
-                    painter,
-                    d.corner(half, side),
-                    d.corner_arc_radius,
-                    start,
-                    start + FRAC_PI_2,
-                );
+                for [start, end] in field_markings::box_segments(d, half, side) {
+                    line(start, end);
+                }
+                let (center, radius, start, end) = field_markings::corner_arc(d, half, side);
+                self.arc(painter, center, radius, start, end);
             }
         }
     }
@@ -330,6 +299,8 @@ impl FieldProjection {
 
 #[cfg(test)]
 mod tests {
+    use std::f32::consts::FRAC_PI_2;
+
     use super::*;
     use crate::panels::image::tests::raw_sample;
     use ros_z_debug::query::plan::State;
