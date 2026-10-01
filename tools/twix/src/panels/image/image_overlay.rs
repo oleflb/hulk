@@ -1,14 +1,21 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use color_eyre::{Report, eyre::Context as _};
 use coordinate_systems::Pixel;
 use eframe::egui::{Popup, PopupCloseBehavior, Ui};
+use projection::camera_matrix::CameraMatrix;
 use ros_z::{Message, time::Time};
-use ros_z_debug::{RetentionPolicy, SampleRecord, TopicObservation};
+use ros_z_debug::{
+    ObservationPolicy, RetentionPolicy, SampleRecord, TargetIdentity, TopicObservation,
+    TopicReference,
+};
 use serde_json::{Value, json};
 use types::time_wrapper::TimeWrapper;
 
-use crate::repaint::{ObservationContext, ObservationRepaint, RepaintOnUpdates};
+use crate::{
+    backend::RobotBackend,
+    repaint::{ObservationContext, ObservationRepaint, RepaintOnUpdates},
+};
 use twix_visualization::twix_painter::TwixPainter;
 
 use super::overlays::{
@@ -16,7 +23,15 @@ use super::overlays::{
     ObjectDetectionOverlay, PoseDetectionOverlay,
 };
 
-const OVERLAY_RETENTION_WINDOW: Duration = Duration::from_secs(2);
+const OVERLAY_HISTORY_CAPACITY: usize = 4096;
+
+fn overlay_retention() -> RetentionPolicy {
+    RetentionPolicy::time_window_with_max_samples(
+        Duration::MAX,
+        OVERLAY_HISTORY_CAPACITY.try_into().unwrap(),
+    )
+    .unwrap()
+}
 
 pub(super) struct ImageOverlays {
     line_detection: OverlaySlot<LineDetectionOverlay>,
@@ -58,23 +73,71 @@ impl ImageOverlays {
             });
     }
 
-    pub(super) fn paint(&self, painter: &TwixPainter<Pixel>, image_time: Time) {
-        self.line_detection.paint(painter, image_time);
-        self.ball_detection.paint(painter, image_time);
-        self.horizon.paint(painter, image_time);
-        self.field_border.paint(painter, image_time);
-        self.object_detection.paint(painter, image_time);
-        self.pose_detection.paint(painter, image_time);
+    pub(super) fn prepare(&self, time: Time) -> OverlaySnapshot {
+        OverlaySnapshot {
+            objects: self.object_detection.prepare(time),
+            poses: self.pose_detection.prepare(time),
+            horizon: self.horizon.prepare(time),
+            border: self.field_border.prepare(time),
+        }
     }
 
-    pub(super) fn preferred_image_time(&self) -> Option<Time> {
-        [
-            self.object_detection.latest_time(),
-            self.pose_detection.latest_time(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+    pub(super) fn ready(&self, snapshot: &OverlaySnapshot) -> bool {
+        (!self.object_detection.active || snapshot.objects.is_some())
+            && (!self.pose_detection.active || snapshot.poses.is_some())
+            && (!self.horizon.active || snapshot.horizon.is_some())
+            && (!self.field_border.active || snapshot.border.is_some())
+    }
+
+    pub(super) fn detection_times(&self) -> Option<BTreeSet<Time>> {
+        let objects = self.object_detection.active.then(|| {
+            self.object_detection
+                .overlay
+                .as_ref()
+                .map(|o| {
+                    o.object_detections
+                        .get_all()
+                        .iter()
+                        .map(|s| s.value.time)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        });
+        let poses = self.pose_detection.active.then(|| {
+            self.pose_detection
+                .overlay
+                .as_ref()
+                .map(|o| {
+                    o.poses
+                        .get_all()
+                        .iter()
+                        .map(|s| s.value.time)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        });
+        match (objects, poses) {
+            (Some(mut objects), Some(poses)) => {
+                objects.retain(|time| poses.contains(time));
+                Some(objects)
+            }
+            (objects, poses) => objects.or(poses),
+        }
+    }
+
+    pub(super) fn retain_enabled(&self, snapshot: &mut OverlaySnapshot) {
+        if !self.object_detection.active {
+            snapshot.objects = None;
+        }
+        if !self.pose_detection.active {
+            snapshot.poses = None;
+        }
+        if !self.horizon.active {
+            snapshot.horizon = None;
+        }
+        if !self.field_border.active {
+            snapshot.border = None;
+        }
     }
 
     pub(super) fn save(&self) -> Value {
@@ -86,6 +149,31 @@ impl ImageOverlays {
             ObjectDetectionOverlay::STORAGE_KEY: self.object_detection.save(),
             PoseDetectionOverlay::STORAGE_KEY: self.pose_detection.save(),
         })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct OverlaySnapshot {
+    objects: Option<<ObjectDetectionOverlay as ImageOverlay>::Sample>,
+    poses: Option<<PoseDetectionOverlay as ImageOverlay>::Sample>,
+    horizon: Option<<HorizonOverlay as ImageOverlay>::Sample>,
+    border: Option<<FieldBorderOverlay as ImageOverlay>::Sample>,
+}
+
+impl OverlaySnapshot {
+    pub(super) fn paint(&self, painter: &TwixPainter<Pixel>) {
+        if let Some(sample) = &self.horizon {
+            HorizonOverlay::paint(painter, sample);
+        }
+        if let Some(sample) = &self.border {
+            FieldBorderOverlay::paint(painter, sample);
+        }
+        if let Some(sample) = &self.objects {
+            ObjectDetectionOverlay::paint(painter, sample);
+        }
+        if let Some(sample) = &self.poses {
+            PoseDetectionOverlay::paint(painter, sample);
+        }
     }
 }
 
@@ -170,14 +258,8 @@ where
         }
     }
 
-    fn paint(&self, painter: &TwixPainter<Pixel>, image_time: Time) {
-        if let Some(overlay) = &self.overlay {
-            overlay.paint(painter, image_time);
-        }
-    }
-
-    fn latest_time(&self) -> Option<Time> {
-        self.overlay.as_ref().and_then(ImageOverlay::latest_time)
+    fn prepare(&self, time: Time) -> Option<T::Sample> {
+        self.overlay.as_ref()?.prepare(time)
     }
 
     fn save(&self) -> Value {
@@ -186,6 +268,7 @@ where
 }
 
 pub(super) trait ImageOverlay: Sized {
+    type Sample;
     const NAME: &'static str;
     const STORAGE_KEY: &'static str;
 
@@ -193,14 +276,13 @@ pub(super) trait ImageOverlay: Sized {
     where
         C: ObservationContext;
 
-    fn paint(&self, painter: &TwixPainter<Pixel>, image_time: Time);
-
-    fn latest_time(&self) -> Option<Time> {
-        None
-    }
+    fn prepare(&self, time: Time) -> Option<Self::Sample>;
+    fn paint(painter: &TwixPainter<Pixel>, sample: &Self::Sample);
 }
 
 pub(super) struct OverlayObservation<T> {
+    backend: Arc<RobotBackend>,
+    topic: TopicReference,
     observation: TopicObservation<T>,
     _repaint: ObservationRepaint,
 }
@@ -214,19 +296,42 @@ where
     where
         C: ObservationContext,
     {
-        let (observation, repaint) = create_typed_observation(context, topic)?;
+        Self::with_policy(context, topic, ObservationPolicy::default())
+    }
+
+    pub(super) fn with_policy<C>(
+        context: &C,
+        topic: &str,
+        policy: ObservationPolicy,
+    ) -> Result<Self, Report>
+    where
+        C: ObservationContext,
+    {
+        let (observation, repaint) = create_typed_observation(context, topic, policy)?;
         Ok(Self {
+            backend: Arc::clone(context.backend()),
+            topic: TopicReference::new(topic)?,
             observation,
             _repaint: repaint,
         })
     }
 
-    pub(super) fn latest(&self) -> Option<Arc<SampleRecord<T>>> {
-        self.observation.latest()
+    pub(super) fn get_all(&self) -> Vec<Arc<SampleRecord<T>>> {
+        let Some(topic) = self.resolved_topic() else {
+            return Vec::new();
+        };
+        self.observation
+            .get_all()
+            .into_iter()
+            .filter(|record| record.metadata.resolved_topic == topic)
+            .collect()
     }
 
-    fn get_all(&self) -> Vec<Arc<SampleRecord<T>>> {
-        self.observation.get_all()
+    fn resolved_topic(&self) -> Option<String> {
+        // Retargeting is asynchronous; the observer can still expose the previous cache.
+        self.topic
+            .resolve(&TargetIdentity::new(self.backend.namespace()).ok()?)
+            .ok()
     }
 }
 
@@ -235,39 +340,110 @@ where
     TimeWrapper<T>: Message + Send + Sync + 'static,
     <TimeWrapper<T> as Message>::Codec: Send + Sync,
 {
-    pub(super) fn latest_time(&self) -> Option<Time> {
-        self.latest().map(|record| record.value.time)
-    }
-
-    pub(super) fn nearest_to_time(
-        &self,
-        time: Time,
-        tolerance: Duration,
-    ) -> Option<Arc<SampleRecord<TimeWrapper<T>>>> {
-        let nearest = self
-            .get_all()
-            .into_iter()
-            .min_by_key(|record| time_distance(record.value.time, time))?;
-        (time_distance(nearest.value.time, time) <= tolerance).then_some(nearest)
-    }
-
     pub(super) fn at_time(&self, time: Time) -> Option<Arc<SampleRecord<TimeWrapper<T>>>> {
         self.get_all()
             .into_iter()
             .rev()
             .find(|record| record.value.time == time)
     }
+
+    pub(super) fn interpolate<R>(
+        &self,
+        time: Time,
+        interpolate: impl FnOnce(&T, &T, f32) -> Option<R>,
+    ) -> Option<R> {
+        let samples = self.get_all();
+        let (before, after, fraction) = bracket(&samples, time)?;
+        interpolate(&before.inner, &after.inner, fraction)
+    }
 }
 
-fn time_distance(first: Time, second: Time) -> Duration {
-    first
-        .duration_since(second)
-        .max(second.duration_since(first))
+pub(super) fn bracket<T>(
+    samples: &[Arc<SampleRecord<TimeWrapper<T>>>],
+    time: Time,
+) -> Option<(&TimeWrapper<T>, &TimeWrapper<T>, f32)> {
+    let before = samples
+        .iter()
+        .filter(|s| s.value.time <= time)
+        .max_by_key(|s| s.value.time)?;
+    if before.value.time == time {
+        return Some((&before.value, &before.value, 0.0));
+    }
+    let after = samples
+        .iter()
+        .rev()
+        .filter(|s| s.value.time >= time)
+        .min_by_key(|s| s.value.time)?;
+    let gap = after.value.time.duration_since(before.value.time);
+    // Brackets, not transport age, bound interpolation; callers reject discontinuities.
+    let fraction = if gap.is_zero() {
+        0.0
+    } else {
+        time.duration_since(before.value.time).as_secs_f32() / gap.as_secs_f32()
+    };
+    Some((&before.value, &after.value, fraction))
+}
+
+pub(super) fn valid_intrinsics(intrinsics: &projection::intrinsic::Intrinsic) -> bool {
+    intrinsics.focals.iter().all(|v| v.is_finite() && *v > 0.0)
+        && intrinsics
+            .optical_center
+            .inner
+            .iter()
+            .all(|v| v.is_finite())
+}
+
+pub(super) fn interpolate_transform<From, To>(
+    a: linear_algebra::Isometry3<From, To>,
+    b: linear_algebra::Isometry3<From, To>,
+    t: f32,
+) -> Option<linear_algebra::Isometry3<From, To>> {
+    if !a
+        .inner
+        .to_homogeneous()
+        .iter()
+        .chain(b.inner.to_homogeneous().iter())
+        .all(|v| v.is_finite())
+    {
+        return None;
+    }
+    Some(linear_algebra::Isometry3::wrap(
+        a.inner.lerp_slerp(&b.inner, t),
+    ))
+}
+
+impl OverlayObservation<TimeWrapper<CameraMatrix>> {
+    pub(super) fn camera_at(&self, time: Time) -> Option<CameraSample> {
+        self.interpolate(time, |a, b, t| {
+            // Calibration changes are discontinuities, not motion to interpolate.
+            if a.intrinsics != b.intrinsics || a.image_size != b.image_size {
+                return None;
+            }
+            if !valid_intrinsics(&a.intrinsics) {
+                return None;
+            }
+            let ground_to_robot = interpolate_transform(a.ground_to_robot, b.ground_to_robot, t)?;
+            let robot_to_head = interpolate_transform(a.robot_to_head, b.robot_to_head, t)?;
+            let head_to_camera = interpolate_transform(a.head_to_camera, b.head_to_camera, t)?;
+            let robot_to_camera = head_to_camera * robot_to_head;
+            Some(CameraSample {
+                horizon: projection::horizon::Horizon::from_parameters(
+                    robot_to_camera * ground_to_robot,
+                    &a.intrinsics,
+                ),
+            })
+        })
+    }
+}
+
+pub(super) struct CameraSample {
+    pub(super) horizon: Option<projection::horizon::Horizon>,
 }
 
 fn create_typed_observation<T>(
     context: &impl ObservationContext,
     topic: &str,
+    policy: ObservationPolicy,
 ) -> Result<(TopicObservation<T>, ObservationRepaint), Report>
 where
     T: Message + Send + Sync + 'static,
@@ -281,8 +457,32 @@ where
         .observer()
         .observe_typed::<T>(topic)
         .wrap_err_with(|| format!("failed to create typed topic observation for {topic}"))?
-        .retention(RetentionPolicy::time_window(OVERLAY_RETENTION_WINDOW)?)
+        .policy(policy)
+        .retention(overlay_retention())
         .spawn();
     let repaint = observation.repaint_on_updates(context);
     Ok((observation, repaint))
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    pub(in crate::panels::image) async fn publish_until<T>(
+        publisher: &ros_z::pubsub::Publisher<T>,
+        value: &T,
+        mut received: impl FnMut() -> bool,
+    ) where
+        T: Message + Send + Sync,
+        T::Codec: Send + Sync,
+    {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !received() {
+                publisher.publish(value).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sample should reach asynchronous observer");
+    }
 }
