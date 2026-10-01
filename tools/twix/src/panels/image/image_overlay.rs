@@ -634,6 +634,7 @@ pub(super) mod tests {
             backend: Arc::clone(&backend),
             value: None,
             egui_context: eframe::egui::Context::default(),
+            render_state: None,
         };
         let ros = ContextBuilder::default().build().await.unwrap();
         let node = Arc::new(
@@ -889,6 +890,7 @@ pub(super) mod tests {
             backend,
             value: None,
             egui_context: eframe::egui::Context::default(),
+            render_state: None,
         };
         let ros = ContextBuilder::default().build().await.unwrap();
         let node = Arc::new(
@@ -1113,6 +1115,7 @@ pub(super) mod tests {
             backend: Arc::clone(&backend),
             value: None,
             egui_context: eframe::egui::Context::default(),
+            render_state: None,
         };
         let ros = ContextBuilder::default().build().await.unwrap();
         let node = Arc::new(
