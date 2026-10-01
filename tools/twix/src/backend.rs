@@ -12,6 +12,8 @@ pub struct RobotBackend {
     node: Arc<Node>,
     observer: TopicObserver,
     namespace: Mutex<String>,
+
+    replay: Mutex<crate::replay::ReplaySession>,
 }
 
 impl RobotBackend {
@@ -52,6 +54,8 @@ impl RobotBackend {
             node,
             observer,
             namespace: Mutex::new(namespace),
+
+            replay: Mutex::new(Default::default()),
         })
     }
 
@@ -87,6 +91,16 @@ impl RobotBackend {
             .lock()
             .expect("namespace mutex should not be poisoned") = namespace;
         Ok(())
+    }
+
+    pub fn set_replay_sources(&self, sources: Option<ros_z_debug::replay::ReplaySources>) {
+        self.observer.set_replay_sources(sources);
+    }
+
+    pub fn replay(&self) -> std::sync::MutexGuard<'_, crate::replay::ReplaySession> {
+        self.replay
+            .lock()
+            .expect("replay mutex should not be poisoned")
     }
 }
 
