@@ -18,7 +18,7 @@ use eframe::{
 };
 use layout::{FocusDirection, TwixLayout};
 use log::{error, warn};
-use panels::{AudioPanel, ImagePanel, MapPanel, ParameterPanel, TextPanel};
+use panels::{AudioPanel, ImagePanel, MapPanel, ParameterPanel, TextPanel, TimelinePanel};
 use repository::{Repository, inspect_version::check_for_update};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use visuals::Visuals;
@@ -33,10 +33,18 @@ mod panel;
 mod panels;
 mod presets;
 mod repaint;
+mod replay;
 mod selectable_panel_macro;
 mod visuals;
 
-impl_selectable_panel!(TextPanel, ImagePanel, MapPanel, ParameterPanel, AudioPanel);
+impl_selectable_panel!(
+    AudioPanel,
+    TextPanel,
+    ImagePanel,
+    MapPanel,
+    ParameterPanel,
+    TimelinePanel
+);
 
 #[derive(Debug, Clone, clap::Parser)]
 struct Arguments {
@@ -144,6 +152,7 @@ impl App for TwixApp {
             })
         });
 
+        self.backend.replay().update(&context, &self.backend);
         CentralPanel::default().show(ui, |ui| {
             let layout = &mut self.layout;
             if shortcuts_enabled {
@@ -179,6 +188,7 @@ impl App for TwixApp {
             layout.ui(ui, &self.backend);
         });
         self.layout.dialogs(&context);
+        self.backend.replay().dispatch(&context, &self.backend);
     }
 
     fn save(&mut self, storage: &mut dyn Storage) {

@@ -257,3 +257,278 @@ async fn paused_snapshots_rewind_and_reject_other_generations() {
     assert!(observation.latest().is_none());
     assert!(dynamic.latest_json().is_none());
 }
+
+async fn control(node: &Node, payload: Option<serde_json::Value>) -> Result<ReplayStatus> {
+    let mut query = node
+        .session()
+        .get(control_key(node.namespace()))
+        .timeout(Duration::from_secs(3));
+    if let Some(payload) = payload {
+        query = query.payload(serde_json::to_vec(&payload)?);
+    }
+    let replies = query
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let reply = replies
+        .recv_async()
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let sample = reply
+        .into_result()
+        .map_err(|error| color_eyre::eyre::eyre!("{error:?}"))?;
+    Ok(serde_json::from_slice(&sample.payload().to_bytes())?)
+}
+
+async fn exercise_controls(recording: Recording) {
+    let args =
+        Arguments::try_parse_from(["mcap-replay", "test.mcap", "--listen", "tcp/127.0.0.1:0"])
+            .unwrap();
+    let context = args.connect().await.unwrap();
+    let uri = context.session().info().locators().await[0].to_string();
+    assert!(!uri.ends_with(":0"));
+    let server_node = Arc::new(
+        context
+            .create_node("control_test")
+            .with_namespace("/replay")
+            .build()
+            .await
+            .unwrap(),
+    );
+    // A separate ROS-Z peer exercises routing and the --router override, rather
+    // than relying on same-session delivery inside the embedded router.
+    let client_args =
+        Arguments::try_parse_from(["mcap-replay", "test.mcap", "--router", &uri]).unwrap();
+    let client_context = client_args.connect().await.unwrap();
+    let node = Arc::new(
+        client_context
+            .create_node("control_client")
+            .with_namespace("/replay")
+            .build()
+            .await
+            .unwrap(),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve(&server_node, recording, "test.mcap".into(), async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let mut status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(status) = control(&node, None).await {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!status.playing);
+    assert_eq!(status.position, status.start);
+    let instance = status.instance.clone();
+    for position in [
+        status.end,
+        status.start + (status.end - status.start) / 2,
+        status.start,
+    ] {
+        let before = Instant::now();
+        let next = control(
+            &node,
+            Some(
+                serde_json::json!({"command": "seek", "instance": instance, "position": position}),
+            ),
+        )
+        .await
+        .unwrap();
+        println!(
+            "seek {:.3}s: {:?}",
+            (position - status.start) as f64 / 1e9,
+            before.elapsed()
+        );
+        assert_eq!(next.position, position);
+        assert_eq!(next.generation, status.generation + 1);
+        assert_ne!(next.sources, status.sources);
+        assert!(!next.playing);
+        status = next;
+        if position > status.start && position < status.end {
+            let observer = TopicObserver::new(
+                node.clone(),
+                TopicObserverOptions::with_namespace("/replay").unwrap(),
+            );
+            observer.set_replay_sources(Some(status.sources.clone()));
+            let topic = status.sources.keys().next().unwrap();
+            let observation = observer.observe_dynamic(topic).unwrap().spawn();
+            let mut updates = observation.subscribe_updates().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while observation.latest_json().is_none() {
+                    updates.recv().await.unwrap();
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("dynamic replay {topic}: {:?}", observation.status()));
+        }
+    }
+    assert!(control(&node, Some(serde_json::json!({"command": "seek", "instance": instance, "position": status.end + 1}))).await.is_err());
+    assert!(
+        control(
+            &node,
+            Some(serde_json::json!({"command": "play", "instance": "stale"}))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        control(&node, None).await.unwrap().generation,
+        status.generation
+    );
+    assert!(
+        control(
+            &node,
+            Some(serde_json::json!({"command": "play", "instance": instance}))
+        )
+        .await
+        .unwrap()
+        .playing
+    );
+    assert!(
+        !control(
+            &node,
+            Some(serde_json::json!({"command": "pause", "instance": instance}))
+        )
+        .await
+        .unwrap()
+        .playing
+    );
+    control(&node, Some(serde_json::json!({"command": "seek", "instance": instance, "position": status.end - 1}))).await.unwrap();
+    control(
+        &node,
+        Some(serde_json::json!({"command": "play", "instance": instance})),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = control(&node, None).await.unwrap();
+            if !status.playing {
+                assert_eq!(status.position, status.end);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[test]
+fn cli_defaults_to_embedded_router_and_rejects_conflicting_modes() {
+    let args = Arguments::try_parse_from(["mcap-replay", "test.mcap"]).unwrap();
+    assert!(args.router.is_none());
+    assert_eq!(args.listen, "tcp/0.0.0.0:7447");
+    assert!(
+        Arguments::try_parse_from([
+            "mcap-replay",
+            "test.mcap",
+            "--router",
+            "tcp/127.0.0.1:7447",
+            "--listen",
+            "tcp/127.0.0.1:0"
+        ])
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zenoh_controls_seek_pause_reject_stale_commands_and_stop_at_eof() {
+    let file = fixture();
+    exercise_controls(Recording::open(file.path(), "/replay").unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set MCAP_REPLAY_FILE to an indexed ROS-Z recording"]
+async fn recorded_file_controls() {
+    let path = std::env::var_os("MCAP_REPLAY_FILE").expect("set MCAP_REPLAY_FILE");
+    exercise_controls(Recording::open(std::path::Path::new(&path), "/replay").unwrap()).await;
+}
+
+/// Run with MCAP_REPLAY_FILE=... cargo test -p mcap-replay scrub_latency -- --ignored --nocapture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MCAP_REPLAY_FILE; measures real seek-to-observation latency"]
+async fn scrub_latency() {
+    let path = std::env::var_os("MCAP_REPLAY_FILE").expect("set MCAP_REPLAY_FILE");
+    let mut recording = Recording::open(std::path::Path::new(&path), "/replay").unwrap();
+    let args =
+        Arguments::try_parse_from(["mcap-replay", "test.mcap", "--listen", "tcp/127.0.0.1:0"])
+            .unwrap();
+    let context = args.connect().await.unwrap();
+    let uri = context.session().info().locators().await[0].to_string();
+    let client = ContextBuilder::default()
+        .with_router_endpoint(uri)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let server_node = context
+        .create_node("bench")
+        .with_namespace("/replay")
+        .build()
+        .await
+        .unwrap();
+    let node = Arc::new(client.create_node("bench_client").build().await.unwrap());
+    let observer = TopicObserver::new(
+        node,
+        TopicObserverOptions::with_namespace("/replay").unwrap(),
+    );
+    let observation = observer.observe_dynamic("camera_matrix").unwrap().spawn();
+    let mut status = ReplayStatus {
+        instance: "bench".into(),
+        recording: "bench".into(),
+        generation: 0,
+        start: recording.start,
+        end: recording.end,
+        position: recording.start,
+        playing: false,
+        sources: Default::default(),
+    };
+    let mut retained = BTreeMap::new();
+    let mut timings = Vec::new();
+    for fraction in [
+        0.5, 0.501, 0.502, 0.503, 0.504, 0.505, 0.9, 0.2, 0.7, 0.3, 0.8, 0.4,
+    ] {
+        let position = status.start + ((status.end - status.start) as f64 * fraction) as u64;
+        let start = Instant::now();
+        let snapshot = recording.snapshot(position).unwrap();
+        let read = start.elapsed();
+        let publishers = publishers(&server_node, &recording).await.unwrap();
+        let declared = start.elapsed();
+        for message in snapshot {
+            publish(&publishers, message).await.unwrap();
+        }
+        retained = publishers;
+        update_sources(&mut status, &retained);
+        observer.set_replay_sources(Some(status.sources.clone()));
+        let mut updates = observation.subscribe_updates().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observation.latest_json().is_none() {
+                updates.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{:?}", observation.status()));
+        let elapsed = start.elapsed();
+        println!(
+            "scrub {fraction:.3}: read {read:?}, declare {:?}, visible {elapsed:?}",
+            declared - read
+        );
+        timings.push(elapsed);
+    }
+    timings.sort();
+    println!(
+        "seek-to-decoded median {:?}, max {:?}",
+        timings[timings.len() / 2],
+        timings.last().unwrap()
+    );
+    drop(retained);
+}
