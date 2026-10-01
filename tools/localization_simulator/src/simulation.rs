@@ -492,12 +492,442 @@ mod tests {
 
     use super::*;
 
+    fn sparse_scenario(duration: f32, opponent_half: bool) -> Scenario {
+        use crate::trajectory::PoseKeyframe;
+
+        let own = Scenario::stationary().sample_camera_to_field(0.0);
+        let mut poses = vec![(0.0, own)];
+        let end = if opponent_half {
+            let mirror = Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, std::f32::consts::PI),
+            )
+            .framed_transform::<Field, Field>()
+                * own;
+            // Smooth start/stop: this fixture tests field-branch recovery, not
+            // the response to infinite acceleration in a piecewise-linear path.
+            poses.extend((0..=150).map(|step| {
+                let u = step as f32 / 150.0;
+                let blend = u.powi(3) * (10.0 - 15.0 * u + 6.0 * u * u);
+                (
+                    1.0 + 3.0 * u,
+                    own.inner
+                        .lerp_slerp(&mirror.inner, blend)
+                        .framed_transform(),
+                )
+            }));
+            mirror
+        } else {
+            own
+        };
+        poses.push((duration, end));
+        Scenario::new(
+            "sparse_lifecycle",
+            duration,
+            poses
+                .into_iter()
+                .map(|(time, pose)| PoseKeyframe::from_camera_to_field(time, pose))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn run_sparse(
+        scenario: Scenario,
+        config: SimulationConfig,
+        count_at: impl Fn(i64) -> usize,
+    ) -> LocalizationSimulation {
+        let mut simulation = LocalizationSimulation::new(scenario, config).unwrap();
+        assert_eq!(simulation.state(), LocalizationState::Startup);
+        while simulation
+            .step_with_observation_filter(|time, observations| {
+                // Restrict the emitted sensor frame, not the associator's output or its pose prior.
+                let retained = count_at(time.as_nanos());
+                observations.true_associations.truncate(retained);
+                for features in [
+                    &mut observations.detections.goalposts,
+                    &mut observations.detections.l_spots,
+                    &mut observations.detections.t_spots,
+                    &mut observations.detections.x_spots,
+                    &mut observations.detections.penalty_spots,
+                ] {
+                    features.retain(|feature| {
+                        observations
+                            .true_associations
+                            .iter()
+                            .any(|association| association.detection == feature.pixel)
+                    });
+                }
+                assert!(observations.detections.supported_feature_count() <= retained);
+            })
+            .unwrap()
+        {}
+        simulation
+    }
+
     fn exact_sensor_config() -> SimulationConfig {
         SimulationConfig {
             landmark_pixel_sigma: 0.0,
             vo_translation_sigma_m: 0.0,
             vo_rotation_sigma_rad: 0.0,
             ..Default::default()
+        }
+    }
+
+    fn state_transitions(simulation: &LocalizationSimulation) -> Vec<(i64, &'static str)> {
+        let mut transitions = Vec::new();
+        let mut maximum_translation_error = 0.0_f32;
+        let mut maximum_rotation_error = 0.0_f32;
+        for sample in simulation.history() {
+            let state = match sample.state {
+                LocalizationState::Startup => "Startup",
+                LocalizationState::Tracking => "Tracking",
+                LocalizationState::LostTrack => "LostTrack",
+            };
+            if transitions
+                .last()
+                .is_none_or(|&(_, previous)| previous != state)
+            {
+                transitions.push((sample.time.as_nanos(), state));
+                if sample.state == LocalizationState::Tracking {
+                    assert_eq!(sample.estimate_time, Some(sample.time));
+                    assert!(sample.diagnostics.as_ref().unwrap().measurement_count >= 3);
+                }
+            }
+            if let Some(pose) = sample.live_robot_to_field {
+                let truth_time = sample.estimate_time.expect("pose has a solve timestamp");
+                let truth = robot_to_field_from_camera_to_field(
+                    &simulation
+                        .scenario
+                        .sample_camera_to_field(truth_time.as_nanos() as f32 * 1.0e-9),
+                );
+                let error = (pose.translation() - truth.translation()).norm();
+                maximum_translation_error = maximum_translation_error.max(error);
+                maximum_rotation_error =
+                    maximum_rotation_error.max(pose.inner.rotation.angle_to(&truth.inner.rotation));
+                // Accuracy is checked by the stationary and smooth-trajectory tests.
+                // These discontinuous-motion fixtures test lifecycle and field branch.
+                assert!(error.is_finite());
+                assert!(pose.inner.rotation.angle_to(&truth.inner.rotation) < 5.0_f32.to_radians());
+            }
+            if let Some(frame) = &sample.landmark_frame
+                && frame.emitted_detections < 3
+                && simulation.config.association_mode == AssociationMode::ProductionAssociation
+            {
+                assert_eq!(frame.associated, 0);
+            }
+        }
+        eprintln!(
+            "sparse transitions: {transitions:?}; max_error={maximum_translation_error:.4} m / {:.3} deg",
+            maximum_rotation_error.to_degrees()
+        );
+        transitions
+    }
+
+    #[test]
+    fn sparse_stationary_startup_tracking_loss_and_recovery() {
+        let simulation = run_sparse(
+            sparse_scenario(10.0, false),
+            exact_sensor_config(),
+            |time| match time / 1_000_000_000 {
+                0 => 0,
+                1 => 1,
+                2 | 4 | 6..=8 => 2,
+                _ => 3,
+            },
+        );
+        let transitions = state_transitions(&simulation);
+        assert_eq!(
+            transitions,
+            vec![
+                (0, "Startup"),
+                // Bootstrap preserves the already-ingested IMU/VO window.
+                (3_000_000_000, "Tracking"),
+                (7_900_000_000, "LostTrack"),
+                (9_000_000_000, "Tracking"),
+            ]
+        );
+        for sample in simulation.history() {
+            if sample.state == LocalizationState::LostTrack {
+                assert_eq!(sample.global_visual_lock, GlobalVisualLock::Unlocked);
+                assert_eq!(sample.estimate_time, Some(sample.time));
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_recovery_keeps_opponent_half_and_heading() {
+        for association_mode in [
+            AssociationMode::ProductionAssociation,
+            AssociationMode::KnownCorrespondences,
+        ] {
+            let simulation = run_sparse(
+                sparse_scenario(10.0, true),
+                SimulationConfig {
+                    association_mode,
+                    ..exact_sensor_config()
+                },
+                |time| {
+                    if (5_000_000_000..8_000_000_000).contains(&time) {
+                        2
+                    } else {
+                        3
+                    }
+                },
+            );
+            let transitions = state_transitions(&simulation);
+            assert_eq!(
+                transitions,
+                vec![
+                    (0, "Startup"),
+                    (100_000_000, "Tracking"),
+                    (6_900_000_000, "LostTrack"),
+                    (8_000_000_000, "Tracking"),
+                ]
+            );
+            for sample in simulation
+                .history()
+                .iter()
+                .filter(|sample| sample.time.as_nanos() >= 4_000_000_000)
+            {
+                assert_ne!(
+                    sample.state,
+                    LocalizationState::Startup,
+                    "recovery must not restart globally"
+                );
+                assert!(sample.raw_backend_robot_to_field.unwrap().translation().x() > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_expired_tracking_prior_recovers_with_heading() {
+        let simulation = run_sparse(
+            sparse_scenario(10.0, false),
+            exact_sensor_config(),
+            |time| {
+                if (1_000_000_000..9_000_000_000).contains(&time) {
+                    2
+                } else {
+                    3
+                }
+            },
+        );
+        assert_eq!(
+            state_transitions(&simulation),
+            vec![
+                (0, "Startup"),
+                (100_000_000, "Tracking"),
+                (2_900_000_000, "LostTrack"),
+                (9_000_000_000, "Tracking"),
+            ]
+        );
+        for sample in simulation
+            .history()
+            .iter()
+            .filter(|sample| sample.time.as_nanos() >= 9_000_000_000)
+        {
+            if let Some(frame) = &sample.landmark_frame {
+                assert_eq!(frame.emitted_detections, 3);
+                assert_eq!(frame.associated, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_timeout_boundary_requires_a_post_loss_frame() {
+        let simulation = run_sparse(sparse_scenario(4.0, false), exact_sensor_config(), |time| {
+            if (1_000_000_000..2_900_000_000).contains(&time) {
+                2
+            } else {
+                3
+            }
+        });
+        assert_eq!(
+            state_transitions(&simulation),
+            vec![
+                (0, "Startup"),
+                (100_000_000, "Tracking"),
+                (2_900_000_000, "LostTrack"),
+                (3_000_000_000, "Tracking"),
+            ]
+        );
+        let boundary = simulation
+            .history()
+            .iter()
+            .find(|sample| sample.time.as_nanos() == 2_900_000_000)
+            .unwrap();
+        assert_eq!(boundary.landmark_frame.as_ref().unwrap().associated, 0);
+        assert!(
+            boundary.state == LocalizationState::LostTrack,
+            "shared dispatch requires exposure after the loss boundary"
+        );
+    }
+
+    #[test]
+    fn sparse_noisy_three_feature_recovery_without_motion() {
+        for (index, seed) in [0, 1, 2, 3, 0x5eed].into_iter().enumerate() {
+            let sparse_count = index % 3;
+            let simulation = run_sparse(
+                sparse_scenario(6.0, false),
+                SimulationConfig {
+                    seed,
+                    ..Default::default()
+                },
+                |time| {
+                    if (1_000_000_000..4_000_000_000).contains(&time) {
+                        sparse_count
+                    } else {
+                        3
+                    }
+                },
+            );
+            eprintln!("seed={seed}, gap_features={sparse_count}");
+            let transitions = state_transitions(&simulation);
+            assert_eq!(
+                transitions
+                    .iter()
+                    .map(|&(_, state)| state)
+                    .collect::<Vec<_>>(),
+                vec!["Startup", "Tracking", "LostTrack", "Tracking"]
+            );
+            assert!((2_800_000_000..=3_000_000_000).contains(&transitions[2].0));
+            assert!(
+                (4_000_000_000..=4_600_000_000).contains(&transitions[3].0),
+                "recovery must occur promptly after restoring three detections"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_recovery_with_four_or_five_features() {
+        for count in [4, 5] {
+            let simulation =
+                run_sparse(sparse_scenario(6.0, false), exact_sensor_config(), |time| {
+                    if (1_000_000_000..4_000_000_000).contains(&time) {
+                        2
+                    } else {
+                        count
+                    }
+                });
+            assert_eq!(
+                simulation.history()[0]
+                    .landmark_frame
+                    .as_ref()
+                    .unwrap()
+                    .emitted_detections,
+                count
+            );
+            eprintln!("restored_features={count}");
+            assert_eq!(
+                state_transitions(&simulation),
+                vec![
+                    (0, "Startup"),
+                    (100_000_000, "Tracking"),
+                    (2_900_000_000, "LostTrack"),
+                    (4_000_000_000, "Tracking"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_boundary_view_with_two_l_spots_and_a_penalty_spot() {
+        let robot = Isometry3::from_parts(
+            Translation3::new(-4.5, 0.0, 0.55),
+            UnitQuaternion::from_euler_angles(0.0, 0.2, std::f32::consts::FRAC_PI_6),
+        );
+        let camera =
+            FramedIsometry3::<Robot, Field>::wrap(robot) * fixed_robot_to_camera().inverse();
+        let scenario = Scenario::new(
+            "sparse_boundary",
+            6.0,
+            [0.0, 6.0]
+                .map(|time| crate::trajectory::PoseKeyframe::from_camera_to_field(time, camera))
+                .to_vec(),
+        )
+        .unwrap();
+        let mut simulation =
+            LocalizationSimulation::new(scenario, SimulationConfig::default()).unwrap();
+        while simulation
+            .step_with_observation_filter(|time, observations| {
+                let features = &mut observations.detections;
+                features.goalposts.clear();
+                features.t_spots.clear();
+                features.x_spots.clear();
+                features
+                    .l_spots
+                    .sort_by(|a, b| b.pixel.y().total_cmp(&a.pixel.y()));
+                features.l_spots.truncate(2);
+                features
+                    .penalty_spots
+                    .sort_by(|a, b| b.pixel.y().total_cmp(&a.pixel.y()));
+                features.penalty_spots.truncate(usize::from(
+                    !(1_000_000_000..4_000_000_000).contains(&time.as_nanos()),
+                ));
+                observations.true_associations.retain(|association| {
+                    features
+                        .l_spots
+                        .iter()
+                        .chain(&features.penalty_spots)
+                        .any(|feature| feature.pixel == association.detection)
+                });
+                assert_eq!(features.l_spots.len(), 2);
+            })
+            .unwrap()
+        {}
+        assert_eq!(
+            state_transitions(&simulation),
+            vec![
+                (0, "Startup"),
+                (100_000_000, "Tracking"),
+                (2_900_000_000, "LostTrack"),
+                (4_000_000_000, "Tracking"),
+            ]
+        );
+    }
+
+    #[test]
+    fn distant_stationary_view_does_not_fabricate_a_startup_lock() {
+        let robot = Isometry3::from_parts(
+            Translation3::new(-3.5, 1.5, 0.55),
+            UnitQuaternion::from_euler_angles(0.0, -0.1, 0.5),
+        );
+        let camera =
+            FramedIsometry3::<Robot, Field>::wrap(robot) * fixed_robot_to_camera().inverse();
+        let scenario = Scenario::new(
+            "distant_stationary",
+            3.0,
+            [0.0, 3.0]
+                .map(|time| crate::trajectory::PoseKeyframe::from_camera_to_field(time, camera))
+                .to_vec(),
+        )
+        .unwrap();
+        let mut simulation = LocalizationSimulation::new(
+            scenario,
+            SimulationConfig {
+                landmark_pixel_sigma: 0.0,
+                vo_translation_sigma_m: 0.0,
+                vo_rotation_sigma_rad: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        simulation.run_to_end().unwrap();
+        assert!(
+            simulation
+                .history
+                .iter()
+                .all(|sample| sample.state == LocalizationState::Startup
+                    && sample.live_robot_to_field.is_none())
+        );
+        for counts in simulation
+            .history
+            .iter()
+            .filter_map(|sample| sample.landmark_frame.as_ref())
+        {
+            assert_eq!(counts.emitted_detections, 7);
+            assert_eq!(counts.associated, 0);
         }
     }
 
@@ -751,5 +1181,77 @@ mod tests {
                 _ => panic!("live output availability differs"),
             }
         }
+    }
+
+    #[test]
+    fn production_figure_eight_is_accurate_at_estimate_timestamps() {
+        check_figure_eight_accuracy(AssociationMode::ProductionAssociation);
+    }
+
+    #[test]
+    fn known_correspondence_figure_eight_isolates_estimator_accuracy() {
+        check_figure_eight_accuracy(AssociationMode::KnownCorrespondences);
+    }
+
+    fn check_figure_eight_accuracy(association_mode: AssociationMode) {
+        let mut simulation = LocalizationSimulation::new(
+            Scenario::field_figure_eight_twice(),
+            SimulationConfig {
+                association_mode,
+                ..exact_sensor_config()
+            },
+        )
+        .expect("simulation initializes");
+        simulation.run_to_end().expect("simulation runs");
+
+        let first = simulation
+            .history
+            .iter()
+            .find(|sample| sample.live_robot_to_field.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "bootstrap must eventually localize: {:?}",
+                    simulation
+                        .history
+                        .iter()
+                        .step_by(10)
+                        .take(8)
+                        .map(|s| &s.diagnostics)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            first.truth_robot_to_field.translation().x() < 0.0,
+            "bootstrap must acquire on the own half: {:?}",
+            first.time
+        );
+        let mut squared_errors = 0.0;
+        let mut sample_count = 0;
+        for current in &simulation.history[1..simulation.history.len() - 1] {
+            let Some(estimate) = current.live_robot_to_field.map(|pose| pose.inner) else {
+                continue;
+            };
+            let truth_time = current.estimate_time.expect("pose has a solve timestamp");
+            let truth = robot_to_field_from_camera_to_field(
+                &simulation
+                    .scenario
+                    .sample_camera_to_field(truth_time.as_nanos() as f32 * 1.0e-9),
+            );
+            let error = estimate.translation.vector - truth.inner.translation.vector;
+            squared_errors += error.norm_squared();
+            sample_count += 1;
+        }
+        assert!(
+            sample_count > simulation.history.len() / 2,
+            "{association_mode:?} localized only {sample_count}/{} interior samples",
+            simulation.history.len() - 2
+        );
+        let translation_rms = (squared_errors / sample_count as f32).sqrt();
+        eprintln!("{association_mode:?}: figure8 rms={translation_rms} samples={sample_count}");
+
+        assert!(
+            translation_rms < 0.1,
+            "translation RMS was {translation_rms}"
+        );
     }
 }
