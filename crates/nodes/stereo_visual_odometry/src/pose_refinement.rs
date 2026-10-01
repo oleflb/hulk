@@ -374,7 +374,7 @@ pub fn matrix3_from_mat3a(matrix: &Mat3AF32) -> na::Matrix3<f32> {
     na::Matrix3::from_column_slice(&array)
 }
 
-fn mat3a_from_matrix3(matrix: &na::Matrix3<f32>) -> Mat3AF32 {
+pub(crate) fn mat3a_from_matrix3(matrix: &na::Matrix3<f32>) -> Mat3AF32 {
     Mat3AF32::from_cols(
         Vec3AF32::new(matrix[(0, 0)], matrix[(1, 0)], matrix[(2, 0)]),
         Vec3AF32::new(matrix[(0, 1)], matrix[(1, 1)], matrix[(2, 1)]),
@@ -386,6 +386,6 @@ pub fn vector3_from_vec3a(vector: Vec3AF32) -> na::Vector3<f32> {
     na::Vector3::new(vector.x, vector.y, vector.z)
 }
 
-fn vec3a_from_vector3(vector: na::Vector3<f32>) -> Vec3AF32 {
+pub(crate) fn vec3a_from_vector3(vector: na::Vector3<f32>) -> Vec3AF32 {
     Vec3AF32::new(vector.x, vector.y, vector.z)
 }
