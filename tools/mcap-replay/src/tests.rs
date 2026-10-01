@@ -205,8 +205,19 @@ async fn paused_snapshots_rewind_and_reject_other_generations() {
     let new = seek(&node, &mut recording, 10).await.unwrap();
     update_sources(&mut status, &new);
     observer.set_replay_sources(Some(status.sources.clone()));
-    assert!(observation.latest().is_none());
-    assert!(observation.get_all().is_empty());
+    // The receive task may already have installed the new retained snapshot.
+    // Only data from the previous generation must be invisible.
+    assert!(
+        observation
+            .latest()
+            .is_none_or(|record| record.value == "10")
+    );
+    assert!(
+        observation
+            .get_all()
+            .iter()
+            .all(|record| record.value == "10")
+    );
     wait_value(&observation, "10").await;
     for message in recording.snapshot(40).unwrap() {
         publish(&old, message).await.unwrap();
