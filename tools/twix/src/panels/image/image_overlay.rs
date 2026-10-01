@@ -20,7 +20,7 @@ use twix_visualization::twix_painter::TwixPainter;
 
 use super::overlays::{
     BallDetectionOverlay, FieldBorderOverlay, HorizonOverlay, LineDetectionOverlay,
-    ObjectDetectionOverlay, PoseDetectionOverlay,
+    ObjectDetectionOverlay, PoseDetectionOverlay, ProjectedFieldLinesOverlay,
 };
 
 const OVERLAY_HISTORY_CAPACITY: usize = 4096;
@@ -40,6 +40,7 @@ pub(super) struct ImageOverlays {
     field_border: OverlaySlot<FieldBorderOverlay>,
     object_detection: OverlaySlot<ObjectDetectionOverlay>,
     pose_detection: OverlaySlot<PoseDetectionOverlay>,
+    projected_field_lines: OverlaySlot<ProjectedFieldLinesOverlay>,
 }
 
 impl ImageOverlays {
@@ -54,6 +55,7 @@ impl ImageOverlays {
             field_border: OverlaySlot::new(value, context),
             object_detection: OverlaySlot::new(value, context),
             pose_detection: OverlaySlot::new(value, context),
+            projected_field_lines: OverlaySlot::new(value, context),
         }
     }
 
@@ -70,6 +72,7 @@ impl ImageOverlays {
                 self.field_border.checkbox(ui, context);
                 self.object_detection.checkbox(ui, context);
                 self.pose_detection.checkbox(ui, context);
+                self.projected_field_lines.checkbox(ui, context);
             });
     }
 
@@ -79,6 +82,12 @@ impl ImageOverlays {
             poses: self.pose_detection.prepare(time),
             horizon: self.horizon.prepare(time),
             border: self.field_border.prepare(time),
+            field: self.projected_field_lines.prepare(time),
+            field_unavailable: self
+                .projected_field_lines
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.unavailable(time)),
         }
     }
 
@@ -87,6 +96,9 @@ impl ImageOverlays {
             && (!self.pose_detection.active || snapshot.poses.is_some())
             && (!self.horizon.active || snapshot.horizon.is_some())
             && (!self.field_border.active || snapshot.border.is_some())
+            && (!self.projected_field_lines.active
+                || snapshot.field.is_some()
+                || snapshot.field_unavailable)
     }
 
     pub(super) fn detection_times(&self) -> Option<BTreeSet<Time>> {
@@ -138,6 +150,35 @@ impl ImageOverlays {
         if !self.field_border.active {
             snapshot.border = None;
         }
+        if !self.projected_field_lines.active {
+            snapshot.field = None;
+        }
+    }
+
+    pub(super) fn restore_projection(&self, snapshot: &mut OverlaySnapshot, time: Time) -> bool {
+        snapshot.field = self.projected_field_lines.prepare(time);
+        snapshot.field.is_some() || !self.projected_field_lines.active
+    }
+
+    pub(super) fn enrich_residual(&self, snapshot: &mut OverlaySnapshot, time: Time) {
+        if let Some(overlay) = &self.projected_field_lines.overlay
+            && let Some(field) = &mut snapshot.field
+        {
+            overlay.enrich_residual(field, time);
+        }
+    }
+
+    pub(super) fn invalidate_projection(&self, snapshot: &mut OverlaySnapshot) -> bool {
+        if let Some(overlay) = &self.projected_field_lines.overlay
+            && snapshot
+                .field
+                .as_ref()
+                .is_some_and(|field| !overlay.valid(field))
+        {
+            snapshot.field = None;
+            return true;
+        }
+        false
     }
 
     pub(super) fn save(&self) -> Value {
@@ -148,6 +189,7 @@ impl ImageOverlays {
             FieldBorderOverlay::STORAGE_KEY: self.field_border.save(),
             ObjectDetectionOverlay::STORAGE_KEY: self.object_detection.save(),
             PoseDetectionOverlay::STORAGE_KEY: self.pose_detection.save(),
+            ProjectedFieldLinesOverlay::STORAGE_KEY: self.projected_field_lines.save(),
         })
     }
 }
@@ -158,10 +200,15 @@ pub(super) struct OverlaySnapshot {
     poses: Option<<PoseDetectionOverlay as ImageOverlay>::Sample>,
     horizon: Option<<HorizonOverlay as ImageOverlay>::Sample>,
     border: Option<<FieldBorderOverlay as ImageOverlay>::Sample>,
+    field: Option<<ProjectedFieldLinesOverlay as ImageOverlay>::Sample>,
+    pub(super) field_unavailable: bool,
 }
 
 impl OverlaySnapshot {
     pub(super) fn paint(&self, painter: &TwixPainter<Pixel>) {
+        if let Some(sample) = &self.field {
+            ProjectedFieldLinesOverlay::paint(painter, sample);
+        }
         if let Some(sample) = &self.horizon {
             HorizonOverlay::paint(painter, sample);
         }
@@ -186,6 +233,7 @@ impl Default for ImageOverlays {
             field_border: OverlaySlot::inactive(),
             object_detection: OverlaySlot::inactive(),
             pose_detection: OverlaySlot::inactive(),
+            projected_field_lines: OverlaySlot::inactive(),
         }
     }
 }
@@ -316,6 +364,13 @@ where
         })
     }
 
+    pub(super) fn latest(&self) -> Option<Arc<SampleRecord<T>>> {
+        let topic = self.resolved_topic()?;
+        self.observation
+            .latest()
+            .filter(|record| record.metadata.resolved_topic == topic)
+    }
+
     pub(super) fn get_all(&self) -> Vec<Arc<SampleRecord<T>>> {
         let Some(topic) = self.resolved_topic() else {
             return Vec::new();
@@ -427,6 +482,8 @@ impl OverlayObservation<TimeWrapper<CameraMatrix>> {
             let head_to_camera = interpolate_transform(a.head_to_camera, b.head_to_camera, t)?;
             let robot_to_camera = head_to_camera * robot_to_head;
             Some(CameraSample {
+                robot_to_camera,
+                intrinsics: a.intrinsics,
                 horizon: projection::horizon::Horizon::from_parameters(
                     robot_to_camera * ground_to_robot,
                     &a.intrinsics,
@@ -437,6 +494,9 @@ impl OverlayObservation<TimeWrapper<CameraMatrix>> {
 }
 
 pub(super) struct CameraSample {
+    pub(super) robot_to_camera:
+        linear_algebra::Isometry3<coordinate_systems::Robot, coordinate_systems::Camera>,
+    pub(super) intrinsics: projection::intrinsic::Intrinsic,
     pub(super) horizon: Option<projection::horizon::Horizon>,
 }
 

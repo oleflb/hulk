@@ -284,6 +284,7 @@ struct RenderedImageCache {
     overlays: OverlaySnapshot,
     namespace: String,
     overlay_settings: Value,
+    projection_invalidated: bool,
     publisher: Option<ros_z::EndpointGlobalId>,
 }
 
@@ -303,6 +304,7 @@ impl RenderedImageCache {
             overlays: OverlaySnapshot::default(),
             namespace: String::new(),
             overlay_settings: Value::Null,
+            projection_invalidated: false,
             publisher: None,
         }
     }
@@ -363,6 +365,18 @@ impl RenderedImageCache {
         overlays: &ImageOverlays,
         aligned_camera: bool,
     ) {
+        if overlays.invalidate_projection(&mut self.overlays) {
+            self.projection_invalidated = true;
+        }
+        if self.projection_invalidated
+            && let Some(time) = self.image_time()
+            && overlays.restore_projection(&mut self.overlays, time)
+        {
+            self.projection_invalidated = false;
+        }
+        if let Some(time) = self.image_time() {
+            overlays.enrich_residual(&mut self.overlays, time);
+        }
         images.retain(|s| {
             self.image_time()
                 .is_none_or(|time| image_time(&s.value) > time)
@@ -388,6 +402,7 @@ impl RenderedImageCache {
                 && self.refresh_sample(egui_context, Some(Arc::clone(image)))
             {
                 self.overlays = snapshot;
+                self.projection_invalidated = false;
                 return;
             }
         }
