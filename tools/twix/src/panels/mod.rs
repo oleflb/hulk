@@ -1,6 +1,7 @@
 mod audio;
 mod image;
 mod map;
+mod map_3d;
 mod parameter;
 mod text;
 mod timeline;
@@ -8,6 +9,7 @@ mod timeline;
 pub use audio::AudioPanel;
 pub use image::ImagePanel;
 pub use map::MapPanel;
+pub use map_3d::Map3DPanel;
 pub use parameter::ParameterPanel;
 pub use text::TextPanel;
 pub use timeline::TimelinePanel;
