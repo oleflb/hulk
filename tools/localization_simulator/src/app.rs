@@ -6,8 +6,8 @@ use eframe::{
 };
 use egui_bevy::BevyWidget;
 use localization_simulator::{
-    LocalizationSimulation, PoseKeyframe, Scenario, SimulationConfig, SimulationHistorySample,
-    VisualOdometryMode, VisualOdometryOutlier,
+    AssociationMode, LocalizationSimulation, PoseKeyframe, Scenario, SimulationConfig,
+    SimulationHistorySample, VisualOdometryMode, VisualOdometryOutlier,
     config::TICK_INTERVAL,
     trajectory::{fixed_robot_to_camera, robot_to_field_from_camera_to_field},
 };
@@ -77,88 +77,6 @@ pub(crate) struct LocalizationSimulatorApp {
 }
 
 impl LocalizationSimulatorApp {
-    fn controls(&mut self, ui: &mut Ui) {
-        ui.heading("Localization Simulator");
-        let previous = self.scenario_choice;
-        ComboBox::from_label("Scenario")
-            .selected_text(self.scenario_choice.label())
-            .show_ui(ui, |ui| {
-                for choice in [
-                    ScenarioChoice::Stationary,
-                    ScenarioChoice::SixDofLoop,
-                    ScenarioChoice::FieldFigureEightTwice,
-                    ScenarioChoice::PoseTeleport,
-                    ScenarioChoice::VoFault,
-                    ScenarioChoice::Custom,
-                ] {
-                    ui.selectable_value(&mut self.scenario_choice, choice, choice.label());
-                }
-            });
-        if self.scenario_choice != previous {
-            self.playing = false;
-            self.fast_forward = false;
-            self.config.vo_outlier = if self.scenario_choice == ScenarioChoice::VoFault {
-                self.config.visual_odometry_mode = VisualOdometryMode::SyntheticDelta;
-                Some(default_vo_outlier())
-            } else {
-                None
-            };
-        }
-        self.configuration_dirty = self.applied_scenario_choice != self.scenario_choice
-            || self
-                .simulation
-                .as_ref()
-                .is_none_or(|simulation| simulation.config() != &self.config);
-        ui.add_enabled_ui(self.recorder.is_none(), |ui| {
-            if ui.button("Reset").clicked() {
-                self.rebuild();
-            }
-            ui.add_enabled_ui(!self.configuration_dirty && !self.simulation_failed, |ui| {
-                if ui
-                    .button(if self.playing { "Pause" } else { "Play" })
-                    .clicked()
-                {
-                    self.fast_forward = false;
-                    self.playing = !self.playing;
-                }
-                if ui.button("Step").clicked() {
-                    self.playing = false;
-                    self.fast_forward = false;
-                    self.step_once();
-                }
-                if ui
-                    .button(if self.fast_forward {
-                        "Stop fast-forward"
-                    } else {
-                        "Run to end"
-                    })
-                    .clicked()
-                {
-                    self.playing = false;
-                    self.fast_forward = !self.fast_forward;
-                }
-            });
-        });
-        ui.add(Slider::new(&mut self.playback_speed, 0.1..=4.0).text("Playback speed"));
-        let length = self
-            .simulation
-            .as_ref()
-            .map_or(0, |simulation| simulation.history().len());
-        if length > 0 {
-            ui.add_enabled(
-                !self.playing && !self.fast_forward && self.recorder.is_none(),
-                Slider::new(&mut self.inspect_index, 0..=length - 1)
-                    .text("Inspect history (read-only)"),
-            );
-        }
-        self.flight_controls(ui);
-        self.file_controls(ui);
-        self.diagnostics(ui);
-        if let Some(status) = &self.status {
-            ui.label(status);
-        }
-    }
-
     pub(crate) fn new(creation_context: &CreationContext) -> Self {
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut widget = BevyWidget::new(
@@ -315,6 +233,285 @@ impl LocalizationSimulatorApp {
             if !self.playing {
                 break;
             }
+        }
+    }
+
+    fn controls(&mut self, ui: &mut Ui) {
+        ui.heading("Localization Simulator");
+        ui.label(RichText::new("Deterministic 20 ms logical clock").color(Color32::GRAY));
+        ui.separator();
+
+        ui.strong("Scenario and inputs");
+        let previous_scenario_choice = self.scenario_choice;
+        ComboBox::from_label("Scenario")
+            .selected_text(self.scenario_choice.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.scenario_choice,
+                    ScenarioChoice::Stationary,
+                    "stationary",
+                );
+                ui.selectable_value(
+                    &mut self.scenario_choice,
+                    ScenarioChoice::SixDofLoop,
+                    "six_dof_loop",
+                );
+                ui.selectable_value(
+                    &mut self.scenario_choice,
+                    ScenarioChoice::FieldFigureEightTwice,
+                    "field_figure_eight_twice",
+                );
+                ui.selectable_value(
+                    &mut self.scenario_choice,
+                    ScenarioChoice::PoseTeleport,
+                    "pose_teleport",
+                );
+                ui.selectable_value(
+                    &mut self.scenario_choice,
+                    ScenarioChoice::VoFault,
+                    "vo_fault",
+                );
+                if self.custom_scenario.is_some() {
+                    ui.selectable_value(
+                        &mut self.scenario_choice,
+                        ScenarioChoice::Custom,
+                        "Custom",
+                    );
+                }
+            });
+        if self.scenario_choice != previous_scenario_choice {
+            if self.scenario_choice == ScenarioChoice::VoFault {
+                self.config.visual_odometry_mode = VisualOdometryMode::SyntheticDelta;
+                self.config.vo_outlier = Some(default_vo_outlier());
+            } else if previous_scenario_choice == ScenarioChoice::VoFault
+                || self.scenario_choice == ScenarioChoice::PoseTeleport
+            {
+                self.config.vo_outlier = None;
+            }
+        }
+        ComboBox::from_label("Association")
+            .selected_text(match self.config.association_mode {
+                AssociationMode::KnownCorrespondences => "Known correspondences",
+                AssociationMode::ProductionAssociation => "Production association",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.config.association_mode,
+                    AssociationMode::KnownCorrespondences,
+                    "Known correspondences",
+                );
+                ui.selectable_value(
+                    &mut self.config.association_mode,
+                    AssociationMode::ProductionAssociation,
+                    "Production association",
+                );
+            });
+        let previous_vo_mode = self.config.visual_odometry_mode;
+        ComboBox::from_label("Visual odometry")
+            .selected_text(match self.config.visual_odometry_mode {
+                VisualOdometryMode::SyntheticDelta => "Synthetic delta",
+                VisualOdometryMode::ProductionStereo => "Production stereo",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.config.visual_odometry_mode,
+                    VisualOdometryMode::SyntheticDelta,
+                    "Synthetic delta",
+                );
+                ui.add_enabled_ui(self.scenario_choice != ScenarioChoice::VoFault, |ui| {
+                    ui.selectable_value(
+                        &mut self.config.visual_odometry_mode,
+                        VisualOdometryMode::ProductionStereo,
+                        "Production stereo",
+                    );
+                });
+            });
+        if self.config.visual_odometry_mode == VisualOdometryMode::ProductionStereo {
+            if previous_vo_mode != self.config.visual_odometry_mode {
+                self.config.vo_translation_sigma_m = 0.0;
+                self.config.vo_rotation_sigma_rad = 0.0;
+                self.config.vo_translation_bias_per_step = [0.0; 3];
+                self.config.vo_rotation_bias_per_step = [0.0; 3];
+                self.config.vo_outlier = None;
+            }
+            ui.label("Synthetic VO noise, bias and outliers are disabled in production stereo.");
+            ui.add(
+                Slider::new(&mut self.config.right_camera_delay_ms, 0.0..=20.0)
+                    .step_by(0.1)
+                    .text("Right camera delay (ms)"),
+            );
+            ui.checkbox(
+                &mut self.config.assume_synchronized_stereo_timestamps,
+                "Assume synchronized stereo timestamps",
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("Seed");
+            ui.add(egui::DragValue::new(&mut self.config.seed));
+        });
+        ui.add(
+            Slider::new(&mut self.config.landmark_pixel_sigma, 0.0..=10.0)
+                .text("Landmark sigma (px)"),
+        );
+        ui.add(
+            Slider::new(&mut self.config.landmark_dropout_probability, 0.0..=1.0)
+                .text("Landmark dropout"),
+        );
+        ui.add_enabled_ui(
+            self.config.visual_odometry_mode == VisualOdometryMode::SyntheticDelta,
+            |ui| {
+                ui.add(
+                    Slider::new(&mut self.config.vo_translation_sigma_m, 0.0..=0.05)
+                        .text("VO translation sigma (m)"),
+                );
+                ui.add(
+                    Slider::new(&mut self.config.vo_rotation_sigma_rad, 0.0..=0.05)
+                        .text("VO rotation sigma (rad)"),
+                );
+                ui.collapsing("VO bias and one-shot outlier", |ui| {
+                    vector_controls(
+                        ui,
+                        "Translation bias/step (m)",
+                        &mut self.config.vo_translation_bias_per_step,
+                        0.0001,
+                    );
+                    vector_controls(
+                        ui,
+                        "Rotation bias/step (rad)",
+                        &mut self.config.vo_rotation_bias_per_step,
+                        0.0001,
+                    );
+
+                    let mut outlier_enabled = self.config.vo_outlier.is_some();
+                    if ui
+                        .checkbox(&mut outlier_enabled, "Enable one-shot VO outlier")
+                        .changed()
+                    {
+                        self.config.vo_outlier = outlier_enabled.then_some(default_vo_outlier());
+                    }
+                    if let Some(outlier) = &mut self.config.vo_outlier {
+                        ui.horizontal(|ui| {
+                            ui.label("Transition index");
+                            ui.add(egui::DragValue::new(&mut outlier.transition_index).speed(1));
+                        });
+                        vector_controls(ui, "Translation (m)", &mut outlier.translation, 0.1);
+                        vector_controls(
+                            ui,
+                            "Rotation scaled axis (rad)",
+                            &mut outlier.rotation_scaled_axis,
+                            0.05,
+                        );
+                    }
+                });
+            },
+        );
+        self.configuration_dirty = self.simulation.as_ref().is_none_or(|simulation| {
+            simulation.config() != &self.config
+                || self.scenario_choice != self.applied_scenario_choice
+        });
+        if self.configuration_dirty {
+            self.playing = false;
+            self.fast_forward = false;
+            ui.colored_label(
+                Color32::YELLOW,
+                "Inputs changed. Rebuild before playback so the displayed results match.",
+            );
+        }
+        if ui.button("Apply configuration / rebuild").clicked() {
+            self.rebuild();
+        }
+
+        ui.separator();
+        ui.strong("Playback");
+        ui.add(
+            Slider::new(&mut self.playback_speed, 0.1..=8.0)
+                .logarithmic(true)
+                .text("Speed"),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.recorder.is_none()
+                        && !self.fast_forward
+                        && (self.playing || (!self.configuration_dirty && !self.simulation_failed)),
+                    egui::Button::new(if self.playing { "Pause" } else { "Play" }),
+                )
+                .clicked()
+            {
+                self.playing = !self.playing;
+                if self.playing {
+                    self.inspect_index = self
+                        .simulation
+                        .as_ref()
+                        .map_or(0, |simulation| simulation.history().len().saturating_sub(1));
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.playing
+                        && self.recorder.is_none()
+                        && !self.configuration_dirty
+                        && !self.simulation_failed,
+                    egui::Button::new("Step"),
+                )
+                .clicked()
+            {
+                self.step_once();
+            }
+            if ui
+                .add_enabled(self.recorder.is_none(), egui::Button::new("Restart"))
+                .clicked()
+            {
+                self.rebuild();
+            }
+            if ui
+                .add_enabled(
+                    self.recorder.is_none()
+                        && (self.fast_forward
+                            || (!self.configuration_dirty && !self.simulation_failed)),
+                    egui::Button::new(if self.fast_forward {
+                        "Stop fast-forward"
+                    } else {
+                        "Run to end"
+                    }),
+                )
+                .clicked()
+            {
+                self.playing = false;
+                self.fast_forward = !self.fast_forward;
+            }
+        });
+
+        let history_len = self
+            .simulation
+            .as_ref()
+            .map_or(0, |simulation| simulation.history().len());
+        if history_len > 0 {
+            ui.add_enabled(
+                !self.playing && !self.fast_forward && self.recorder.is_none(),
+                Slider::new(&mut self.inspect_index, 0..=history_len - 1)
+                    .text("Inspect history (read-only)"),
+            );
+        } else {
+            ui.label("Inspect history (read-only): no samples");
+        }
+        ui.small("Resuming always returns the display to the latest generated sample.");
+
+        ui.separator();
+        self.flight_controls(ui);
+        ui.separator();
+        self.file_controls(ui);
+        ui.separator();
+        self.diagnostics(ui);
+        ui.separator();
+        ui.strong("View");
+        ui.colored_label(Color32::from_rgb(0, 230, 242), "Cyan: truth");
+        ui.colored_label(Color32::from_rgb(255, 209, 13), "Yellow: raw backend");
+        ui.colored_label(Color32::from_rgb(255, 13, 191), "Magenta: live estimate");
+        ui.label("Orbit: left drag | Pan: right drag | Zoom: wheel");
+        if let Some(status) = &self.status {
+            ui.separator();
+            ui.label(status);
         }
     }
 
@@ -680,4 +877,14 @@ fn error_labels(ui: &mut Ui, name: &str, truth: &Isometry3<f32>, estimate: &Isom
         .angle()
         .to_degrees();
     ui.label(format!("{name}: {translation:.3} m / {rotation:.2} deg"));
+}
+
+fn vector_controls(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        for (axis, value) in ["x", "y", "z"].into_iter().zip(values) {
+            ui.label(axis);
+            ui.add(egui::DragValue::new(value).speed(speed));
+        }
+    });
 }
