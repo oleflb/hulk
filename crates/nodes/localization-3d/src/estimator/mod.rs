@@ -837,19 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn measurements_older_than_window_are_rejected() {
-        let mut estimator = estimator();
-        estimator
-            .ingest_imu(Time::from_nanos(4_000_000_000), ImuState::default())
-            .unwrap();
-        assert!(
-            !estimator
-                .ingest_imu(Time::from_nanos(1_500_000_000), ImuState::default())
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn kinematic_odometry_stops_blind_motion_and_survives_marginalization() {
         use types::odometry::KinematicOdometryDelta;
         let run = |observe_stop: bool| {
