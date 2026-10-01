@@ -2,6 +2,9 @@
 
 pub mod bevy_scene;
 pub mod config;
+pub mod production_vo;
+pub mod sensors;
+pub mod simulation;
 pub mod stereo_render;
 pub mod trajectory;
 
