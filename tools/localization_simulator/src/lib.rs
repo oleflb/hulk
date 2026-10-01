@@ -1,4 +1,4 @@
-//! Deterministic, headless inputs for exercising 3D localization.
+//! Deterministic, headless inputs and runner for exercising 3D localization.
 
 pub mod bevy_scene;
 pub mod config;
