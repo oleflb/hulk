@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use color_eyre::{Result, eyre::Context as _};
 use ros_z::{context::ContextBuilder, graph::Graph, node::Node, prelude::*};
@@ -12,7 +15,7 @@ pub struct RobotBackend {
     node: Arc<Node>,
     observer: TopicObserver,
     namespace: Mutex<String>,
-
+    replay_revision: AtomicU64,
     replay: Mutex<crate::replay::ReplaySession>,
 }
 
@@ -54,7 +57,7 @@ impl RobotBackend {
             node,
             observer,
             namespace: Mutex::new(namespace),
-
+            replay_revision: AtomicU64::new(0),
             replay: Mutex::new(Default::default()),
         })
     }
@@ -95,6 +98,11 @@ impl RobotBackend {
 
     pub fn set_replay_sources(&self, sources: Option<ros_z_debug::replay::ReplaySources>) {
         self.observer.set_replay_sources(sources);
+        self.replay_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn replay_revision(&self) -> u64 {
+        self.replay_revision.load(Ordering::Relaxed)
     }
 
     pub fn replay(&self) -> std::sync::MutexGuard<'_, crate::replay::ReplaySession> {
