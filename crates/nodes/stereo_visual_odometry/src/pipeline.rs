@@ -2,7 +2,10 @@ use std::path::Path;
 
 use crate::{
     feature_extractor::{FeatureExtractor, NUM_KEYPOINTS, PreviousFeatureState},
-    odometry::{OdometryDiagnostics, OdometryScratch, PreviousFrame, estimate_previous_to_current},
+    odometry::{
+        OdometryDiagnostics, OdometryScratch, PoseEvaluationDiagnostics, PreviousFrame,
+        estimate_previous_to_current,
+    },
     parameters::StereoVisualOdometryPoseEstimationParameters,
     tracking::{FrameOutput, TrackingOutcome, TrackingState},
     triangulator::StereoTriangulator,
@@ -122,6 +125,14 @@ impl VisualOdometryPipeline {
         self.odometry_scratch.diagnostics()
     }
 
+    pub fn evaluate_previous_to_current(
+        &self,
+        pose: &na::Isometry3<f32>,
+    ) -> Option<PoseEvaluationDiagnostics> {
+        self.odometry_scratch
+            .evaluate_pose(pose, &self.triangulator)
+    }
+
     /// Return the stereo points triangulated from the most recently processed frame.
     ///
     /// Points are expressed in the current left-camera frame.
@@ -136,5 +147,9 @@ impl VisualOdometryPipeline {
                 }
             })
             .collect()
+    }
+
+    pub fn triangulated_feature_count(&self) -> usize {
+        self.current_points.len()
     }
 }
