@@ -186,6 +186,10 @@ impl ImuIntervals {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn interval_count(&self) -> usize {
+        self.intervals.len()
+    }
     pub(super) fn insert(
         &mut self,
         origin: Time,
@@ -232,7 +236,7 @@ impl ImuIntervals {
 }
 
 impl Estimator {
-    pub fn prepare_preintegration(&mut self) -> Result<()> {
+    pub(super) fn prepare_preintegration(&mut self) -> Result<()> {
         let p = &self.parameters.imu_preintegration;
         for (&index, interval) in &mut self.preintegration.intervals {
             let knot =
@@ -526,7 +530,7 @@ impl Estimator {
         })?)
     }
 
-    pub fn retire_preintegration(&mut self, oldest: i64) {
+    pub(super) fn retire_preintegration(&mut self, oldest: i64) {
         let first =
             oldest * self.parameters.timing.knot_ns() / self.parameters.timing.interval_ns();
         // Endpoint and boundary factors were removed by marginalization.
