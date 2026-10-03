@@ -7,7 +7,13 @@ use kinematics::{
 use linear_algebra::{Isometry2, Point3, Pose2, Vector2};
 use ros_z::{Message, time::Time};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use types::fall_detection::{FallDetection, Posture};
+use types::odometry::KinematicOdometryDelta;
+use types::time_wrapper::TimeWrapper;
+
+const DELTA_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const MAX_SAMPLE_GAP: Duration = Duration::from_millis(100);
 
 /// Parameters controlling contact-aware odometry integration.
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -26,16 +32,25 @@ pub struct Parameters {
     pub max_linear_speed: f32,
     /// Maximum accepted angular speed for one odometry update in radians per second.
     pub max_angular_speed: f32,
+    /// Maximum disagreement between feet's displacement during double support, in metres.
+    #[serde(default = "default_double_support_tolerance")]
+    pub double_support_translation_tolerance: f32,
     /// Candidate left-sole vertices used to estimate the current contact point.
     pub left_sole_contact_vertices: Vec<Point3<LeftSole>>,
     /// Candidate right-sole vertices used to estimate the current contact point.
     pub right_sole_contact_vertices: Vec<Point3<RightSole>>,
 }
 
+fn default_double_support_tolerance() -> f32 {
+    0.01
+}
+
 pub struct EstimatorInput<'a> {
+    /// Source timestamp of the IMU update triggering publication.
     pub time: Time,
+    /// Attitude aligned to the encoder source timestamp.
     pub imu_state: &'a ImuState,
-    pub robot_kinematics: Option<&'a RobotKinematics>,
+    pub robot_kinematics: Option<&'a TimeWrapper<RobotKinematics>>,
     pub fall_detection: Option<&'a FallDetection>,
 }
 
@@ -45,8 +60,12 @@ pub struct OdometryEstimator {
     yaw_offset_at_start: Option<f32>,
     last_yaw: Option<f32>,
     last_time: Option<Time>,
+    last_kinematics_time: Option<Time>,
     support_side: Option<SoleSide>,
-    previous_support_contact: Option<Vector2<Robot>>,
+    previous_contacts: Option<[Vector2<Robot>; 2]>,
+    previous_double_support: bool,
+    pending_delta: Option<KinematicOdometryDelta>,
+    delta: Option<KinematicOdometryDelta>,
 }
 
 impl OdometryEstimator {
@@ -55,7 +74,41 @@ impl OdometryEstimator {
         input: EstimatorInput<'_>,
         parameters: &Parameters,
     ) -> Option<Pose2<Odometry>> {
-        let robot_kinematics = input.robot_kinematics?;
+        self.delta = None;
+        let Some(robot_kinematics) = input.robot_kinematics else {
+            self.clear_contact_tracking();
+            return None;
+        };
+        let time = robot_kinematics.time;
+        // Duplicate or reordered encoders must not create observations or discard the anchor.
+        if self.last_kinematics_time.is_some_and(|last| time <= last) {
+            return None;
+        }
+        self.last_kinematics_time = Some(time);
+        let robot_kinematics = &robot_kinematics.inner;
+        if !input
+            .imu_state
+            .roll_pitch_yaw
+            .inner
+            .iter()
+            .all(|v| v.is_finite())
+            || [
+                robot_kinematics.left_leg.sole_to_robot.inner,
+                robot_kinematics.right_leg.sole_to_robot.inner,
+            ]
+            .iter()
+            .any(|pose| !pose.to_homogeneous().iter().all(|v| v.is_finite()))
+            || time.abs_diff(input.time) > MAX_SAMPLE_GAP
+        {
+            self.clear_contact_tracking();
+            return None;
+        }
+        if self
+            .last_time
+            .is_some_and(|last| time.duration_since(last) > MAX_SAMPLE_GAP)
+        {
+            self.clear_contact_tracking();
+        }
 
         let yaw_offset = *self
             .yaw_offset_at_start
@@ -65,7 +118,7 @@ impl OdometryEstimator {
         if !is_upright(input.fall_detection) {
             self.clear_contact_tracking();
             self.pose = pose_with_yaw(self.pose, yaw);
-            self.last_time = Some(input.time);
+            self.last_time = Some(time);
             return Some(self.pose);
         }
 
@@ -75,14 +128,20 @@ impl OdometryEstimator {
             input.imu_state.roll_pitch_yaw.y(),
             &parameters.left_sole_contact_vertices,
             parameters.contact_height_epsilon,
-        )?;
+        );
         let right_contact = kinematics::sole_contact::estimate_sole_contact(
             robot_kinematics.right_leg.sole_to_robot,
             input.imu_state.roll_pitch_yaw.x(),
             input.imu_state.roll_pitch_yaw.y(),
             &parameters.right_sole_contact_vertices,
             parameters.contact_height_epsilon,
-        )?;
+        );
+        let (Some(left_contact), Some(right_contact)) = (left_contact, right_contact) else {
+            self.clear_contact_tracking();
+            return None;
+        };
+        let double_support =
+            (left_contact.min_z - right_contact.min_z).abs() < parameters.double_support_deadband;
         let support_side = kinematics::sole_contact::select_support_side(
             left_contact,
             right_contact,
@@ -93,36 +152,43 @@ impl OdometryEstimator {
             },
         );
 
-        let Some(support_side) = support_side else {
-            self.clear_contact_tracking();
-            self.pose = pose_with_yaw(self.pose, yaw);
-            self.last_time = Some(input.time);
-            return Some(self.pose);
-        };
-
-        let current_contact = match support_side {
-            SoleSide::Left => left_contact.contact_xy_in_leveled_robot,
-            SoleSide::Right => right_contact.contact_xy_in_leveled_robot,
-        };
-
-        let Some(previous_contact) = self.previous_support_contact else {
-            self.anchor(support_side, current_contact, yaw, input.time);
+        let support_side = support_side.unwrap_or(self.support_side.unwrap_or(SoleSide::Left));
+        let contacts = [
+            left_contact.contact_xy_in_leveled_robot,
+            right_contact.contact_xy_in_leveled_robot,
+        ];
+        let side = usize::from(support_side == SoleSide::Right);
+        let Some(previous_contacts) = self.previous_contacts else {
+            self.anchor(support_side, contacts, yaw, time, double_support);
             return Some(self.pose);
         };
 
         if self.support_side != Some(support_side) {
-            self.anchor(support_side, current_contact, yaw, input.time);
+            self.anchor(support_side, contacts, yaw, time, double_support);
             return Some(self.pose);
         }
 
         let yaw_delta = normalize_angle(yaw - self.last_yaw.unwrap_or(yaw));
         let rotation = nalgebra::Rotation2::new(yaw_delta);
-        let mut translation = previous_contact - Vector2::wrap(rotation * current_contact.inner);
+        let translations = std::array::from_fn::<_, 2, _>(|i| {
+            previous_contacts[i] - Vector2::wrap(rotation * contacts[i].inner)
+        });
+        if double_support
+            && self.previous_double_support
+            && (translations[0] - translations[1]).norm()
+                > parameters.double_support_translation_tolerance
+        {
+            self.anchor(support_side, contacts, yaw, time, double_support);
+            return Some(self.pose);
+        }
+        let mut translation = translations[side];
         translation.inner.x *= parameters.translation_scale.x();
         translation.inner.y *= parameters.translation_scale.y();
 
-        if self.delta_exceeds_limits(input.time, translation, yaw_delta, parameters) {
-            self.anchor(support_side, current_contact, yaw, input.time);
+        if !translation.inner.iter().all(|v| v.is_finite())
+            || self.delta_exceeds_limits(time, translation, yaw_delta, parameters)
+        {
+            self.anchor(support_side, contacts, yaw, time, double_support);
             return Some(self.pose);
         }
 
@@ -132,22 +198,48 @@ impl OdometryEstimator {
         let current_to_odometry = previous_to_odometry * current_to_previous;
         self.pose = pose_with_yaw(current_to_odometry.as_pose(), yaw);
 
-        self.previous_support_contact = Some(current_contact);
+        let pending = self.pending_delta.get_or_insert(KinematicOdometryDelta {
+            previous_time: self.last_time?,
+            time,
+            current_to_previous: Isometry2::identity(),
+        });
+        pending.current_to_previous = pending.current_to_previous * current_to_previous;
+        pending.time = time;
+        if pending.time.duration_since(pending.previous_time) >= DELTA_INTERVAL {
+            self.delta = self.pending_delta.take();
+        }
+        self.previous_contacts = Some(contacts);
+        self.previous_double_support = double_support;
         self.last_yaw = Some(yaw);
-        self.last_time = Some(input.time);
+        self.last_time = Some(time);
 
         Some(self.pose)
     }
 
     fn clear_contact_tracking(&mut self) {
         self.support_side = None;
-        self.previous_support_contact = None;
+        self.previous_contacts = None;
         self.last_yaw = None;
+        self.pending_delta = None;
     }
 
-    fn anchor(&mut self, support_side: SoleSide, contact: Vector2<Robot>, yaw: f32, time: Time) {
+    /// Take the completed contact interval from the latest update, if any.
+    pub fn take_delta(&mut self) -> Option<KinematicOdometryDelta> {
+        self.delta.take()
+    }
+
+    fn anchor(
+        &mut self,
+        support_side: SoleSide,
+        contacts: [Vector2<Robot>; 2],
+        yaw: f32,
+        time: Time,
+        double_support: bool,
+    ) {
+        self.pending_delta = None;
         self.support_side = Some(support_side);
-        self.previous_support_contact = Some(contact);
+        self.previous_contacts = Some(contacts);
+        self.previous_double_support = double_support;
         self.last_yaw = Some(yaw);
         self.last_time = Some(time);
         self.pose = pose_with_yaw(self.pose, yaw);
@@ -213,6 +305,7 @@ mod tests {
             translation_scale: vector![<Robot>, 1.0, 1.0],
             max_linear_speed: 10.0,
             max_angular_speed: 10.0,
+            double_support_translation_tolerance: 0.01,
             left_sole_contact_vertices: vec![
                 point![<LeftSole>, 0.1, 0.05, 0.0],
                 point![<LeftSole>, 0.1, -0.05, 0.0],
@@ -258,6 +351,13 @@ mod tests {
         kinematics_with_heights(left_x, -0.02, right_x, 0.0)
     }
 
+    fn sample(milliseconds: i64, inner: RobotKinematics) -> TimeWrapper<RobotKinematics> {
+        TimeWrapper {
+            time: Time::from_nanos(milliseconds * 1_000_000),
+            inner,
+        }
+    }
+
     fn kinematics_with_heights(
         left_x: f32,
         left_z: f32,
@@ -283,7 +383,7 @@ mod tests {
     fn first_valid_frame_anchors_without_translation() {
         let mut estimator = OdometryEstimator::default();
         let imu = imu(1.0);
-        let kinematics = kinematics(0.0, 0.0);
+        let kinematics = sample(1000, kinematics(0.0, 0.0));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -306,7 +406,7 @@ mod tests {
         let mut estimator = OdometryEstimator::default();
         let parameters = parameters();
         let imu = imu(0.0);
-        let first = kinematics(0.0, 0.0);
+        let first = sample(1000, kinematics(0.0, 0.0));
         estimator.update(
             EstimatorInput {
                 time: Time::from_nanos(1_000_000_000),
@@ -317,7 +417,7 @@ mod tests {
             &parameters,
         );
 
-        let second = kinematics(0.05, 0.0);
+        let second = sample(1010, kinematics(0.05, 0.0));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -338,7 +438,7 @@ mod tests {
         let mut estimator = OdometryEstimator::default();
         let parameters = parameters();
         let imu = imu(0.0);
-        let first = kinematics_with_heights(0.0, -0.02, 0.0, 0.0);
+        let first = sample(1000, kinematics_with_heights(0.0, -0.02, 0.0, 0.0));
         estimator.update(
             EstimatorInput {
                 time: Time::from_nanos(1_000_000_000),
@@ -349,7 +449,7 @@ mod tests {
             &parameters,
         );
 
-        let second = kinematics_with_heights(0.5, 0.0, 0.5, -0.02);
+        let second = sample(1010, kinematics_with_heights(0.5, 0.0, 0.5, -0.02));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -372,7 +472,7 @@ mod tests {
         let mut parameters = parameters();
         parameters.max_linear_speed = 0.1;
         let imu = imu(0.0);
-        let first = kinematics(0.0, 0.0);
+        let first = sample(1000, kinematics(0.0, 0.0));
         estimator.update(
             EstimatorInput {
                 time: Time::from_nanos(1_000_000_000),
@@ -383,7 +483,7 @@ mod tests {
             &parameters,
         );
 
-        let second = kinematics(1.0, 0.0);
+        let second = sample(1010, kinematics(1.0, 0.0));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -405,7 +505,7 @@ mod tests {
         let mut estimator = OdometryEstimator::default();
         let parameters = parameters();
         let imu = imu(0.0);
-        let first = kinematics(0.0, 0.0);
+        let first = sample(1000, kinematics(0.0, 0.0));
         estimator.update(
             EstimatorInput {
                 time: Time::from_nanos(1_000_000_000),
@@ -416,7 +516,7 @@ mod tests {
             &parameters,
         );
 
-        let second = kinematics(0.5, 0.0);
+        let second = sample(1010, kinematics(0.5, 0.0));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -437,7 +537,7 @@ mod tests {
         let mut estimator = OdometryEstimator::default();
         let parameters = parameters();
         let imu = imu(0.0);
-        let first = kinematics(0.0, 0.0);
+        let first = sample(1000, kinematics(0.0, 0.0));
         estimator.update(
             EstimatorInput {
                 time: Time::from_nanos(1_000_000_000),
@@ -448,7 +548,7 @@ mod tests {
             &parameters,
         );
 
-        let second = kinematics(0.5, 0.0);
+        let second = sample(1010, kinematics(0.5, 0.0));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -499,7 +599,7 @@ mod tests {
         assert!(pose.is_none());
 
         let valid_imu = imu(1.5);
-        let kinematics = kinematics(0.0, 0.0);
+        let kinematics = sample(1010, kinematics(0.0, 0.0));
         let pose = estimator
             .update(
                 EstimatorInput {
@@ -513,5 +613,99 @@ mod tests {
             .expect("first valid frame publishes");
 
         assert!(pose.orientation().angle().abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn encoder_times_control_speed_limits_and_deltas_despite_imu_skew_and_duplicates() {
+        let mut estimator = OdometryEstimator::default();
+        let mut parameters = parameters();
+        parameters.max_linear_speed = 0.5;
+        let imu = imu(0.0);
+        let ready = upright();
+        let mut update = |encoder_ms, imu_ms: i64, x| {
+            let feet = sample(encoder_ms, kinematics(x, 0.0));
+            let pose = estimator.update(
+                EstimatorInput {
+                    time: Time::from_nanos(imu_ms * 1_000_000),
+                    imu_state: &imu,
+                    robot_kinematics: Some(&feet),
+                    fall_detection: Some(&ready),
+                },
+                &parameters,
+            );
+            (pose, estimator.take_delta())
+        };
+
+        assert!(update(1000, 1090, 0.0).1.is_none());
+        // 0.4 m/s over encoder time, but 0.8 m/s over the triggering IMU time.
+        let (pose, delta) = update(1020, 1100, -0.008);
+        assert!((pose.unwrap().position().x() - 0.008).abs() < 1e-6);
+        assert!(delta.is_none());
+        assert!(matches!(update(1020, 1101, -0.008), (None, None)));
+        assert!(matches!(update(1000, 1102, 0.0), (None, None)));
+
+        let (pose, delta) = update(1050, 1103, -0.02);
+        assert!((pose.unwrap().position().x() - 0.02).abs() < 1e-6);
+        let delta = delta.unwrap();
+        assert_eq!(delta.previous_time, Time::from_nanos(1_000_000_000));
+        assert_eq!(delta.time, Time::from_nanos(1_050_000_000));
+        assert!((delta.current_to_previous.translation().x() - 0.02).abs() < 1e-6);
+
+        // 2 m/s over encoder time must be rejected, even with a slow IMU trigger interval.
+        let (pose, delta) = update(1060, 1153, -0.04);
+        assert!((pose.unwrap().position().x() - 0.02).abs() < 1e-6);
+        assert!(delta.is_none());
+        assert!(matches!(update(1060, 1154, -0.04), (None, None)));
+    }
+
+    #[test]
+    fn measured_stops_in_double_support_are_distinct_from_rejected_intervals() {
+        let mut estimator = OdometryEstimator::default();
+        let parameters = parameters();
+        let imu = imu(0.0);
+        let ready = upright();
+        let fallen = fallen();
+        let mut update =
+            |milliseconds: i64, x, right_x, height, valid: bool, state: &FallDetection| {
+                let feet = sample(
+                    milliseconds,
+                    kinematics_with_heights(x, height, right_x, 0.0),
+                );
+                estimator.update(
+                    EstimatorInput {
+                        time: Time::from_nanos(milliseconds * 1_000_000),
+                        imu_state: &imu,
+                        robot_kinematics: valid.then_some(&feet),
+                        fall_detection: Some(state),
+                    },
+                    &parameters,
+                );
+                estimator.take_delta()
+            };
+        assert!(update(1000, 0.0, 0.0, -0.02, true, &ready).is_none());
+        let walking = update(1050, -0.02, 0.0, -0.02, true, &ready).unwrap();
+        assert!((walking.current_to_previous.translation().x() - 0.02).abs() < 1e-6);
+        let stopped = update(1100, -0.02, 0.0, 0.0, true, &ready).unwrap();
+        assert!(stopped.current_to_previous.translation().coords().norm() < 1e-6);
+        assert!(update(1150, -0.02, 0.0, 0.0, true, &ready).is_some());
+        // Both feet must agree before a double-support displacement is accepted.
+        assert!(update(1200, -0.1, 0.0, 0.0, true, &ready).is_none());
+        // A support switch reanchors rather than measuring zero motion.
+        assert!(update(1250, -0.1, 0.0, 0.02, true, &ready).is_none());
+        assert!(update(1300, -0.1, -5.0, 0.02, true, &ready).is_none());
+        assert!(update(1350, -0.1, -5.0, 0.02, false, &ready).is_none());
+        assert!(update(1400, -0.1, -5.0, 0.02, true, &ready).is_none());
+        assert!(update(1450, -0.1, -5.0, 0.02, true, &fallen).is_none());
+        assert!(update(1500, -0.1, -5.0, 0.02, true, &ready).is_none());
+        assert!(update(1500, -0.1, -5.0, 0.02, true, &ready).is_none());
+        assert!(update(1550, -0.1, -5.0, 0.02, true, &ready).is_some());
+        assert!(update(1800, -0.1, -5.0, 0.02, true, &ready).is_none());
+        let resumed = update(1850, -0.1, -5.0, 0.02, true, &ready).unwrap();
+        assert_eq!(resumed.previous_time, Time::from_nanos(1_800_000_000));
+        assert!(update(1860, -0.1, -5.0, 0.02, true, &ready).is_none());
+        assert!(update(1870, -0.1, -5.0, 0.02, false, &ready).is_none());
+        assert!(update(1880, -0.1, -5.0, 0.02, true, &ready).is_none());
+        let resumed = update(1930, -0.1, -5.0, 0.02, true, &ready).unwrap();
+        assert_eq!(resumed.previous_time, Time::from_nanos(1_880_000_000));
     }
 }
