@@ -83,7 +83,7 @@ mod tests;
 
 pub use field_containment::FieldContainment;
 pub use ground::{FootGround, FootObservation};
-pub use imu::{ImuKinematics, RelativeYaw};
+pub use imu::{GyroObservation, ImuKinematics, RelativeYaw, TiltObservation};
 pub use imu_bias::{ImuBiasPrior, ImuBiasWalk};
 pub use kinematic_odometry::{AdjacentKinematicOdometry, KinematicOdometry};
 pub use motion::MotionPrior;

@@ -335,14 +335,18 @@ mod factor_workload {
             .unwrap();
         let imu = ImuKinematics {
             controls,
-            biases,
             duration: c(0.2),
-            gyroscope_information_root: Matrix3::identity(),
-            tilt_information_root: Matrix3::identity(),
             tau: c(0.0),
-            bias_tau: c(0.0),
-            angular_velocity: Framed::wrap(Vector3::zeros()),
-            measured_up: Some(Framed::wrap(Vector3::z())),
+            gyro: Some(GyroObservation {
+                biases,
+                bias_tau: c(0.0),
+                reading: Framed::wrap(Vector3::zeros()),
+                root: Matrix3::identity(),
+            }),
+            tilt: Some(TiltObservation {
+                up: Framed::wrap(Vector3::z()),
+                root: Matrix3::identity(),
+            }),
         };
         let feet = graph.add_batch(FootGround {
             controls,
@@ -360,7 +364,10 @@ mod factor_workload {
             graph
                 .add_factor(ImuKinematics {
                     tau,
-                    bias_tau: tau,
+                    gyro: imu.gyro.clone().map(|gyro| GyroObservation {
+                        bias_tau: tau,
+                        ..gyro
+                    }),
                     ..imu.clone()
                 })
                 .unwrap();
