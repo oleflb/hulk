@@ -336,27 +336,27 @@ ordinary_case!(ImuCase, ImuKinematics, |input, states| {
     };
     ImuKinematics {
         controls: input.controls(states),
-        biases: std::array::from_fn(|i| {
-            states.insert(ImuBias {
-                gyroscope: Framed::wrap(Vector3::new(c(input.values[i]), c(0.03), c(-0.02))),
-                accelerometer: Framed::wrap(Vector3::zeros()),
-            })
-        }),
         duration: c(0.25),
         tau: c(tau),
-        bias_tau: c(0.1 + 0.8 * tau),
-        gyroscope_information_root: if input.bridge {
-            nalgebra::Matrix3::zeros()
-        } else {
-            root()
-        },
-        tilt_information_root: root(),
-        measured_up: (!input.stationary).then(|| input.measured_up()),
-        angular_velocity: Framed::wrap(Vector3::new(
-            c(input.values[6]),
-            c(input.values[7]),
-            c(input.values[8]),
-        )),
+        gyro: (!input.bridge).then(|| GyroObservation {
+            biases: std::array::from_fn(|i| {
+                states.insert(ImuBias {
+                    gyroscope: Framed::wrap(Vector3::new(c(input.values[i]), c(0.03), c(-0.02))),
+                    accelerometer: Framed::wrap(Vector3::zeros()),
+                })
+            }),
+            bias_tau: c(0.1 + 0.8 * tau),
+            root: root(),
+            reading: Framed::wrap(Vector3::new(
+                c(input.values[6]),
+                c(input.values[7]),
+                c(input.values[8]),
+            )),
+        }),
+        tilt: (!input.stationary).then(|| TiltObservation {
+            up: input.measured_up(),
+            root: root(),
+        }),
     }
 });
 
@@ -601,17 +601,16 @@ impl Scene {
             self.controls[3],
         ]
     }
-    fn tilt(&mut self) -> ImuKinematics {
+    fn tilt(&self) -> ImuKinematics {
         ImuKinematics {
             controls: self.segment(),
-            biases: std::array::from_fn(|_| self.graph.add(ImuBias::identity())),
             duration: 0.25,
             tau: 0.5,
-            bias_tau: 0.5,
-            angular_velocity: Framed::wrap(Vector3::zeros()),
-            measured_up: Some(Framed::wrap(Vector3::z())),
-            gyroscope_information_root: nalgebra::Matrix3::zeros(),
-            tilt_information_root: nalgebra::Matrix3::identity(),
+            gyro: None,
+            tilt: Some(TiltObservation {
+                up: Framed::wrap(Vector3::z()),
+                root: nalgebra::Matrix3::identity(),
+            }),
         }
     }
     fn reprojections(&self) -> FrameReprojections {
@@ -680,6 +679,86 @@ impl LinearizationSink for Capture {
 }
 
 #[test]
+fn tilt_only_has_no_bias_dependency_and_validates_present_payloads() {
+    let mut scene = Scene::new();
+    let factor = scene.tilt();
+    let mut variables = Vec::new();
+    <ImuKinematics as Factor<Scene>>::visit_variables(&factor, |key| variables.push(key));
+    assert_eq!(variables, scene.segment().map(|key| key.block_id()));
+    assert_eq!(factor.cost(&scene).unwrap(), 0.0);
+    let mut capture = Capture::default();
+    factor.linearize(&scene, &mut capture).unwrap();
+    assert_eq!(capture.blocks.len(), 1);
+    assert_eq!(
+        capture.blocks[0]
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>(),
+        variables
+    );
+
+    let gyro = GyroObservation {
+        biases: std::array::from_fn(|_| scene.graph.add(ImuBias::identity())),
+        bias_tau: 0.5,
+        reading: Framed::wrap(Vector3::zeros()),
+        root: nalgebra::Matrix3::zeros(),
+    };
+    let tilt = TiltObservation {
+        up: Framed::wrap(Vector3::z()),
+        root: nalgebra::Matrix3::identity(),
+    };
+    for invalid in [
+        ImuKinematics {
+            gyro: Some(GyroObservation {
+                bias_tau: f64::NAN,
+                ..gyro.clone()
+            }),
+            ..factor.clone()
+        },
+        ImuKinematics {
+            gyro: Some(GyroObservation {
+                reading: Framed::wrap(Vector3::repeat(f64::NAN)),
+                ..gyro.clone()
+            }),
+            ..factor.clone()
+        },
+        ImuKinematics {
+            gyro: Some(GyroObservation {
+                root: nalgebra::Matrix3::repeat(f64::NAN),
+                ..gyro.clone()
+            }),
+            ..factor.clone()
+        },
+        ImuKinematics {
+            tilt: Some(TiltObservation {
+                up: Framed::wrap(Vector3::zeros()),
+                ..tilt.clone()
+            }),
+            ..factor.clone()
+        },
+        ImuKinematics {
+            tilt: Some(TiltObservation {
+                root: nalgebra::Matrix3::repeat(f64::NAN),
+                ..tilt
+            }),
+            ..factor.clone()
+        },
+    ] {
+        assert!(invalid.cost(&scene).is_err());
+        assert!(invalid.linearize(&scene, &mut Capture::default()).is_err());
+    }
+    let gyro_only = ImuKinematics {
+        gyro: Some(gyro),
+        tilt: None,
+        ..factor
+    };
+    assert_eq!(gyro_only.cost(&scene).unwrap(), 0.0);
+    gyro_only
+        .linearize(&scene, &mut Capture::default())
+        .unwrap();
+}
+
+#[test]
 fn shared_imu_tilt_has_the_same_objective_as_separate_factors() {
     let mut scene = Scene::new();
     let input = Inputs {
@@ -696,20 +775,21 @@ fn shared_imu_tilt_has_the_same_objective_as_separate_factors() {
     let up = input.measured_up();
     let mut combined = ImuKinematics {
         controls,
-        biases,
         duration: 0.25,
-        gyroscope_information_root: root,
-        tilt_information_root: root,
         tau: 0.4,
-        bias_tau: 0.3,
-        angular_velocity: Framed::wrap(Vector3::new(0.1, -0.2, 0.3)),
-        measured_up: Some(up),
+        gyro: Some(GyroObservation {
+            biases,
+            bias_tau: 0.3,
+            reading: Framed::wrap(Vector3::new(0.1, -0.2, 0.3)),
+            root,
+        }),
+        tilt: Some(TiltObservation { up, root }),
     };
     let with_tilt = combined.cost(&scene).unwrap();
-    combined.measured_up = None;
+    combined.tilt = None;
     let tilt = ImuKinematics {
-        gyroscope_information_root: nalgebra::Matrix3::zeros(),
-        measured_up: Some(up),
+        gyro: None,
+        tilt: Some(TiltObservation { up, root }),
         ..combined.clone()
     };
     let separate = combined.cost(&scene).unwrap() + tilt.cost(&scene).unwrap();
@@ -753,9 +833,13 @@ fn exact_static_measurements_and_one_sided_constraints() {
     motion.linearize(&scene, &mut Capture::default()).unwrap();
 
     let imu = ImuKinematics {
-        gyroscope_information_root: nalgebra::Matrix3::identity(),
-        bias_tau: 0.4,
-        measured_up: None,
+        gyro: Some(GyroObservation {
+            biases: std::array::from_fn(|_| scene.graph.add(ImuBias::identity())),
+            bias_tau: 0.4,
+            reading: Framed::wrap(Vector3::zeros()),
+            root: nalgebra::Matrix3::identity(),
+        }),
+        tilt: None,
         ..tilt
     };
     assert_eq!(imu.cost(&scene).unwrap(), 0.0);
@@ -833,7 +917,10 @@ fn tilt_distinguishes_inversion_without_observing_yaw() {
     let mut scene = Scene::new();
     let measured = UnitQuaternion::from_euler_angles(0.0, 0.03, 0.0);
     let factor = ImuKinematics {
-        measured_up: Some(Framed::wrap(measured.inverse() * Vector3::z())),
+        tilt: Some(TiltObservation {
+            up: Framed::wrap(measured.inverse() * Vector3::z()),
+            root: nalgebra::Matrix3::identity(),
+        }),
         ..scene.tilt()
     };
     for yaw in [0.0, 1.7] {
@@ -1078,7 +1165,10 @@ fn invalid_inputs_and_yaw_wrapping() {
     assert!(prior.linearize(&scene, &mut Capture::default()).is_err());
     prior.controls = scene.segment();
     for z in [2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
-        prior.measured_up = Some(Framed::wrap(Vector3::new(0.0, 0.0, z)));
+        prior.tilt = Some(TiltObservation {
+            up: Framed::wrap(Vector3::new(0.0, 0.0, z)),
+            root: nalgebra::Matrix3::identity(),
+        });
         assert!(prior.cost(&scene).is_err());
         assert!(prior.linearize(&scene, &mut Capture::default()).is_err());
     }
@@ -1091,7 +1181,7 @@ fn invalid_inputs_and_yaw_wrapping() {
     for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert!(common::huber(&nalgebra::Vector2::new(1.0, 0.0), bad).is_err());
     }
-    prior.measured_up = Some(Framed::wrap(Vector3::z()));
+    prior.tilt = scene.tilt().tilt;
     let mut seam = PoseControl::identity();
     seam.pose.inner.rotation =
         UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::PI - 1e-7);
