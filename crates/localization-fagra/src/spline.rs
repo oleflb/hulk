@@ -467,7 +467,7 @@ impl<R: RealField + Copy> Basis<R> {
     }
 }
 
-fn validate_tau<R: RealField + Copy>(tau: R) -> Result<(), EvaluationError> {
+pub(crate) fn validate_tau<R: RealField + Copy>(tau: R) -> Result<(), EvaluationError> {
     if tau >= R::zero() && tau <= R::one() {
         Ok(())
     } else {
