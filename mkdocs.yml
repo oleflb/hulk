@@ -61,6 +61,9 @@ nav:
           - Audio: robotics/perception/audio.md
           - Filters: robotics/perception/filters.md
           - HSL Network: robotics/perception/hsl_network.md
+          - Localization:
+              - IMU Preintegration: tooling/localization_preintegration.md
+              - Visual Bearing Residual: tooling/localization_visual_residual.md
       - Behavior: robotics/behavior/overview.md
       - Motion:
           - Overview: robotics/motion/overview.md
