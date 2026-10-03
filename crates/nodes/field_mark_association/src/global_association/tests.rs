@@ -474,24 +474,27 @@ fn tracking_rejects_invalid_covariance_future_solve_and_ambiguous_assignment() {
 }
 
 #[test]
-fn tracking_age_is_a_validity_horizon_including_its_exact_boundary() {
+fn tracking_joint_assignment_keeps_plausible_rivals_outside_the_distance_limit() {
     let mut geometry = geometry();
-    let features = project(stationary_three(), &geometry);
-    let mut parameters = calibrated_parameters();
-    parameters.tracking.position_sigma_per_second = 1.0e-6;
-    parameters.tracking.yaw_sigma_per_second = 1.0e-6;
-    geometry.estimate = tracking_estimate(0.0);
-    let mut input = input(&features, &geometry);
-    input.time = input.time + parameters.tracking.max_age;
-    assert_eq!(
-        associate_tracking_visual_features(input, &parameters)
-            .associations
-            .len(),
-        3
+    geometry.estimate.pose.inner.translation.vector.y = 0.375;
+    let features = project(
+        [
+            stationary_three()[0],
+            stationary_three()[1],
+            stationary_three()[2],
+            (VisualFeatureClass::XSpot, point![0.0, 0.365]),
+        ],
+        &geometry,
     );
-    input.time = input.time + std::time::Duration::from_nanos(1);
+    let mut parameters = FieldMarkAssociationParameters::default();
+    parameters.tracking.max_pixel_distance = 340.0;
+    // The center and +y crossing have mirror-symmetric image covariances about robot y=0.375.
+    // This observation is 332 pixels from the center and 350 from its plausible rival.
+    // Pruning that rival at the output ceiling would falsely certify the center match.
+    geometry.estimate = tracking_estimate(1.0);
+    geometry.estimate.pose.inner.translation.vector.y = 0.375;
     assert!(
-        associate_tracking_visual_features(input, &parameters)
+        associate_tracking_visual_features(input(&features, &geometry), &parameters)
             .associations
             .is_empty()
     );
@@ -512,14 +515,18 @@ fn tracking_high_covariance_keeps_distinct_opponent_landmarks_and_exact_age_hori
     .collect::<Vec<_>>();
     let parameters = FieldMarkAssociationParameters::default();
     geometry.estimate.covariance = sparse_retained_covariance();
-    for age in [
-        std::time::Duration::from_millis(3100),
-        parameters.tracking.max_age,
+    for (age, expected_count) in [
+        (std::time::Duration::from_millis(3100), 3),
+        (parameters.tracking.max_age, 3),
+        (
+            parameters.tracking.max_age + std::time::Duration::from_nanos(1),
+            0,
+        ),
     ] {
         let mut input = input(&features, &geometry);
         input.time = input.time + age;
         let result = associate_tracking_visual_features(input, &parameters);
-        assert_eq!(result.associations.len(), 3, "age={age:?}");
+        assert_eq!(result.associations.len(), expected_count, "age={age:?}");
         for association in &result.associations {
             assert!(expected.contains(&(association.detection, association.field_point.xy())));
             assert!(association.field_point.x() > 0.0);
