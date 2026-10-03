@@ -1,42 +1,58 @@
-use nalgebra::{Matrix3, vector};
 use ros_z::Message;
+use ros_z::time::Time;
 use serde::{Deserialize, Serialize};
 
-use coordinate_systems::{Field, Ground, Robot};
-use linear_algebra::{Isometry2, Isometry3, Point2, Pose2};
+use coordinate_systems::{Field, Ground, ImuReference, Robot};
+use linear_algebra::{Isometry2, Isometry3, Orientation2, Rotation2};
 
 use crate::multivariate_normal_distribution::MultivariateNormalDistribution;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, ros_z::Message)]
-pub struct Update {
-    pub ground_to_field: Isometry2<Ground, Field>,
-    pub line_center_point: Point2<Field>,
-    pub fit_error: f32,
-    pub number_of_measurements_weight: f32,
-    pub line_distance_to_robot: f32,
-    pub line_length_weight: f32,
+/// An exposure-time robot heading constraint, independent of optimized Local.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Message, PartialEq)]
+pub struct HeadingConstraint {
+    pub expected: Orientation2<Field, f64>,
+    /// Absolute angular error in radians, strictly between zero and pi/2.
+    pub max_error: f64,
+}
+
+impl HeadingConstraint {
+    pub fn is_valid(&self) -> bool {
+        (self.expected.inner.norm_sqr() - 1.0).abs() < 1e-6
+            && self.max_error > 0.0
+            && self.max_error < std::f64::consts::FRAC_PI_2
+    }
+
+    pub fn accepts(&self, heading: Orientation2<Field, f64>) -> bool {
+        self.is_valid() && self.expected.rotation_to(heading).inner.angle().abs() <= self.max_error
+    }
+}
+
+/// Read-only snapshot of localization's trusted IMU-to-field reference.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Message, PartialEq)]
+pub struct FieldHeadingReference {
+    pub time: Time,
+    pub imu_to_field: Rotation2<ImuReference, Field, f64>,
+    pub max_error: f64,
+}
+
+impl FieldHeadingReference {
+    pub fn at(
+        &self,
+        time: Time,
+        imu_yaw: Orientation2<ImuReference, f64>,
+    ) -> Option<HeadingConstraint> {
+        let constraint = HeadingConstraint {
+            expected: self.imu_to_field * imu_yaw,
+            max_error: self.max_error,
+        };
+        (time >= self.time && constraint.is_valid()).then_some(constraint)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Message)]
 pub struct ScoredPose {
     pub state: MultivariateNormalDistribution<3>,
     pub score: f32,
-}
-
-impl ScoredPose {
-    pub fn from_isometry(pose: Pose2<Field>, covariance: Matrix3<f32>, score: f32) -> Self {
-        Self {
-            state: MultivariateNormalDistribution {
-                mean: vector![
-                    pose.position().x(),
-                    pose.position().y(),
-                    pose.orientation().angle(),
-                ],
-                covariance,
-            },
-            score,
-        }
-    }
 }
 
 pub fn ground_to_field_from_field_to_robot(

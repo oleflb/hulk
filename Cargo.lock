@@ -12117,6 +12117,7 @@ dependencies = [
  "nalgebra 0.34.2",
  "num-traits",
  "ordered-float 4.6.0",
+ "projection",
  "pyo3",
  "ros-z",
  "ros-z-schema",
