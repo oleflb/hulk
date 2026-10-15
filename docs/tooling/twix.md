@@ -128,6 +128,8 @@ The X axis shows the seconds before the newest sample, and **History** sets the 
 ## Timestamp-aligned image overlays
 
 The Image panel selects images and optional overlays through one Live query plan.
+When `inputs/left_image` is absent, it selects `inputs/stereo_image_pair` and decodes the left image using its `.left.header.stamp` timestamp.
+The advertised primary topic wins even while empty; Live discovery updates the selected source automatically.
 Enabled object and pose detections contribute their latest acquisition timestamps; their minimum selects an exact retained image, falling back to the latest image if absent.
 Missing overlay inputs never gate the image, and only selected images are decoded.
 The Horizon overlay interpolates compatible camera matrices over brackets spanning at most 100 ms.
