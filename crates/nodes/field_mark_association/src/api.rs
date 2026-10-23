@@ -53,7 +53,6 @@ pub struct GlobalAssociationInput<'a> {
 }
 
 /// Fixed correspondences only; pose estimation belongs to localization.
-#[derive(Default)]
 pub struct AssociationResult {
     pub associations: Vec<FieldMarkAssociation>,
     pub source: VisualAssociationSource,
@@ -65,44 +64,43 @@ pub struct AssociationResult {
 pub fn associate_visual_features(
     input: AssociationInput<'_>,
     parameters: &FieldMarkAssociationParameters,
-) -> AssociationResult {
+) -> Option<AssociationResult> {
     if parameters.validate().is_err() {
-        return AssociationResult::default();
+        return None;
     }
-    if input.status.state == LocalizationState::Tracking {
-        let Some(geometry) = input.tracking.filter(|geometry| {
+    if input.status.state == LocalizationState::LostTrack && input.time <= input.status.time {
+        return None;
+    }
+    if input.status.state != LocalizationState::Startup {
+        let geometry = input.tracking.filter(|geometry| {
             geometry.epoch == input.status.epoch && geometry.generation == input.status.generation
-        }) else {
-            return AssociationResult::default();
-        };
-        return tracking::associate(
-            TrackingAssociationInput {
-                geometry,
-                visual_features: input.visual_features,
-                robot_to_camera: input.robot_to_camera,
-                camera_intrinsic: input.camera_intrinsic,
-                field_dimensions: input.field_dimensions,
-                time: input.time,
-            },
-            parameters,
-        )
-        .unwrap_or_default();
-    }
-    let Some(attitude) = input.attitude else {
-        return AssociationResult::default();
-    };
-    let (roll, pitch, yaw) = attitude.euler_angles();
-    let heading = if input.status.state == LocalizationState::LostTrack {
-        if input.time <= input.status.time {
-            return AssociationResult::default();
+        });
+        // Retain the motion posterior through a visual dropout. Its covariance
+        // supplies the expanding search region; global recovery is the fallback.
+        let local = geometry.and_then(|geometry| {
+            tracking::associate(
+                TrackingAssociationInput {
+                    geometry,
+                    visual_features: input.visual_features,
+                    robot_to_camera: input.robot_to_camera,
+                    camera_intrinsic: input.camera_intrinsic,
+                    field_dimensions: input.field_dimensions,
+                    time: input.time,
+                },
+                parameters,
+            )
+        });
+        if let Some(local) = local {
+            return Some(local);
         }
-        let Some(heading) = input
+    }
+    let attitude = input.attitude?;
+    let (roll, pitch, yaw) = attitude.euler_angles();
+    let heading = if input.status.state != LocalizationState::Startup {
+        let heading = input
             .status
             .heading
-            .and_then(|reference| reference.at(input.time, Orientation2::new(f64::from(yaw))))
-        else {
-            return AssociationResult::default();
-        };
+            .and_then(|reference| reference.at(input.time, Orientation2::new(f64::from(yaw))))?;
         Some(heading)
     } else {
         None
@@ -123,17 +121,19 @@ pub fn associate_visual_features(
 pub fn associate_tracking_visual_features(
     input: TrackingAssociationInput<'_>,
     parameters: &FieldMarkAssociationParameters,
-) -> AssociationResult {
+) -> Option<AssociationResult> {
     if parameters.validate().is_err() {
-        return AssociationResult::default();
+        return None;
     }
-    tracking::associate(input, parameters).unwrap_or_default()
+    tracking::associate(input, parameters)
 }
 
 /// Guided two-point hypotheses with soft crossing classes and pixel-space refinement.
 /// Reject near-tied sampled poses, ambiguous fixed-pose assignments and exhausted work.
 /// Without heading, return a representative modulo field half-turn symmetry;
 /// bounded sampling is not an exhaustive uniqueness proof.
-pub fn associate_global_visual_features(input: GlobalAssociationInput<'_>) -> AssociationResult {
-    solver::associate(input).unwrap_or_default()
+pub fn associate_global_visual_features(
+    input: GlobalAssociationInput<'_>,
+) -> Option<AssociationResult> {
+    solver::associate(input)
 }

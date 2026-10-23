@@ -124,6 +124,55 @@ fn stationary_three() -> [(VisualFeatureClass, Point2<Field>); 3] {
     ]
 }
 
+#[test]
+fn lost_tracking_reuses_the_motion_posterior_without_global_reinitialization() {
+    use types::localization::{LocalizationState, LocalizationStatus};
+    let geometry = geometry();
+    let features = project(stationary_three(), &geometry);
+    let parameters = calibrated_parameters();
+    let mut status = LocalizationStatus {
+        time: Time::from_nanos(900_000_000),
+        epoch: 0,
+        generation: 0,
+        state: LocalizationState::LostTrack,
+        heading: None,
+    };
+    let associate = |status: &LocalizationStatus| {
+        crate::associate_visual_features(
+            crate::AssociationInput {
+                status,
+                attitude: None,
+                tracking: Some(&geometry),
+                visual_features: &features,
+                robot_to_camera: robot_to_camera(),
+                camera_intrinsic: intrinsic(),
+                field_dimensions: &FieldDimensions::SPL_2025,
+                time: Time::from_nanos(1_000_000_000),
+            },
+            &parameters,
+        )
+    };
+    let result = associate(&status).unwrap();
+    assert_eq!(
+        result.source,
+        types::visual_localization::VisualAssociationSource::Tracking
+    );
+    assert_eq!(result.associations.len(), 3);
+    for count in 1..=2 {
+        let sparse = project(stationary_three().into_iter().take(count), &geometry);
+        let result =
+            associate_tracking_visual_features(input(&sparse, &geometry), &parameters).unwrap();
+        assert_eq!(result.associations.len(), count);
+    }
+    status.generation += 1;
+    assert!(associate(&status).is_none());
+    status.generation = 0;
+    status.time = Time::from_nanos(1_000_000_000);
+    assert!(associate(&status).is_none());
+    status.state = LocalizationState::Startup;
+    assert!(associate(&status).is_none());
+}
+
 fn key(result: &AssociationResult) -> Vec<([f32; 2], [f32; 2])> {
     result
         .associations
@@ -152,7 +201,7 @@ fn geometric_numerical_guards_are_applied() {
     let associate = |config: &GlobalAssociationConfig| {
         associate_global_visual_features(global_input(input(&features, &geometry), config))
     };
-    assert_eq!(associate(&baseline).associations.len(), 3);
+    assert_eq!(associate(&baseline).unwrap().associations.len(), 3);
     for config in [
         GlobalAssociationConfig {
             min_pair_distance: 1.0e6,
@@ -164,7 +213,7 @@ fn geometric_numerical_guards_are_applied() {
         },
     ] {
         config.validate().unwrap();
-        assert!(associate(&config).associations.is_empty());
+        assert!(associate(&config).is_none());
     }
 }
 
@@ -177,7 +226,8 @@ fn three_stationary_features_certify_without_history_or_pose() {
     let first = associate_global_visual_features(global_input(
         input(&features, &geometry),
         &parameters.global_localizer,
-    ));
+    ))
+    .unwrap();
     assert_eq!(first.associations.len(), 3);
     assert!(first.associations.iter().all(|a| a.field_point.x() < 0.0));
     assert_eq!(first.debug.as_ref().unwrap().association_count, 3);
@@ -189,7 +239,8 @@ fn three_stationary_features_certify_without_history_or_pose() {
         key(&associate_global_visual_features(global_input(
             input(&features, &geometry),
             &parameters.global_localizer
-        )))
+        ))
+        .unwrap())
     );
 }
 
@@ -227,15 +278,15 @@ fn lifecycle_dispatch_uses_exposure_attitude_and_matches_generations() {
         )
     };
     // Startup must ignore an optimizer tilt that disagrees with the source IMU.
-    assert_eq!(call(&status, Some(&wrong)).associations.len(), 3);
+    assert_eq!(call(&status, Some(&wrong)).unwrap().associations.len(), 3);
     status.state = LocalizationState::LostTrack;
-    assert!(call(&status, None).associations.is_empty());
+    assert!(call(&status, None).is_none());
     status.heading = Some(FieldHeadingReference {
         time: status.time,
         imu_to_field: linear_algebra::Rotation2::new(-1.3),
         max_error: 0.3,
     });
-    let recovery = call(&status, None);
+    let recovery = call(&status, None).unwrap();
     assert_eq!(
         recovery.source,
         types::visual_localization::VisualAssociationSource::Global
@@ -249,7 +300,14 @@ fn lifecycle_dispatch_uses_exposure_attitude_and_matches_generations() {
     );
     status.state = LocalizationState::Tracking;
     status.generation = 1;
-    assert!(call(&status, Some(&wrong)).associations.is_empty());
+    let fallback = call(&status, Some(&wrong)).unwrap();
+    assert_eq!(
+        fallback.source,
+        types::visual_localization::VisualAssociationSource::Global
+    );
+    assert_eq!(fallback.associations.len(), 3);
+    status.heading = None;
+    assert!(call(&status, Some(&wrong)).is_none());
 }
 
 #[test]
@@ -263,7 +321,7 @@ fn heading_preserves_orientation_and_budget_exhaustion_still_rejects() {
         max_error: 0.3,
     };
     input.heading = Some(heading);
-    let result = associate_global_visual_features(input);
+    let result = associate_global_visual_features(input).unwrap();
     assert_eq!(result.associations.len(), 3);
     assert!(result.associations.iter().all(|a| a.field_point.x() > 0.0));
     let exhausted = GlobalAssociationConfig {
@@ -275,19 +333,14 @@ fn heading_preserves_orientation_and_budget_exhaustion_still_rejects() {
             parameters: &exhausted,
             ..input
         })
-        .associations
-        .is_empty()
+        .is_none()
     );
     for limit in [f64::NAN, 0.0, std::f64::consts::FRAC_PI_2] {
         input.heading = Some(crate::HeadingConstraint {
             max_error: limit,
             ..heading
         });
-        assert!(
-            associate_global_visual_features(input)
-                .associations
-                .is_empty()
-        );
+        assert!(associate_global_visual_features(input).is_none());
     }
 }
 
@@ -299,7 +352,8 @@ fn canonical_landmarks_do_not_select_the_robot_half() {
         let features = project(stationary_three(), &geometry);
         let config = calibrated_parameters().global_localizer;
         let result =
-            associate_global_visual_features(global_input(input(&features, &geometry), &config));
+            associate_global_visual_features(global_input(input(&features, &geometry), &config))
+                .unwrap();
         assert_eq!(result.associations.len(), 3, "robot x {robot_x}");
         assert!(result.associations.iter().all(|a| a.field_point.x() < 0.0));
         // These correspondences imply a half-turn, so the canonical robot is at -robot_x.
@@ -334,7 +388,8 @@ fn halfturn_equivalent_triangles_are_not_ambiguous() {
     );
     let config = calibrated_parameters().global_localizer;
     let result =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config));
+        associate_global_visual_features(global_input(input(&features, &geometry), &config))
+            .unwrap();
     assert_eq!(result.associations.len(), 3);
 }
 
@@ -359,11 +414,13 @@ fn field_center_does_not_hide_halfturn_equivalence() {
     );
     let config = calibrated_parameters().global_localizer;
     let first =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config));
+        associate_global_visual_features(global_input(input(&features, &geometry), &config))
+            .unwrap();
     assert_eq!(first.associations.len(), 4);
     features.x_spots.reverse();
     let second =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config));
+        associate_global_visual_features(global_input(input(&features, &geometry), &config))
+            .unwrap();
     let expected = key(&first);
     let actual = key(&second);
     assert_eq!(actual.len(), expected.len());
@@ -399,11 +456,7 @@ fn translated_triangle_orbits_are_rejected() {
     let config = calibrated_parameters().global_localizer;
     let mut input = input(&features, &geometry);
     input.field_dimensions = &field;
-    assert!(
-        associate_global_visual_features(global_input(input, &config))
-            .associations
-            .is_empty()
-    );
+    assert!(associate_global_visual_features(global_input(input, &config)).is_none());
 }
 
 #[test]
@@ -423,8 +476,7 @@ fn collinear_and_duplicate_seeds_do_not_certify() {
             input(&features, &geometry),
             &GlobalAssociationConfig::default()
         ))
-        .associations
-        .is_empty()
+        .is_none()
     );
     let mut features = project(stationary_three(), &geometry);
     features.goalposts[1] = features.goalposts[0];
@@ -433,8 +485,7 @@ fn collinear_and_duplicate_seeds_do_not_certify() {
             input(&features, &geometry),
             &GlobalAssociationConfig::default()
         ))
-        .associations
-        .is_empty()
+        .is_none()
     );
 }
 
@@ -448,13 +499,13 @@ fn rich_frame_has_bounded_search_and_budget_exhaustion_rejects() {
     let features = project(map.landmarks.iter().map(|l| (l.class, l.xy)), &geometry);
     let mut config = calibrated_parameters().global_localizer;
     let result =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config));
+        associate_global_visual_features(global_input(input(&features, &geometry), &config))
+            .unwrap();
     assert_eq!(result.associations.len(), map.landmarks.len());
     config.max_work = 1;
     assert!(
         associate_global_visual_features(global_input(input(&features, &geometry), &config))
-            .associations
-            .is_empty()
+            .is_none()
     );
 }
 
@@ -466,7 +517,8 @@ fn tracking_keeps_opponent_half_prediction() {
     let result = associate_tracking_visual_features(
         input(&features, &geometry),
         &FieldMarkAssociationParameters::default(),
-    );
+    )
+    .unwrap();
     assert_eq!(result.associations.len(), 3);
     assert!(result.associations.iter().all(|a| a.field_point.x() > 0.0));
     geometry.estimate.pose.inner.translation.x = f64::NAN;
@@ -475,8 +527,7 @@ fn tracking_keeps_opponent_half_prediction() {
             input(&features, &geometry),
             &FieldMarkAssociationParameters::default()
         )
-        .associations
-        .is_empty()
+        .is_none()
     );
 }
 
@@ -490,15 +541,14 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
         // Generate observations from truth before shifting the single prior by 20 pixels.
         geometry.estimate.pose.inner.translation.x += 20.0 * 0.55 / 500.0;
         assert!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters)
-                .associations
-                .is_empty()
+            associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none()
         );
         // Keep stored covariance zero; age-dependent noise alone must explain the offset.
         let mut older = input(&features, &geometry);
         older.time = Time::from_nanos(2_000_000_000);
         assert_eq!(
             associate_tracking_visual_features(older, &parameters)
+                .unwrap()
                 .associations
                 .len(),
             3,
@@ -507,6 +557,7 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
         geometry.estimate.covariance = SMatrix::identity() * 0.001;
         assert_eq!(
             associate_tracking_visual_features(input(&features, &geometry), &parameters)
+                .unwrap()
                 .associations
                 .len(),
             3,
@@ -514,9 +565,7 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
         );
         parameters.tracking.max_pixel_distance = 19.0;
         assert!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters)
-                .associations
-                .is_empty()
+            associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none()
         );
     }
 }
@@ -532,7 +581,7 @@ fn guided_matching_handles_crossing_class_errors_and_outliers() {
     let outlier = project([(VisualFeatureClass::LSpot, point![15.0, 7.0])], &geometry).l_spots[0];
     features.l_spots.push(outlier);
     let input = global_input(input(&features, &geometry), &config);
-    let result = associate_global_visual_features(input);
+    let result = associate_global_visual_features(input).unwrap();
     assert_eq!(result.associations.len(), map.landmarks.len());
     assert!(
         !result
@@ -546,7 +595,10 @@ fn guided_matching_handles_crossing_class_errors_and_outliers() {
         .find(|a| a.detection == mislabeled.pixel)
         .unwrap();
     assert_eq!(actual.field_point.xy(), -map.landmarks[4].xy);
-    assert_eq!(key(&result), key(&associate_global_visual_features(input)));
+    assert_eq!(
+        key(&result),
+        key(&associate_global_visual_features(input).unwrap())
+    );
 }
 
 #[test]
@@ -584,7 +636,7 @@ fn recorded_near_and_distant_marks_are_matched_in_pixel_space() {
             max_error: 20.0_f64.to_radians(),
         }),
     };
-    let result = associate_global_visual_features(input);
+    let result = associate_global_visual_features(input).unwrap();
     assert_eq!(result.associations.len(), 7);
     for detection in frame["detections"].as_array().unwrap() {
         let pixel: Point2<_> = serde_json::from_value(detection["pixel"].clone()).unwrap();
@@ -649,11 +701,7 @@ fn uncertain_ray_pruning_does_not_turn_four_random_matches_into_consensus() {
     assert_eq!(rays.len(), 5);
     assert_eq!(observation_count, 6);
     // A fitted four-feature subset is insufficient: at least ceil(0.7 * 6) = 5 must agree.
-    assert!(
-        associate_global_visual_features(input)
-            .associations
-            .is_empty()
-    );
+    assert!(associate_global_visual_features(input).is_none());
 }
 
 #[test]
@@ -663,11 +711,7 @@ fn invalid_geometry_and_input_caps_fail_closed() {
     let config = GlobalAssociationConfig::default();
     let mut invalid = input(&features, &geometry);
     invalid.camera_intrinsic.focals.x = f32::NAN;
-    assert!(
-        associate_global_visual_features(global_input(invalid, &config))
-            .associations
-            .is_empty()
-    );
+    assert!(associate_global_visual_features(global_input(invalid, &config)).is_none());
     let mut over_cap = project(
         (0..33).map(|i| {
             (
@@ -689,15 +733,13 @@ fn invalid_geometry_and_input_caps_fail_closed() {
     geometry.estimate.pose.inner.rotation = UnitQuaternion::from_euler_angles(f64::NAN, 0.0, 0.0);
     assert!(
         associate_global_visual_features(global_input(input(&features, &geometry), &config))
-            .associations
-            .is_empty()
+            .is_none()
     );
     geometry.estimate.pose.inner.rotation = UnitQuaternion::identity();
     features.goalposts = vec![features.goalposts[0]; 129];
     assert!(
         associate_global_visual_features(global_input(input(&features, &geometry), &config))
-            .associations
-            .is_empty()
+            .is_none()
     );
 }
 
@@ -708,7 +750,8 @@ fn global_detection_order_preserves_correspondences_up_to_a_common_halfturn() {
     let mut features = project(stationary_three(), &geometry);
     for _ in 0..2 {
         let result =
-            associate_global_visual_features(global_input(input(&features, &geometry), &config));
+            associate_global_visual_features(global_input(input(&features, &geometry), &config))
+                .unwrap();
         assert_eq!(result.associations.len(), 3);
         // Detection reordering may choose the other half-turn representative, but never a reflection.
         let (_, detections, _) =
@@ -799,19 +842,13 @@ fn tracking_rejects_invalid_covariance_future_solve_and_ambiguous_assignment() {
     for covariance in invalid_covariances {
         geometry.estimate.covariance = covariance;
         assert!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters)
-                .associations
-                .is_empty()
+            associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none()
         );
     }
     geometry.estimate = tracking_estimate(0.0001);
     let mut future = input(&features, &geometry);
     future.time = Time::from_nanos(999_999_999);
-    assert!(
-        associate_tracking_visual_features(future, &parameters)
-            .associations
-            .is_empty()
-    );
+    assert!(associate_tracking_visual_features(future, &parameters).is_none());
     geometry.estimate = tracking_estimate(1.0);
     let field = FieldDimensions::SPL_2025;
     let features = project(
@@ -825,11 +862,7 @@ fn tracking_rejects_invalid_covariance_future_solve_and_ambiguous_assignment() {
         ],
         &geometry,
     );
-    assert!(
-        associate_tracking_visual_features(input(&features, &geometry), &parameters)
-            .associations
-            .is_empty()
-    );
+    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
 }
 
 #[test]
@@ -855,8 +888,7 @@ fn global_never_certifies_a_seed_subset_with_a_competing_penalty() {
         );
         assert!(
             associate_global_visual_features(global_input(input(&features, &geometry), &config))
-                .associations
-                .is_empty()
+                .is_none()
         );
     }
     // Each competing triple alone is certifiable; retaining both must not silently omit either.
@@ -868,6 +900,7 @@ fn global_never_certifies_a_seed_subset_with_a_competing_penalty() {
         };
         assert_eq!(
             associate_global_visual_features(global_input(input(&triple, &geometry), &config))
+                .unwrap()
                 .associations
                 .len(),
             3
@@ -895,11 +928,7 @@ fn tracking_joint_assignment_keeps_plausible_rivals_outside_the_distance_limit()
     // Pruning that rival at the output ceiling would falsely certify the center match.
     geometry.estimate = tracking_estimate(1.0);
     geometry.estimate.pose.inner.translation.vector.y = 0.375;
-    assert!(
-        associate_tracking_visual_features(input(&features, &geometry), &parameters)
-            .associations
-            .is_empty()
-    );
+    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
 }
 
 #[test]
@@ -928,6 +957,11 @@ fn tracking_high_covariance_keeps_distinct_opponent_landmarks_and_exact_age_hori
         let mut input = input(&features, &geometry);
         input.time = input.time + age;
         let result = associate_tracking_visual_features(input, &parameters);
+        if expected_count == 0 {
+            assert!(result.is_none(), "age={age:?}");
+            continue;
+        }
+        let result = result.unwrap();
         assert_eq!(result.associations.len(), expected_count, "age={age:?}");
         for association in &result.associations {
             assert!(expected.contains(&(association.detection, association.field_point.xy())));
@@ -1002,7 +1036,8 @@ fn tracking_uses_raw_image_features_even_when_their_rays_reach_the_horizon() {
             .is_empty()
     );
     let result =
-        associate_tracking_visual_features(input, &FieldMarkAssociationParameters::default());
+        associate_tracking_visual_features(input, &FieldMarkAssociationParameters::default())
+            .unwrap();
     assert_eq!(result.associations.len(), 3);
     assert!(result.associations.iter().all(|a| a.field_point.x() > 0.0));
     assert!(
@@ -1021,6 +1056,7 @@ fn tracking_filters_duplicates_but_rejects_input_and_retained_overflow() {
     features.goalposts.push(duplicate);
     assert_eq!(
         associate_tracking_visual_features(input(&features, &geometry), &parameters)
+            .unwrap()
             .associations
             .len(),
         3
@@ -1029,11 +1065,7 @@ fn tracking_filters_duplicates_but_rejects_input_and_retained_overflow() {
         .goalposts
         .extend(std::iter::repeat_n(duplicate, 125));
     assert_eq!(features.supported_feature_count(), 129);
-    assert!(
-        associate_tracking_visual_features(input(&features, &geometry), &parameters)
-            .associations
-            .is_empty()
-    );
+    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
     let mut features = project(stationary_three(), &geometry);
     features
         .goalposts
@@ -1042,11 +1074,7 @@ fn tracking_filters_duplicates_but_rejects_input_and_retained_overflow() {
             confidence: 0.95,
         }));
     assert_eq!(features.supported_feature_count(), 33);
-    assert!(
-        associate_tracking_visual_features(input(&features, &geometry), &parameters)
-            .associations
-            .is_empty()
-    );
+    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
 }
 
 #[test]
@@ -1106,7 +1134,8 @@ fn runtime_characterization() {
                     ))
                 } else {
                     associate_tracking_visual_features(black_box(input), black_box(&parameters))
-                });
+                })
+                .unwrap();
                 let elapsed = started.elapsed();
                 assert_eq!(
                     result.associations.len(),

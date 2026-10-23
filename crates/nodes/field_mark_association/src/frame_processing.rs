@@ -17,7 +17,7 @@ use ros_z::{
 use types::{
     camera_geometry::{CameraGeometry, camera_geometry_at},
     field_dimensions::FieldDimensions,
-    localization::{LocalizationEstimate, LocalizationState, LocalizationStatus},
+    localization::{LocalizationEstimate, LocalizationStatus},
     object_detection::{Object, RobocupObjectLabel},
     time_wrapper::TimeWrapper,
     visual_localization::{
@@ -100,7 +100,7 @@ pub(crate) async fn process_detected_objects(
         return Ok(());
     };
     let started = Instant::now();
-    let (frame, localization) = tokio::task::spawn_blocking(move || {
+    let (frame, mut localization) = tokio::task::spawn_blocking(move || {
         let visual_features = crate::find_detected_visual_features(&frame.objects);
         let localization = associate_visual_features(
             AssociationInput {
@@ -123,10 +123,12 @@ pub(crate) async fn process_detected_objects(
     // A blocking job cannot be cancelled: retain its slot until it returns, then discard late work.
     // Reuse the calibrated age limit for the wall-time budget, including blocking-pool queue time.
     let max_age = frame.parameters.max_pose_hint_age;
-    if started.elapsed() > max_age || !frame_is_current(&frame, ctx, max_age, localization.source) {
+    let source = localization.as_ref().map(|result| result.source);
+    if started.elapsed() > max_age || !frame_is_current(&frame, ctx, max_age, source) {
         return Ok(());
     }
-    if !localization.associations.is_empty() {
+    let debug = localization.as_mut().and_then(|result| result.debug.take());
+    if let Some(localization) = localization {
         let publisher = Arc::clone(&ctx.associations_publisher);
         let message = TimeWrapper {
             time: frame.image_time,
@@ -146,11 +148,11 @@ pub(crate) async fn process_detected_objects(
             .await
             .wrap_err("field-mark association publisher failed")??;
     }
-    if started.elapsed() <= max_age && frame_is_current(&frame, ctx, max_age, localization.source) {
+    if started.elapsed() <= max_age && frame_is_current(&frame, ctx, max_age, source) {
         let publisher = Arc::clone(&ctx.global_localization_publisher);
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            runtime.block_on(publisher.publish_if_subscribed(|| ready(localization.debug)))
+            runtime.block_on(publisher.publish_if_subscribed(|| ready(debug)))
         })
         .await
         .wrap_err("field-mark association debug publisher failed")??;
@@ -171,14 +173,8 @@ fn prepare_detection_frame(
     )?;
     let field_dimensions = ctx.field_dimensions_cache.get_latest()?;
     let status = ctx.status.get_latest()?;
-    let (attitude, tracking) = if status.state == LocalizationState::Tracking {
-        (
-            None,
-            tracking_geometry(image_time, ctx, &status, parameters.max_pose_hint_age),
-        )
-    } else {
-        (ctx.attitude_at(image_time, parameters.max_imu_gap), None)
-    };
+    let tracking = tracking_geometry(image_time, ctx, &status, parameters.max_pose_hint_age);
+    let attitude = ctx.attitude_at(image_time, parameters.max_imu_gap);
     if attitude.is_none() && tracking.is_none() {
         return None;
     }
@@ -203,17 +199,12 @@ fn tracking_geometry(
     max_age: Duration,
 ) -> Option<AssociationGeometry> {
     let latest_estimate = ctx.estimates.get_latest()?;
-    let latest = TimeWrapper {
-        time: latest_estimate.time,
-        inner: AssociationGeometry::from_estimate(&latest_estimate, status)?,
-    };
+    let latest = AssociationGeometry::from_estimate(&latest_estimate, status)?;
     let history = ctx.estimates.get_interval(image_time - max_age, image_time);
-    let snapshots = history.iter().rev().filter_map(|estimate| {
-        Some(TimeWrapper {
-            time: estimate.time,
-            inner: AssociationGeometry::from_estimate(estimate, status)?,
-        })
-    });
+    let snapshots = history
+        .iter()
+        .rev()
+        .filter_map(|estimate| AssociationGeometry::from_estimate(estimate, status));
     geometry_for_image(image_time, snapshots, &latest, max_age)
 }
 
@@ -244,8 +235,8 @@ fn interpolate_attitude(
 
 fn geometry_for_image(
     image_time: Time,
-    history: impl IntoIterator<Item = TimeWrapper<AssociationGeometry>>,
-    latest: &TimeWrapper<AssociationGeometry>,
+    history: impl IntoIterator<Item = AssociationGeometry>,
+    latest: &AssociationGeometry,
     max_age: Duration,
 ) -> Option<AssociationGeometry> {
     // Select complete snapshots; never attach a new state/covariance to an old branch's pose.
@@ -253,12 +244,16 @@ fn geometry_for_image(
     std::iter::once(latest.clone())
         .chain(history)
         .filter(|geometry| {
-            geometry.time <= image_time
-                && geometry.time.abs_diff(image_time) <= max_age
-                && same_lifecycle(&geometry.inner, &latest.inner)
+            geometry.last_successful_solve <= image_time
+                && geometry.last_successful_solve.abs_diff(image_time) <= max_age
+                && same_lifecycle(geometry, latest)
         })
-        .min_by_key(|geometry| (geometry.time.abs_diff(image_time), geometry.time))
-        .map(|geometry| geometry.inner)
+        .min_by_key(|geometry| {
+            (
+                geometry.last_successful_solve.abs_diff(image_time),
+                geometry.last_successful_solve,
+            )
+        })
 }
 
 fn lifecycle_is_current(
@@ -288,51 +283,61 @@ fn frame_is_current(
     frame: &PreparedDetectionFrame,
     ctx: &DetectionProcessingContext<'_>,
     max_age: Duration,
-    source: VisualAssociationSource,
+    source: Option<VisualAssociationSource>,
 ) -> bool {
-    if !lifecycle_is_current(frame, ctx, max_age) {
-        return false;
-    }
-    // Global recovery needs a trusted heading and fresh exposure IMU, not a fresh
-    // optimized pose: rejecting field estimates must not starve its own recovery.
-    if source == VisualAssociationSource::Global {
-        return ctx
-            .status
-            .get_latest()
-            .is_some_and(|status| status.heading == frame.status.heading);
-    }
-    let Some(geometry) = frame.tracking.as_ref() else {
-        return false;
-    };
-    let latest = ctx
-        .estimates
-        .get_latest()
-        .zip(ctx.status.get_latest())
-        .and_then(|(estimate, status)| {
-            Some(TimeWrapper {
-                time: estimate.time,
-                inner: AssociationGeometry::from_estimate(&estimate, &status)?,
-            })
-        });
-    result_is_current(
-        frame.image_time,
-        geometry,
-        latest.as_ref(),
-        ctx.clock.now(),
-        max_age,
+    publication_is_current(
+        lifecycle_is_current(frame, ctx, max_age),
+        source,
+        |source| {
+            // Global recovery needs a trusted heading and fresh exposure IMU, not a fresh
+            // optimized pose: rejecting field estimates must not starve its own recovery.
+            if source == VisualAssociationSource::Global {
+                return ctx
+                    .status
+                    .get_latest()
+                    .is_some_and(|status| status.heading == frame.status.heading);
+            }
+            let Some(geometry) = frame.tracking.as_ref() else {
+                return false;
+            };
+            let latest = ctx
+                .estimates
+                .get_latest()
+                .zip(ctx.status.get_latest())
+                .and_then(|(estimate, status)| {
+                    AssociationGeometry::from_estimate(&estimate, &status)
+                });
+            result_is_current(
+                frame.image_time,
+                geometry,
+                latest.as_ref(),
+                ctx.clock.now(),
+                max_age,
+            )
+        },
     )
+}
+
+fn publication_is_current(
+    lifecycle_current: bool,
+    source: Option<VisualAssociationSource>,
+    source_is_current: impl FnOnce(VisualAssociationSource) -> bool,
+) -> bool {
+    // Failed attempts clear debug without requiring a tracking pose or a success source.
+    lifecycle_current && source.is_none_or(source_is_current)
 }
 
 fn result_is_current(
     image_time: Time,
     geometry: &AssociationGeometry,
-    latest: Option<&TimeWrapper<AssociationGeometry>>,
+    latest: Option<&AssociationGeometry>,
     now: Time,
     max_age: Duration,
 ) -> bool {
     image_time.abs_diff(now) <= max_age
         && latest.is_some_and(|latest| {
-            latest.time.abs_diff(now) <= max_age && same_lifecycle(geometry, &latest.inner)
+            latest.last_successful_solve.abs_diff(now) <= max_age
+                && same_lifecycle(geometry, latest)
         })
 }
 
@@ -343,7 +348,55 @@ fn same_lifecycle(geometry: &AssociationGeometry, latest: &AssociationGeometry) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::localization::PoseEstimate;
+    use types::localization::{LocalizationState, PoseEstimate};
+
+    #[test]
+    fn failed_global_attempt_clears_debug_without_tracking_geometry() {
+        let result = associate_visual_features(
+            AssociationInput {
+                status: &LocalizationStatus {
+                    time: Time::zero(),
+                    epoch: 0,
+                    generation: 0,
+                    state: LocalizationState::Startup,
+                    heading: None,
+                },
+                attitude: Some(Orientation3::from_euler_angles(0.0, 0.0, 0.0)),
+                tracking: None,
+                visual_features: &crate::DetectedVisualFeatures::default(),
+                robot_to_camera: Isometry3::identity(),
+                camera_intrinsic: Intrinsic::new(
+                    nalgebra::vector![500.0, 500.0],
+                    linear_algebra::point![320.0, 240.0],
+                ),
+                field_dimensions: &FieldDimensions::SPL_2025,
+                time: Time::zero(),
+            },
+            &FieldMarkAssociationParameters::default(),
+        );
+        assert!(result.is_none());
+        let mut debug = Some(GlobalLocalizationDebug {
+            association_count: 3,
+            pairwise_distance_rms: 0.0,
+        });
+        if publication_is_current(true, result.as_ref().map(|result| result.source), |_| false) {
+            debug = result.and_then(|result| result.debug);
+        }
+        assert!(debug.is_none());
+    }
+
+    #[test]
+    fn publications_require_current_lifecycle_and_successful_source() {
+        assert!(!publication_is_current(false, None, |_| true));
+        for source in [
+            VisualAssociationSource::Global,
+            VisualAssociationSource::Tracking,
+        ] {
+            assert!(publication_is_current(true, Some(source), |_| true));
+            assert!(!publication_is_current(true, Some(source), |_| false));
+            assert!(!publication_is_current(false, Some(source), |_| true));
+        }
+    }
 
     #[test]
     fn snapshot_selection_uses_preceding_pose_from_the_same_generation() {
@@ -351,26 +404,22 @@ mod tests {
             pose: Isometry3::from_translation(1.0, 0.0, 0.0),
             covariance: nalgebra::SMatrix::identity(),
         };
-        let previous = TimeWrapper {
-            time: Time::from_nanos(90_000_000),
-            inner: AssociationGeometry {
-                epoch: 7,
-                generation: 2,
-                estimate: pose,
-                last_successful_solve: Time::from_nanos(90_000_000),
-            },
+        let previous = AssociationGeometry {
+            epoch: 7,
+            generation: 2,
+            estimate: pose,
+            last_successful_solve: Time::from_nanos(90_000_000),
         };
         let mut future = previous.clone();
-        future.time = Time::from_nanos(105_000_000);
-        future.inner.estimate.pose.inner.translation.x = 2.0;
-        future.inner.last_successful_solve = future.time;
+        future.last_successful_solve = Time::from_nanos(105_000_000);
+        future.estimate.pose.inner.translation.x = 2.0;
         let image = Time::from_nanos(100_000_000);
         let age = Duration::from_millis(20);
         let selected = geometry_for_image(image, [previous.clone()], &future, age).unwrap();
         assert_eq!(selected.estimate.pose.translation().x(), 1.0);
-        assert_eq!(selected.estimate, previous.inner.estimate);
+        assert_eq!(selected.estimate, previous.estimate);
         assert!(geometry_for_image(image, [], &future, age).is_none());
-        future.inner.generation += 1;
+        future.generation += 1;
         assert!(geometry_for_image(image, [previous], &future, age).is_none());
     }
 
@@ -425,39 +474,35 @@ mod tests {
             pose: Isometry3::identity(),
             covariance: nalgebra::SMatrix::identity(),
         };
-        let tracking = TimeWrapper {
-            time,
-            inner: AssociationGeometry {
-                generation: 0,
-                epoch: 7,
-                estimate,
-                last_successful_solve: time,
-            },
+        let tracking = AssociationGeometry {
+            generation: 0,
+            epoch: 7,
+            estimate,
+            last_successful_solve: time,
         };
         let mut replacement = tracking.clone();
-        replacement.time = time - Duration::from_millis(100);
-        replacement.inner.generation += 1;
-        replacement.inner.estimate.covariance *= 2.0;
-        replacement.inner.last_successful_solve = replacement.time;
-        replacement.inner.estimate.pose = Isometry3::from_translation(1.0, 2.0, 0.0);
+        replacement.last_successful_solve = time - Duration::from_millis(100);
+        replacement.generation += 1;
+        replacement.estimate.covariance *= 2.0;
+        replacement.estimate.pose = Isometry3::from_translation(1.0, 2.0, 0.0);
 
         let mut history = CacheInner::new(128);
-        history.insert(tracking.time, tracking.clone());
-        history.insert(replacement.time, replacement.clone());
+        history.insert(tracking.last_successful_solve, tracking.clone());
+        history.insert(replacement.last_successful_solve, replacement.clone());
         let mut publications = CacheInner::new(1);
         publications.insert(time, tracking.clone());
         publications.insert(time + Duration::from_millis(1), replacement.clone());
         let latest = publications.get_latest().unwrap();
         assert!(result_is_current(
             time,
-            &tracking.inner,
+            &tracking,
             history.get_latest().as_deref(),
             time,
             age
         ));
         assert!(!result_is_current(
             time,
-            &tracking.inner,
+            &tracking,
             Some(&latest),
             time,
             age
@@ -474,17 +519,20 @@ mod tests {
             age,
         )
         .unwrap();
-        assert_eq!(selected.estimate, replacement.inner.estimate);
-        assert_eq!(selected.last_successful_solve, replacement.time);
+        assert_eq!(selected.estimate, replacement.estimate);
+        assert_eq!(
+            selected.last_successful_solve,
+            replacement.last_successful_solve
+        );
         // Latest remains usable before the history subscriber receives the transition.
         let old_branch = [Arc::new(tracking)];
         assert_eq!(
             geometry_for_image(time, old_branch.iter().map(|g| (**g).clone()), &latest, age)
                 .unwrap()
                 .estimate,
-            replacement.inner.estimate
+            replacement.estimate
         );
-        replacement.time = time - age - Duration::from_nanos(1);
+        replacement.last_successful_solve = time - age - Duration::from_nanos(1);
         assert!(
             geometry_for_image(
                 time,
@@ -521,31 +569,30 @@ mod tests {
             heading: None,
         };
         let geometry = AssociationGeometry::from_estimate(&estimate, &status).unwrap();
-        let mut latest = TimeWrapper {
-            time,
-            inner: geometry.clone(),
-        };
-        let valid = |latest: Option<&TimeWrapper<AssociationGeometry>>, now| {
+        let mut latest = geometry.clone();
+        let valid = |latest: Option<&AssociationGeometry>, now| {
             result_is_current(time, &geometry, latest, now, age)
         };
         for state in [LocalizationState::Startup, LocalizationState::LostTrack] {
             status.state = state;
-            let unavailable = AssociationGeometry::from_estimate(&estimate, &status)
-                .map(|inner| TimeWrapper { time, inner });
-            assert!(!valid(unavailable.as_ref(), time));
+            let unavailable = AssociationGeometry::from_estimate(&estimate, &status);
+            assert_eq!(
+                valid(unavailable.as_ref(), time),
+                state == LocalizationState::LostTrack
+            );
         }
         let expired = age + Duration::from_nanos(1);
         assert!(valid(Some(&latest), time + age));
         assert!(!valid(None, time));
         assert!(!valid(Some(&latest), time + expired));
         assert!(!valid(Some(&latest), time - expired));
-        latest.time = time - expired;
+        latest.last_successful_solve = time - expired;
         assert!(!valid(Some(&latest), time));
-        latest.time = time;
-        latest.inner.epoch += 1;
+        latest.last_successful_solve = time;
+        latest.epoch += 1;
         assert!(!valid(Some(&latest), time));
-        latest.inner.epoch = geometry.epoch;
-        latest.inner.generation += 1;
+        latest.epoch = geometry.epoch;
+        latest.generation += 1;
         assert!(!valid(Some(&latest), time));
     }
 }

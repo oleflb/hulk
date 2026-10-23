@@ -181,7 +181,7 @@ fn verify_recording(recording: Recording) {
         let robot_to_local: Rotation3<Robot, Local> = Rotation3::wrap(recorded.leveling().inner);
         if recorded.sequence < 3737 {
             assert!(
-                unconstrained.associations.is_empty(),
+                unconstrained.is_none(),
                 "{} must reject ambiguous geometry with exposure tilt",
                 recorded.sequence
             );
@@ -203,7 +203,8 @@ fn verify_recording(recording: Recording) {
                 expected,
                 max_error: parameters.max_heading_error,
             }),
-        );
+        )
+        .unwrap();
         assert_eq!(
             associated.associations.len(),
             recorded.associations.len(),
@@ -259,7 +260,9 @@ fn verify_recording(recording: Recording) {
                 pose,
             )
             .unwrap();
-            localization.status.state = LocalizationState::LostTrack;
+            // This two-sample fixture has no prior field trajectory to recover.
+            // Initialize with its recorded heading; continuity is tested with full motion history.
+            localization.status.state = LocalizationState::Startup;
             localization.status.time = Time::from_nanos(recording.reference.time);
             localization.heading_reference = Some(reference);
             for sample in &recorded.imu {
