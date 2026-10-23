@@ -67,6 +67,7 @@ fn real_recording_global_association_rejects_excessive_uncertainty() {
                 heading: None,
             });
             if config.detection_pixel_sigma == 2.0 {
+                let result = result.unwrap();
                 assert_eq!(result.associations.len(), fixture.expected.len());
                 assert!(
                     [1.0, -1.0]
@@ -86,7 +87,7 @@ fn real_recording_global_association_rejects_excessive_uncertainty() {
                     result.associations
                 );
             } else {
-                assert!(result.associations.is_empty());
+                assert!(result.is_none());
             }
         }
     }
@@ -124,7 +125,8 @@ fn real_recording_tracking_fixtures_match_all_expected_landmarks() {
                 time: Time::from_nanos(0),
             },
             &FieldMarkAssociationParameters::default(),
-        );
+        )
+        .unwrap();
         let mut actual: Vec<_> = localization
             .associations
             .iter()
