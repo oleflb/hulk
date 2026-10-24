@@ -4,6 +4,8 @@ The trajectory estimator integrates IMU readings into relative rotation, velocit
 Preintegration retains high-rate motion evidence without evaluating a separate spline factor for every reading.
 There is no GTSAM runtime dependency; GTSAM is used only to generate an independent test reference.
 
+For recorded-data workflows, see the [localization replay guide](https://github.com/HULKs/hulk/blob/main/crates/nodes/localization-3d/examples/README.md).
+
 ## Configuration
 
 The shipped timing, calibration, noise, and bias settings are in [`localization3d.json5`](https://github.com/HULKs/hulk/blob/main/etc/parameters/base/localization3d.json5).

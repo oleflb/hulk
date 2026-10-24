@@ -1,6 +1,8 @@
+use std::{collections::BTreeMap, time::Duration};
+
 use color_eyre::Result;
-use coordinate_systems::Robot;
-use linear_algebra::{IntoTransform, Isometry3, Point3, Vector3};
+use coordinate_systems::{ImuReference, Robot};
+use linear_algebra::{IntoTransform, Isometry3, Orientation3, Point3, Vector3};
 use localization_fagra::variables::{FieldAlignment, PoseControl, TrajectoryState};
 use nalgebra::{Matrix2, UnitQuaternion};
 use projection::intrinsic::Intrinsic;
@@ -12,6 +14,58 @@ use crate::{
     alignment::{seed_alignment, seed_recovery_alignment, valid_visual_frame},
     heading::HeadingReference,
 };
+
+/// Source observations and admission cursors survive reconstruction; graph handles do not.
+#[derive(Clone)]
+pub(super) struct MotionHistory {
+    pub records: Vec<MotionRecord>,
+    pub start: Time,
+    pub attitudes: BTreeMap<Time, Orientation3<ImuReference, f64>>,
+    pub latest_vo_epoch: Option<u64>,
+    pub latest_kinematic_time: Option<Time>,
+}
+
+impl MotionHistory {
+    pub(super) fn new(start: Time) -> Self {
+        Self {
+            records: Vec::new(),
+            start,
+            attitudes: BTreeMap::new(),
+            latest_vo_epoch: None,
+            latest_kinematic_time: None,
+        }
+    }
+
+    fn push(&mut self, record: MotionRecord, start: Time) {
+        if start > self.start {
+            self.records.retain(|record| record.start() >= start);
+            // Preserve the source sample needed to interpolate the left boundary.
+            if let Some((&before, _)) = self.attitudes.range(..=start).next_back() {
+                self.attitudes.retain(|time, _| *time >= before);
+            }
+            self.start = start;
+        }
+        self.records.push(record);
+    }
+
+    pub(super) fn attitude_at(
+        &self,
+        time: Time,
+        max_gap: Duration,
+    ) -> Option<Orientation3<ImuReference, f64>> {
+        let (&before, a) = self.attitudes.range(..=time).next_back()?;
+        if before == time {
+            return Some(*a);
+        }
+        let (&after, b) = self.attitudes.range(time..).next()?;
+        if after.duration_since(before) > max_gap {
+            return None;
+        }
+        let fraction = (time.as_nanos() - before.as_nanos()) as f64
+            / (after.as_nanos() - before.as_nanos()) as f64;
+        Some(a.slerp(*b, fraction))
+    }
+}
 
 /// Accepted, normalized observations. Replay bypasses stream admission, not factor construction.
 #[derive(Clone)]
@@ -166,15 +220,7 @@ impl Estimator {
         let first = (self.oldest_window_segment() - 1).max(0);
         let start =
             Time::from_nanos(self.origin.as_nanos() + first * self.parameters.timing.knot_ns());
-        if start > self.history_start {
-            self.motion_history.retain(|record| record.start() >= start);
-            // Preserve the source sample needed to interpolate the left boundary.
-            if let Some((&before, _)) = self.attitudes.range(..=start).next_back() {
-                self.attitudes.retain(|time, _| *time >= before);
-            }
-            self.history_start = start;
-        }
-        self.motion_history.push(record);
+        self.history.push(record, start);
         Ok(true)
     }
 
@@ -268,10 +314,9 @@ impl Estimator {
             self.parameters.clone(),
             self.field_half_extents,
         )?;
-        candidate.options = self.options;
         candidate.generation = self.generation;
-        candidate.initialize_biases(self.history_start, self.bias_at(self.history_start)?)?;
-        let first = self.segment_and_tau(self.history_start)?.0;
+        candidate.initialize_biases(self.history.start, self.bias_at(self.history.start)?)?;
+        let first = self.segment_and_tau(self.history.start)?.0;
         let last = self.segment_and_tau(self.latest_time)?.0;
         let reference_attitude = self
             .attitude_at(time)
@@ -282,10 +327,11 @@ impl Estimator {
             let stamp = self.origin.as_nanos() + index * self.parameters.timing.knot_ns();
             let sample_time = Time::from_nanos(stamp);
             let attitude = self.attitude_at(sample_time).unwrap_or_else(|| {
-                self.attitudes
+                self.history
+                    .attitudes
                     .range(..=sample_time)
                     .next_back()
-                    .or_else(|| self.attitudes.first_key_value())
+                    .or_else(|| self.history.attitudes.first_key_value())
                     .map_or(reference_attitude, |(_, a)| *a)
             });
             let (roll, pitch, yaw) = attitude.euler_angles();
@@ -307,20 +353,16 @@ impl Estimator {
         for segment in first..=last {
             candidate.add_motion_prior(segment, false)?;
         }
-        for record in self.motion_history.iter().cloned() {
+        for record in self.history.records.iter().cloned() {
             record.insert(&mut candidate)?;
         }
-        candidate.attitudes.clone_from(&self.attitudes);
         candidate.preintegration.restore_boundary(
             self.origin,
-            self.history_start,
+            self.history.start,
             &self.preintegration,
         );
-        candidate.motion_history.clone_from(&self.motion_history);
-        candidate.history_start = self.history_start;
+        candidate.history.clone_from(&self.history);
         candidate.latest_time = self.latest_time;
-        candidate.latest_kinematic_time = self.latest_kinematic_time;
-        candidate.latest_vo_epoch = self.latest_vo_epoch;
         Ok(candidate)
     }
 }

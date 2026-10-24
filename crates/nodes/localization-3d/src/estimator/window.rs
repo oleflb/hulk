@@ -1,12 +1,24 @@
 use super::{Estimator, control_keys};
 use color_eyre::{Result, eyre::eyre};
-use fagra::StateKey;
+use fagra::{BatchKey, FactorKey, StateKey};
 use localization_fagra::{
-    factors::{FieldContainment, MotionPrior},
+    factors::{
+        FieldContainment, FootGround, FrameReprojections, MotionPrior, RelativeYaw, VisualOdometry,
+    },
     spline::PoseSpline,
     variables::PoseControl,
 };
 use ros_z::time::Time;
+
+/// Handles and diagnostics retired together after their segment is marginalized.
+#[derive(Default)]
+pub(super) struct SegmentFactors {
+    pub measurements: usize,
+    pub yaw: Option<FactorKey<RelativeYaw>>,
+    pub feet: Option<BatchKey<FootGround>>,
+    pub odometry: Option<BatchKey<VisualOdometry>>,
+    pub reprojections: Vec<BatchKey<FrameReprojections>>,
+}
 
 impl Estimator {
     pub(super) fn check_time(
@@ -141,28 +153,22 @@ impl Estimator {
         self.graph.marginalize(&old_states)?;
         self.biases.retain(|index, _| *index >= oldest_bias);
         self.controls.retain(|index, _| *index >= oldest - 1);
-        self.measurements.retain(|index, _| *index >= oldest);
-        self.yaw_factors.retain(|index, _| *index >= oldest);
         self.retire_preintegration(oldest);
-        while let Some(entry) = self.foot_batches.first_entry() {
+        while let Some(entry) = self.segment_factors.first_entry() {
             if *entry.key() >= oldest {
                 break;
             }
-            self.graph.remove_batch(entry.remove())?;
-        }
-        while let Some(entry) = self.odometry_batches.first_entry() {
-            if *entry.key() >= oldest {
-                break;
+            let factors = entry.remove();
+            if let Some(batch) = factors.feet {
+                self.graph.remove_batch(batch)?;
             }
-            self.graph.remove_batch(entry.remove())?;
-        }
-        for &(index, batch) in &self.reprojection_batches {
-            if index < oldest {
+            if let Some(batch) = factors.odometry {
+                self.graph.remove_batch(batch)?;
+            }
+            for batch in factors.reprojections {
                 self.graph.remove_batch(batch)?;
             }
         }
-        self.reprojection_batches
-            .retain(|(index, _)| *index >= oldest);
         Ok(())
     }
 
