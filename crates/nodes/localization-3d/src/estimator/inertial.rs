@@ -47,8 +47,11 @@ impl Estimator {
         self.ensure_biases(time)?;
         self.preintegration
             .insert(self.origin, time, angular_velocity, force);
-        self.attitudes.insert(time, orientation);
-        *self.measurements.entry(segment).or_default() += 1;
+        self.history.attitudes.insert(time, orientation);
+        self.segment_factors
+            .entry(segment)
+            .or_default()
+            .measurements += 1;
         Ok(())
     }
 
@@ -86,13 +89,18 @@ impl Estimator {
     ) -> Result<()> {
         let (segment, tau) = self.segment_and_tau(time)?;
         let controls = self.ensure_segment(segment)?;
-        let batch = *self.foot_batches.entry(segment).or_insert_with(|| {
-            self.graph.add_batch(FootGround {
-                controls,
-                duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
-                sigma: self.parameters.model.foot_sigma,
-            })
-        });
+        let batch = *self
+            .segment_factors
+            .entry(segment)
+            .or_default()
+            .feet
+            .get_or_insert_with(|| {
+                self.graph.add_batch(FootGround {
+                    controls,
+                    duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
+                    sigma: self.parameters.model.foot_sigma,
+                })
+            });
         self.graph.add_factor_to(
             batch,
             FootObservation {
@@ -101,7 +109,10 @@ impl Estimator {
                 right_sole: right,
             },
         )?;
-        *self.measurements.entry(segment).or_default() += 1;
+        self.segment_factors
+            .entry(segment)
+            .or_default()
+            .measurements += 1;
         Ok(())
     }
 }

@@ -24,6 +24,46 @@ pub(super) struct PendingVisual {
 }
 
 impl Estimator {
+    pub(super) fn pending_visual_cost(&self) -> Result<f64> {
+        let mut cost = 0.0;
+        for pending in &self.pending_visuals {
+            for &key in &pending.factors {
+                cost += self.graph.factor_cost(key)?;
+            }
+        }
+        Ok(cost)
+    }
+
+    pub(super) fn trace_visual_audit(&self, stage: &str) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        for pending in &self.pending_visuals {
+            let time = pending.frame.time;
+            let pose = (|| {
+                let (segment, tau) = self.segment_and_tau(time).ok()?;
+                Some(
+                    self.graph
+                        .get(self.alignment?)
+                        .ok()?
+                        .local_to_field
+                        .to_3d()
+                        .inner
+                        * self
+                            .spline(control_keys(&self.controls, segment).ok()?)
+                            .ok()?
+                            .pose(tau)
+                            .ok()?
+                            .inner,
+                )
+            })();
+            tracing::debug!(?time, stage, source = ?pending.frame.inner.source,
+                features = pending.frame.inner.associations.len(),
+                rms_px = ?self.frame_rms(&pending.frame), ?pose,
+                "visual correction audit");
+        }
+    }
+
     pub(crate) fn field_heading_at(&self, time: Time) -> Option<Orientation2<Field, f64>> {
         let (segment, tau) = self.segment_and_tau(time).ok()?;
         let pose = self
@@ -67,6 +107,7 @@ impl Estimator {
     /// Validate before either publication or marginalization can retain a bad field update.
     pub(super) fn validate_heading(&self, reference: &HeadingReference) -> Result<()> {
         let (&time, _) = self
+            .history
             .attitudes
             .range(..=self.latest_time)
             .next_back()
@@ -90,7 +131,12 @@ impl Estimator {
     }
 
     pub(super) fn validate_tilt(&self) -> Result<()> {
-        let Some((&time, &attitude)) = self.attitudes.range(..=self.latest_time).next_back() else {
+        let Some((&time, &attitude)) = self
+            .history
+            .attitudes
+            .range(..=self.latest_time)
+            .next_back()
+        else {
             return Ok(());
         };
         let (segment, tau) = self.segment_and_tau(time)?;
@@ -120,9 +166,13 @@ impl Estimator {
     }
 
     pub(super) fn accept_visuals(&mut self) {
+        self.trace_visual_audit("accepted");
         for pending in self.pending_visuals.drain(..) {
-            self.reprojection_batches
-                .push((pending.segment, pending.batch));
+            self.segment_factors
+                .entry(pending.segment)
+                .or_default()
+                .reprojections
+                .push(pending.batch);
             if self
                 .latest_visual_frame
                 .as_ref()
@@ -139,7 +189,10 @@ impl Estimator {
                 self.graph.remove_factor(*key)?;
             }
             self.graph.remove_batch(pending.batch)?;
-            *self.measurements.entry(pending.segment).or_default() -= pending.factors.len();
+            self.segment_factors
+                .entry(pending.segment)
+                .or_default()
+                .measurements -= pending.factors.len();
         }
         Ok(())
     }
@@ -165,6 +218,13 @@ impl Estimator {
         let controls = self.ensure_segment(segment)?;
         let pose = self.spline(controls)?.pose(tau)?;
         let alignment = self.graph.get(alignment_key)?;
+        tracing::debug!(
+            ?time,
+            source = ?frame.source,
+            predicted_field_pose = ?(alignment.local_to_field.to_3d().inner * pose.inner),
+            associations = ?frame.associations,
+            "admitting visual observations"
+        );
         let field_to_camera = frame.robot_to_camera.inner.cast::<f64>()
             * pose.inner.inverse()
             * alignment.local_to_field.to_3d().inner.inverse();
@@ -201,7 +261,10 @@ impl Estimator {
                     detection: Point2::wrap(association.detection.inner.cast()),
                 },
             )?);
-            *self.measurements.entry(segment).or_default() += 1;
+            self.segment_factors
+                .entry(segment)
+                .or_default()
+                .measurements += 1;
         }
         self.pending_visuals.push(PendingVisual {
             segment,
@@ -209,6 +272,7 @@ impl Estimator {
             factors,
             frame: TimeWrapper { time, inner: frame },
         });
+        self.trace_visual_audit("before");
         self.commit_time(time);
         Ok(true)
     }
@@ -223,13 +287,14 @@ impl Estimator {
             return Ok(false);
         };
         if self
+            .history
             .latest_vo_epoch
             .is_some_and(|epoch| sample.epoch < epoch)
         {
             tracing::warn!(epoch = sample.epoch, "discarding old VO epoch");
             return Ok(false);
         }
-        self.latest_vo_epoch = Some(sample.epoch);
+        self.history.latest_vo_epoch = Some(sample.epoch);
         let Some(delta) = sample.delta else {
             return Ok(false);
         };
@@ -299,9 +364,11 @@ impl Estimator {
         if previous_segment == current_segment {
             let controls = self.ensure_segment(current_segment)?;
             let batch = *self
-                .odometry_batches
+                .segment_factors
                 .entry(current_segment)
-                .or_insert_with(|| {
+                .or_default()
+                .odometry
+                .get_or_insert_with(|| {
                     self.graph.add_batch(VisualOdometry {
                         controls,
                         duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
@@ -321,7 +388,10 @@ impl Estimator {
                 huber_threshold: self.parameters.model.huber_threshold,
             })?;
         }
-        *self.measurements.entry(previous_segment).or_default() += 1;
+        self.segment_factors
+            .entry(previous_segment)
+            .or_default()
+            .measurements += 1;
         Ok(())
     }
 }

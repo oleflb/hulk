@@ -16,6 +16,7 @@ impl Estimator {
         };
         if sample.time <= sample.previous_time
             || self
+                .history
                 .latest_kinematic_time
                 .is_some_and(|last| sample.previous_time < last)
             || !sample
@@ -65,7 +66,7 @@ impl Estimator {
             translation,
             information_root,
         })?;
-        self.latest_kinematic_time = Some(sample.time);
+        self.history.latest_kinematic_time = Some(sample.time);
         Ok(true)
     }
 
@@ -101,7 +102,7 @@ impl Estimator {
                 huber_threshold: self.parameters.model.huber_threshold,
             })?;
         }
-        *self.measurements.entry(a).or_default() += 1;
+        self.segment_factors.entry(a).or_default().measurements += 1;
         Ok(())
     }
 }

@@ -64,6 +64,7 @@ nav:
           - Localization:
               - IMU Preintegration: tooling/localization_preintegration.md
               - Visual Bearing Residual: tooling/localization_visual_residual.md
+              - Replay Guide: https://github.com/HULKs/hulk/blob/main/crates/nodes/localization-3d/examples/README.md
       - Behavior: robotics/behavior/overview.md
       - Motion:
           - Overview: robotics/motion/overview.md
