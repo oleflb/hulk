@@ -13,6 +13,9 @@ use twix_visualization::twix_painter::TwixPainter;
 
 pub trait Layer<Frame> {
     const NAME: &'static str;
+    fn is_querying(&self) -> bool {
+        false
+    }
     fn new(backend: Arc<RobotBackend>) -> Self;
     fn paint(&self, painter: &TwixPainter<Frame>, field_dimensions: &FieldDimensions)
     -> Result<()>;
@@ -31,6 +34,10 @@ impl<T, Frame> EnabledLayer<T, Frame>
 where
     T: Layer<Frame>,
 {
+    pub fn is_querying(&self) -> bool {
+        self.layer.as_ref().is_some_and(Layer::is_querying)
+    }
+
     pub fn new(backend: Arc<RobotBackend>, value: Option<&Value>, active: bool) -> Self {
         let active = value
             .and_then(|value| value.get(T::NAME.to_case(Case::Snake)))

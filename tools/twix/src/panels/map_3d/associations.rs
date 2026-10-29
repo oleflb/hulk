@@ -3,42 +3,7 @@ use super::{
 };
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*};
 
-use super::{Observation, ObservationContext};
 use projection::Projection;
-use ros_z_debug::SampleRecord;
-use std::sync::Arc;
-use types::time_wrapper::TimeWrapper;
-
-pub(super) struct Observations {
-    frames: Observation<TimeWrapper<FieldMarkAssociations>>,
-}
-
-impl Observations {
-    pub(super) fn new(context: &impl ObservationContext) -> color_eyre::Result<Self> {
-        Ok(Self {
-            frames: Observation::new(
-                context,
-                "field_mark_association/visual_localization_local",
-                64,
-                Default::default(),
-            )?,
-        })
-    }
-
-    pub(super) fn current_frames(
-        &self,
-        namespace: &str,
-        frame_id: Option<(u64, u64)>,
-    ) -> Vec<Arc<SampleRecord<TimeWrapper<FieldMarkAssociations>>>> {
-        self.frames
-            .all(namespace)
-            .into_iter()
-            .filter(|frame| {
-                Some((frame.value.inner.epoch, frame.value.inner.generation)) == frame_id
-            })
-            .collect()
-    }
-}
 
 #[derive(Component)]
 pub(super) struct FieldMarkAssociationLines;

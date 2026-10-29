@@ -493,6 +493,7 @@ impl LiveQuery {
             .unwrap_or_else(|error| Evaluation::unresolved(time, State::Failed(error.to_string())));
         let snapshot = Arc::new(PlanSnapshot {
             revision: position.revision,
+            retrying: false,
             evaluation: Arc::new(evaluation),
         });
         *cache = Some(CachedPlan {

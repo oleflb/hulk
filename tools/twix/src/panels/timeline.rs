@@ -423,11 +423,7 @@ fn scrub(ui: &Ui, response: &Response, view: TimeView, replay: &mut ReplaySessio
     let duration = (status.end - status.start) as f64 / 1e9;
     let seconds = view.time_at(response.rect, pointer.x).clamp(0.0, duration);
     let position = status.start + ((seconds * 1e9).round() as u64).min(status.end - status.start);
-    if ui.input(|input| input.pointer.primary_down()) {
-        replay.scrub_to(position);
-    } else {
-        replay.seek(position);
-    }
+    replay.seek(position);
 }
 
 /// Pane, canvas and toolbar focus qualify; sibling editors do not.

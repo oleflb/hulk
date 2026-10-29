@@ -108,6 +108,7 @@ fn external_backends_can_construct_observations() {
             };
             let snapshot = Arc::new(PlanSnapshot {
                 revision: position.revision,
+                retrying: false,
                 evaluation: Arc::new(
                     plan.evaluate(time, &[], |_, _| panic!("unexpected payload read"))?,
                 ),

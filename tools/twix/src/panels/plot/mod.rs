@@ -140,6 +140,10 @@ pub struct PlotPanel {
 }
 
 impl Panel for PlotPanel {
+    fn is_querying(&self) -> bool {
+        self.history.is_querying()
+    }
+
     const STORAGE_ID: &'static str = "plot";
     const DISPLAY_NAME: &'static str = "Plot";
     const ICON: &'static str = egui_material_icons::icons::ICON_SHOW_CHART.codepoint;

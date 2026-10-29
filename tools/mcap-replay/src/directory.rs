@@ -25,7 +25,11 @@ use tokio::{
 };
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{open_recording, recording::IndexCache, serve_queries};
+use crate::{
+    open_recording,
+    recording::{ChunkCache, IndexCache},
+    serve_queries,
+};
 
 #[derive(PartialEq, Eq)]
 struct Stamp {
@@ -146,6 +150,7 @@ struct Directory<'a> {
     base: &'a str,
     context: &'a Context,
     cache: Arc<IndexCache>,
+    chunks: Arc<ChunkCache>,
     router: &'a str,
     serving: BTreeMap<PathBuf, Serving>,
     failures: BTreeMap<PathBuf, String>,
@@ -159,11 +164,13 @@ impl Directory<'_> {
 
         let (stop, stopped) = oneshot::channel();
         let cache = Arc::clone(&self.cache);
+        let chunks = Arc::clone(&self.chunks);
         let task = spawn(async move {
-            if let Err(error) = serve_queries(&node, recording, name.clone(), cache, async {
-                let _ = stopped.await;
-            })
-            .await
+            if let Err(error) =
+                serve_queries(&node, recording, name.clone(), cache, chunks, async {
+                    let _ = stopped.await;
+                })
+                .await
             {
                 tracing::error!(path = %name, namespace = %node.namespace(), error = %format!("{error:#}"), "serving recording failed");
             }
@@ -256,6 +263,7 @@ pub async fn watch(
     base: &str,
     context: &Context,
     cache: Arc<IndexCache>,
+    chunks: Arc<ChunkCache>,
     router: &str,
 ) -> Result<()> {
     let root = root
@@ -266,6 +274,7 @@ pub async fn watch(
         base,
         context,
         cache,
+        chunks,
         router,
         serving: BTreeMap::new(),
         failures: BTreeMap::new(),

@@ -96,7 +96,7 @@ struct Observations {
     kinematics: Observation<TimeWrapper<RobotKinematics>>,
     matrix: Observation<TimeWrapper<CameraMatrix>>,
     images: Option<Observation<RosImage>>,
-    associations: Option<associations::Observations>,
+    associations: Option<Observation<TimeWrapper<FieldMarkAssociations>>>,
 }
 
 impl Observations {
@@ -163,7 +163,12 @@ impl Observations {
             )?);
         }
         if settings.associations_active() && self.associations.is_none() {
-            self.associations = Some(associations::Observations::new(context)?);
+            self.associations = Some(Observation::new(
+                context,
+                "field_mark_association/visual_localization_local",
+                64,
+                Default::default(),
+            )?);
         }
         Ok(())
     }
@@ -186,11 +191,14 @@ impl Observations {
             .as_ref()
             .map(|images| images.all(namespace))
             .unwrap_or_default();
-        let associations = self
+        let mut associations = self
             .associations
             .as_ref()
-            .map(|associations| associations.current_frames(namespace, frame_id))
+            .map(|associations| associations.all(namespace))
             .unwrap_or_default();
+        associations.retain(|frame| {
+            Some((frame.value.inner.epoch, frame.value.inner.generation)) == frame_id
+        });
         let anchor = select_anchor(
             images.iter().map(|record| image_time(record)),
             associations.iter().map(|record| record.value.time),
@@ -276,6 +284,25 @@ pub struct Map3DPanel {
 }
 
 impl Panel for Map3DPanel {
+    fn is_querying(&self) -> bool {
+        self.observations.as_ref().is_ok_and(|observations| {
+            observations.dimensions.is_querying()
+                || observations.localization.is_querying()
+                || observations.localization_status.is_querying()
+                || observations.odometer.is_querying()
+                || observations.kinematics.is_querying()
+                || observations.matrix.is_querying()
+                || observations
+                    .images
+                    .as_ref()
+                    .is_some_and(Observation::is_querying)
+                || observations
+                    .associations
+                    .as_ref()
+                    .is_some_and(Observation::is_querying)
+        })
+    }
+
     const STORAGE_ID: &'static str = "map_3d";
     const DISPLAY_NAME: &'static str = "3D Map";
     const ICON: &'static str = egui_material_icons::icons::ICON_MAP.codepoint;

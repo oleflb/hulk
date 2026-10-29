@@ -33,6 +33,13 @@ struct TopicHistory {
 }
 
 impl PlotHistory {
+    pub fn is_querying(&self) -> bool {
+        self.topics
+            .values()
+            .filter_map(|entry| entry.as_ref().ok())
+            .any(|history| crate::panel::query_pending(history.observation.query_status()))
+    }
+
     /// Reconcile subscriptions with the configured sources. Returns true when
     /// switching namespace or retention has discarded the displayed history.
     pub fn reconcile<'a>(
