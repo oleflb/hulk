@@ -17,6 +17,10 @@ pub struct Path {
 }
 
 impl Layer<Ground> for Path {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.motion_command.query_status())
+    }
+
     const NAME: &'static str = "Path";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

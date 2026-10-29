@@ -48,6 +48,10 @@ where
 }
 
 impl<T> Observation<T> {
+    pub(super) fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.observation.query_status())
+    }
+
     pub(super) fn latest(&self, namespace: &str) -> Option<Arc<SampleRecord<T>>> {
         let topic = self
             .topic

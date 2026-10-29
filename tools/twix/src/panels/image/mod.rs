@@ -174,6 +174,16 @@ impl ImagePanel {
 }
 
 impl Panel for ImagePanel {
+    fn is_querying(&self) -> bool {
+        self.observation
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|observed| {
+                crate::panel::query_pending(Some(observed.observation.raw().status()))
+            })
+    }
+
     const STORAGE_ID: &'static str = "image";
     const DISPLAY_NAME: &'static str = "Image";
     const ICON: &'static str = egui_material_icons::icons::ICON_PHOTO_CAMERA.codepoint;

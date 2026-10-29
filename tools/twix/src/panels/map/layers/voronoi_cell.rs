@@ -13,6 +13,10 @@ pub struct VoronoiCell {
 }
 
 impl Layer<Field> for VoronoiCell {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.blackboard.query_status())
+    }
+
     const NAME: &'static str = "Voronoi Cells";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

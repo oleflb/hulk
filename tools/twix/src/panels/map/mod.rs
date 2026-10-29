@@ -80,6 +80,21 @@ pub struct MapPanel {
 }
 
 impl Panel for MapPanel {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.field_dimensions.query_status())
+            || crate::panel::query_pending(self.ground_to_field.query_status())
+            || self.ball_search_heatmap.is_querying()
+            || self.path_obstacles.is_querying()
+            || self.obstacles.is_querying()
+            || self.path.is_querying()
+            || self.odometry.is_querying()
+            || self.ball_percepts.is_querying()
+            || self.ball_position.is_querying()
+            || self.ball_filter.is_querying()
+            || self.obstacle_filter.is_querying()
+            || self.voronoi_cells.is_querying()
+    }
+
     const STORAGE_ID: &'static str = "map";
     const DISPLAY_NAME: &'static str = "Map";
     const ICON: &'static str = egui_material_icons::icons::ICON_MAP.codepoint;

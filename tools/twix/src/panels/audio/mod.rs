@@ -58,6 +58,11 @@ struct ObservedSpectra {
 }
 
 impl Panel for AudioPanel {
+    fn is_querying(&self) -> bool {
+        matches!(&self.observation, ObservationState::Observing(observed)
+            if crate::panel::query_pending(observed.observation.query_status()))
+    }
+
     const STORAGE_ID: &'static str = "audio";
     const DISPLAY_NAME: &'static str = "Audio";
     const ICON: &'static str = egui_material_icons::icons::ICON_GRAPHIC_EQ.codepoint;

@@ -14,6 +14,10 @@ pub struct BallSearchHeatmap {
 }
 
 impl Layer<Field> for BallSearchHeatmap {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.ball_search_heatmap.query_status())
+    }
+
     const NAME: &'static str = "Ball Search Heatmap";
 
     fn new(backend: Arc<RobotBackend>) -> Self {
