@@ -273,6 +273,7 @@ impl IndexCache {
         if let Some(index) = self.get(owner, key) {
             return Ok(index);
         }
+        let start = std::time::Instant::now();
         let mut pending = PendingIndex::new(recording, key.clone())?;
         self.state.lock().make_room(0, 1)?;
         self.build_index(recording, cancel, workers, &mut pending)?;
@@ -281,6 +282,7 @@ impl IndexCache {
         self.state
             .lock()
             .insert(owner, key.clone(), Arc::clone(&index))?;
+        tracing::debug!(%owner, channel = key.0, entries = index.entries.len(), elapsed_us = start.elapsed().as_micros(), "built replay timestamp index");
         Ok(index)
     }
 

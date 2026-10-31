@@ -231,9 +231,11 @@ impl ChunkCache {
             match state.entries.get_mut(&key) {
                 Some(entry) => {
                     entry.last_used = clock;
+                    tracing::trace!(%owner, chunk, "decoded chunk cache hit");
                     entry.result.clone()
                 }
                 None => {
+                    tracing::debug!(%owner, chunk, bytes = size, "decoded chunk cache miss");
                     let (sender, result) = watch::channel(None);
                     state.entries.insert(
                         key,
@@ -318,6 +320,7 @@ impl ChunkCache {
             decoder = Arc::clone(&self.workers).acquire_owned() => decoder?,
         };
         let cancel = cancel.clone();
+        let start = std::time::Instant::now();
         let decoded = spawn_blocking(move || {
             let _decoder = decoder;
             recording.decode_chunk(chunk, &cancel, reservation)
@@ -325,6 +328,12 @@ impl ChunkCache {
         .await??;
         #[cfg(test)]
         self.decoded_chunks.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            chunk,
+            bytes = size,
+            elapsed_us = start.elapsed().as_micros(),
+            "decoded replay chunk"
+        );
         Ok(decoded)
     }
 

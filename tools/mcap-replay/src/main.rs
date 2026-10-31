@@ -5,7 +5,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -86,7 +86,12 @@ impl Arguments {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    tracing_subscriber::fmt().with_writer(stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     let args = Arguments::parse();
     let index_budget = args
@@ -185,6 +190,7 @@ async fn open_recording(
 }
 
 struct PlanRequest {
+    received: Instant,
     cursor: Time,
     plan: QueryPlan,
     reply: mpsc::Sender<Response>,
@@ -306,6 +312,10 @@ async fn run_query_worker(
 
 #[instrument(skip_all, fields(path = %recording.info.name))]
 async fn process_request(recording: &Arc<QueryRecording>, request: &PlanRequest) {
+    tracing::debug!(
+        queue_us = request.received.elapsed().as_micros(),
+        "starting replay query"
+    );
     let mut query = match PendingQuery::new(recording, request.plan.clone(), request.cursor) {
         Ok(query) => query,
         Err(error) => {
@@ -337,6 +347,10 @@ async fn process_request(recording: &Arc<QueryRecording>, request: &PlanRequest)
     if let Err(error) = result {
         reply_query_error(&recording.info.name, &request.reply, error).await;
     }
+    tracing::debug!(
+        elapsed_us = request.received.elapsed().as_micros(),
+        "finished replay query"
+    );
 }
 
 async fn reply_query_error(name: &str, reply: &mpsc::Sender<Response>, error: Report) {
@@ -381,6 +395,7 @@ fn dispatch_request(
                 revision,
                 cancel: cancel.clone(),
                 request: Mutex::new(Some(PlanRequest {
+                    received: Instant::now(),
                     cursor,
                     plan,
                     reply,
@@ -447,8 +462,15 @@ async fn reply_to_query(
     };
     let result = async {
         while let Some(response) = responses.recv().await {
+            let start = Instant::now();
             let bytes = chunks.blocking(move || encode(&response)).await??;
-            if incoming.reply(&key, bytes).await.is_err() {
+            tracing::debug!(
+                bytes = bytes.len(),
+                elapsed_us = start.elapsed().as_micros(),
+                "encoded replay response"
+            );
+            if let Err(error) = incoming.reply(&key, bytes).await {
+                tracing::warn!(%error, %key, "sending replay response failed");
                 return Ok(());
             }
         }

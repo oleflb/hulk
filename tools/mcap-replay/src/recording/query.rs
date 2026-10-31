@@ -369,6 +369,7 @@ impl PendingQuery {
         let cursor = self.cursor;
         // Tuple drop order releases index views before recording cleanup, even on panic.
         let input = (views, recording.clone());
+        let start = std::time::Instant::now();
         let selected = recording
             .chunks
             .blocking(move || {
@@ -377,13 +378,23 @@ impl PendingQuery {
                 selected
             })
             .await??;
+        let selection_us = start.elapsed().as_micros();
+        let locations = selected.locations().len();
         let records = recording
             .load_records(&self.keys, &self.pinned, selected.locations())
             .await?;
+        let payload_us = start.elapsed().as_micros() - selection_us;
         let result = recording
             .chunks
             .blocking(move || selected.assemble(records))
             .await??;
+        tracing::debug!(
+            selection_us,
+            payload_us,
+            locations,
+            elapsed_us = start.elapsed().as_micros(),
+            "evaluated replay plan"
+        );
         let pending = result
             .dependencies
             .iter()

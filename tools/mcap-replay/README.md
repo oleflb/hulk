@@ -66,6 +66,9 @@ cancels its server work; abandoned idle workers expire after 120 seconds.
 Rebuild both the server and Twix together: plan requests now carry observation IDs
 and revisions, and the protocol includes explicit cancellation.
 
+To inspect index builds, chunk misses, evaluation phases, queue waits, and response
+encoding times, run with `RUST_LOG=mcap_replay=debug`. Use `trace` for cache hits.
+
 ## Options
 
 Pass options after `--` in the Cargo command above.

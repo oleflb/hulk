@@ -1009,6 +1009,7 @@ async fn newer_seek_supersedes_cold_work_without_blocking_other_observations() {
                 revision,
                 cancel: CancellationToken::new(),
                 request: Mutex::new(Some(crate::PlanRequest {
+                    received: std::time::Instant::now(),
                     cursor: Time::from_nanos(time),
                     plan,
                     reply,
