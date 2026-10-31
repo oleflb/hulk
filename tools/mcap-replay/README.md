@@ -78,6 +78,8 @@ Pass options after `--` in the Cargo command above.
 
 In Twix, open **+ → Timeline**, then add the panels you want to inspect.
 
+Panels show **Querying server** for queries or retries lasting longer than 250 ms.
+
 - Click or drag to seek; seeking pauses playback.
 - Use the header buttons to play, pause, step, or jump to the start/end.
 - Wheel/pinch zooms; middle-drag or Shift + wheel pans. **Frame all** fits the recording.

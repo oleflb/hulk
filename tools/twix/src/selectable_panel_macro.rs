@@ -118,6 +118,12 @@ macro_rules! impl_selectable_panel {
         }
 
         impl SelectablePanel {
+            pub fn is_querying(&self) -> bool {
+                match self {
+                    $(Self::$name(panel) => <$name as $crate::panel::Panel>::is_querying(panel),)*
+                }
+            }
+
             pub fn header_ui(
                 &mut self,
                 ui: &mut eframe::egui::Ui,

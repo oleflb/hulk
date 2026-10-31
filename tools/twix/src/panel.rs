@@ -26,6 +26,10 @@ pub trait Panel {
 
     fn header_ui(&mut self, _ui: &mut Ui, _context: PanelUiContext<'_>) {}
 
+    fn is_querying(&self) -> bool {
+        false
+    }
+
     /// Focus this panel's topic input on its next render, if it has one.
     fn focus_topic(&mut self) {}
 
@@ -37,6 +41,20 @@ pub trait Panel {
     fn save(&self) -> Value {
         json!({})
     }
+}
+
+pub fn query_pending(status: Option<ros_z_debug::query::PlanStatus>) -> bool {
+    use ros_z_debug::query::plan::State;
+
+    status.is_some_and(|status| {
+        !status.current
+            || status.snapshot.retrying
+            || match &status.snapshot.evaluation.state {
+                State::Pending => true,
+                State::Ready(_) => !status.snapshot.evaluation.settled(),
+                State::Failed(_) => false,
+            }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

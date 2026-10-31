@@ -16,6 +16,10 @@ pub struct BallPercepts {
 }
 
 impl Layer<Ground> for BallPercepts {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.ball_percepts.query_status())
+    }
+
     const NAME: &'static str = "Ball Percepts";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

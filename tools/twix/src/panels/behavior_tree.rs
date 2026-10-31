@@ -18,6 +18,11 @@ pub struct BehaviorTreePanel {
 }
 
 impl Panel for BehaviorTreePanel {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.tree_layout.query_status())
+            || crate::panel::query_pending(self.trace.query_status())
+    }
+
     const STORAGE_ID: &'static str = "behavior_tree";
     const DISPLAY_NAME: &'static str = "Behavior Tree";
     const ICON: &'static str = egui_material_icons::icons::ICON_FAMILY_HISTORY.codepoint;

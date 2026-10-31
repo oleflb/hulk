@@ -20,6 +20,11 @@ const TRAIL_DURATION: Duration = Duration::from_secs(60 * 60);
 const TRAIL_MAX_SAMPLES: usize = 100_000;
 
 impl Layer<Field> for Odometry {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.pose.query_status())
+            || crate::panel::query_pending(self.booster_pose.query_status())
+    }
+
     const NAME: &'static str = "Odometry";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

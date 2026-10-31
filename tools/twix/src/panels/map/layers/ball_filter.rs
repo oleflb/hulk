@@ -17,6 +17,10 @@ pub struct BallFilter {
 }
 
 impl Layer<Ground> for BallFilter {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.filter.query_status())
+    }
+
     const NAME: &'static str = "Ball Filter";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

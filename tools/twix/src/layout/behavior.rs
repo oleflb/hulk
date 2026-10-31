@@ -1,8 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use eframe::egui::{
-    Button, Context, CornerRadius, Event, Id, Key, Margin, Modifiers, Popup, Rect, Response, Sense,
-    StrokeKind, Ui, UiBuilder, WidgetInfo, WidgetText, WidgetType, vec2,
+    Align, Button, Context, CornerRadius, Event, Id, Key, Label, Layout, Margin, Modifiers, Popup,
+    Rect, Response, Sense, StrokeKind, TextWrapMode, Ui, UiBuilder, WidgetInfo, WidgetText,
+    WidgetType, vec2,
 };
 use egui_tiles::{
     Behavior, EditAction, SimplificationOptions, TabState, TileId, Tiles, UiResponse,
@@ -31,6 +32,34 @@ pub(super) struct LayoutBehavior<'a> {
     pub(super) focus_dirty: &'a mut bool,
     pub(super) dropped: bool,
     pub(super) requests: Vec<LayoutRequest>,
+}
+
+fn query_indicator(ui: &mut Ui, querying: bool) {
+    let now = ui.input(|input| input.time);
+    let id = ui.id().with("query_pending_since");
+    let since = ui.data_mut(|data| {
+        let since = data.get_temp_mut_or_default::<Option<f64>>(id);
+        if querying {
+            since.get_or_insert(now);
+        } else {
+            *since = None;
+        }
+        *since
+    });
+    let visible = since.is_some_and(|since| now - since >= 0.25);
+    if let Some(since) = since {
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs_f64(if visible {
+                0.1
+            } else {
+                (0.25 - (now - since)).max(0.0)
+            }));
+    }
+    // Reserve the label's space even during short queries, so controls never jump.
+    ui.add_visible(
+        visible,
+        Label::new("Querying server").wrap_mode(TextWrapMode::Extend),
+    );
 }
 
 impl Behavior<SelectablePanel> for LayoutBehavior<'_> {
@@ -87,10 +116,22 @@ impl Behavior<SelectablePanel> for LayoutBehavior<'_> {
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    pane.header_ui(
-                                        ui,
-                                        panel_ui_context(self.backend, &self.egui_context),
-                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let remote = self.backend.replay().status.is_some();
+                                        query_indicator(ui, remote && pane.is_querying());
+                                        ui.with_layout(
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                pane.header_ui(
+                                                    ui,
+                                                    panel_ui_context(
+                                                        self.backend,
+                                                        &self.egui_context,
+                                                    ),
+                                                );
+                                            },
+                                        );
+                                    });
                                 });
                             });
                         ui.add_space(4.0);

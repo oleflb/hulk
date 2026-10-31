@@ -16,6 +16,10 @@ pub struct ObstacleFilter {
 }
 
 impl Layer<Ground> for ObstacleFilter {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.hypotheses.query_status())
+    }
+
     const NAME: &'static str = "Obstacle Filter";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

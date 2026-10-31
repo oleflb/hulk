@@ -15,6 +15,10 @@ pub struct Obstacles {
 }
 
 impl Layer<Ground> for Obstacles {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.obstacles.query_status())
+    }
+
     const NAME: &'static str = "Obstacles";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

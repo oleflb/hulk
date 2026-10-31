@@ -41,6 +41,11 @@ struct RenderedRecordCache {
 }
 
 impl Panel for TextPanel {
+    fn is_querying(&self) -> bool {
+        matches!(&self.observation, ObservationState::Observing(observed)
+            if crate::panel::query_pending(observed.observation.query_status()))
+    }
+
     const STORAGE_ID: &'static str = "text";
     const DISPLAY_NAME: &'static str = "Text";
     const ICON: &'static str = egui_material_icons::icons::ICON_TEXT_FIELDS.codepoint;

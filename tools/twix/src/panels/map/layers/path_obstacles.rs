@@ -16,6 +16,10 @@ pub struct PathObstacles {
 }
 
 impl Layer<Ground> for PathObstacles {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.blackboard.query_status())
+    }
+
     const NAME: &'static str = "Path Obstacles";
 
     fn new(backend: Arc<RobotBackend>) -> Self {

@@ -18,6 +18,12 @@ pub struct BallPosition {
 }
 
 impl Layer<Field> for BallPosition {
+    fn is_querying(&self) -> bool {
+        crate::panel::query_pending(self.ground_to_field.query_status())
+            || crate::panel::query_pending(self.ball_position.query_status())
+            || crate::panel::query_pending(self.team_ball.query_status())
+    }
+
     const NAME: &'static str = "Ball Position";
 
     fn new(backend: Arc<RobotBackend>) -> Self {
