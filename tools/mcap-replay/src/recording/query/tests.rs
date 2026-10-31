@@ -905,6 +905,7 @@ async fn counted_server(recording: Arc<QueryRecording>) -> CountedServer {
                     info.instance = current_instance.borrow().clone();
                     Response::Catalog(info)
                 }
+                Request::Cancel { .. } => continue,
             };
             incoming
                 .reply(&key, encode(&response).unwrap())
@@ -985,5 +986,78 @@ async fn shared_build_survives_dropped_waiter_and_coalesces_concurrent_waiters()
         1,
         "one shared scan, despite dropped and concurrent waiters"
     );
+    recording.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_seek_supersedes_cold_work_without_blocking_other_observations() {
+    let file = fixture_records(
+        true,
+        false,
+        &[(0, 10, 100, 100), (0, 20, 200, 200), (1, 20, 200, 200)],
+    );
+    let recording = open(file.path());
+    let warm = Source::from(projected("images"))
+        .latest(plan::cursor())
+        .plan();
+    finish(&recording, &warm, Time::from_nanos(10));
+    let guard = recording.acquire_build().await;
+    let submit = |revision, plan, time| {
+        let (reply, responses) = tokio::sync::mpsc::channel(2);
+        (
+            crate::Submission {
+                revision,
+                cancel: CancellationToken::new(),
+                request: Mutex::new(Some(crate::PlanRequest {
+                    cursor: Time::from_nanos(time),
+                    plan,
+                    reply,
+                })),
+            },
+            responses,
+        )
+    };
+    let cold = Source::from(projected("detections"))
+        .latest(plan::cursor())
+        .plan();
+    let (initial, mut obsolete) = submit(1, cold, 20);
+    let (latest, requests) = watch::channel(initial);
+    let worker = tokio::spawn(crate::run_query_worker(
+        recording.clone(),
+        requests,
+        recording.cancel_token(),
+    ));
+    assert!(matches!(obsolete.recv().await, Some(Response::PlanData(result)) if !result.settled()));
+
+    let (independent, mut independent_replies) = submit(1, warm.clone(), 10);
+    let (other, requests) = watch::channel(independent);
+    let other_worker = tokio::spawn(crate::run_query_worker(
+        recording.clone(),
+        requests,
+        recording.cancel_token(),
+    ));
+    let response = tokio::time::timeout(Duration::from_secs(5), independent_replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(response, Response::PlanData(result) if result.settled()));
+
+    let (final_seek, mut replies) = submit(100, warm, 20);
+    latest.send_replace(final_seek).cancel.cancel();
+    let response = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let Response::PlanData(result) = response else {
+        panic!("plan data")
+    };
+    assert!(result.settled());
+    assert_eq!(records(&result)[0].record.time, Time::from_nanos(20));
+    assert!(obsolete.recv().await.is_none());
+    drop(latest);
+    drop(other);
+    worker.await.unwrap();
+    other_worker.await.unwrap();
+    drop(guard);
     recording.shutdown().await;
 }

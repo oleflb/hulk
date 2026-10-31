@@ -316,6 +316,7 @@ mod tests {
     fn channel(cursor: CursorHandle) -> (PlanObservation, impl Fn(Arc<PlanSnapshot>)) {
         let (sender, receiver) = watch::channel(Arc::new(PlanSnapshot {
             revision: cursor.position().revision,
+            retrying: false,
             evaluation: Arc::new(Evaluation::unresolved(Time::zero(), State::Pending)),
         }));
         let (notify, updates) = watch::channel(0);
@@ -378,6 +379,7 @@ mod tests {
             let revision = cursor.position().revision;
             send(Arc::new(PlanSnapshot {
                 revision,
+                retrying: false,
                 evaluation: result.clone(),
             }));
             let (started, waiting) = oneshot::channel();
@@ -418,6 +420,7 @@ mod tests {
             cursor.set(Cursor::At(Time::from_nanos(50 + i64::from(fail))));
             send(Arc::new(PlanSnapshot {
                 revision: cursor.position().revision,
+                retrying: false,
                 evaluation: Arc::new(Evaluation {
                     state: State::Pending,
                     ..(*result).clone()
@@ -462,6 +465,7 @@ mod tests {
         let emit = |revision, value: Option<Arc<Evaluation>>| {
             send(Arc::new(PlanSnapshot {
                 revision,
+                retrying: false,
                 evaluation: value.unwrap_or_else(|| {
                     Arc::new(Evaluation {
                         state: State::Pending,

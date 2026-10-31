@@ -1,9 +1,11 @@
 use std::{
+    collections::HashMap,
     future::Future,
     io::{Error, stderr},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -11,6 +13,7 @@ use color_eyre::{
     Report,
     eyre::{Context as _, OptionExt, Result},
 };
+use parking_lot::Mutex;
 use recording::{ChunkCache, IndexCache, PendingQuery, QueryRecording, Recording};
 use ros_z::{
     config::RouterConfigBuilder,
@@ -22,13 +25,12 @@ use ros_z_debug::{
     TargetIdentity,
     query::{
         plan::QueryPlan,
-        remote::{RecordingInfo, Request, Response, encode, query_key},
+        remote::{Request, Response, encode, query_key},
     },
 };
 use tokio::{
     signal::ctrl_c,
-    spawn,
-    sync::mpsc,
+    sync::{mpsc, watch},
     task::{JoinSet, spawn_blocking},
 };
 use tokio_util::sync::CancellationToken;
@@ -178,11 +180,23 @@ async fn open_recording(
 }
 
 struct PlanRequest {
-    instance: String,
     cursor: Time,
     plan: QueryPlan,
     reply: mpsc::Sender<Response>,
 }
+
+struct Submission {
+    revision: u64,
+    request: Mutex<Option<PlanRequest>>,
+    cancel: CancellationToken,
+}
+
+struct ObservationWorker {
+    generation: uuid::Uuid,
+    latest: watch::Sender<Submission>,
+}
+
+const MAX_OBSERVATIONS: usize = 128;
 
 async fn serve_queries(
     node: &Node,
@@ -199,9 +213,8 @@ async fn serve_queries(
         name,
         cancel.clone(),
         cache,
-        Arc::clone(&chunks),
+        chunks.clone(),
     )?);
-    let catalog = recording.info.clone();
     tokio::pin!(shutdown);
 
     let key = query_key(node.namespace());
@@ -212,81 +225,82 @@ async fn serve_queries(
         .await
         .map_err(Error::other)
         .wrap_err("declaring replay queryable")?;
-    let (sender, receiver) = mpsc::channel(16);
-    let stopped = recording.cancel_token();
-    let mut worker = spawn(run_query_worker(
-        recording,
-        receiver,
-        node.namespace().to_owned(),
-        stopped,
-    ));
-    tracing::info!(path = %catalog.name, namespace = %node.namespace(), "serving recording");
+    tracing::info!(path = %recording.info.name, namespace = %node.namespace(), "serving recording");
     let mut replies = JoinSet::new();
+    let mut workers = JoinSet::new();
+    let mut observations = HashMap::new();
 
     let result = loop {
         tokio::select! {
+            biased;
             _ = &mut shutdown => break Ok(()),
-            result = &mut worker => return result?,
+            Some(finished) = workers.join_next(), if !workers.is_empty() => {
+                match finished {
+                    Ok((id, generation)) => {
+                        if observations.get(&id).is_some_and(|entry: &ObservationWorker| entry.generation == generation) {
+                            observations.remove(&id);
+                        }
+                    }
+                    Err(error) => tracing::error!(%error, "query worker failed"),
+                }
+            },
             Some(_) = replies.join_next(), if !replies.is_empty() => {},
             incoming = queryable.recv_async() => {
                 let incoming = match incoming.map_err(Error::other).wrap_err("receiving replay query") {
                     Ok(incoming) => incoming,
                     Err(error) => break Err(error),
                 };
-                let responses = dispatch_request(&incoming, &catalog, &sender);
-                replies.spawn(reply_to_query(incoming, key.clone(), responses, Arc::clone(&chunks)));
+                if replies.len() >= 2 * MAX_OBSERVATIONS {
+                    tracing::warn!("query reply limit reached; dropping request");
+                    continue;
+                }
+                let responses = dispatch_request(&incoming, &recording, &mut observations, &mut workers);
+                replies.spawn(reply_to_query(incoming, key.clone(), responses, chunks.clone()));
             }
         }
     };
 
     replies.abort_all();
     cancel.cancel();
-    drop(sender);
-    worker.await??;
+    drop(observations);
+    while workers.join_next().await.is_some() {}
+    recording.shutdown().await;
+    spawn_blocking(move || drop(recording)).await?;
 
     result
 }
 
 async fn run_query_worker(
     recording: Arc<QueryRecording>,
-    mut requests: mpsc::Receiver<PlanRequest>,
-    namespace: String,
+    mut requests: watch::Receiver<Submission>,
     stopped: CancellationToken,
-) -> Result<()> {
+) {
     loop {
-        let request = tokio::select! {
-            biased;
-            _ = stopped.cancelled() => break,
-            request = requests.recv() => match request {
-                Some(request) => request,
-                None => break,
-            },
-        };
-        if request.reply.is_closed() {
-            continue;
+        let request = requests.borrow_and_update().request.lock().take();
+        if let Some(request) = request {
+            tokio::select! {
+                biased;
+                _ = stopped.cancelled() => break,
+                changed = requests.changed() => {
+                    if changed.is_err() { break; }
+                    continue;
+                },
+                _ = request.reply.closed() => {},
+                _ = process_request(&recording, &request) => {},
+            }
         }
-
         tokio::select! {
             biased;
             _ = stopped.cancelled() => break,
-            _ = request.reply.closed() => {},
-            _ = process_request(&recording, &request, &namespace) => {},
+            changed = requests.changed() => if changed.is_err() { break; },
+            // Abandoned client observations must not occupy admission slots forever.
+            _ = tokio::time::sleep(Duration::from_secs(120)) => break,
         }
     }
-
-    recording.shutdown().await;
-    spawn_blocking(move || drop(recording)).await?;
-
-    Ok(())
 }
 
-#[instrument(skip_all, fields(path = %recording.info.name, namespace = %namespace))]
-async fn process_request(recording: &Arc<QueryRecording>, request: &PlanRequest, namespace: &str) {
-    if request.instance != recording.info.instance {
-        let _ = request.reply.send(Response::RecordingChanged).await;
-        return;
-    }
-
+#[instrument(skip_all, fields(path = %recording.info.name))]
+async fn process_request(recording: &Arc<QueryRecording>, request: &PlanRequest) {
     let mut query = match PendingQuery::new(recording, request.plan.clone(), request.cursor) {
         Ok(query) => query,
         Err(error) => {
@@ -327,53 +341,119 @@ async fn reply_query_error(name: &str, reply: &mpsc::Sender<Response>, error: Re
 
 fn dispatch_request(
     incoming: &Query,
-    catalog: &RecordingInfo,
-    worker: &mpsc::Sender<PlanRequest>,
-) -> Result<mpsc::Receiver<Response>> {
+    recording: &Arc<QueryRecording>,
+    observations: &mut HashMap<String, ObservationWorker>,
+    workers: &mut JoinSet<(String, uuid::Uuid)>,
+) -> Result<(mpsc::Receiver<Response>, CancellationToken)> {
     let payload = incoming
         .payload()
         .filter(|payload| payload.len() <= 64 * 1024)
         .ok_or_eyre("missing or oversized request")?;
     let request: Request = serde_json::from_slice(&payload.to_bytes())?;
     let (reply, responses) = mpsc::channel(2);
+    let cancel = recording.cancel_token().child_token();
     match request {
         // Catalog requests must not wait for long-running index builds.
         Request::Catalog => reply
-            .try_send(Response::Catalog(catalog.clone()))
+            .try_send(Response::Catalog(recording.info.clone()))
             .wrap_err("sending recording catalog")?,
         Request::Plan {
             instance,
+            observation,
+            revision,
             cursor,
             plan,
-        } => worker
-            .try_send(PlanRequest {
-                instance,
-                cursor,
-                plan,
-                reply,
-            })
-            .wrap_err("query worker busy; retry")?,
+        } => {
+            if instance != recording.info.instance {
+                reply.try_send(Response::RecordingChanged)?;
+                return Ok((responses, cancel));
+            }
+            color_eyre::eyre::ensure!(
+                !observation.is_empty() && observation.len() <= 256,
+                "invalid observation ID"
+            );
+            let submission = Submission {
+                revision,
+                cancel: cancel.clone(),
+                request: Mutex::new(Some(PlanRequest {
+                    cursor,
+                    plan,
+                    reply,
+                })),
+            };
+            if let Some(worker) = observations.get(&observation)
+                && !worker.latest.is_closed()
+            {
+                color_eyre::eyre::ensure!(
+                    revision >= worker.latest.borrow().revision,
+                    "obsolete query revision"
+                );
+                worker.latest.send_replace(submission).cancel.cancel();
+            } else {
+                color_eyre::eyre::ensure!(
+                    observations.len() < MAX_OBSERVATIONS
+                        || observations.contains_key(&observation),
+                    "too many query observations; retry"
+                );
+                let (latest, requests) = watch::channel(submission);
+                let generation = uuid::Uuid::new_v4();
+                observations.insert(
+                    observation.clone(),
+                    ObservationWorker { generation, latest },
+                );
+                let recording = Arc::clone(recording);
+                let stopped = recording.cancel_token();
+                workers.spawn(async move {
+                    run_query_worker(recording, requests, stopped).await;
+                    (observation, generation)
+                });
+            }
+        }
+        Request::Cancel {
+            instance,
+            observation,
+            revision,
+        } => {
+            if instance == recording.info.instance
+                && observations
+                    .get(&observation)
+                    .is_some_and(|worker| worker.latest.borrow().revision <= revision)
+                && let Some(worker) = observations.remove(&observation)
+            {
+                worker.latest.borrow().cancel.cancel();
+            }
+        }
     }
-    Ok(responses)
+    Ok((responses, cancel))
 }
 
 async fn reply_to_query(
     incoming: Query,
     key: String,
-    responses: Result<mpsc::Receiver<Response>>,
+    responses: Result<(mpsc::Receiver<Response>, CancellationToken)>,
     chunks: Arc<ChunkCache>,
 ) {
-    let result: Result<()> = async {
-        let mut responses = responses?;
+    let (mut responses, superseded) = match responses {
+        Ok(responses) => responses,
+        Err(error) => {
+            let _ = incoming.reply_err(error.to_string()).await;
+            return;
+        }
+    };
+    let result = async {
         while let Some(response) = responses.recv().await {
             let bytes = chunks.blocking(move || encode(&response)).await??;
             if incoming.reply(&key, bytes).await.is_err() {
                 return Ok(());
             }
         }
-        Ok(())
-    }
-    .await;
+        Ok::<(), Report>(())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = superseded.cancelled() => return,
+        result = result => result,
+    };
 
     if let Err(error) = result {
         let _ = incoming.reply_err(error.to_string()).await;

@@ -35,7 +35,7 @@ Write recordings to a temporary name and rename them to `.mcap` when complete to
 The index budget is shared across recordings, including active and building timestamp indexes.
 Idle indexes are evicted globally in least-recently-used order; queries that cannot fit return errors.
 Index builds are serialized across recordings, with parallel scanning within each build.
-Queries share in-progress index builds and await them asynchronously.
+Queries share in-progress index builds and await them asynchronously. Warm queries can run while other indexes are built.
 Running builds retain their owned mutex guard until they finish and check the same cancellation token while scanning.
 This is not a total memory limit: summaries, schemas, selected payloads, replies, and decoder scratch buffers use additional memory.
 Dropping a recording queues index removal to one Tokio blocking task, without taking the cache lock.
@@ -49,8 +49,16 @@ completed chunks are evicted; buffers still held by queries remain charged until
 In-flight decodes reserve their uncompressed size before allocating. A chunk larger
 than the configured budget returns an error; increase `--chunk-cache-mib` to fit it.
 Timestamp-index scans bypass this cache so scanning a recording does not evict the
-interactive working set. Chunk decoding, payload copying, evaluation, and response
-encoding share four blocking-work slots.
+interactive working set.
+
+Queries run concurrently, with four shared blocking-work slots for chunk decoding,
+payload copying, evaluation, and response encoding. Each recording admits up to 128
+observations and 256 reply tasks. New cursor revisions replace pending/active work
+for the same observation without affecting other panels or clients. Shared decodes
+and index builds survive an individual query being superseded. Closing an observation
+cancels its server work; abandoned idle workers expire after 120 seconds.
+Rebuild both the server and Twix together: plan requests now carry observation IDs
+and revisions, and the protocol includes explicit cancellation.
 
 ## Options
 

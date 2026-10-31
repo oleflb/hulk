@@ -1,9 +1,19 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use bincode::{DefaultOptions, Options};
 use ros_z::{node::Node, time::Time};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinHandle,
+};
 use zenoh::query::ConsolidationMode;
 
 use super::{
@@ -16,6 +26,7 @@ use super::{
 use crate::{Error, Result, TopicReference};
 
 pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+static NEXT_OBSERVATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn query_key(namespace: &str) -> String {
     let namespace = namespace.trim_matches('/');
@@ -40,8 +51,15 @@ pub enum Request {
     Catalog,
     Plan {
         instance: String,
+        observation: String,
+        revision: u64,
         cursor: Time,
         plan: QueryPlan,
+    },
+    Cancel {
+        instance: String,
+        observation: String,
+        revision: u64,
     },
 }
 
@@ -146,6 +164,7 @@ pub struct RemoteMcap {
     key: String,
     info: Arc<RecordingInfo>,
     topics: TopicList,
+    decoders: Arc<Semaphore>,
 }
 
 impl RemoteMcap {
@@ -204,6 +223,7 @@ impl RemoteMcap {
             key,
             info: Arc::new(info),
             topics: TopicList(receiver),
+            decoders: Arc::new(Semaphore::new(4)),
         })
     }
 
@@ -235,6 +255,11 @@ impl Backend for RemoteMcap {
         plan.resolve_topics(&self.namespace)?;
         let (observation, sender) = PlanObservation::channel(cursor.clone());
         let worker = RemoteObservation {
+            observation: format!(
+                "{}-{}",
+                self.node.session().zid(),
+                NEXT_OBSERVATION.fetch_add(1, Ordering::Relaxed)
+            ),
             node: Arc::clone(&self.node),
             key: self.key.clone(),
             catalog: Arc::clone(&self.info),
@@ -243,6 +268,7 @@ impl Backend for RemoteMcap {
             cursor,
             plan,
             sender,
+            decoders: self.decoders.clone(),
         };
         tokio::spawn(worker.run());
         Ok(observation)
@@ -250,6 +276,7 @@ impl Backend for RemoteMcap {
 }
 
 struct RemoteObservation {
+    observation: String,
     node: Arc<Node>,
     key: String,
     catalog: Arc<RecordingInfo>,
@@ -258,6 +285,7 @@ struct RemoteObservation {
     cursor: CursorHandle,
     plan: QueryPlan,
     sender: PlanSender,
+    decoders: Arc<Semaphore>,
 }
 
 impl RemoteObservation {
@@ -267,11 +295,12 @@ impl RemoteObservation {
         loop {
             let position = *positions.borrow_and_update();
             if *replacement.borrow() {
-                self.publish_failure(position, "recording changed; reconnect".into());
+                self.publish_failure(position, "recording changed; reconnect".into(), false);
                 break;
             }
             let Cursor::At(time) = position.cursor else {
-                self.publish_failure(position, "recordings require Cursor::At".into());
+                self.cancel(position.revision).await;
+                self.publish_failure(position, "recordings require Cursor::At".into(), false);
                 tokio::select! {
                     _ = self.sender.closed() => break,
                     _ = positions.changed() => {},
@@ -287,6 +316,7 @@ impl RemoteObservation {
                 if previous.revision != position.revision {
                     self.sender.send_replace(Arc::new(PlanSnapshot {
                         revision: position.revision,
+                        retrying: false,
                         evaluation: previous.evaluation.clone(),
                     }));
                 }
@@ -299,24 +329,26 @@ impl RemoteObservation {
             }
             self.sender.send_replace(Arc::new(PlanSnapshot {
                 revision: position.revision,
+                retrying: false,
                 evaluation: Arc::new(Evaluation::unresolved(time, State::Pending)),
             }));
+            // A newer request supersedes this observation's work on the server.
             let result = tokio::select! {
+                biased;
                 _ = self.sender.closed() => break,
                 _ = replacement.changed() => continue,
-                _ = async {
-                    while positions.changed().await.is_ok() {
-                        if positions.borrow().revision != position.revision { break; }
-                    }
-                } => continue,
+                changed = positions.changed() => {
+                    if changed.is_err() { break; }
+                    continue;
+                },
                 result = self.execute_plan(time, position.revision) => result,
             };
             if let Err(error) = &result
                 && self.cursor.position().revision == position.revision
             {
-                self.publish_failure(position, error.to_string());
+                self.publish_failure(position, error.to_string(), !*self.replaced.borrow());
             }
-            if self.cursor.position().cursor != position.cursor {
+            if self.cursor.position().revision != position.revision {
                 continue;
             }
             tokio::select! {
@@ -326,11 +358,26 @@ impl RemoteObservation {
                 _ = tokio::time::sleep(Duration::from_secs(1)), if result.is_err() => {},
             }
         }
+        self.cancel(self.cursor.position().revision).await;
+    }
+
+    async fn cancel(&self, revision: u64) {
+        // Zenoh query handles do not cancel server work when dropped.
+        let command = Request::Cancel {
+            instance: self.catalog.instance.clone(),
+            observation: self.observation.clone(),
+            revision,
+        };
+        if let Ok(payload) = serde_json::to_vec(&command) {
+            let _ = self.node.session().get(&self.key).payload(payload).await;
+        }
     }
 
     async fn execute_plan(&self, time: Time, revision: u64) -> Result<()> {
         let command = Request::Plan {
             instance: self.catalog.instance.clone(),
+            observation: self.observation.clone(),
+            revision,
             cursor: time,
             plan: self.plan.clone(),
         };
@@ -349,13 +396,32 @@ impl RemoteObservation {
             let sample = reply.into_result().map_err(|error| {
                 query_error(String::from_utf8_lossy(&error.payload().to_bytes()))
             })?;
-            match decode(&sample.payload().to_bytes())? {
-                Response::PlanData(mut result) => {
+            if self.cursor.position().revision != revision {
+                return Ok(());
+            }
+            let permit = self
+                .decoders
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(query_error)?;
+            let plan = self.plan.clone();
+            let catalog = self.catalog.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut response = decode(&sample.payload().to_bytes())?;
+                if let Response::PlanData(result) = &mut response {
                     if result.cursor != time {
                         return Err(query_error("plan response cursor mismatch"));
                     }
-                    self.plan
-                        .validate_result(&mut result, &self.catalog.topics)?;
+                    plan.validate_result(result, &catalog.topics)?;
+                }
+                Ok(response)
+            })
+            .await
+            .map_err(query_error)??;
+            match response {
+                Response::PlanData(result) => {
                     settled = result.settled();
                     if let Some((start, end)) = result.bounds {
                         self.bounds.send_modify(|bounds| {
@@ -366,6 +432,7 @@ impl RemoteObservation {
                     if self.cursor.position().revision == revision {
                         self.sender.send_replace(Arc::new(PlanSnapshot {
                             revision,
+                            retrying: false,
                             evaluation: Arc::new(result),
                         }));
                     }
@@ -385,9 +452,10 @@ impl RemoteObservation {
         }
     }
 
-    fn publish_failure(&self, position: CursorPosition, error: String) {
+    fn publish_failure(&self, position: CursorPosition, error: String, retrying: bool) {
         self.sender.send_replace(Arc::new(PlanSnapshot {
             revision: position.revision,
+            retrying,
             evaluation: Arc::new(Evaluation {
                 valid_for: CursorRange {
                     start: Time::zero(),
@@ -486,7 +554,126 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn incomplete_plan_stream_reports_failure() {
+    async fn latest_seek_does_not_wait_for_obsolete_reply_and_drop_cancels_observation() {
+        let context = ContextBuilder::default()
+            .disable_multicast_scouting()
+            .with_json("connect/endpoints", serde_json::json!([]))
+            .build()
+            .await
+            .unwrap();
+        let node = Arc::new(context.create_node("latest_seek").build().await.unwrap());
+        let key = query_key("/replay");
+        let queryable = node.session().declare_queryable(key.clone()).await.unwrap();
+        let (started, first_received) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, old_finished) = tokio::sync::oneshot::channel();
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut started = Some(started);
+            let mut released = Some(released);
+            let mut finished = Some(finished);
+            let mut old = None;
+            let mut observation_id = None;
+            while let Ok(incoming) = queryable.recv_async().await {
+                let command: Request =
+                    serde_json::from_slice(&incoming.payload().unwrap().to_bytes()).unwrap();
+                let response = match command {
+                    Request::Catalog => Response::Catalog(RecordingInfo {
+                        instance: "test".into(),
+                        name: "test.mcap".into(),
+                        start: Time::zero(),
+                        end: Time::from_nanos(100),
+                        topics: Vec::new(),
+                    }),
+                    Request::Plan {
+                        cursor,
+                        plan,
+                        observation,
+                        ..
+                    } => {
+                        let evaluation = plan
+                            .evaluate(cursor, &[], |_, _| panic!("no payloads"))
+                            .unwrap();
+                        if let Some(started) = started.take() {
+                            observation_id = Some(observation);
+                            old = Some((incoming, evaluation));
+                            started.send(()).unwrap();
+                            continue;
+                        }
+                        assert_eq!(Some(observation), observation_id);
+                        incoming
+                            .reply(&key, encode(&Response::PlanData(evaluation)).unwrap())
+                            .await
+                            .unwrap();
+                        if let Some(released) = released.take() {
+                            released.await.unwrap();
+                            let (incoming, evaluation) = old.take().unwrap();
+                            let _ = incoming
+                                .reply(&key, encode(&Response::PlanData(evaluation)).unwrap())
+                                .await;
+                            finished.take().unwrap().send(()).unwrap();
+                        }
+                        continue;
+                    }
+                    Request::Cancel {
+                        observation,
+                        revision,
+                        ..
+                    } => {
+                        assert_eq!(Some(observation), observation_id);
+                        assert_eq!(revision, 1);
+                        cancelled.send(()).unwrap();
+                        break;
+                    }
+                };
+                incoming
+                    .reply(&key, encode(&response).unwrap())
+                    .await
+                    .unwrap();
+            }
+        });
+        let remote = RemoteMcap::connect(node, "/replay").await.unwrap();
+        let cursor = CursorHandle::new(Cursor::At(Time::from_nanos(10)));
+        let observation = remote
+            .observe(cursor.clone(), plan::cursor().plan())
+            .unwrap();
+        let mut updates = observation.subscribe_updates();
+        tokio::time::timeout(Duration::from_secs(5), first_received)
+            .await
+            .unwrap()
+            .unwrap();
+        cursor.set(Cursor::At(Time::from_nanos(20)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                updates.borrow_and_update();
+                let snapshot = observation.snapshot();
+                if observation.is_current(&snapshot)
+                    && matches!(snapshot.evaluation.state, State::Ready(_))
+                {
+                    assert_eq!(snapshot.evaluation.cursor, Time::from_nanos(20));
+                    break;
+                }
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        old_finished.await.unwrap();
+        assert_eq!(
+            observation.snapshot().evaluation.cursor,
+            Time::from_nanos(20)
+        );
+        drop(observation);
+        tokio::time::timeout(Duration::from_secs(5), cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incomplete_plan_stream_reports_retry_until_recovery() {
         let context = ContextBuilder::default()
             .disable_multicast_scouting()
             .with_json("connect/endpoints", serde_json::json!([]))
@@ -503,6 +690,7 @@ mod tests {
         let key = query_key("/replay");
         let queryable = node.session().declare_queryable(key.clone()).await.unwrap();
         let server = tokio::spawn(async move {
+            let mut first_plan = true;
             while let Ok(incoming) = queryable.recv_async().await {
                 let command: Request =
                     serde_json::from_slice(&incoming.payload().unwrap().to_bytes()).unwrap();
@@ -514,7 +702,16 @@ mod tests {
                         end: Time::from_nanos(100),
                         topics: Vec::new(),
                     }),
-                    Request::Plan { .. } => continue,
+                    Request::Plan { cursor, plan, .. } => {
+                        if std::mem::take(&mut first_plan) {
+                            continue;
+                        }
+                        Response::PlanData(
+                            plan.evaluate(cursor, &[], |_, _| panic!("no records expected"))
+                                .unwrap(),
+                        )
+                    }
+                    Request::Cancel { .. } => continue,
                 };
                 incoming
                     .reply(&key, encode(&response).unwrap())
@@ -524,8 +721,9 @@ mod tests {
         });
         let remote = RemoteMcap::connect(node, "/replay").await.unwrap();
         let time = Time::from_nanos(10);
+        let cursor = CursorHandle::new(Cursor::At(time));
         let observation = remote
-            .observe(CursorHandle::new(Cursor::At(time)), plan::cursor().plan())
+            .observe(cursor.clone(), plan::cursor().plan())
             .unwrap();
         let mut updates = observation.subscribe_updates();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -534,6 +732,33 @@ mod tests {
                 if let State::Failed(error) = &snapshot.evaluation.state {
                     assert_eq!(error, "query: plan response ended before completion");
                     assert_eq!(snapshot.evaluation.cursor, time);
+                    assert!(snapshot.retrying);
+                    break;
+                }
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = observation.snapshot();
+                if matches!(snapshot.evaluation.state, State::Ready(_)) {
+                    assert!(!snapshot.retrying);
+                    break;
+                }
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        cursor.set(Cursor::Live);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = observation.snapshot();
+                if let State::Failed(error) = &snapshot.evaluation.state {
+                    assert_eq!(error, "recordings require Cursor::At");
+                    assert!(!snapshot.retrying);
                     break;
                 }
                 updates.changed().await.unwrap();

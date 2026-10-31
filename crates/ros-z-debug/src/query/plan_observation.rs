@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug)]
 pub struct PlanSnapshot {
     pub revision: u64,
+    /// The failed request will be retried automatically; resolution is still ongoing.
+    pub retrying: bool,
     pub evaluation: Arc<Evaluation>,
 }
 
@@ -90,6 +92,7 @@ impl PlanObservation {
     pub(crate) fn channel(cursor: CursorHandle) -> (Self, PlanSender) {
         let (sender, receiver) = watch::channel(Arc::new(PlanSnapshot {
             revision: cursor.position().revision,
+            retrying: false,
             evaluation: Arc::new(Evaluation::unresolved(Time::zero(), State::Pending)),
         }));
         let (updates_sender, updates) = watch::channel(0);
