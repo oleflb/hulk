@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Seek},
     path::Path,
@@ -19,6 +19,7 @@ use mcap::{
 };
 use ros_z::{TypeInfo, dynamic::Schema, topic_name::qualify_topic_name};
 use ros_z_schema::{SchemaBundle, TypeDef, compute_hash};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
@@ -26,11 +27,12 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
+mod chunk_cache;
 mod query;
+pub use chunk_cache::ChunkCache;
 pub use query::{IndexCache, PendingQuery, QueryRecording};
 
 const MAX_CHUNK: usize = 64 * 1024 * 1024;
-const CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Each scanner has a private cursor. Positional reads keep parallel scans on
 /// the original file descriptor without racing a shared seek position.
@@ -169,7 +171,9 @@ fn read_channels(summary: &Summary, namespace: &str) -> Result<BTreeMap<u16, Cha
 /// Uncompressed records in their original file order. Index offsets point directly
 /// into this buffer; only selected message payloads need separate ownership.
 struct SnapshotChunk {
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
+    // The reservation follows the allocation, even after cache eviction.
+    _reservation: OwnedSemaphorePermit,
 }
 
 impl SnapshotChunk {
@@ -200,9 +204,6 @@ pub struct Recording {
     pub channels: BTreeMap<u16, Channel>,
     pub start: u64,
     pub end: u64,
-    chunks: VecDeque<(u32, Arc<SnapshotChunk>)>,
-    cached_bytes: usize,
-    decoded_chunks: usize,
 }
 
 impl Recording {
@@ -230,9 +231,6 @@ impl Recording {
             channels,
             start,
             end,
-            chunks: VecDeque::new(),
-            cached_bytes: 0,
-            decoded_chunks: 0,
         })
     }
 
@@ -240,14 +238,13 @@ impl Recording {
     /// The library handles compression; offsets count all uncompressed records,
     /// including schemas and channels preceding messages.
     fn scan_chunk(
-        &mut self,
+        &self,
         index: u32,
         cancel: &CancellationToken,
         visit: impl FnMut(u32, u8, &[u8]) -> Result<()>,
     ) -> Result<()> {
         let chunk = &self.summary.chunk_indexes[index as usize];
         Self::scan_chunk_at(&self.file, chunk, || cancel.is_cancelled(), visit)?;
-        self.decoded_chunks += 1;
         Ok(())
     }
 
@@ -304,17 +301,12 @@ impl Recording {
         Ok(())
     }
 
-    fn snapshot_chunk(
-        &mut self,
+    fn decode_chunk(
+        &self,
         index: u32,
         cancel: &CancellationToken,
-    ) -> Result<Arc<SnapshotChunk>> {
-        if let Some(slot) = self.chunks.iter().position(|(cached, _)| *cached == index) {
-            let chunk = self.chunks.remove(slot).expect("existing chunk");
-            let result = Arc::clone(&chunk.1);
-            self.chunks.push_back(chunk);
-            return Ok(result);
-        }
+        reservation: OwnedSemaphorePermit,
+    ) -> Result<SnapshotChunk> {
         let size = usize::try_from(self.summary.chunk_indexes[index as usize].uncompressed_size)?;
         ensure!(size <= MAX_CHUNK, "chunk exceeds 64 MiB limit");
         let mut bytes = Vec::new();
@@ -325,18 +317,10 @@ impl Recording {
             bytes.extend_from_slice(data);
             Ok(())
         })?;
-        let chunk = Arc::new(SnapshotChunk { bytes });
-        let size = chunk.bytes.capacity();
-        if size <= CACHE_BYTES {
-            while self.cached_bytes + size > CACHE_BYTES {
-                if let Some((_, old)) = self.chunks.pop_front() {
-                    self.cached_bytes -= old.bytes.capacity();
-                }
-            }
-            self.cached_bytes += size;
-            self.chunks.push_back((index, Arc::clone(&chunk)));
-        }
-        Ok(chunk)
+        Ok(SnapshotChunk {
+            bytes: bytes.into_boxed_slice(),
+            _reservation: reservation,
+        })
     }
 }
 

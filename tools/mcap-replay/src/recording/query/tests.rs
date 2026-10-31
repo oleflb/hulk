@@ -29,27 +29,40 @@ use uuid::Uuid;
 const DEFAULT_INDEX_BYTES: usize = 1024 * 1024 * 1024;
 
 impl QueryRecording {
-    fn with_index_budget(self, bytes: usize) -> Result<Self> {
+    fn with_index_budget(self: Arc<Self>, bytes: usize) -> Result<Arc<Self>> {
         self.cache.state.lock().set_budget(bytes)?;
         Ok(self)
     }
 
     fn query_plan(
-        &mut self,
+        self: &Arc<Self>,
         plan: &QueryPlan,
         cursor: Time,
         mut emit: impl FnMut(Evaluation) -> bool,
     ) -> Result<()> {
-        let mut query = PendingQuery::new(self, plan.clone(), cursor)?;
-        while let Some(source) = query.advance(self, &mut emit)? {
-            let guard = Arc::clone(&self.cache.builds).try_lock_owned()?;
-            query.build(self, source, guard)?;
-        }
-        Ok(())
+        tokio::task::block_in_place(|| {
+            runtime().block_on(async {
+                let mut query = PendingQuery::new(self, plan.clone(), cursor)?;
+                loop {
+                    let (evaluation, source) = query.advance(self).await?;
+                    if !emit(evaluation) {
+                        break;
+                    }
+                    let Some(source) = source else {
+                        break;
+                    };
+                    query.build_async(self, source).await?;
+                }
+                Ok(())
+            })
+        })
     }
 
     fn decoded_chunks(&self) -> usize {
-        self.recording.decoded_chunks + self.cache.state.lock().stats.decoded_chunks
+        self.chunks
+            .decoded_chunks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            + self.cache.state.lock().stats.decoded_chunks
     }
 
     fn index_stats(&self) -> (usize, usize) {
@@ -57,9 +70,9 @@ impl QueryRecording {
         (cache.entries.len(), cache.bytes)
     }
 
-    fn with_index_workers(mut self, workers: usize) -> Self {
+    fn with_index_workers(mut self: Arc<Self>, workers: usize) -> Arc<Self> {
         assert!((1..=INDEX_WORKERS).contains(&workers));
-        self.index_workers = workers;
+        Arc::get_mut(&mut self).unwrap().index_workers = workers;
         self
     }
 
@@ -150,22 +163,32 @@ pub(crate) fn fixture_records(
     file
 }
 
-fn index_cache() -> Arc<IndexCache> {
+fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| Runtime::new().unwrap());
-    let _entered = runtime.enter();
+    RUNTIME.get_or_init(|| Runtime::new().unwrap())
+}
+
+fn chunk_cache() -> Arc<ChunkCache> {
+    Arc::new(ChunkCache::new(256 * 1024 * 1024).unwrap())
+}
+
+fn index_cache() -> Arc<IndexCache> {
+    let _entered = runtime().enter();
     let (cache, _cleanup) = IndexCache::new(DEFAULT_INDEX_BYTES).unwrap();
     Arc::new(cache)
 }
 
-fn open(file: &Path) -> QueryRecording {
-    QueryRecording::new(
-        Recording::open(file, "/replay").unwrap(),
-        "fixture".into(),
-        CancellationToken::new(),
-        index_cache(),
+fn open(file: &Path) -> Arc<QueryRecording> {
+    Arc::new(
+        QueryRecording::new(
+            Recording::open(file, "/replay").unwrap(),
+            "fixture".into(),
+            CancellationToken::new(),
+            index_cache(),
+            chunk_cache(),
+        )
+        .unwrap(),
     )
-    .unwrap()
 }
 
 fn projected(topic: &str) -> TopicSource {
@@ -188,7 +211,7 @@ fn image_plan(selection: Selection, matching: Selection) -> QueryPlan {
 }
 
 /// Collect the actual progressive plan path; never prebuild indexes in tests.
-fn finish(recording: &mut QueryRecording, query: &QueryPlan, time: Time) -> Evaluation {
+fn finish(recording: &Arc<QueryRecording>, query: &QueryPlan, time: Time) -> Evaluation {
     let mut result = None;
     recording
         .query_plan(query, time, |evaluation| {
@@ -250,10 +273,10 @@ fn normalize_publications(result: &mut Evaluation, publisher: [u8; 16]) {
 #[test]
 fn publication_ids_are_scoped_to_recording_instances_and_stable_across_queries() {
     let file = fixture(true);
-    let mut first = open(file.path());
-    let mut second = open(file.path());
+    let first = open(file.path());
+    let second = open(file.path());
     let plan = image_plan(Selection::latest(), Selection::Exact);
-    let query = |recording: &mut QueryRecording, time| {
+    let query = |recording: &Arc<QueryRecording>, time| {
         let result = finish(recording, &plan, Time::from_nanos(time));
         let Response::PlanData(result) =
             remote::decode(&encode(&Response::PlanData(result)).unwrap()).unwrap()
@@ -276,8 +299,8 @@ fn publication_ids_are_scoped_to_recording_instances_and_stable_across_queries()
             })
             .collect::<Vec<_>>()
     };
-    let original = query(&mut first, 20);
-    let reopened = query(&mut second, 20);
+    let original = query(&first, 20);
+    let reopened = query(&second, 20);
     assert_eq!(original.len(), 2);
     for (a, b) in original.iter().zip(reopened.iter()) {
         assert_eq!(a.0, b.0);
@@ -285,9 +308,9 @@ fn publication_ids_are_scoped_to_recording_instances_and_stable_across_queries()
         assert_ne!(a.1, b.1);
     }
     assert_ne!(original[0].1, original[1].1);
-    assert_ne!(original, query(&mut first, 10));
-    assert_eq!(original, query(&mut first, 20));
-    assert_eq!(reopened, query(&mut second, 20));
+    assert_ne!(original, query(&first, 10));
+    assert_eq!(original, query(&first, 20));
+    assert_eq!(reopened, query(&second, 20));
 }
 
 #[test]
@@ -305,9 +328,9 @@ fn progressive_indexes_preserve_file_order_ties_and_reuse_loaded_chunks() {
                 (1, 20, 905, 25),
             ],
         );
-        let mut recording = open(file.path());
+        let recording = open(file.path());
         let plan = image_plan(Selection::latest(), Selection::Exact);
-        let result = finish(&mut recording, &plan, Time::from_nanos(20));
+        let result = finish(&recording, &plan, Time::from_nanos(20));
         let frame = &frames(&result)[0];
         assert_eq!(frame.primary.record.source_time, Time::from_nanos(225));
         assert_eq!(input(frame, 0)[0].record.source_time, Time::from_nanos(905));
@@ -321,7 +344,7 @@ fn progressive_indexes_preserve_file_order_ties_and_reuse_loaded_chunks() {
             "two progressive index scans, one payload load"
         );
         assert_eq!(recording.index_stats(), (2, 6 * 16));
-        finish(&mut recording, &plan, Time::from_nanos(10));
+        finish(&recording, &plan, Time::from_nanos(10));
         assert_eq!(
             recording.decoded_chunks(),
             3,
@@ -340,8 +363,8 @@ fn index_budget_evicts_lru_and_pins_active_plan_sources() {
     let query = |source: TopicSource| Source::from(source).latest(plan::cursor()).plan();
     let time = Time::from_nanos(1000);
     for optional in [false, true] {
-        let mut recording = open(file.path()).with_index_budget(64).unwrap();
-        finish(&mut recording, &query(detections.clone()), time);
+        let recording = open(file.path()).with_index_budget(64).unwrap();
+        finish(&recording, &query(detections.clone()), time);
         let primary = if optional {
             Source::from(images.clone())
                 .latest(plan::cursor())
@@ -355,28 +378,28 @@ fn index_budget_evicts_lru_and_pins_active_plan_sources() {
                 .latest(plan::cursor())
                 .plan()
         };
-        let result = finish(&mut recording, &primary, time);
+        let result = finish(&recording, &primary, time);
         assert!(matches!(result.state, State::Ready(_)));
         assert!(recording.has_index(&images));
         assert!(!recording.has_index(&detections));
     }
-    let mut recording = open(file.path()).with_index_budget(96).unwrap();
+    let recording = open(file.path()).with_index_budget(96).unwrap();
     for source in [
         images.clone(),
         raw.clone(),
         images.clone(),
         detections.clone(),
     ] {
-        finish(&mut recording, &query(source), time);
+        finish(&recording, &query(source), time);
     }
     assert!(recording.has_index(&images));
     assert!(!recording.has_index(&raw));
     assert!(recording.has_index(&detections));
     assert!(recording.index_stats().1 <= 96);
-    let mut recording = open(file.path()).with_index_budget(64).unwrap();
-    finish(&mut recording, &query(images.clone()), time);
+    let recording = open(file.path()).with_index_budget(64).unwrap();
+    finish(&recording, &query(images.clone()), time);
     let result = finish(
-        &mut recording,
+        &recording,
         &image_plan(Selection::latest(), Selection::Exact),
         time,
     );
@@ -385,10 +408,10 @@ fn index_budget_evicts_lru_and_pins_active_plan_sources() {
     assert!(!recording.has_index(&detections));
     assert_eq!(recording.index_stats(), (1, 48));
     assert_eq!(
-        records(&finish(&mut recording, &query(images.clone()), time)).len(),
+        records(&finish(&recording, &query(images.clone()), time)).len(),
         1
     );
-    let mut recording = recording.with_index_budget(80).unwrap();
+    let recording = recording.with_index_budget(80).unwrap();
     let spec = InputSpec {
         source: detections.into(),
         selection: Selection::Exact,
@@ -398,10 +421,7 @@ fn index_budget_evicts_lru_and_pins_active_plan_sources() {
         .requiring([spec.clone()])
         .attach([spec.clone(), spec])
         .plan();
-    assert_eq!(
-        frames(&finish(&mut recording, &plan, time))[0].inputs.len(),
-        2
-    );
+    assert_eq!(frames(&finish(&recording, &plan, time))[0].inputs.len(), 2);
     assert_eq!(
         recording.index_stats(),
         (2, 80),
@@ -423,8 +443,8 @@ fn parallel_indexes_match_serial_across_chunks_duplicates_and_rejected_times() {
         .collect();
     for message_indexes in [false, true] {
         let file = fixture_records(message_indexes, true, &data);
-        let mut serial = open(file.path()).with_index_workers(1);
-        let mut parallel = open(file.path()).with_index_workers(4);
+        let serial = open(file.path()).with_index_workers(1);
+        let parallel = open(file.path()).with_index_workers(4);
         let plan = image_plan(
             Selection::AtOrBefore {
                 count: NonZeroUsize::new(3).unwrap(),
@@ -432,8 +452,8 @@ fn parallel_indexes_match_serial_across_chunks_duplicates_and_rejected_times() {
             Selection::Exact,
         );
         for time in (0..35).chain((0..35).rev()) {
-            let expected = finish(&mut serial, &plan, Time::from_nanos(time));
-            let mut actual = finish(&mut parallel, &plan, Time::from_nanos(time));
+            let expected = finish(&serial, &plan, Time::from_nanos(time));
+            let mut actual = finish(&parallel, &plan, Time::from_nanos(time));
             assert!(
                 actual
                     .dependencies
@@ -470,15 +490,18 @@ fn worker_failure_discards_builders_without_cancelling_the_recording() {
         ],
     );
     let cancel = CancellationToken::new();
-    let mut recording = QueryRecording::new(
-        Recording::open(file.path(), "/replay").unwrap(),
-        "failure".into(),
-        cancel.clone(),
-        index_cache(),
-    )
-    .unwrap();
+    let recording = Arc::new(
+        QueryRecording::new(
+            Recording::open(file.path(), "/replay").unwrap(),
+            "failure".into(),
+            cancel.clone(),
+            index_cache(),
+            chunk_cache(),
+        )
+        .unwrap(),
+    );
     let result = finish(
-        &mut recording,
+        &recording,
         &image_plan(Selection::latest(), Selection::Exact),
         Time::from_nanos(1000),
     );
@@ -495,7 +518,7 @@ fn worker_failure_discards_builders_without_cancelling_the_recording() {
     .latest(plan::cursor())
     .plan();
     assert_eq!(
-        records(&finish(&mut recording, &plan, Time::from_nanos(1000)))[0]
+        records(&finish(&recording, &plan, Time::from_nanos(1000)))[0]
             .record
             .source_time,
         Time::from_nanos(500)
@@ -512,12 +535,12 @@ fn worker_failure_discards_builders_without_cancelling_the_recording() {
 fn exact_and_before_inputs_ignore_publication_time_and_reuse_indexes() {
     for indexes in [false, true] {
         let file = fixture(indexes);
-        let mut recording = open(file.path());
+        let recording = open(file.path());
         assert_eq!(recording.info.start, Time::from_nanos(210));
         assert_eq!(recording.decoded_chunks(), 0);
         assert_eq!(recording.index_stats(), (0, 0));
         let plan = image_plan(Selection::latest(), Selection::Exact);
-        let result = finish(&mut recording, &plan, Time::from_nanos(30));
+        let result = finish(&recording, &plan, Time::from_nanos(30));
         assert_eq!(frames(&result)[0].primary.record.time, Time::from_nanos(20));
         assert_eq!(
             input(&frames(&result)[0], 0)[0].record.source_time,
@@ -526,7 +549,7 @@ fn exact_and_before_inputs_ignore_publication_time_and_reuse_indexes() {
         let decoded = recording.cache.state.lock().stats.projected_messages;
         for time in [10, 20, 30, 10] {
             assert_eq!(
-                frames(&finish(&mut recording, &plan, Time::from_nanos(time)))[0]
+                frames(&finish(&recording, &plan, Time::from_nanos(time)))[0]
                     .primary
                     .record
                     .time,
@@ -538,7 +561,7 @@ fn exact_and_before_inputs_ignore_publication_time_and_reuse_indexes() {
             decoded
         );
         let result = finish(
-            &mut recording,
+            &recording,
             &image_plan(Selection::latest(), Selection::latest()),
             Time::from_nanos(30),
         );
@@ -554,7 +577,7 @@ fn exact_and_before_inputs_ignore_publication_time_and_reuse_indexes() {
         .latest(plan::cursor())
         .plan();
         assert!(matches!(
-            finish(&mut recording, &bad, Time::from_nanos(20)).state,
+            finish(&recording, &bad, Time::from_nanos(20)).state,
             State::Failed(_)
         ));
     }
@@ -563,7 +586,7 @@ fn exact_and_before_inputs_ignore_publication_time_and_reuse_indexes() {
 #[test]
 fn plan_publishes_primary_before_optional_indexes_and_keeps_failures_local() {
     let file = fixture(true);
-    let mut recording = open(file.path());
+    let recording = open(file.path());
     let detections = Source::from(projected("detections"));
     let invalid = Source::from(TopicSource::new(
         "/replay/detections",
@@ -598,7 +621,7 @@ fn plan_publishes_primary_before_optional_indexes_and_keeps_failures_local() {
     assert!(partial && complete);
     let chunks = recording.decoded_chunks();
     let result = finish(
-        &mut recording,
+        &recording,
         &detections.latest(plan::cursor()).effective_time().plan(),
         Time::from_nanos(25),
     );
@@ -704,9 +727,16 @@ fn start_server(
     let name = name.to_owned();
     let (stop, shutdown) = oneshot::channel();
     let server = tokio::spawn(async move {
-        serve_queries(&node, recording, name, index_cache(), async {
-            let _ = shutdown.await;
-        })
+        serve_queries(
+            &node,
+            recording,
+            name,
+            index_cache(),
+            chunk_cache(),
+            async {
+                let _ = shutdown.await;
+            },
+        )
         .await
         .unwrap();
     });
@@ -843,7 +873,7 @@ struct CountedServer {
     task: JoinHandle<()>,
 }
 
-async fn counted_server(mut recording: QueryRecording) -> CountedServer {
+async fn counted_server(recording: Arc<QueryRecording>) -> CountedServer {
     let node = test_node("cache_test").await;
     let key = query_key("/replay");
     let queryable = node
@@ -868,7 +898,7 @@ async fn counted_server(mut recording: QueryRecording) -> CountedServer {
                     {
                         delayed.await.unwrap();
                     }
-                    Response::PlanData(finish(&mut recording, &plan, cursor))
+                    Response::PlanData(finish(&recording, &plan, cursor))
                 }
                 Request::Catalog => {
                     let mut info = recording.info.clone();
@@ -893,38 +923,9 @@ async fn counted_server(mut recording: QueryRecording) -> CountedServer {
 }
 
 #[test]
-fn oversized_cache_chunk_is_loaded_once_for_multiple_selected_records() {
-    let file = NamedTempFile::new().unwrap();
-    let channels = channels::<String>(&["images", "padding"]);
-    let mut writer = WriteOptions::new()
-        .chunk_size(None)
-        .create(file.reopen().unwrap())
-        .unwrap();
-    writer
-        .write(&mcap::Message {
-            channel: channels[1].clone(),
-            sequence: 0,
-            log_time: 1000,
-            publish_time: 1000,
-            data: Cow::Owned(
-                <String as Message>::Codec::serialize(&"x".repeat(33 * 1024 * 1024)).unwrap(),
-            ),
-        })
-        .unwrap();
-    for time in 1..=2 {
-        writer
-            .write(&mcap::Message {
-                channel: channels[0].clone(),
-                sequence: time as u32,
-                log_time: time,
-                publish_time: time,
-                data: Cow::Owned(<String as Message>::Codec::serialize(&time.to_string()).unwrap()),
-            })
-            .unwrap();
-    }
-    writer.finish().unwrap();
-    drop(writer);
-    let mut recording = open(file.path());
+fn chunk_is_loaded_once_for_multiple_selected_records() {
+    let file = fixture_records(true, false, &[(0, 1, 1, 1), (0, 2, 2, 2)]);
+    let recording = open(file.path());
     let plan = Source::from(TopicSource::new(
         "/replay/images",
         TimeProjection::SourceTime,
@@ -937,7 +938,7 @@ fn oversized_cache_chunk_is_loaded_once_for_multiple_selected_records() {
     )
     .plan();
     assert_eq!(
-        records(&finish(&mut recording, &plan, Time::from_nanos(2))).len(),
+        records(&finish(&recording, &plan, Time::from_nanos(2))).len(),
         2
     );
     assert_eq!(
@@ -945,10 +946,44 @@ fn oversized_cache_chunk_is_loaded_once_for_multiple_selected_records() {
         2,
         "one index scan and one payload load"
     );
-    finish(&mut recording, &plan, Time::from_nanos(2));
+    finish(&recording, &plan, Time::from_nanos(2));
     assert_eq!(
         recording.decoded_chunks(),
-        3,
-        "cached index and one grouped payload load"
+        2,
+        "cached index and payload chunk reused"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_build_survives_dropped_waiter_and_coalesces_concurrent_waiters() {
+    let file = fixture_records(true, false, &[(0, 10, 100, 100), (1, 20, 200, 200)]);
+    let recording = open(file.path());
+    let guard = recording.acquire_build().await;
+    let cold = Source::from(projected("detections"))
+        .latest(plan::cursor())
+        .plan();
+    let mut a = PendingQuery::new(&recording, cold.clone(), Time::from_nanos(20)).unwrap();
+    let mut b = PendingQuery::new(&recording, cold, Time::from_nanos(20)).unwrap();
+    let (_, source) = a.advance(&recording).await.unwrap();
+    let source = source.unwrap();
+    let mut build = Box::pin(a.build_async(&recording, source));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(build.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(build);
+    drop(guard);
+    let (a, b) = tokio::join!(
+        a.build_async(&recording, source),
+        b.build_async(&recording, source)
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(
+        recording.cache.state.lock().stats.decoded_chunks,
+        1,
+        "one shared scan, despite dropped and concurrent waiters"
+    );
+    recording.shutdown().await;
 }

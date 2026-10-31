@@ -35,13 +35,22 @@ Write recordings to a temporary name and rename them to `.mcap` when complete to
 The index budget is shared across recordings, including active and building timestamp indexes.
 Idle indexes are evicted globally in least-recently-used order; queries that cannot fit return errors.
 Index builds are serialized across recordings, with parallel scanning within each build.
-Missing indexes wait asynchronously for the build mutex; a cancellation token stops that wait without polling.
+Queries share in-progress index builds and await them asynchronously.
 Running builds retain their owned mutex guard until they finish and check the same cancellation token while scanning.
-This is not a total memory limit: summaries, schemas, and decoded chunks use additional memory.
+This is not a total memory limit: summaries, schemas, selected payloads, replies, and decoder scratch buffers use additional memory.
 Dropping a recording queues index removal to one Tokio blocking task, without taking the cache lock.
 Scanning and sorting run outside that lock, so cleanup and cached lookups can proceed during builds.
 Removed allocations remain charged until freed.
 Shutdown signals all recordings before waiting for them, then drains the cleanup queue and awaits the cleanup task.
+
+Decoded chunks have a separate global byte budget, shared across recordings. Concurrent
+requests for a chunk share one decode and wait asynchronously. Least-recently-used
+completed chunks are evicted; buffers still held by queries remain charged until freed.
+In-flight decodes reserve their uncompressed size before allocating. A chunk larger
+than the configured budget returns an error; increase `--chunk-cache-mib` to fit it.
+Timestamp-index scans bypass this cache so scanning a recording does not evict the
+interactive working set. Chunk decoding, payload copying, evaluation, and response
+encoding share four blocking-work slots.
 
 ## Options
 
@@ -53,6 +62,7 @@ Pass options after `--` in the Cargo command above.
 | `--listen tcp/127.0.0.1:0` | Choose a router listen address; port `0` selects an available port. |
 | `--router tcp/127.0.0.1:7447` | Connect to an existing router instead of starting one. |
 | `--index-cache-mib 1024` | Global timestamp-index memory budget; defaults to 1 GiB (1024 MiB). |
+| `--chunk-cache-mib 256` | Global decoded-chunk buffer budget, including in-flight and pinned buffers; defaults to 256 MiB. |
 
 `--listen` and `--router` are mutually exclusive. Use `--help` for all options.
 

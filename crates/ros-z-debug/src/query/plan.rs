@@ -403,6 +403,61 @@ struct Reference {
 
 pub type LoadedRecord = std::result::Result<Arc<RawRecord>, String>;
 
+/// Index-only selection, ready for an adapter to load payloads without rerunning the plan.
+pub struct SelectedEvaluation {
+    evaluation: Evaluation<Reference>,
+    locations: Vec<(usize, usize)>,
+    topics: Vec<Option<TopicInfo>>,
+}
+
+impl SelectedEvaluation {
+    pub fn locations(&self) -> &[(usize, usize)] {
+        &self.locations
+    }
+
+    pub fn assemble(self, records: Vec<LoadedRecord>) -> Result<Evaluation> {
+        if records.len() != self.locations.len() {
+            return Err(query_error("payload loader returned invalid record count"));
+        }
+        let records: HashMap<_, _> = self.locations.into_iter().zip(records).collect();
+        let mut bytes = 0usize;
+        let mut loaded = HashMap::new();
+        let state = map_state(self.evaluation.state, &mut |reference: Reference| {
+            if let Some(sample) = loaded.get(&(reference.source, reference.slot)) {
+                return Ok(Clone::clone(sample));
+            }
+            let topic = self.topics[reference.source]
+                .as_ref()
+                .ok_or_else(|| query_error("selected source is not ready"))?;
+            let record = records[&(reference.source, reference.slot)]
+                .as_ref()
+                .map_err(query_error)?
+                .clone();
+            if record.time != reference.time {
+                return Err(query_error("payload timestamp differs from selected index"));
+            }
+            bytes = bytes.saturating_add(record.data.len());
+            if bytes as u64 > MAX_PAYLOAD_BYTES {
+                return Err(query_error("plan payload exceeds 32 MiB"));
+            }
+            let sample = Sample {
+                topic: topic.clone(),
+                record,
+            };
+            loaded.insert((reference.source, reference.slot), sample.clone());
+            Ok(sample)
+        });
+        Ok(Evaluation {
+            cursor: self.evaluation.cursor,
+            valid_for: self.evaluation.valid_for,
+            bounds: self.evaluation.bounds,
+            missing: self.evaluation.missing,
+            dependencies: self.evaluation.dependencies,
+            state,
+        })
+    }
+}
+
 impl QueryPlan {
     /// Limit selected rows before loading payloads, within the backend response limit.
     pub fn with_max_rows(mut self, max_rows: NonZeroUsize) -> Self {
@@ -583,22 +638,16 @@ impl QueryPlan {
         views: &[SourceState],
         mut load: impl FnMut(usize, usize) -> Result<Arc<RawRecord>>,
     ) -> Result<Evaluation> {
-        self.evaluate_batched(cursor, views, |locations| {
-            locations
-                .iter()
-                .map(|&(source, slot)| load(source, slot).map_err(|error| error.to_string()))
-                .collect()
-        })
+        let selected = self.select(cursor, views)?;
+        let records = selected
+            .locations()
+            .iter()
+            .map(|&(source, slot)| load(source, slot).map_err(|error| error.to_string()))
+            .collect();
+        selected.assemble(records)
     }
 
-    /// Selection is index-only. Disk adapters receive all unique locations at
-    /// once, allowing payload reads to be grouped by chunk without changing semantics.
-    pub fn evaluate_batched(
-        &self,
-        cursor: Time,
-        views: &[SourceState],
-        load: impl FnOnce(&[(usize, usize)]) -> Vec<LoadedRecord>,
-    ) -> Result<Evaluation> {
+    pub fn select(&self, cursor: Time, views: &[SourceState]) -> Result<SelectedEvaluation> {
         let sources = self.sources()?;
         if sources.len() != views.len() {
             return Err(query_error("plan source count mismatch"));
@@ -633,38 +682,6 @@ impl QueryPlan {
             _ => {}
         }
         let locations: Vec<_> = locations.into_iter().collect();
-        let records = load(&locations);
-        if records.len() != locations.len() {
-            return Err(query_error("payload loader returned invalid record count"));
-        }
-        let records: HashMap<_, _> = locations.into_iter().zip(records).collect();
-        let mut bytes = 0usize;
-        let mut loaded = HashMap::new();
-        let state = map_state(state, &mut |reference: Reference| {
-            if let Some(sample) = loaded.get(&(reference.source, reference.slot)) {
-                return Ok(Clone::clone(sample));
-            }
-            let SourceState::Ready(view) = &views[reference.source] else {
-                return Err(query_error("selected source is not ready"));
-            };
-            let record = records[&(reference.source, reference.slot)]
-                .as_ref()
-                .map_err(query_error)?
-                .clone();
-            if record.time != reference.time {
-                return Err(query_error("payload timestamp differs from selected index"));
-            }
-            bytes = bytes.saturating_add(record.data.len());
-            if bytes as u64 > MAX_PAYLOAD_BYTES {
-                return Err(query_error("plan payload exceeds 32 MiB"));
-            }
-            let sample = Sample {
-                topic: view.topic.clone(),
-                record,
-            };
-            loaded.insert((reference.source, reference.slot), sample.clone());
-            Ok(sample)
-        });
         let dependencies = sources
             .iter()
             .enumerate()
@@ -708,13 +725,23 @@ impl QueryPlan {
                 bounds = Some((view.index.time(0), view.index.time(view.index.len() - 1)));
             }
         }
-        Ok(Evaluation {
-            cursor,
-            valid_for,
-            bounds,
-            missing: evaluator.missing,
-            state,
-            dependencies,
+        Ok(SelectedEvaluation {
+            locations,
+            topics: views
+                .iter()
+                .map(|view| match view {
+                    SourceState::Ready(view) => Some(view.topic.clone()),
+                    _ => None,
+                })
+                .collect(),
+            evaluation: Evaluation {
+                cursor,
+                valid_for,
+                bounds,
+                missing: evaluator.missing,
+                state,
+                dependencies,
+            },
         })
     }
 }

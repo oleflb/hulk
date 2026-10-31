@@ -11,7 +11,7 @@ use color_eyre::{
     Report,
     eyre::{Context as _, OptionExt, Result},
 };
-use recording::{IndexCache, PendingQuery, QueryRecording, Recording};
+use recording::{ChunkCache, IndexCache, PendingQuery, QueryRecording, Recording};
 use ros_z::{
     config::RouterConfigBuilder,
     context::{Context, ContextBuilder},
@@ -55,6 +55,9 @@ struct Arguments {
     /// Global memory budget for lazy timestamp indexes, in MiB. Idle indexes are evicted.
     #[arg(long, default_value = "1024")]
     index_cache_mib: NonZeroUsize,
+    /// Global memory budget for decoded chunks, including in-flight and pinned buffers, in MiB.
+    #[arg(long, default_value = "256")]
+    chunk_cache_mib: NonZeroUsize,
 }
 
 impl Arguments {
@@ -111,21 +114,42 @@ async fn main() -> Result<()> {
 
     let (cache, cleanup) = IndexCache::new(index_budget)?;
     let cache = Arc::new(cache);
+    let chunk_budget = args
+        .chunk_cache_mib
+        .get()
+        .checked_mul(1024 * 1024)
+        .ok_or_eyre("chunk cache size overflow")?;
+    let chunks = Arc::new(ChunkCache::new(chunk_budget)?);
     let result = async {
         if args.file.is_dir() {
-            return directory::watch(&args.file, &namespace, &context, Arc::clone(&cache), router)
-                .await;
+            return directory::watch(
+                &args.file,
+                &namespace,
+                &context,
+                Arc::clone(&cache),
+                Arc::clone(&chunks),
+                router,
+            )
+            .await;
         }
 
         let (node, recording, name) =
             open_recording(&context, &args.file, &namespace, router).await?;
-        serve_queries(&node, recording, name, Arc::clone(&cache), async {
-            let _ = ctrl_c().await;
-        })
+        serve_queries(
+            &node,
+            recording,
+            name,
+            Arc::clone(&cache),
+            Arc::clone(&chunks),
+            async {
+                let _ = ctrl_c().await;
+            },
+        )
         .await
     }
     .await;
 
+    chunks.shutdown().await;
     drop(cache);
     cleanup.await.wrap_err("joining index cleanup task")??;
     result
@@ -165,11 +189,18 @@ async fn serve_queries(
     recording: Recording,
     name: String,
     cache: Arc<IndexCache>,
+    chunks: Arc<ChunkCache>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let cancel = CancellationToken::new();
     let _cancel_on_drop = cancel.clone().drop_guard();
-    let recording = QueryRecording::new(recording, name, cancel.clone(), cache)?;
+    let recording = Arc::new(QueryRecording::new(
+        recording,
+        name,
+        cancel.clone(),
+        cache,
+        Arc::clone(&chunks),
+    )?);
     let catalog = recording.info.clone();
     tokio::pin!(shutdown);
 
@@ -182,11 +213,12 @@ async fn serve_queries(
         .map_err(Error::other)
         .wrap_err("declaring replay queryable")?;
     let (sender, receiver) = mpsc::channel(16);
+    let stopped = recording.cancel_token();
     let mut worker = spawn(run_query_worker(
         recording,
         receiver,
         node.namespace().to_owned(),
-        cancel.clone(),
+        stopped,
     ));
     tracing::info!(path = %catalog.name, namespace = %node.namespace(), "serving recording");
     let mut replies = JoinSet::new();
@@ -202,7 +234,7 @@ async fn serve_queries(
                     Err(error) => break Err(error),
                 };
                 let responses = dispatch_request(&incoming, &catalog, &sender);
-                replies.spawn(reply_to_query(incoming, key.clone(), responses));
+                replies.spawn(reply_to_query(incoming, key.clone(), responses, Arc::clone(&chunks)));
             }
         }
     };
@@ -216,7 +248,7 @@ async fn serve_queries(
 }
 
 async fn run_query_worker(
-    mut recording: QueryRecording,
+    recording: Arc<QueryRecording>,
     mut requests: mpsc::Receiver<PlanRequest>,
     namespace: String,
     stopped: CancellationToken,
@@ -234,70 +266,58 @@ async fn run_query_worker(
             continue;
         }
 
-        recording = process_request(recording, request, &namespace, &stopped).await?;
+        tokio::select! {
+            biased;
+            _ = stopped.cancelled() => break,
+            _ = request.reply.closed() => {},
+            _ = process_request(&recording, &request, &namespace) => {},
+        }
     }
 
+    recording.shutdown().await;
     spawn_blocking(move || drop(recording)).await?;
 
     Ok(())
 }
 
 #[instrument(skip_all, fields(path = %recording.info.name, namespace = %namespace))]
-async fn process_request(
-    recording: QueryRecording,
-    request: PlanRequest,
-    namespace: &str,
-    stopped: &CancellationToken,
-) -> Result<QueryRecording> {
+async fn process_request(recording: &Arc<QueryRecording>, request: &PlanRequest, namespace: &str) {
     if request.instance != recording.info.instance {
         let _ = request.reply.send(Response::RecordingChanged).await;
-        return Ok(recording);
+        return;
     }
 
-    let query = match PendingQuery::new(&recording, request.plan, request.cursor) {
+    let mut query = match PendingQuery::new(recording, request.plan.clone(), request.cursor) {
         Ok(query) => query,
         Err(error) => {
             reply_query_error(&recording.info.name, &request.reply, error).await;
-            return Ok(recording);
+            return;
         }
     };
-    // Keep these together: tuple drop order releases query pins before recording cleanup.
-    let mut work = (query, recording);
-    let mut build = None;
     let result = loop {
-        let reply = request.reply.clone();
-        let (next, step) = spawn_blocking(move || {
-            let step = (|| {
-                if let Some((source, guard)) = build {
-                    work.0.build(&work.1, source, guard)?;
-                }
-                work.0.advance(&mut work.1, |result| {
-                    reply.blocking_send(Response::PlanData(result)).is_ok()
-                })
-            })();
-            (work, step)
-        })
-        .await?;
-        work = next;
-        let source = match step {
-            Ok(Some(source)) => source,
-            finished => break finished.map(|_| ()),
+        let (evaluation, source) = match query.advance(recording).await {
+            Ok(step) => step,
+            Err(error) => break Err(error),
         };
-
-        let guard = tokio::select! {
-            biased;
-            _ = stopped.cancelled() => break Ok(()),
-            _ = request.reply.closed() => break Ok(()),
-            guard = work.1.acquire_build() => guard,
+        if request
+            .reply
+            .send(Response::PlanData(evaluation))
+            .await
+            .is_err()
+        {
+            break Ok(());
+        }
+        let Some(source) = source else {
+            break Ok(());
         };
-        build = Some((source, guard));
+        if let Err(error) = query.build_async(recording, source).await {
+            break Err(error);
+        }
     };
-    let (query, recording) = work;
     drop(query);
     if let Err(error) = result {
         reply_query_error(&recording.info.name, &request.reply, error).await;
     }
-    Ok(recording)
 }
 
 async fn reply_query_error(name: &str, reply: &mpsc::Sender<Response>, error: Report) {
@@ -337,11 +357,16 @@ fn dispatch_request(
     Ok(responses)
 }
 
-async fn reply_to_query(incoming: Query, key: String, responses: Result<mpsc::Receiver<Response>>) {
+async fn reply_to_query(
+    incoming: Query,
+    key: String,
+    responses: Result<mpsc::Receiver<Response>>,
+    chunks: Arc<ChunkCache>,
+) {
     let result: Result<()> = async {
         let mut responses = responses?;
         while let Some(response) = responses.recv().await {
-            let bytes = encode(&response)?;
+            let bytes = chunks.blocking(move || encode(&response)).await??;
             if incoming.reply(&key, bytes).await.is_err() {
                 return Ok(());
             }
@@ -364,8 +389,13 @@ mod tests {
         let defaults = Arguments::try_parse_from(["mcap-replay", "test.mcap"]).unwrap();
         assert_eq!(defaults.listen, "tcp/0.0.0.0:7447");
         assert_eq!(defaults.index_cache_mib.get(), 1024);
+        assert_eq!(defaults.chunk_cache_mib.get(), 256);
         assert!(
             Arguments::try_parse_from(["mcap-replay", "test.mcap", "--index-cache-mib", "0"])
+                .is_err()
+        );
+        assert!(
+            Arguments::try_parse_from(["mcap-replay", "test.mcap", "--chunk-cache-mib", "0"])
                 .is_err()
         );
         assert!(

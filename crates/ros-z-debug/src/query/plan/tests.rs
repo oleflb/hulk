@@ -91,6 +91,55 @@ fn evaluate(plan: &QueryPlan, data: &[(&str, &[i64])], cursor: i64) -> Evaluatio
 }
 
 #[test]
+fn selected_evaluation_can_load_after_views_are_released() {
+    let plan = source("/images")
+        .latest(cursor())
+        .attach([exact_input("/overlay")])
+        .plan();
+    let data: &[(&str, &[i64])] = &[("/images", &[10, 20]), ("/overlay", &[20])];
+    let (selected, records) = {
+        let views = views(&plan, data);
+        let selected = plan.select(Time::from_nanos(20), &views).unwrap();
+        let records = selected
+            .locations()
+            .iter()
+            .map(|&(source, slot)| {
+                let SourceState::Ready(view) = &views[source] else {
+                    panic!("ready source")
+                };
+                Ok(Arc::new(RawRecord {
+                    publication: None,
+                    id: slot as u64,
+                    time: view.index.time(slot),
+                    source_time: Time::from_nanos(1000),
+                    log_time: None,
+                    data: Arc::from([]),
+                }))
+            })
+            .collect();
+        (selected, records)
+    };
+    let actual = selected.assemble(records).unwrap();
+    let State::Ready(Value::Frames(frames)) = actual.state else {
+        panic!("frames")
+    };
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].primary.topic.name, "/images");
+    assert_eq!(frames[0].primary.record.time, Time::from_nanos(20));
+    assert_eq!(frames[0].inputs.len(), 1);
+    let State::Ready(overlay) = &frames[0].inputs[0] else {
+        panic!("overlay")
+    };
+    assert_eq!(overlay.len(), 1);
+    assert_eq!(overlay[0].topic.name, "/overlay");
+    assert_eq!(overlay[0].record.time, Time::from_nanos(20));
+    let selected = plan
+        .select(Time::from_nanos(20), &views(&plan, data))
+        .unwrap();
+    assert!(selected.assemble(Vec::new()).is_err());
+}
+
+#[test]
 fn incompatible_overlay_timestamps_do_not_select_older_images() {
     let images = source("/images");
     let data: &[(&str, &[i64])] = &[("/images", &[10, 20]), ("/overlay", &[10])];

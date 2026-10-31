@@ -1,17 +1,18 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use color_eyre::eyre::{OptionExt, Result, ensure};
+use parking_lot::Mutex;
 use ros_z::time::Time;
 use ros_z_debug::query::{
     Coverage, MAX_PAYLOAD_BYTES, RawRecord, SourceCoverage, TopicInfo,
     plan::{Evaluation, LoadedRecord, QueryPlan, SourceState, SourceView, State, TopicSource},
     remote::RecordingInfo,
 };
-use tokio::sync::OwnedMutexGuard;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{OwnedMutexGuard, watch};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
-use super::{Recording, SnapshotChunk};
+use super::{ChunkCache, Recording, SnapshotChunk};
 pub use index::IndexCache;
 use index::{INDEX_WORKERS, Index, IndexEntry, IndexKey};
 
@@ -22,13 +23,18 @@ pub(super) mod tests;
 /// Coordinates progressive queries; each evaluation pins its acquired indexes.
 pub struct QueryRecording {
     cancel: CancellationToken,
-    recording: Recording,
+    recording: Arc<Recording>,
     publication_publisher: [u8; 16],
     cache: Arc<IndexCache>,
+    pub(crate) chunks: Arc<ChunkCache>,
+    builds: Mutex<HashMap<IndexKey, watch::Receiver<Option<IndexResult>>>>,
+    tasks: TaskTracker,
     owner: Uuid,
     index_workers: usize,
     pub info: RecordingInfo,
 }
+
+type IndexResult = std::result::Result<Arc<Index>, String>;
 
 pub struct PendingQuery {
     plan: QueryPlan,
@@ -40,11 +46,16 @@ pub struct PendingQuery {
 }
 
 impl QueryRecording {
+    pub(crate) fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     pub fn new(
         recording: Recording,
         name: String,
         cancel: CancellationToken,
         cache: Arc<IndexCache>,
+        chunks: Arc<ChunkCache>,
     ) -> Result<Self> {
         let instance = Uuid::new_v4();
         let info = RecordingInfo {
@@ -66,9 +77,12 @@ impl QueryRecording {
         };
         Ok(Self {
             cancel,
-            recording,
+            recording: Arc::new(recording),
             publication_publisher: *instance.as_bytes(),
             cache,
+            chunks,
+            builds: Mutex::new(HashMap::new()),
+            tasks: TaskTracker::new(),
             owner: instance,
             index_workers: INDEX_WORKERS,
             info,
@@ -85,7 +99,7 @@ impl QueryRecording {
     }
 
     fn source_view(
-        &mut self,
+        &self,
         key: Option<&IndexKey>,
         pinned: &mut Option<Arc<Index>>,
         failure: Option<&String>,
@@ -142,65 +156,175 @@ impl QueryRecording {
         }))
     }
 
-    fn load_records(
-        &mut self,
+    async fn load_records(
+        self: &Arc<Self>,
         keys: &[Option<IndexKey>],
         pinned: &[Option<Arc<Index>>],
         locations: &[(usize, usize)],
-    ) -> Vec<LoadedRecord> {
+    ) -> Result<Vec<LoadedRecord>> {
         let mut ordered: Vec<_> = locations
             .iter()
             .enumerate()
             .map(|(output, &(source, slot))| {
-                let entry = pinned[source].as_ref().expect("pinned source").entries[slot];
-                (entry.chunk_id, source, slot, output)
+                let index = pinned[source]
+                    .as_ref()
+                    .ok_or_eyre("selected source is not pinned")?;
+                Ok((index.entries[slot].chunk_id, source, slot, output))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         ordered.sort_unstable();
         let mut results = vec![None; locations.len()];
-        let mut chunk = None;
         let mut bytes = 0;
-        for (chunk_id, source, slot, output) in ordered {
+        for group in ordered.chunk_by(|a, b| a.0 == b.0) {
             if bytes >= MAX_PAYLOAD_BYTES as usize {
-                results[output] = Some(Err("plan payload exceeds 32 MiB".into()));
+                for &(_, _, _, output) in group {
+                    results[output] = Some(Err("plan payload exceeds 32 MiB".into()));
+                }
                 continue;
             }
-            if chunk.as_ref().is_none_or(|(id, _)| *id != chunk_id) {
-                chunk = Some((
-                    chunk_id,
-                    self.recording
-                        .snapshot_chunk(chunk_id, &self.cancel)
-                        .map_err(|error| format!("{error:#}")),
-                ));
+            let chunk = self
+                .chunks
+                .get(
+                    self.owner,
+                    self.recording.clone(),
+                    group[0].0,
+                    self.cancel.clone(),
+                )
+                .await;
+            let locations: Vec<_> = group
+                .iter()
+                .map(|&(_, source, slot, output)| {
+                    let key = keys[source]
+                        .as_ref()
+                        .ok_or_eyre("selected source has no index key")?;
+                    let index = pinned[source]
+                        .as_ref()
+                        .ok_or_eyre("selected source is not pinned")?;
+                    Ok((key.0, index.entries[slot], output))
+                })
+                .collect::<Result<_>>()?;
+            let recording = Arc::clone(self);
+            let loaded = self
+                .chunks
+                .blocking(move || recording.copy_records(chunk, locations, bytes))
+                .await;
+            match loaded {
+                Ok((total, loaded)) => {
+                    bytes = total;
+                    for (output, record) in loaded {
+                        results[output] = Some(record);
+                    }
+                }
+                Err(error) => {
+                    for &(_, _, _, output) in group {
+                        results[output] = Some(Err(format!("{error:#}")));
+                    }
+                }
             }
-            let key = keys[source].as_ref().expect("ready source key");
-            let entry = pinned[source].as_ref().expect("pinned source").entries[slot];
-            let loaded = match &chunk.as_ref().expect("loaded chunk").1 {
-                Ok(chunk) => self
-                    .record(key.0, entry, chunk)
-                    .map_err(|error| format!("{error:#}")),
-                Err(error) => Err(error.clone()),
-            };
-            if let Err(error) = &loaded {
-                tracing::warn!(recording = %self.info.name, %error, "reading query payload failed");
-            }
-            if let Ok(record) = &loaded {
-                bytes += record.data.len();
-            }
-            results[output] = Some(if bytes > MAX_PAYLOAD_BYTES as usize {
-                Err("plan payload exceeds 32 MiB".into())
-            } else {
-                loaded
-            });
         }
         results
             .into_iter()
-            .map(|record| record.expect("visited payload location"))
+            .map(|record| record.ok_or_eyre("selected payload location was not loaded"))
             .collect()
+    }
+
+    fn copy_records(
+        &self,
+        chunk: Result<Arc<SnapshotChunk>>,
+        locations: Vec<(u16, IndexEntry, usize)>,
+        mut bytes: usize,
+    ) -> (usize, Vec<(usize, LoadedRecord)>) {
+        let mut loaded = Vec::with_capacity(locations.len());
+        for (channel, entry, output) in locations {
+            let record = if bytes >= MAX_PAYLOAD_BYTES as usize {
+                Err("plan payload exceeds 32 MiB".into())
+            } else {
+                match &chunk {
+                    Ok(chunk) => self
+                        .record(channel, entry, chunk)
+                        .map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            };
+            if let Err(error) = &record {
+                tracing::warn!(recording = %self.info.name, %error, "reading query payload failed");
+            }
+            if let Ok(record) = &record {
+                bytes += record.data.len();
+            }
+            loaded.push((
+                output,
+                if bytes > MAX_PAYLOAD_BYTES as usize {
+                    Err("plan payload exceeds 32 MiB".into())
+                } else {
+                    record
+                },
+            ));
+        }
+        (bytes, loaded)
     }
 
     pub async fn acquire_build(&self) -> OwnedMutexGuard<()> {
         self.cache.acquire_build().await
+    }
+
+    async fn index(self: &Arc<Self>, key: IndexKey) -> IndexResult {
+        if let Some(index) = self.cache.get(&self.owner, &key) {
+            return Ok(index);
+        }
+        let mut result = {
+            let mut builds = self.builds.lock();
+            builds
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let (sender, result) = watch::channel(None);
+                    let recording = Arc::clone(self);
+                    self.tasks.spawn(async move {
+                        let build = recording.build_index(key.clone()).await;
+                        sender.send_replace(Some(build));
+                        recording.builds.lock().remove(&key);
+                    });
+                    result
+                })
+                .clone()
+        };
+        loop {
+            if let Some(index) = result.borrow_and_update().clone() {
+                return index;
+            }
+            if result.changed().await.is_err() {
+                return Err("index builder stopped".into());
+            }
+        }
+    }
+
+    async fn build_index(self: &Arc<Self>, key: IndexKey) -> IndexResult {
+        let guard = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err("indexing cancelled".into()),
+            guard = self.acquire_build() => guard,
+        };
+        let recording = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            recording.cache.index(
+                &recording.owner,
+                &recording.recording,
+                &recording.cancel,
+                recording.index_workers,
+                &key,
+                guard,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.cancel.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
+        self.chunks.remove_recording(self.owner);
     }
 }
 
@@ -226,40 +350,11 @@ impl PendingQuery {
         })
     }
 
-    pub fn build(
-        &mut self,
-        recording: &QueryRecording,
-        source: usize,
-        guard: OwnedMutexGuard<()>,
-    ) -> Result<()> {
-        let key = self
-            .keys
-            .get(source)
-            .and_then(Option::as_ref)
-            .ok_or_eyre("missing pending source")?;
-        match recording.cache.index(
-            &recording.owner,
-            &recording.recording,
-            &recording.cancel,
-            recording.index_workers,
-            key,
-            guard,
-        ) {
-            Ok(index) => self.pinned[source] = Some(index),
-            Err(error) => {
-                tracing::warn!(recording = %recording.info.name, error = %format!("{error:#}"), "building query index failed");
-                self.failures[source] = Some(format!("{error:#}"));
-            }
-        }
-        Ok(())
-    }
-
     /// Evaluate cached inputs before asking the async driver for the build lock.
-    pub fn advance(
+    pub async fn advance(
         &mut self,
-        recording: &mut QueryRecording,
-        mut emit: impl FnMut(Evaluation) -> bool,
-    ) -> Result<Option<usize>> {
+        recording: &Arc<QueryRecording>,
+    ) -> Result<(Evaluation, Option<usize>)> {
         ensure!(!recording.cancel.is_cancelled(), "query cancelled");
         let views: Vec<_> = self
             .keys
@@ -270,11 +365,25 @@ impl PendingQuery {
                 recording.source_view(key.as_ref(), pinned, failure.as_ref())
             })
             .collect();
-        let result = self
-            .plan
-            .evaluate_batched(self.cursor, &views, |locations| {
-                recording.load_records(&self.keys, &self.pinned, locations)
-            })?;
+        let plan = self.plan.clone();
+        let cursor = self.cursor;
+        // Tuple drop order releases index views before recording cleanup, even on panic.
+        let input = (views, recording.clone());
+        let selected = recording
+            .chunks
+            .blocking(move || {
+                let selected = plan.select(cursor, &input.0);
+                drop(input);
+                selected
+            })
+            .await??;
+        let records = recording
+            .load_records(&self.keys, &self.pinned, selected.locations())
+            .await?;
+        let result = recording
+            .chunks
+            .blocking(move || selected.assemble(records))
+            .await??;
         let pending = result
             .dependencies
             .iter()
@@ -284,7 +393,6 @@ impl PendingQuery {
                     .iter()
                     .position(|source| source == &dependency.source)
             });
-        drop(views);
         for (source, pin) in self.sources.iter().zip(&mut self.pinned) {
             if !result
                 .dependencies
@@ -294,15 +402,33 @@ impl PendingQuery {
                 *pin = None;
             }
         }
-        if !emit(result) {
-            return Ok(None);
+        Ok((result, pending))
+    }
+
+    pub async fn build_async(
+        &mut self,
+        recording: &Arc<QueryRecording>,
+        source: usize,
+    ) -> Result<()> {
+        let key = self
+            .keys
+            .get(source)
+            .and_then(Option::as_ref)
+            .ok_or_eyre("missing pending source")?;
+        match recording.index(key.clone()).await {
+            Ok(index) => self.pinned[source] = Some(index),
+            Err(error) => {
+                tracing::warn!(recording = %recording.info.name, %error, "building query index failed");
+                self.failures[source] = Some(error);
+            }
         }
-        Ok(pending)
+        Ok(())
     }
 }
 
 impl Drop for QueryRecording {
     fn drop(&mut self) {
         self.cache.remove_recording(self.owner);
+        self.chunks.remove_recording(self.owner);
     }
 }
