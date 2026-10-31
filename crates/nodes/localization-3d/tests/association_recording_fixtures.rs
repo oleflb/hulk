@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -97,6 +97,44 @@ fn real_recording_association_fixtures_match_expected_landmarks() -> Result<(), 
 }
 
 #[test]
+fn extractor_preserves_chunk_crc_validation() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    let mut writer = mcap::WriteOptions::new()
+        .compression(None)
+        .create(std::io::Cursor::new(&mut bytes))?;
+    let channel_id =
+        writer.add_channel(0, "unrelated", "raw", &std::collections::BTreeMap::new())?;
+    writer.write_to_known_channel(
+        &mcap::records::MessageHeader {
+            channel_id,
+            sequence: 0,
+            log_time: 10,
+            publish_time: 10,
+        },
+        b"ignored",
+    )?;
+    writer.finish()?;
+    drop(writer);
+    assert!(extract_fixtures(&bytes)?.is_empty());
+
+    let summary = mcap::Summary::read(&bytes)?.ok_or("missing test recording summary")?;
+    // Chunk headers begin with two timestamps and an uncompressed size, then the CRC.
+    let crc_offset = usize::try_from(summary.chunk_indexes[0].chunk_start_offset)? + 9 + 3 * 8;
+    let crc = u32::from_le_bytes(bytes[crc_offset..crc_offset + 4].try_into()?);
+    let wrong_crc = crc.wrapping_add(1).max(1);
+    bytes[crc_offset..crc_offset + 4].copy_from_slice(&wrong_crc.to_le_bytes());
+
+    let error = extract_fixtures(&bytes)
+        .err()
+        .ok_or("corrupt chunk was accepted")?;
+    assert!(matches!(
+        error.downcast_ref::<mcap::McapError>(),
+        Some(mcap::McapError::BadChunkCrc { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 #[ignore = "extracts compact fixtures from LOCALIZATION_3D_ASSOCIATION_RECORDING"]
 // Regenerate with:
 // LOCALIZATION_3D_ASSOCIATION_RECORDING=/path/to/recording.mcap \
@@ -109,7 +147,7 @@ fn extract_association_fixtures_from_recording() -> Result<(), Box<dyn Error>> {
             "set LOCALIZATION_3D_ASSOCIATION_RECORDING to the MCAP recording path",
         )
     })?;
-    let fixtures = extract_fixtures(Path::new(&recording_path))?;
+    let fixtures = extract_fixtures(&fs::read(recording_path)?)?;
     if fixtures.is_empty() {
         return Err("no matching association fixtures found in recording".into());
     }
@@ -118,14 +156,16 @@ fn extract_association_fixtures_from_recording() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn extract_fixtures(path: &Path) -> Result<Vec<AssociationFixture>, Box<dyn Error>> {
-    let bytes = fs::read(path)?;
+fn extract_fixtures(bytes: &[u8]) -> Result<Vec<AssociationFixture>, Box<dyn Error>> {
     let mut cameras = Vec::new();
     let mut detections = Vec::new();
     let mut debugs = Vec::new();
     let mut stats = ExtractionStats::default();
 
-    for (order, message) in MessageStream::new(&bytes)?.enumerate() {
+    // MCAP 0.26 no longer validates chunk CRCs by default.
+    let messages =
+        MessageStream::new_with_options(bytes, mcap::read::Options::ValidateChunkCrcs.into())?;
+    for (order, message) in messages.enumerate() {
         let message = message?;
         let log_time = system_time_from_nanos(message.log_time);
         match message.channel.topic.as_str() {

@@ -343,6 +343,32 @@ impl Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{SeekFrom, Write};
+
+    #[test]
+    fn malformed_compressed_chunk_returns_an_error_instead_of_panicking() -> Result<()> {
+        let file = query::tests::fixture_records(true, false, &[(0, 10, 100, 100)]);
+        let recording = Recording::open(file.path(), "/replay")?;
+        let chunk = &recording.summary.chunk_indexes[0];
+        assert!(!chunk.compression.is_empty());
+
+        // The on-disk chunk header stores its uncompressed size after the two timestamps.
+        let mut writer = file.reopen()?;
+        writer.seek(SeekFrom::Start(chunk.chunk_start_offset + 9 + 2 * 8))?;
+        writer.write_all(&(chunk.uncompressed_size - 1).to_le_bytes())?;
+
+        let error = Recording::scan_chunk_at(&recording.file, chunk, || false, |_, _, _| Ok(()))
+            .err()
+            .ok_or_eyre("malformed compressed chunk was accepted")?;
+        assert!(
+            matches!(
+                error.downcast_ref::<mcap::McapError>(),
+                Some(mcap::McapError::DecompressionError(_))
+            ),
+            "{error:#}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn positional_scan_honors_cancellation_without_moving_the_file_cursor() {
