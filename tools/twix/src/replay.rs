@@ -20,8 +20,6 @@ use tokio::{
 
 use crate::backend::RobotBackend;
 
-const SCRUB_INTERVAL: Duration = Duration::from_millis(125);
-
 #[derive(Clone, Debug)]
 pub struct ReplayStatus {
     pub instance: String,
@@ -42,7 +40,6 @@ pub struct ReplaySession {
     cursor: Option<CursorHandle>,
     remote: Option<Arc<RemoteMcap>>,
     playback: Option<watch::Sender<(u64, bool, Instant)>>,
-    scrub_preview_at: Option<Instant>,
 }
 
 impl ReplaySession {
@@ -51,7 +48,6 @@ impl ReplaySession {
     }
 
     pub fn seek(&mut self, position: u64) {
-        self.scrub_preview_at = None;
         let Some(status) = &mut self.status else {
             return;
         };
@@ -65,34 +61,7 @@ impl ReplaySession {
         }
     }
 
-    pub fn scrub_to(&mut self, position: u64) {
-        self.scrub_to_at(position, Instant::now());
-    }
-
-    fn scrub_to_at(&mut self, position: u64, now: Instant) {
-        let Some(status) = &mut self.status else {
-            return;
-        };
-        status.position = position.clamp(status.start, status.end);
-        if self
-            .scrub_preview_at
-            .is_none_or(|last| now.duration_since(last) >= SCRUB_INTERVAL)
-        {
-            self.seek(position);
-            self.scrub_preview_at = Some(now);
-        }
-    }
-
-    pub fn finish_scrub(&mut self) {
-        if self.scrub_preview_at.take().is_some()
-            && let Some(position) = self.position()
-        {
-            self.seek(position);
-        }
-    }
-
     pub fn set_playing(&mut self, playing: bool) {
-        self.finish_scrub();
         let Some(status) = &mut self.status else {
             return;
         };
@@ -108,7 +77,6 @@ impl ReplaySession {
         self.cursor = None;
         self.remote = None;
         self.playback = None;
-        self.scrub_preview_at = None;
     }
 
     pub fn update(&mut self, context: &Context, backend: &RobotBackend) {
@@ -196,9 +164,7 @@ impl ReplaySession {
                 status.start = start.as_nanos() as u64;
                 status.end = end.as_nanos() as u64;
             }
-            if self.scrub_preview_at.is_none()
-                && let Cursor::At(time) = cursor.position().cursor
-            {
+            if let Cursor::At(time) = cursor.position().cursor {
                 status.position = time.as_nanos() as u64;
                 if status.position >= status.end && status.playing {
                     status.playing = false;
@@ -216,19 +182,6 @@ impl ReplaySession {
     }
 
     pub fn dispatch(&mut self, context: &Context, backend: &RobotBackend) {
-        // Finish even if the pointer was released outside the timeline or its tab was closed.
-        if self.scrub_preview_at.is_some() {
-            if context.input(|input| input.focused && input.pointer.primary_down()) {
-                if let Some(position) = self.position() {
-                    self.scrub_to(position);
-                }
-                if let Some(last) = self.scrub_preview_at {
-                    context.request_repaint_after(SCRUB_INTERVAL.saturating_sub(last.elapsed()));
-                }
-            } else {
-                self.finish_scrub();
-            }
-        }
         if self.status.is_none()
             && self.request.is_none()
             && self.retry_at.is_none_or(|time| Instant::now() >= time)
@@ -292,6 +245,14 @@ mod tests {
             replay.cursor.as_ref().unwrap().position().cursor,
             Cursor::At(Time::from_nanos(20))
         );
+        for position in [11, 12] {
+            replay.seek(position);
+            assert_eq!(replay.position(), Some(position));
+            assert_eq!(
+                replay.cursor.as_ref().unwrap().position().cursor,
+                Cursor::At(Time::from_nanos(position as i64))
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -327,62 +288,5 @@ mod tests {
         replay.seek(15);
         assert_eq!(cursor.position().revision, revision);
         assert!(!replay.status.as_ref().unwrap().playing);
-    }
-
-    #[test]
-    fn scrubbing_coalesces_at_eight_hz_and_release_flushes_immediately() {
-        let mut replay = session();
-        replay.status.as_mut().unwrap().end = 1_000;
-        replay.set_playing(true);
-        let cursor = replay.cursor.as_ref().unwrap().clone();
-        let now = Instant::now();
-        replay.scrub_to_at(11, now);
-        assert!(!replay.status.as_ref().unwrap().playing);
-        let revision = cursor.position().revision;
-        for millis in 1..125 {
-            replay.scrub_to_at(11 + millis, now + Duration::from_millis(millis));
-            assert_eq!(
-                replay.position(),
-                Some(11 + millis),
-                "playhead follows every move"
-            );
-            assert_eq!(
-                cursor.position().revision,
-                revision,
-                "pending moves must not invalidate previews"
-            );
-        }
-        assert_eq!(cursor.position().cursor, Cursor::At(Time::from_nanos(11)));
-        replay.scrub_to_at(200, now + SCRUB_INTERVAL);
-        assert_eq!(cursor.position().cursor, Cursor::At(Time::from_nanos(200)));
-        assert_eq!(cursor.position().revision, revision + 1);
-        replay.scrub_to_at(250, now + SCRUB_INTERVAL + Duration::from_millis(1));
-        replay.finish_scrub();
-        assert_eq!(cursor.position().cursor, Cursor::At(Time::from_nanos(250)));
-        assert!(replay.scrub_preview_at.is_none());
-        replay.finish_scrub();
-        assert_eq!(
-            cursor.position().revision,
-            revision + 2,
-            "release is idempotent"
-        );
-
-        replay.scrub_to_at(300, now);
-        replay.scrub_to_at(350, now + Duration::from_millis(1));
-        replay.seek(400);
-        replay.finish_scrub();
-        assert_eq!(
-            cursor.position().cursor,
-            Cursor::At(Time::from_nanos(400)),
-            "explicit seeks supersede pending scrubs"
-        );
-        replay.scrub_to_at(500, now);
-        replay.scrub_to_at(550, now + Duration::from_millis(1));
-        replay.set_playing(true);
-        assert_eq!(cursor.position().cursor, Cursor::At(Time::from_nanos(550)));
-        assert!(replay.status.as_ref().unwrap().playing);
-        replay.scrub_to_at(600, now);
-        replay.retry();
-        assert!(replay.scrub_preview_at.is_none());
     }
 }
