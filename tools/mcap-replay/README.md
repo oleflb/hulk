@@ -12,6 +12,12 @@ The server starts a Zenoh router and prints a Twix connection command:
 ./twix /replay --router tcp/127.0.0.1:7447
 ```
 
+The embedded router allows up to 60 seconds of transmit congestion before closing
+a connection, so image replies can finish over slow or lossy links. With
+`--router`, configure the external router's
+`transport/link/tx/queue/congestion_control/block/wait_before_close` separately
+(microseconds). This prevents premature disconnects; it does not improve link throughput.
+
 Recordings need a summary and chunk indexes. Recover/reindex incomplete recordings first.
 
 ## Watch a directory

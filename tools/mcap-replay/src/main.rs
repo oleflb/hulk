@@ -69,6 +69,11 @@ impl Arguments {
         } else {
             let config = RouterConfigBuilder::new()
                 .with_listen_endpoint(&self.listen)
+                .with_override(
+                    "transport/link/tx/queue/congestion_control/block/wait_before_close",
+                    serde_json::json!(60_000_000),
+                    "Allow large recording replies to finish over slow or lossy links",
+                )
                 .build_config()
                 .map_err(Error::other)
                 .wrap_err("configuring embedded router")?;
