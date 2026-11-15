@@ -20,6 +20,11 @@ blocking worker and the newest pending detection, with stale-result checks befor
 publication. Estimation, calibration, intrinsic optimization, and visual acceptance
 checks are unchanged.
 
+Localization ingests measurements as they arrive and solves dirty graphs on
+`solver.solve_interval` ticks (default 25 ms / 40 Hz). Missed ticks are skipped,
+not replayed. This interval is live-updatable; changing it restarts the cadence
+without discarding pending measurements. Lifecycle deadlines remain independent.
+
 ## Configuration
 
 The shipped timing, calibration, noise, and bias settings are in [`localization3d.json5`](https://github.com/HULKs/hulk/blob/main/etc/parameters/base/localization3d.json5).

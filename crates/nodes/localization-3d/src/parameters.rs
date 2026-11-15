@@ -104,6 +104,8 @@ impl Default for ModelParameters {
 #[derive(Clone, Debug, Deserialize, Serialize, Message, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SolverParameters {
+    /// Live node solve cadence; unchanged graphs are not solved.
+    pub solve_interval: Duration,
     pub max_trials: usize,
     pub max_iterations: usize,
     pub gradient_tolerance: f64,
@@ -113,6 +115,7 @@ pub struct SolverParameters {
 impl Default for SolverParameters {
     fn default() -> Self {
         Self {
+            solve_interval: Duration::from_millis(25),
             max_trials: 8,
             max_iterations: 20,
             gradient_tolerance: 1e-3,
@@ -359,6 +362,7 @@ impl Localization3dParameters {
             t.max_imu_gap,
             t.max_camera_gap,
             t.startup_kinematics_freshness,
+            self.solver.solve_interval,
             self.imu_preintegration.reference_duration,
         ] {
             if duration.is_zero() || duration.as_nanos() > i64::MAX as u128 {
@@ -643,6 +647,9 @@ mod tests {
         invalid.field_containment_sigma = 1.0e-250;
         assert!(invalid.validate().is_err());
         for timeout in [Duration::ZERO, Duration::MAX] {
+            invalid = parameters.clone();
+            invalid.solver.solve_interval = timeout;
+            assert!(invalid.validate().is_err());
             invalid = parameters.clone();
             invalid.tracking_timeout = timeout;
             assert!(invalid.validate().is_err());
