@@ -31,6 +31,7 @@
     containment_tau: 0.5, // segment sampling fraction, [0, 1]
   },
   solver: {
+    solve_interval: { secs: 0, nanos: 25000000 }, // Live cadence: 40 Hz, only when dirty.
     max_trials: 8,
     max_iterations: 20, // Allow recovery candidates to converge; normal solves stop early.
     gradient_tolerance: 0.001,

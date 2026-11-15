@@ -724,62 +724,51 @@ mod tests {
     }
 
     #[test]
-    fn late_delivered_camera_allows_next_imu_to_initialize_after_unready_solve() -> Result<()> {
+    fn late_delivered_camera_allows_next_imu_to_initialize() -> Result<()> {
         let parameters: Localization3dParameters = json5::from_str(include_str!(
             "../../../../etc/parameters/base/localization3d.json5"
         ))?;
         let first = Time::from_nanos(1_000_000_000);
         let camera_time = first.saturating_add(Duration::from_millis(5));
         let second = first.saturating_add(Duration::from_millis(6));
-        let events = [
-            Event::Feet(Box::new(TimeWrapper {
+        let feet = BTreeMap::from([(
+            first,
+            TimeWrapper {
                 time: first,
                 inner: RobotKinematics::default(),
-            })),
-            Event::Imu(first, ImuState::default()),
-            Event::Solve,
-            Event::Camera(TimeWrapper {
+            },
+        )]);
+        let mut cameras = BTreeMap::new();
+        assert!(
+            initialize_from_imu(
+                first,
+                &ImuState::default(),
+                7,
+                &parameters,
+                &FieldDimensions::SPL_2025,
+                &cameras,
+                &feet,
+            )
+            .is_none()
+        );
+        cameras.insert(
+            camera_time,
+            TimeWrapper {
                 time: camera_time,
                 inner: CameraGeometry::default(),
-            }),
-            Event::Imu(second, ImuState::default()),
-            Event::Solve,
-        ];
-        let mut cameras = BTreeMap::new();
-        let mut feet = BTreeMap::new();
-        let mut pending = None;
-        let mut readiness = Vec::new();
-        let mut initialized_time = None;
-        for event in events {
-            match event {
-                Event::Feet(sample) => {
-                    feet.insert(sample.time, *sample);
-                }
-                Event::Camera(sample) => {
-                    cameras.insert(sample.time, sample);
-                }
-                Event::Imu(time, imu) => pending = Some((time, imu)),
-                Event::Solve => {
-                    let (time, imu) = pending.take().ok_or_else(|| eyre!("missing test IMU"))?;
-                    let initialized = initialize_from_imu(
-                        time,
-                        &imu,
-                        7,
-                        &parameters,
-                        &FieldDimensions::SPL_2025,
-                        &cameras,
-                        &feet,
-                    );
-                    readiness.push(initialized.is_some());
-                    if let Some(localization) = initialized {
-                        initialized_time = Some(localization?.status().time);
-                    }
-                }
-                _ => return Err(eyre!("unexpected test event")),
-            }
-        }
-        assert_eq!(readiness, [false, true]);
-        assert_eq!(initialized_time, Some(second));
+            },
+        );
+        let localization = initialize_from_imu(
+            second,
+            &ImuState::default(),
+            7,
+            &parameters,
+            &FieldDimensions::SPL_2025,
+            &cameras,
+            &feet,
+        )
+        .ok_or_else(|| eyre!("late camera did not allow initialization"))??;
+        assert_eq!(localization.status().time, second);
         Ok(())
     }
 

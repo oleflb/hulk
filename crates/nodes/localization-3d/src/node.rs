@@ -22,6 +22,12 @@ use types::{
     primary_state::PrimaryState,
 };
 
+fn solve_timer(period: Duration) -> tokio::time::Interval {
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer
+}
+
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(run(ctx))
 }
@@ -30,6 +36,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let node = ctx.create_node("localization3d").build().await?;
     let parameters = node.bind_parameter_as::<Localization3dParameters>("localization3d")?;
     let startup = parameters.snapshot().typed().clone();
+    startup
+        .validate()
+        .map_err(|message| color_eyre::eyre::eyre!(message))?;
     let baseline = startup.clone();
     // Hooks run under the ROSZ commit lock before storage/publication. Rejection
     // leaves both the node snapshot and its subscribers at the previous revision.
@@ -76,6 +85,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
     let mut active: Option<Localization> = None;
     let mut damping = true;
     let mut epoch_start = status.time;
+    let mut timer = solve_timer(startup.solver.solve_interval);
+    let mut needs_solve = false;
+    let mut ingestion_duration = Duration::ZERO;
     loop {
         let deadline = active.as_ref().and_then(Localization::deadline);
         let first = tokio::select! {
@@ -85,6 +97,8 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 if damping && !next_damping {
                     epoch_start = node.clock().now();
                     active = None;
+                    needs_solve = false;
+                    ingestion_duration = Duration::ZERO;
                     status = LocalizationStatus { time: epoch_start, epoch: status.epoch.wrapping_add(1), generation: 0, state: LocalizationState::Startup, heading: None };
                     statuses.publish(&status).await?;
                 }
@@ -97,6 +111,10 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 if let Some(active) = active.as_mut()
                     && let Err(error) = active.set_parameters(snapshot.typed()) {
                     tracing::error!(%error, "parameter update rejected; retaining active localization");
+                    continue;
+                }
+                if timer.period() != snapshot.typed().solver.solve_interval {
+                    timer = solve_timer(snapshot.typed().solver.solve_interval);
                 }
                 continue;
             }
@@ -107,12 +125,35 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 }
                 continue;
             }
-            sample = inputs.recv() => sample?,
+            _ = timer.tick() => None,
+            sample = inputs.recv() => Some(sample?),
+        };
+        let Some(first) = first else {
+            if !std::mem::take(&mut needs_solve) {
+                continue;
+            }
+            let Some(localization) = active.as_mut() else {
+                continue;
+            };
+            let mut output = tokio::task::block_in_place(|| localization.solve(node.clock().now()));
+            output.diagnostics.ingestion_duration = std::mem::take(&mut ingestion_duration);
+            // Advance lifecycle after the potentially expensive solve, before publishing.
+            localization.advance_time(node.clock().now());
+            if status != localization.status() {
+                status = localization.status();
+                statuses.publish(&status).await?;
+            }
+            if let Some(estimate) = output.estimate {
+                estimates.publish(&estimate).await?;
+            }
+            if let Some(error) = &output.diagnostics.failure {
+                tracing::warn!(%error, "localization solve failed");
+            }
+            diagnostics.publish(&output.diagnostics).await?;
+            continue;
         };
         let samples = inputs.drain(first).await?;
         let now = node.clock().now();
-        let mut needs_solve = false;
-        let mut ingestion_duration = Duration::ZERO;
         for sample in samples {
             let time = sample.time();
             if time < epoch_start || time > now {
@@ -133,6 +174,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                 active = None;
                 // Measurements inserted before the reset belonged to the old estimator.
                 needs_solve = false;
+                ingestion_duration = Duration::ZERO;
                 epoch_start = time;
                 status = LocalizationStatus {
                     time,
@@ -188,27 +230,6 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             needs_solve |= inputs.ingest(localization, sample)?;
             ingestion_duration += started.elapsed();
         }
-        if !needs_solve {
-            continue;
-        }
-        let Some(localization) = active.as_mut() else {
-            continue;
-        };
-        let mut output = tokio::task::block_in_place(|| localization.solve(node.clock().now()));
-        output.diagnostics.ingestion_duration = ingestion_duration;
-        // Advance lifecycle after the potentially expensive solve, before publishing.
-        localization.advance_time(node.clock().now());
-        if status != localization.status() {
-            status = localization.status();
-            statuses.publish(&status).await?;
-        }
-        if let Some(estimate) = output.estimate {
-            estimates.publish(&estimate).await?;
-        }
-        if let Some(error) = &output.diagnostics.failure {
-            tracing::warn!(%error, "localization solve failed");
-        }
-        diagnostics.publish(&output.diagnostics).await?;
     }
 }
 
@@ -217,11 +238,17 @@ mod tests {
     use super::*;
     use ros_z::time::Time;
 
-    #[test]
-    fn rejected_update_preserves_running_estimator() -> Result<()> {
+    #[tokio::test(start_paused = true)]
+    async fn rejected_update_preserves_running_estimator_and_solve_cadence() -> Result<()> {
         let original: Localization3dParameters = json5::from_str(include_str!(
             "../../../../etc/parameters/base/localization3d.json5"
         ))?;
+        let started = tokio::time::Instant::now();
+        let mut timer = solve_timer(original.solver.solve_interval);
+        assert_eq!(timer.tick().await, started + Duration::from_millis(25));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(timer.tick().await, started + Duration::from_millis(50));
+        assert_eq!(timer.tick().await, started + Duration::from_millis(150));
         let origin = Time::from_nanos(1_000_000_000);
         let mut active = Localization::new(
             origin,
@@ -267,7 +294,10 @@ mod tests {
         }
         let mut live = original;
         live.solver.max_iterations = 12;
+        live.solver.solve_interval = Duration::from_millis(50);
         active.set_parameters(&live)?;
+        timer = solve_timer(live.solver.solve_interval);
+        assert_eq!(timer.tick().await, started + Duration::from_millis(200));
         let time = origin + Duration::from_millis(102);
         active.ingest_imu(time, booster::ImuState::default())?;
         let estimate = active

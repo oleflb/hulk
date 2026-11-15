@@ -29,4 +29,5 @@ json5.workspace = true
 mcap.workspace = true
 odometry.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

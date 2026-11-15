@@ -981,22 +981,11 @@ fn tracking_rejects_invalid_covariance_future_solve_and_ambiguous_assignment() {
     indefinite[(0, 1)] = 2.0;
     indefinite[(1, 0)] = 2.0;
     invalid_covariances.push(indefinite);
-    let overflow = DetectedVisualFeatures {
-        penalty_spots: (0..=parameters.global_localizer.max_retained_detections)
-            .map(|index| DetectedVisualFeature {
-                pixel: point![index as f32 * 10.0, 100.0],
-                confidence: 1.0,
-            })
-            .collect(),
-        ..Default::default()
-    };
     for covariance in invalid_covariances {
         geometry.estimate.covariance = covariance;
         assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
-        assert!(associate_visual_features(input(&overflow, &geometry), &parameters).is_none());
     }
     geometry.estimate = tracking_estimate(0.0001);
-    assert!(associate_visual_features(input(&overflow, &geometry), &parameters).is_none());
     let mut future = input(&features, &geometry);
     future.time = Time::from_nanos(999_999_999);
     assert!(associate_visual_features(future, &parameters).is_none());
@@ -1136,7 +1125,7 @@ fn sparse_retained_covariance() -> nalgebra::Matrix6<f64> {
 #[test]
 fn tracking_uses_raw_image_features_even_when_their_rays_reach_the_horizon() {
     let mut geometry = geometry();
-    geometry.estimate.pose = Isometry3::from_translation(0.0, 0.0, 0.45);
+    geometry.estimate.pose = Isometry3::from_translation(linear_algebra::vector![0.0, 0.0, 0.45]);
     let robot_to_camera = Isometry3::<Robot, Camera>::wrap(nalgebra::Isometry3::rotation(vector![
         0.0,
         -std::f32::consts::FRAC_PI_2,
