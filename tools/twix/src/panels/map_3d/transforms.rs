@@ -1,22 +1,11 @@
-use super::{CameraMatrix, PoseSource, ViewerData};
+use super::{CameraMatrix, ViewerData};
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*};
 
 pub(super) fn robot_to_display(data: &ViewerData) -> nalgebra::Isometry3<f32> {
-    match data.pose_source {
-        PoseSource::Localization => data
-            .localization
-            .as_ref()
-            .map(|field_to_robot| field_to_robot.inverse().inner),
-        PoseSource::VisualOdometer => visual_odometer_robot_to_display(data),
-    }
-    .unwrap_or_else(nalgebra::Isometry3::identity)
-}
-
-fn visual_odometer_robot_to_display(data: &ViewerData) -> Option<nalgebra::Isometry3<f32>> {
-    let visual_odometer = data.visual_odometer?;
-    let camera_matrix = data.camera_matrix.as_ref()?;
-
-    Some(visual_odometer * robot_to_camera(camera_matrix))
+    data.localization
+        .as_ref()
+        .map(|field_to_robot| field_to_robot.inverse().inner)
+        .unwrap_or_else(nalgebra::Isometry3::identity)
 }
 
 pub(super) fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
@@ -68,8 +57,8 @@ mod tests {
     }
 
     #[test]
-    fn localization_is_inverted_and_vo_includes_camera_extrinsics() {
-        let mut data = ViewerData {
+    fn localization_is_inverted() {
+        let data = ViewerData {
             localization: Some(linear_algebra::Isometry3::wrap(
                 nalgebra::Isometry3::translation(1.0, 2.0, 3.0),
             )),
@@ -79,11 +68,5 @@ mod tests {
             robot_to_display(&data).translation.vector,
             nalgebra::Vector3::new(-1.0, -2.0, -3.0)
         );
-        data.pose_source = PoseSource::VisualOdometer;
-        data.visual_odometer = Some(nalgebra::Isometry3::translation(4.0, 5.0, 6.0));
-        data.camera_matrix = Some(CameraMatrix::default());
-        let expected =
-            data.visual_odometer.unwrap() * robot_to_camera(data.camera_matrix.as_ref().unwrap());
-        assert_eq!(robot_to_display(&data), expected);
     }
 }

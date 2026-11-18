@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bevy::{camera_controller::pan_orbit_camera::prelude::PanOrbitCamera, prelude::*};
 use coordinate_systems::{Field, Robot};
-use eframe::egui::{ComboBox, Ui};
+use eframe::egui::Ui;
 use egui_bevy::BevyWidget;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
@@ -18,7 +18,6 @@ use serde_json::Value;
 use types::{
     field_dimensions::FieldDimensions, time_wrapper::TimeWrapper,
     visual_localization::VisualLocalizationFrame as FieldMarkAssociations,
-    visual_odometry::VisualOdometer,
 };
 
 use crate::{
@@ -37,13 +36,6 @@ mod observation;
 mod robot;
 mod transforms;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-enum PoseSource {
-    #[default]
-    Localization,
-    VisualOdometer,
-}
-
 #[derive(Clone, Resource, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -51,13 +43,6 @@ struct Settings {
     robot: bool,
     camera: bool,
     associations: bool,
-    pose_source: PoseSource,
-}
-
-impl Settings {
-    fn associations_active(&self) -> bool {
-        self.associations && self.pose_source == PoseSource::Localization
-    }
 }
 
 impl Default for Settings {
@@ -67,17 +52,14 @@ impl Default for Settings {
             robot: true,
             camera: true,
             associations: false,
-            pose_source: PoseSource::Localization,
         }
     }
 }
 
 #[derive(Default, Resource)]
 struct ViewerData {
-    pose_source: PoseSource,
     field_dimensions: Option<Arc<SampleRecord<FieldDimensions>>>,
     localization: Option<Isometry3<Field, Robot>>,
-    visual_odometer: Option<nalgebra::Isometry3<f32>>,
     robot_kinematics: Option<Arc<SampleRecord<TimeWrapper<RobotKinematics>>>>,
     camera_matrix: Option<CameraMatrix>,
     camera_frame: Option<Arc<SampleRecord<RosImage>>>,
@@ -92,7 +74,6 @@ struct Observations {
     dimensions: Observation<FieldDimensions>,
     localization: Observation<types::localization::LocalizationEstimate>,
     localization_status: Observation<types::localization::LocalizationStatus>,
-    odometer: Observation<VisualOdometer>,
     kinematics: Observation<TimeWrapper<RobotKinematics>>,
     matrix: Observation<TimeWrapper<CameraMatrix>>,
     images: Option<Observation<RosImage>>,
@@ -121,12 +102,6 @@ impl Observations {
                 1,
                 Default::default(),
             )?,
-            odometer: Observation::new(
-                context,
-                "visual_odometry/current_left_camera_to_visual_odometer",
-                64,
-                Default::default(),
-            )?,
             localization_status: Observation::new(
                 context,
                 "localization/status",
@@ -151,7 +126,7 @@ impl Observations {
         if !settings.camera {
             self.images = None;
         }
-        if !settings.associations_active() {
+        if !settings.associations {
             self.associations = None;
         }
         if settings.camera && self.images.is_none() {
@@ -162,7 +137,7 @@ impl Observations {
                 Default::default(),
             )?);
         }
-        if settings.associations_active() && self.associations.is_none() {
+        if settings.associations && self.associations.is_none() {
             self.associations = Some(Observation::new(
                 context,
                 "field_mark_association/visual_localization_local",
@@ -180,7 +155,7 @@ impl Observations {
             .map(|status| (status.value.epoch, status.value.generation));
         if self.namespace != namespace
             || self.frame_id != frame_id
-            || (!settings.camera && !settings.associations_active())
+            || (!settings.camera && !settings.associations)
         {
             self.namespace = namespace.to_owned();
             self.frame_id = frame_id;
@@ -208,7 +183,7 @@ impl Observations {
         self.last_anchor = anchor;
         let association = associations
             .iter()
-            .find(|record| settings.associations_active() && Some(record.value.time) == anchor);
+            .find(|record| settings.associations && Some(record.value.time) == anchor);
         let camera_frame = images
             .iter()
             .find(|image| Some(image_time(image)) == anchor)
@@ -217,21 +192,7 @@ impl Observations {
             .matrix
             .aligned(namespace, anchor)
             .map(|record| record.value.inner.clone());
-        let odometer = match anchor {
-            Some(time) => observation::nearest(
-                self.odometer.all(namespace),
-                time,
-                std::time::Duration::from_millis(100),
-                |record| record.value.time,
-            ),
-            None => self
-                .odometer
-                .all(namespace)
-                .into_iter()
-                .max_by_key(|record| record.value.time),
-        };
         ViewerData {
-            pose_source: settings.pose_source,
             field_dimensions: self.dimensions.latest(namespace),
             // ponytail: latest solve pose; use estimate history for image-aligned rendering.
             localization: self
@@ -240,8 +201,6 @@ impl Observations {
                 .filter(|record| frame_id == Some((record.value.epoch, record.value.generation)))
                 .and_then(|record| record.value.robot_to_field)
                 .map(|field| Isometry3::wrap(field.pose.inner.cast::<f32>().inverse())),
-            visual_odometer: odometer
-                .map(|record| record.value.current_left_camera_to_visual_odometer),
             robot_kinematics: self.kinematics.aligned(namespace, anchor),
             camera_matrix,
             camera_frame,
@@ -258,7 +217,7 @@ fn select_anchor(
 ) -> Option<Time> {
     let latest_image = images.clone().filter(|time| Some(*time) >= last).max();
     let association = associations
-        .filter(|_| settings.associations_active())
+        .filter(|_| settings.associations)
         .filter(|time| Some(*time) >= last)
         .filter(|time| {
             latest_image.is_none_or(|latest| {
@@ -289,7 +248,6 @@ impl Panel for Map3DPanel {
             observations.dimensions.is_querying()
                 || observations.localization.is_querying()
                 || observations.localization_status.is_querying()
-                || observations.odometer.is_querying()
                 || observations.kinematics.is_querying()
                 || observations.matrix.is_querying()
                 || observations
@@ -367,28 +325,8 @@ impl Panel for Map3DPanel {
                 ui.checkbox(&mut self.settings.field, "Field");
                 ui.checkbox(&mut self.settings.robot, "Robot");
                 ui.checkbox(&mut self.settings.camera, "Camera");
-                ui.checkbox(&mut self.settings.associations, "Associations")
-                    .on_hover_text(
-                        "Field-frame associations require the localization pose source.",
-                    );
+                ui.checkbox(&mut self.settings.associations, "Associations");
             });
-            ComboBox::from_id_salt(ui.id().with("pose_source"))
-                .selected_text(match self.settings.pose_source {
-                    PoseSource::Localization => "Localization",
-                    PoseSource::VisualOdometer => "Visual odometry",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.settings.pose_source,
-                        PoseSource::Localization,
-                        "Localization",
-                    );
-                    ui.selectable_value(
-                        &mut self.settings.pose_source,
-                        PoseSource::VisualOdometer,
-                        "Visual odometry",
-                    );
-                });
         });
         let Some(widget) = &mut self.widget else {
             ui.label("3D rendering requires the WGPU renderer.");
@@ -475,30 +413,6 @@ mod tests {
         assert_eq!(select(&[5], &[5], None), Some(Time::from_nanos(5)));
     }
 
-    #[test]
-    fn inactive_association_preference_does_not_change_image_anchor_or_source() {
-        let mut settings = Settings {
-            pose_source: PoseSource::VisualOdometer,
-            ..default()
-        };
-        for associations in [false, true] {
-            settings.associations = associations;
-            assert!(!settings.associations_active());
-            assert_eq!(
-                select_anchor(
-                    [10, 20].into_iter().map(Time::from_nanos),
-                    [10].into_iter().map(Time::from_nanos),
-                    None,
-                    &settings,
-                ),
-                Some(Time::from_nanos(20))
-            );
-            assert!(settings.pose_source == PoseSource::VisualOdometer);
-        }
-        settings.pose_source = PoseSource::Localization;
-        assert!(settings.associations_active());
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn expensive_observations_follow_layer_preferences() {
         let context = PanelCreationContext {
@@ -525,13 +439,6 @@ mod tests {
         assert!(observations.images.is_none() && observations.associations.is_none());
         settings.camera = true;
         settings.associations = true;
-        observations.update_layers(&context, &settings).unwrap();
-        assert!(observations.images.is_some() && observations.associations.is_some());
-        settings.pose_source = PoseSource::VisualOdometer;
-        observations.update_layers(&context, &settings).unwrap();
-        assert!(observations.images.is_some() && observations.associations.is_none());
-        assert!(settings.associations);
-        settings.pose_source = PoseSource::Localization;
         observations.update_layers(&context, &settings).unwrap();
         assert!(observations.images.is_some() && observations.associations.is_some());
         settings.camera = false;

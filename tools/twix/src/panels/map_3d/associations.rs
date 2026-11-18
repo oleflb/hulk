@@ -41,7 +41,7 @@ pub(super) fn update(
         return;
     };
 
-    if !settings.associations_active() || associations.value.inner.associations.is_empty() {
+    if !settings.associations || associations.value.inner.associations.is_empty() {
         *lines.1 = Visibility::Hidden;
         return;
     }
