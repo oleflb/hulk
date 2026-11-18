@@ -245,7 +245,7 @@ impl Estimator {
             robot_to_camera: frame.robot_to_camera.inner.cast().framed_transform(),
             // Fixed calibration-based conversion; do not let optimized focal lengths
             // change measurement strength during a solve.
-            angular_information_root: (f64::from(frame.camera_intrinsic.focals.x)
+            information_root: (f64::from(frame.camera_intrinsic.focals.x)
                 * f64::from(frame.camera_intrinsic.focals.y))
             .sqrt()
                 / self.parameters.visual_feature_noise_variance.sqrt(),
