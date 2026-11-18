@@ -1,5 +1,3 @@
-use std::{hint::black_box, time::Instant};
-
 use fagra::{
     Tangent, Variable,
     testing::{TestScalar, TestVariable, Tolerance, proptest::prelude::*},
@@ -335,30 +333,4 @@ fn quarter_turn_couples_velocity_and_position() {
         velocity: state.velocity,
     };
     assert!((negative_quaternion.log() - state.log()).norm() < 1e-12);
-}
-
-#[test]
-#[ignore = "release-mode operation timing; run with --release --ignored --nocapture"]
-fn lie_operation_timings() {
-    fn measure<V: Variable<Scalar = f64>>(name: &str, coords: &[f64]) {
-        let delta = V::tangent_from_slice(coords);
-        let state = V::exp(&delta);
-        let start = Instant::now();
-        for _ in 0..20_000 {
-            black_box(V::exp(black_box(&delta)));
-            black_box(black_box(&state).log());
-            black_box(black_box(&state).compose(black_box(&state)));
-            black_box(black_box(&state).inverse());
-            black_box(black_box(&state).adjoint());
-            black_box(V::right_jacobian(black_box(&delta)));
-            black_box(V::right_jacobian_inverse(black_box(&delta)));
-        }
-        println!(
-            "{name}: {:.0} ns / seven-operation bundle",
-            start.elapsed().as_nanos() as f64 / 20_000.0
-        );
-    }
-    measure::<TrajectoryState>("SE₂(3)", &[0.2, -0.1, 0.3, 1.0, 2.0, 3.0, -2.0, 0.5, 1.5]);
-    measure::<FieldAlignment>("SE(2)", &[0.4, 1.0, -2.0]);
-    measure::<CameraIntrinsics>("R⁴", &[500.0, 500.0, 320.0, 240.0]);
 }
