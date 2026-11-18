@@ -6317,6 +6317,7 @@ dependencies = [
  "localization-fagra",
  "mcap",
  "nalgebra 0.34.2",
+ "odometry",
  "projection",
  "ros-z",
  "serde",
