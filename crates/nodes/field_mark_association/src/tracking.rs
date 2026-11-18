@@ -7,9 +7,10 @@ use ndarray::Array2;
 use types::{localization::PoseEstimate, visual_localization::FieldMarkAssociation};
 
 use crate::{
-    AssociationResult, DetectedVisualFeature, FieldMarkAssociationParameters,
-    TrackingAssociationInput as AssociationInput, VisualFeatureClass,
-    assignment::unique_assignment, features::filter_detections, map::LandmarkMap,
+    AssociationResult, DetectedVisualFeature, FieldMarkAssociationParameters, VisualFeatureClass,
+    api::{PreparedAssociation, TrackingAssociationInput as AssociationInput},
+    assignment::unique_assignment,
+    map::LandmarkMap,
 };
 
 const COVARIANCE_SYMMETRY_TOLERANCE: f32 = 1.0e-5;
@@ -30,20 +31,15 @@ struct PredictionNoise {
 pub(crate) fn associate(
     input: AssociationInput<'_>,
     parameters: &FieldMarkAssociationParameters,
+    prepared: &PreparedAssociation,
+    age: f32,
 ) -> Option<AssociationResult> {
-    let age = validated_age(input, parameters)?;
-    let map = LandmarkMap::new(input.field_dimensions);
-    if map
-        .landmarks
-        .iter()
-        .any(|landmark| !landmark.xy.coords().inner.iter().all(|x| x.is_finite()))
-    {
-        return None;
-    }
+    let map = &prepared.map;
     let config = parameters.global_localizer;
-    let detections = filter_detections(input.visual_features, &map, config)?
-        .into_iter()
-        .map(|(_, class, feature)| (class, feature))
+    let detections = prepared
+        .detections
+        .iter()
+        .map(|&(_, class, feature)| (class, feature))
         .collect::<Vec<_>>();
     if detections.is_empty() {
         return None;
@@ -58,10 +54,20 @@ pub(crate) fn associate(
         .iter()
         .map(|point| project_landmark(point.xy.extend(0.0), input, &noise))
         .collect::<Vec<_>>();
-    match_predictions(&detections, &map, &predictions, &noise, parameters)
+    if detections.len() <= 5
+        && detections.iter().any(|(class, _)| {
+            !map.landmarks
+                .iter()
+                .zip(&predictions)
+                .any(|(landmark, prediction)| landmark.class == *class && prediction.is_some())
+        })
+    {
+        return None;
+    }
+    match_predictions(&detections, map, &predictions, &noise, parameters)
 }
 
-fn validated_age(
+pub(crate) fn validated_age(
     input: AssociationInput<'_>,
     parameters: &FieldMarkAssociationParameters,
 ) -> Option<f32> {
@@ -162,6 +168,14 @@ fn match_predictions(
         predictions,
         parameters.global_localizer.mahalanobis_gate,
     )?;
+    if detections.len() <= 5
+        && log_likelihoods
+            .rows()
+            .into_iter()
+            .any(|row| !row.iter().any(|value| value.is_finite()))
+    {
+        return None;
+    }
     let pairs = match detections.len() {
         1 => joint_assignment::<2>(detections, predictions, &log_likelihoods, noise, parameters),
         2 => joint_assignment::<4>(detections, predictions, &log_likelihoods, noise, parameters),
@@ -484,7 +498,7 @@ fn project_landmark(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DetectedVisualFeatures;
+    use crate::{DetectedVisualFeatures, features::filter_detections};
 
     fn map() -> LandmarkMap {
         LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025)

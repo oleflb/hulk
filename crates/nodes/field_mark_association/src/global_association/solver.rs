@@ -12,7 +12,7 @@ use types::visual_localization::{
 use super::GlobalAssociationConfig;
 use crate::{
     AssociationResult, DetectedVisualFeature, GlobalAssociationInput, VisualFeatureClass,
-    assignment::unique_assignment, features::filter_detections, map::LandmarkMap,
+    api::PreparedAssociation, assignment::unique_assignment, map::LandmarkMap,
 };
 
 const HYPOTHESES: usize = 128;
@@ -31,14 +31,26 @@ pub(crate) struct Detection {
     pub xy: Vector2<f32>,
 }
 
-/// Exposure-time tilt only: no optimizer translation or assumed standing height.
+#[cfg(test)]
 pub(crate) fn preprocess(
     input: GlobalAssociationInput<'_>,
 ) -> Option<(LandmarkMap, Vec<Detection>, usize)> {
-    let config = *input.parameters;
-    config.validate().ok()?;
-    if input.visual_features.supported_feature_count() > config.max_input_detections
-        || !input.camera_intrinsic.is_valid()
+    input.parameters.validate().ok()?;
+    let prepared = PreparedAssociation::new(
+        input.visual_features,
+        input.field_dimensions,
+        *input.parameters,
+    )?;
+    let detections = project_detections(input, &prepared)?;
+    Some((prepared.map, detections, prepared.detections.len()))
+}
+
+/// Exposure-time tilt only: no optimizer translation or assumed standing height.
+fn project_detections(
+    input: GlobalAssociationInput<'_>,
+    prepared: &PreparedAssociation,
+) -> Option<Vec<Detection>> {
+    if !input.camera_intrinsic.is_valid()
         || !input
             .robot_to_camera
             .inner
@@ -54,21 +66,13 @@ pub(crate) fn preprocess(
     {
         return None;
     }
-    let map = LandmarkMap::new(input.field_dimensions);
-    if map
-        .landmarks
-        .iter()
-        .any(|p| !p.xy.coords().inner.iter().all(|x| x.is_finite()))
-    {
-        return None;
-    }
-    let retained = filter_detections(input.visual_features, &map, config)?;
-    let observation_count = retained.len();
-    let detections = retained
-        .into_iter()
-        .filter_map(|(id, class, feature)| project_detection(input, id, class, feature))
-        .collect();
-    Some((map, detections, observation_count))
+    Some(
+        prepared
+            .detections
+            .iter()
+            .filter_map(|&(id, class, feature)| project_detection(input, id, class, feature))
+            .collect(),
+    )
 }
 
 fn project_detection(
@@ -521,16 +525,21 @@ fn draw(state: &mut u64, limit: usize) -> usize {
     *state as usize % limit
 }
 
-pub(crate) fn associate(input: GlobalAssociationInput<'_>) -> Option<AssociationResult> {
+pub(crate) fn associate(
+    input: GlobalAssociationInput<'_>,
+    prepared: &PreparedAssociation,
+) -> Option<AssociationResult> {
     if input.heading.is_some_and(|heading| !heading.is_valid()) {
         return None;
     }
-    let (map, detections, observation_count) = preprocess(input)?;
+    let map = &prepared.map;
+    let observation_count = prepared.detections.len();
+    let detections = project_detections(input, prepared)?;
     let minimum = minimum_inliers(observation_count, input.parameters);
     if detections.len() < minimum || map.landmarks.len() < minimum {
         return None;
     }
-    let mut search = Search::new(input, &map, &detections, observation_count)?;
+    let mut search = Search::new(input, map, &detections, observation_count)?;
     let mut pool = Vec::new();
     let mut weight = 0.0;
     for a in 0..detections.len() {
