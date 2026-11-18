@@ -16,19 +16,12 @@ pub struct ReprojectionObservation<R: RealField + Copy = f64> {
     pub detection: Point2<Pixel, R>,
 }
 
-/// A frame's monotone oriented-bearing residuals share trajectory and camera geometry.
-///
-/// For predicted unit bearing `d`, observed unit bearing `b`, and `c = b.dot(d)`,
-/// the three-component residual is `sqrt(3 / (2 + c)) * (d - b) / sigma_theta`.
-/// Its least-squares cost is `3 * (1 - c) / ((2 + c) * sigma_theta^2)`, strictly
-/// increasing with angular error on `(0, pi)`. Evaluation is smooth across optical
-/// z=0 and behind the camera. Only zero/near-zero range and invalid inputs fail.
-///
-/// Huber acts on the norm of each complete whitened 3D residual. Both the observed
-/// bearing and the directional weight are differentiated, including intrinsics.
-/// The exact antipode is a stationary maximum; this is not a global convergence
-/// guarantee. Final visibility and pixel-error checks belong to the caller.
-/// The historical type name is retained; this is NOT a pixel-reprojection likelihood.
+/// Monotone oriented-bearing residuals sharing trajectory and camera geometry.
+/// For unit bearings d and b, the residual is sqrt(3 / (2 + b.dot(d))) * (d - b).
+/// Evaluation is smooth across optical z=0 and behind the camera; the exact antipode
+/// is a stationary maximum, so this does not guarantee global convergence.
+/// Huber acts on the complete whitened residual. Final visibility and pixel-error
+/// checks belong to the caller; this is not a pixel-reprojection likelihood.
 #[derive(Clone, Debug)]
 pub struct FrameReprojections<R: RealField + Copy = f64> {
     pub controls: [StateKey<PoseControl<R>>; 4],
@@ -38,9 +31,8 @@ pub struct FrameReprojections<R: RealField + Copy = f64> {
     pub tau: R,
     /// Optical convention: x right, y down, z forward, before perspective division.
     pub robot_to_camera: Isometry3<Robot, Camera, R>,
-    /// Fixed inverse angular standard deviation (radians^-1), independent of the
-    /// optimized intrinsics. Isotropic angular noise, not anisotropic pixel noise.
-    pub angular_information_root: R,
+    /// Fixed inverse angular standard deviation (radians^-1), independent of intrinsics.
+    pub information_root: R,
     pub huber_threshold: R,
     /// Positive minimum camera-to-landmark range in metres, NOT optical depth.
     pub min_range: R,
@@ -82,7 +74,7 @@ where
         for (_, observation) in factors {
             let projection = geometry.bearing(observation, self.min_range)?;
             cost += common::huber(
-                &(projection.error * self.angular_information_root),
+                &(projection.error * self.information_root),
                 self.huber_threshold,
             )?
             .0;
@@ -120,14 +112,14 @@ where
             .into_inner();
         for (id, observation) in factors {
             let projection = geometry.bearing(observation, self.min_range)?;
-            let residual = projection.error * self.angular_information_root;
+            let residual = projection.error * self.information_root;
             let scale = common::huber(&residual, self.huber_threshold)?.1;
             let d = projection.predicted;
             let b = projection.observed;
             let difference = d - b;
             let denominator = scalar::<R>(2.0) + b.dot(&d);
             let weight_derivative = scalar::<R>(0.5) / denominator;
-            let root = self.angular_information_root * scale * projection.weight;
+            let root = self.information_root * scale * projection.weight;
             let predicted_jacobian = (Matrix3::identity()
                 - difference * b.transpose() * weight_derivative)
                 * ((Matrix3::identity() - d * d.transpose()) / projection.range);
@@ -189,7 +181,7 @@ impl<R: RealField + Copy> FrameReprojections<R> {
     fn validate(&self) -> Result<(), EvaluationError> {
         common::positive(self.min_range)?;
         common::positive(self.huber_threshold)?;
-        common::positive(self.angular_information_root)?;
+        common::positive(self.information_root)?;
         Ok(())
     }
 }
@@ -289,8 +281,7 @@ impl<R: RealField + Copy> Geometry<R> {
             return Err(EvaluationError::InvalidEvaluation);
         }
         let observed = observed_ray / ray_norm;
-        let weight = (scalar::<R>(3.0) / (scalar::<R>(2.0) + observed.dot(&predicted))).sqrt();
-        let error = (predicted - observed) * weight;
+        let (error, weight) = bearing_error(predicted, observed);
         common::finite(error.iter())?;
         Ok(Projection {
             local,
@@ -304,4 +295,12 @@ impl<R: RealField + Copy> Geometry<R> {
             error,
         })
     }
+}
+
+fn bearing_error<R: RealField + Copy>(
+    predicted: nalgebra::Vector3<R>,
+    observed: nalgebra::Vector3<R>,
+) -> (nalgebra::Vector3<R>, R) {
+    let weight = (scalar::<R>(3.0) / (scalar::<R>(2.0) + observed.dot(&predicted))).sqrt();
+    ((predicted - observed) * weight, weight)
 }

@@ -423,7 +423,7 @@ impl<const ROBUST: bool> TestFactorBatch for ReprojectionCase<ROBUST> {
                 Vector3::new(c(0.1), c(-0.2), c(0.3)).into(),
                 UnitQuaternion::from_euler_angles(c(0.1), c(-0.2), c(0.15)),
             )),
-            angular_information_root: c(3.0),
+            information_root: c(3.0),
             huber_threshold: c(if ROBUST { 2.0 } else { 1e6 }),
             min_range: c(0.01),
         };
@@ -603,6 +603,35 @@ impl Scene {
             self.controls[3],
         ]
     }
+    fn set_poses(&mut self, mut pose: impl FnMut(usize) -> Isometry3<f64>) {
+        for (i, key) in self.controls.into_iter().enumerate() {
+            self.graph
+                .set(
+                    key,
+                    PoseControl {
+                        pose: Framed::wrap(pose(i)),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn observe(
+        &mut self,
+        batch: fagra::BatchKey<FrameReprojections>,
+        point: [f64; 3],
+        pixel: [f64; 2],
+    ) -> fagra::FactorKey<ReprojectionObservation> {
+        self.graph
+            .add_factor_to(
+                batch,
+                ReprojectionObservation {
+                    field_point: Framed::wrap(nalgebra::Point3::from(point)),
+                    detection: Framed::wrap(nalgebra::Point2::from(pixel)),
+                },
+            )
+            .unwrap()
+    }
     fn tilt(&self) -> ImuKinematics {
         ImuKinematics {
             controls: self.segment(),
@@ -623,7 +652,7 @@ impl Scene {
             alignment: self.alignment,
             intrinsics: self.intrinsics,
             robot_to_camera: Transform::wrap(Isometry3::identity()),
-            angular_information_root: 300.0,
+            information_root: 300.0,
             huber_threshold: 2.0,
             min_range: 0.01,
         }
@@ -920,56 +949,32 @@ fn tilt_distinguishes_inversion_without_observing_yaw() {
         ..scene.tilt()
     };
     for yaw in [0.0, 1.7] {
-        for key in scene.controls {
-            scene
-                .graph
-                .set(
-                    key,
-                    PoseControl {
-                        pose: Framed::wrap(Isometry3::from_parts(
-                            nalgebra::Translation3::identity(),
-                            UnitQuaternion::from_euler_angles(0.0, 0.03, yaw),
-                        )),
-                    },
-                )
-                .unwrap();
-        }
+        scene.set_poses(|_| {
+            Isometry3::from_parts(
+                nalgebra::Translation3::identity(),
+                UnitQuaternion::from_euler_angles(0.0, 0.03, yaw),
+            )
+        });
         assert!(factor.cost(&scene).unwrap() < 1e-20);
     }
-    for key in scene.controls {
-        scene
-            .graph
-            .set(
-                key,
-                PoseControl {
-                    pose: Framed::wrap(Isometry3::from_parts(
-                        nalgebra::Translation3::identity(),
-                        UnitQuaternion::from_euler_angles(std::f64::consts::PI, 0.03, 0.0),
-                    )),
-                },
-            )
-            .unwrap();
-    }
+    scene.set_poses(|_| {
+        Isometry3::from_parts(
+            nalgebra::Translation3::identity(),
+            UnitQuaternion::from_euler_angles(std::f64::consts::PI, 0.03, 0.0),
+        )
+    });
     assert!(factor.cost(&scene).unwrap() > 1.9);
 }
 
 #[test]
 fn relative_yaw_uses_the_observation_endpoint() {
     let mut scene = Scene::new();
-    for (i, key) in scene.controls.iter().take(4).enumerate() {
-        scene
-            .graph
-            .set(
-                *key,
-                PoseControl {
-                    pose: Framed::wrap(Isometry3::new(
-                        Vector3::zeros(),
-                        Vector3::new(0.0, 0.0, 0.4 + i as f64 * 0.2),
-                    )),
-                },
-            )
-            .unwrap();
-    }
+    scene.set_poses(|i| {
+        Isometry3::new(
+            Vector3::zeros(),
+            Vector3::new(0.0, 0.0, 0.4 + i as f64 * 0.2),
+        )
+    });
     let mut factor = RelativeYaw {
         controls: scene.segment(),
         duration: 0.25,
@@ -1003,42 +1008,15 @@ fn bearing_geometry_range_and_robust_cost() {
         (1.0, 220.0, 0.0),
         (0.0, 157.0, robust_cost),
     ] {
-        let key = scene
-            .graph
-            .add_factor_to(
-                batch,
-                ReprojectionObservation {
-                    field_point: Framed::wrap(nalgebra::Point3::new(x, 0.0, 5.0)),
-                    detection: Framed::wrap(nalgebra::Point2::new(detection_x, 120.0)),
-                },
-            )
-            .unwrap();
+        let key = scene.observe(batch, [x, 0.0, 5.0], [detection_x, 120.0]);
         assert!((scene.graph.factor_cost(key).unwrap() - expected).abs() < 1e-9);
     }
     for z in [0.0, 0.01, -0.01, f64::NAN, f64::INFINITY] {
-        let key = scene
-            .graph
-            .add_factor_to(
-                batch,
-                ReprojectionObservation {
-                    field_point: Framed::wrap(nalgebra::Point3::new(0.0, 0.0, z)),
-                    detection: Framed::wrap(nalgebra::Point2::new(160.0, 120.0)),
-                },
-            )
-            .unwrap();
+        let key = scene.observe(batch, [0.0, 0.0, z], [160.0, 120.0]);
         assert!(scene.graph.factor_cost(key).is_err());
         scene.graph.remove_factor(key).unwrap();
     }
-    let key = scene
-        .graph
-        .add_factor_to(
-            batch,
-            ReprojectionObservation {
-                field_point: Framed::wrap(nalgebra::Point3::new(0.0, 0.0, 5.0)),
-                detection: Framed::wrap(nalgebra::Point2::new(160.0, 120.0)),
-            },
-        )
-        .unwrap();
+    let key = scene.observe(batch, [0.0, 0.0, 5.0], [160.0, 120.0]);
     let mut invalid = calibration();
     invalid.focal_lengths.inner.x = 0.0;
     scene.graph.set(scene.intrinsics, invalid).unwrap();
@@ -1055,20 +1033,11 @@ fn bearing_cost_is_monotone_through_side_plane_and_behind_camera() {
         let mut previous = -1.0;
         for index in 0..=360 {
             let theta = index as f64 * std::f64::consts::PI / 360.0;
-            let key = scene
-                .graph
-                .add_factor_to(
-                    batch,
-                    ReprojectionObservation {
-                        field_point: Framed::wrap(nalgebra::Point3::new(
-                            5.0 * theta.sin(),
-                            0.0,
-                            5.0 * theta.cos(),
-                        )),
-                        detection: Framed::wrap(nalgebra::Point2::new(160.0, 120.0)),
-                    },
-                )
-                .unwrap();
+            let key = scene.observe(
+                batch,
+                [5.0 * theta.sin(), 0.0, 5.0 * theta.cos()],
+                [160.0, 120.0],
+            );
             let cost = scene.graph.factor_cost(key).unwrap();
             let raw = 3.0 * 300.0_f64.powi(2) * (1.0 - theta.cos()) / (2.0 + theta.cos());
             let norm = (2.0 * raw).sqrt();
