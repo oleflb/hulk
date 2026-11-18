@@ -59,12 +59,11 @@ pub struct AssociationInput<'a> {
 
 /// Pose prediction for an established Tracking state.
 #[derive(Clone, Copy)]
-pub struct TrackingAssociationInput<'a> {
+pub(crate) struct TrackingAssociationInput<'a> {
     pub visual_features: &'a DetectedVisualFeatures,
     pub robot_to_camera: Isometry3<Robot, Camera>,
     pub geometry: &'a AssociationGeometry,
     pub camera_intrinsic: Intrinsic,
-    pub field_dimensions: &'a FieldDimensions,
     pub time: Time,
 }
 
@@ -116,7 +115,6 @@ pub fn associate_visual_features(
                 visual_features: input.visual_features,
                 robot_to_camera: input.robot_to_camera,
                 camera_intrinsic: input.camera_intrinsic,
-                field_dimensions: input.field_dimensions,
                 time: input.time,
             };
             let age = tracking::validated_age(tracking_input, parameters)?;
@@ -165,19 +163,4 @@ pub fn associate_global_visual_features(
         *input.parameters,
     )?;
     solver::associate(input, &prepared)
-}
-
-/// Predict landmarks with a pose prior, independently of lifecycle dispatch.
-pub fn associate_tracking_visual_features(
-    input: TrackingAssociationInput<'_>,
-    parameters: &FieldMarkAssociationParameters,
-) -> Option<AssociationResult> {
-    parameters.validate().ok()?;
-    let prepared = PreparedAssociation::new(
-        input.visual_features,
-        input.field_dimensions,
-        parameters.global_localizer,
-    )?;
-    let age = tracking::validated_age(input, parameters)?;
-    tracking::associate(input, parameters, &prepared, age)
 }
