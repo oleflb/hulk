@@ -39,8 +39,32 @@ const RESIDUAL_STROKE: Stroke = Stroke {
 };
 
 #[derive(Default)]
+enum Solution {
+    #[default]
+    Original,
+    Comparison,
+}
+
+#[derive(Default)]
 pub(in crate::panels::image) struct ProjectedFieldLinesOverlay {
+    solution: Solution,
     sample: Option<ProjectedFieldSample>,
+}
+
+impl ProjectedFieldLinesOverlay {
+    pub fn comparison() -> Self {
+        Self {
+            solution: Solution::Comparison,
+            sample: None,
+        }
+    }
+
+    fn stroke(&self) -> Stroke {
+        match self.solution {
+            Solution::Original => FIELD_STROKE,
+            Solution::Comparison => Stroke::new(FIELD_STROKE.width, Color32::RED),
+        }
+    }
 }
 
 impl ImageOverlay for ProjectedFieldLinesOverlay {
@@ -51,24 +75,33 @@ impl ImageOverlay for ProjectedFieldLinesOverlay {
         let mut dimensions =
             OverlayInput::new::<FieldDimensions>("field_dimensions", Selection::latest());
         dimensions.source.projection = TimeProjection::SourceTime;
-        let mut status =
-            OverlayInput::new::<LocalizationStatus>("localization/status", Selection::latest());
+        let (estimate_topic, status_topic) = match self.solution {
+            Solution::Original => ("localization/estimate", "localization/status"),
+            Solution::Comparison => (
+                "comparison/localization/estimate",
+                "comparison/localization/status",
+            ),
+        };
+        let mut status = OverlayInput::new::<LocalizationStatus>(status_topic, Selection::latest());
         let latched = ObservationPolicy::default().with_subscriber_qos(QosProfile {
             durability: QosDurability::TransientLocal,
             ..Default::default()
         });
         dimensions.source.live_policy = latched;
         status.source.live_policy = latched;
-        vec![
+        let mut inputs = vec![
             OverlayInput::new::<TimeWrapper<CameraMatrix>>("camera_matrix", bracket.clone()),
-            OverlayInput::new::<LocalizationEstimate>("localization/estimate", bracket),
+            OverlayInput::new::<LocalizationEstimate>(estimate_topic, bracket),
             status,
             dimensions,
-            OverlayInput::new::<TimeWrapper<VisualLocalizationFrame>>(
+        ];
+        if matches!(self.solution, Solution::Original) {
+            inputs.push(OverlayInput::new::<TimeWrapper<VisualLocalizationFrame>>(
                 "field_mark_association/visual_localization_local",
                 Selection::Exact,
-            ),
-        ]
+            ));
+        }
+        inputs
     }
 
     fn prepare(&mut self, image_time: Time, inputs: &mut OverlayInputs) -> Result<(), Report> {
@@ -170,7 +203,9 @@ impl ImageOverlay for ProjectedFieldLinesOverlay {
         let Some(sample) = &self.sample else {
             return;
         };
-        sample.projection.draw_field(painter, &sample.dimensions);
+        sample
+            .projection
+            .draw_field(painter, &sample.dimensions, self.stroke());
         if let Some(frame) = &sample.associations {
             for association in &frame.value.inner.associations {
                 if !association.detection.inner.iter().all(|v| v.is_finite()) {
@@ -238,17 +273,16 @@ impl FieldProjection {
         Some([self.project_camera(start)?, self.project_camera(end)?])
     }
 
-    fn draw_field(&self, painter: &TwixPainter<Pixel>, d: &FieldDimensions) {
+    fn draw_field(&self, painter: &TwixPainter<Pixel>, d: &FieldDimensions, stroke: Stroke) {
         let line = |a, b| {
             if let Some([a, b]) = self.segment(a, b) {
-                painter.line_segment(a, b, FIELD_STROKE);
+                painter.line_segment(a, b, stroke);
             }
         };
         for [start, end] in field_markings::field_segments(d) {
             line(start, end);
         }
-        let (center, radius, start, end) = field_markings::center_circle(d);
-        self.arc(painter, center, radius, start, end);
+        self.arc(painter, field_markings::center_circle(d), stroke);
         for half in [Half::Own, Half::Opponent] {
             for [start, end] in field_markings::half_segments(d, half) {
                 line(start, end);
@@ -261,8 +295,7 @@ impl FieldProjection {
                 for [start, end] in field_markings::box_segments(d, half, side) {
                     line(start, end);
                 }
-                let (center, radius, start, end) = field_markings::corner_arc(d, half, side);
-                self.arc(painter, center, radius, start, end);
+                self.arc(painter, field_markings::corner_arc(d, half, side), stroke);
             }
         }
     }
@@ -270,10 +303,8 @@ impl FieldProjection {
     fn arc(
         &self,
         painter: &TwixPainter<Pixel>,
-        center: Point2<Field>,
-        radius: f32,
-        start: f32,
-        end: f32,
+        (center, radius, start, end): (Point2<Field>, f32, f32, f32),
+        stroke: Stroke,
     ) {
         if !radius.is_finite() || radius <= 0.0 {
             return;
@@ -290,7 +321,7 @@ impl FieldProjection {
         for index in 1..=count {
             let next = at(start + (end - start) * index as f32 / count as f32);
             if let (Some(a), Some(b)) = (previous, next) {
-                painter.line_segment(a, b, FIELD_STROKE);
+                painter.line_segment(a, b, stroke);
             }
             previous = next;
         }
@@ -307,7 +338,23 @@ mod tests {
     use types::localization::{LocalizationState, PoseEstimate};
 
     #[test]
-    fn exposure_snapshot_requires_matching_pose_generation_and_recovers_delayed_inputs() {
+    fn exposure_snapshot_requires_matching_pose_generation_and_recovers_delayed_inputs()
+    -> Result<(), Report> {
+        for overlay in [
+            ProjectedFieldLinesOverlay::default(),
+            ProjectedFieldLinesOverlay::comparison(),
+        ] {
+            check_exposure_snapshot(overlay)?;
+        }
+        Ok(())
+    }
+
+    fn check_exposure_snapshot(mut overlay: ProjectedFieldLinesOverlay) -> Result<(), Report> {
+        let declarations = overlay.inputs();
+        let epoch = match overlay.solution {
+            Solution::Original => 1,
+            Solution::Comparison => 42,
+        };
         let camera = |time| {
             raw_sample(
                 "/camera_matrix",
@@ -321,36 +368,36 @@ mod tests {
             )
         };
         let mut pose_id = 0;
-        let mut pose = |time, generation, tracked: bool| {
+        let mut pose = |time, epoch, generation, tracked: bool| {
             pose_id += 1;
             raw_sample(
-                "/localization/estimate",
+                &declarations[1].source.topic,
                 pose_id,
                 time,
                 time,
                 &LocalizationEstimate {
                     time: Time::from_nanos(time),
-                    epoch: 1,
+                    epoch,
                     generation,
                     robot_to_local: PoseEstimate {
                         pose: Isometry3::identity(),
                         covariance: nalgebra::SMatrix::zeros(),
                     },
                     robot_to_field: tracked.then_some(PoseEstimate {
-                        pose: Isometry3::identity(),
+                        pose: Isometry3::from_translation(time as f64, 0.0, 0.0),
                         covariance: nalgebra::SMatrix::zeros(),
                     }),
                 },
             )
         };
         let status = raw_sample(
-            "/localization/status",
+            &declarations[2].source.topic,
             1,
             0,
             0,
             &LocalizationStatus {
                 time: Time::from_nanos(0),
-                epoch: 1,
+                epoch,
                 generation: 2,
                 state: LocalizationState::Tracking,
                 heading: None,
@@ -364,21 +411,31 @@ mod tests {
             State::Ready(vec![]),
         ];
         let mut inputs = OverlayInputs::default();
-        let mut overlay = ProjectedFieldLinesOverlay::default();
         let time = Time::from_nanos(20);
         inputs.update(&states);
-        overlay.prepare(time, &mut inputs).unwrap();
+        overlay.prepare(time, &mut inputs)?;
         assert!(overlay.sample.is_none());
-        states[1] = State::Ready(vec![pose(10, 2, true), pose(30, 2, true)]);
+        states[1] = State::Ready(vec![pose(10, epoch, 2, true), pose(30, epoch, 2, true)]);
         inputs.update(&states);
-        overlay.prepare(time, &mut inputs).unwrap();
-        assert!(overlay.sample.is_some());
-        for (generation, tracked) in [(3, true), (2, false)] {
-            states[1] = State::Ready(vec![pose(10, 2, true), pose(30, generation, tracked)]);
+        overlay.prepare(time, &mut inputs)?;
+        let sample = overlay
+            .sample
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing interpolated field"))?;
+        assert_eq!(sample.projection.field_to_camera.inner.translation.x, -20.0);
+        assert!(sample.associations.is_none());
+        for (after_epoch, generation, tracked) in
+            [(epoch, 3, true), (epoch, 2, false), (epoch + 1, 2, true)]
+        {
+            states[1] = State::Ready(vec![
+                pose(10, epoch, 2, true),
+                pose(30, after_epoch, generation, tracked),
+            ]);
             inputs.update(&states);
-            overlay.prepare(time, &mut inputs).unwrap();
+            overlay.prepare(time, &mut inputs)?;
             assert!(overlay.sample.is_none());
         }
+        Ok(())
     }
 
     #[test]

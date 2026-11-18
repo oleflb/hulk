@@ -81,6 +81,11 @@ impl ImageOverlays {
                 "Projected Field Lines",
                 ProjectedFieldLinesOverlay::default(),
             ),
+            OverlayEntry::new(
+                "comparison_projected_field_lines",
+                "Projected Field Lines — NEW (red)",
+                ProjectedFieldLinesOverlay::comparison(),
+            ),
         ];
         for entry in &mut entries {
             entry.enabled = value
@@ -185,4 +190,3 @@ impl ImageOverlays {
                 .collect(),
         )
     }
-}
