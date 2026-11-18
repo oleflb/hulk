@@ -334,8 +334,147 @@ mod tests {
 
     use super::*;
     use crate::panels::image::tests::raw_sample;
+    use linear_algebra::vector;
     use ros_z_debug::query::plan::State;
     use types::localization::{LocalizationState, PoseEstimate};
+
+    fn rendered_strokes(paint: impl Fn(&TwixPainter<Pixel>)) -> Vec<Stroke> {
+        use eframe::egui::{Context, Shape};
+        use twix_visualization::twix_painter::Orientation;
+
+        let output = Context::default().run_ui(Default::default(), |ui| {
+            let (_, painter) = TwixPainter::allocate(
+                ui,
+                linear_algebra::vector![200.0, 200.0],
+                point![0.0, 0.0],
+                Orientation::LeftHanded,
+            );
+            paint(&painter);
+        });
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape.shape {
+                Shape::LineSegment { stroke, .. } => Some(stroke),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_comparison_topics_do_not_hide_original() -> Result<(), Report> {
+        use crate::panels::image::image_overlay::ImageOverlays;
+        use ros_z_debug::query::plan::Frame;
+        use serde_json::json;
+
+        let mut overlays = ImageOverlays::new(Some(&json!({
+            "projected_field_lines": {"active": true},
+            "comparison_projected_field_lines": {"active": true},
+        })));
+        overlays.declarations("/replay", true)?;
+        let time = Time::from_nanos(20);
+        let camera = raw_sample(
+            "/replay/camera_matrix",
+            1,
+            20,
+            20,
+            &TimeWrapper {
+                time,
+                inner: CameraMatrix {
+                    head_to_camera: Isometry3::from_translation(vector![0.0, 0.0, 10.0]),
+                    intrinsics: Intrinsic::new(
+                        nalgebra::vector![100.0, 100.0],
+                        point![100.0, 100.0],
+                    ),
+                    ..Default::default()
+                },
+            },
+        );
+        let pose = PoseEstimate {
+            pose: Isometry3::identity(),
+            covariance: nalgebra::SMatrix::zeros(),
+        };
+        let estimate = raw_sample(
+            "/replay/localization/estimate",
+            1,
+            20,
+            20,
+            &LocalizationEstimate {
+                time,
+                epoch: 1,
+                generation: 2,
+                robot_to_local: pose,
+                robot_to_field: Some(PoseEstimate {
+                    pose: Isometry3::identity(),
+                    covariance: nalgebra::SMatrix::zeros(),
+                }),
+            },
+        );
+        let status = raw_sample(
+            "/replay/localization/status",
+            1,
+            20,
+            20,
+            &LocalizationStatus {
+                time,
+                epoch: 1,
+                generation: 2,
+                state: LocalizationState::Tracking,
+                heading: None,
+            },
+        );
+        for missing in [
+            State::Pending,
+            State::Ready(vec![]),
+            State::Failed("missing topic".into()),
+        ] {
+            overlays.prepare(&Frame {
+                primary: raw_sample("/replay/inputs/left_image", 1, 20, 20, &0u64),
+                inputs: vec![
+                    State::Ready(vec![camera.clone()]),
+                    State::Ready(vec![estimate.clone()]),
+                    State::Ready(vec![status.clone()]),
+                    State::Ready(vec![]),
+                    State::Ready(vec![]),
+                    State::Ready(vec![camera.clone()]),
+                    missing.clone(),
+                    missing,
+                    State::Ready(vec![]),
+                ],
+            });
+            let strokes = rendered_strokes(|painter| overlays.paint(painter, time));
+            assert!(strokes.len() > 256);
+            assert!(
+                strokes
+                    .iter()
+                    .all(|stroke| stroke.color == FIELD_STROKE.color)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn both_solutions_draw_lines_and_arcs_in_their_own_color() {
+        for (mut overlay, color) in [
+            (ProjectedFieldLinesOverlay::default(), FIELD_STROKE.color),
+            (ProjectedFieldLinesOverlay::comparison(), Color32::RED),
+        ] {
+            overlay.sample = Some(ProjectedFieldSample {
+                projection: FieldProjection {
+                    field_to_camera: Isometry3::from_translation(vector![0.0, 0.0, 10.0]),
+                    intrinsics: Intrinsic::new(
+                        nalgebra::vector![100.0, 100.0],
+                        point![100.0, 100.0],
+                    ),
+                },
+                dimensions: FieldDimensions::SPL_2025,
+                associations: None,
+            });
+            let strokes = rendered_strokes(|painter| overlay.image_overlay(painter));
+            assert!(strokes.len() > 256, "field includes tessellated arcs");
+            assert!(strokes.iter().all(|stroke| stroke.color == color));
+        }
+    }
 
     #[test]
     fn exposure_snapshot_requires_matching_pose_generation_and_recovers_delayed_inputs()
@@ -384,7 +523,7 @@ mod tests {
                         covariance: nalgebra::SMatrix::zeros(),
                     },
                     robot_to_field: tracked.then_some(PoseEstimate {
-                        pose: Isometry3::from_translation(time as f64, 0.0, 0.0),
+                        pose: Isometry3::from_translation(vector![time as f64, 0.0, 0.0]),
                         covariance: nalgebra::SMatrix::zeros(),
                     }),
                 },
@@ -441,9 +580,7 @@ mod tests {
     #[test]
     fn projection_rejects_invalid_depth_and_clips_crossing_segments() {
         let projection = FieldProjection {
-            field_to_camera: Isometry3::from_rotation(linear_algebra::vector![
-                0.0, -FRAC_PI_2, 0.0
-            ]),
+            field_to_camera: Isometry3::from_axis_angle(vector![0.0, -FRAC_PI_2, 0.0]),
             intrinsics: Intrinsic::default(),
         };
         assert!(projection.project(point![f32::NAN, 0.0, 0.0]).is_none());

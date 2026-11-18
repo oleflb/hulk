@@ -190,3 +190,55 @@ impl ImageOverlays {
                 .collect(),
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comparison_toggle_persists_independently_and_resolves_under_robot_namespace()
+    -> Result<(), Report> {
+        let old_settings = json!({"projected_field_lines": {"active": true}});
+        let original = ImageOverlays::new(Some(&old_settings));
+        assert_eq!(original.save()["projected_field_lines"]["active"], true);
+        assert_eq!(
+            original.save()["comparison_projected_field_lines"]["active"],
+            false
+        );
+
+        for original_enabled in [false, true] {
+            let settings = json!({
+                "projected_field_lines": {"active": original_enabled},
+                "comparison_projected_field_lines": {"active": true},
+            });
+            let mut overlays = ImageOverlays::new(Some(&settings));
+            let saved = overlays.save();
+            assert_eq!(ImageOverlays::new(Some(&saved)).save(), saved);
+            let (inputs, preferences) = overlays.declarations("/42", true)?;
+            assert!(preferences.is_empty());
+            assert_eq!(inputs.len(), if original_enabled { 9 } else { 4 });
+            let comparison = ProjectedFieldLinesOverlay::comparison().inputs();
+            let topics: Vec<_> = comparison
+                .iter()
+                .map(|input| input.source.topic.as_str())
+                .collect();
+            assert_eq!(
+                topics,
+                [
+                    "camera_matrix",
+                    "comparison/localization/estimate",
+                    "comparison/localization/status",
+                    "field_dimensions",
+                ]
+            );
+            for input in comparison {
+                let mut expected = input.source.clone();
+                expected.topic = format!("/42/{}", expected.topic);
+                let spec = input.into_spec("/42")?;
+                assert_eq!(spec.source, Source::from(expected));
+            }
+        }
+        Ok(())
+    }
+}
