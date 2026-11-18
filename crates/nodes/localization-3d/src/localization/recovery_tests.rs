@@ -3,7 +3,6 @@ use booster::ImuState;
 use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Vector3, point, vector};
 use nalgebra::{Translation3, UnitQuaternion};
-use projection::intrinsic::Intrinsic;
 use std::time::Duration;
 use types::{
     odometry::KinematicOdometryDelta,
@@ -11,18 +10,7 @@ use types::{
     visual_odometry::{VisualOdometer, VisualOdometryDelta},
 };
 
-fn camera() -> CameraGeometry {
-    CameraGeometry {
-        robot_to_camera: nalgebra::Isometry3::from_parts(
-            Translation3::new(0.12, -0.04, 0.2),
-            UnitQuaternion::from_euler_angles(std::f32::consts::PI, 0.0, 0.0),
-        )
-        .inverse()
-        .framed_transform(),
-        intrinsics: Intrinsic::new(nalgebra::vector![300.0, 300.0], point![160.0, 120.0]),
-    }
-}
-
+use crate::test_support::{camera, parameters};
 fn turn(t: f64) -> (f64, f64) {
     let u = ((t - 3.0) / 0.6).clamp(0.0, 1.0);
     (0.6 * u * u * (3.0 - 2.0 * u), 6.0 * u * (1.0 - u))
@@ -128,29 +116,7 @@ fn ingest_motion(localization: &mut Localization, index: u64, with_vo: bool) {
 }
 
 fn new_localization() -> Localization {
-    let parameters = Localization3dParameters {
-        timing: Default::default(),
-        model: Default::default(),
-        solver: Default::default(),
-        visual: Default::default(),
-        inputs: Default::default(),
-        imu_preintegration: Default::default(),
-        imu_bias: Default::default(),
-        kinematic_odometry_noise: Some(Default::default()),
-        accelerometer: None,
-        initial_height_sigma: 1.0,
-        initial_velocity_sigma: 5.0,
-        recovery_height_gate: 9.0,
-        max_tilt_error: 20.0_f64.to_radians(),
-        accelerometer_process_noise_variance: 10.0,
-        visual_feature_noise_variance: 100.0,
-        field_containment_sigma: 1.0,
-        max_heading_error: 20.0_f64.to_radians(),
-        max_heading_reference_drift_per_second: 0.5_f64.to_radians(),
-        tracking_timeout: Duration::from_secs(2),
-        visual_tracking_timeout: Duration::from_secs(2),
-    };
-    new_localization_with_parameters(&parameters)
+    new_localization_with_parameters(&parameters())
 }
 
 fn new_localization_with_parameters(parameters: &Localization3dParameters) -> Localization {
@@ -180,6 +146,15 @@ fn lost_localization(with_vo: bool) -> (Localization, LocalizationEstimate) {
     );
     for index in 0..=360 {
         ingest_motion(&mut localization, index, with_vo);
+        if index == 20 {
+            let mut confirmation = frame(0.2, false);
+            confirmation.inner.source = VisualAssociationSource::Tracking;
+            assert!(
+                localization
+                    .ingest_visual_localization_frame(confirmation)
+                    .is_ok_and(|inserted| inserted)
+            );
+        }
         if index > 0 && index % 5 == 0 {
             let time = Time::from_nanos(1_000_000_000) + Duration::from_millis(index * 10);
             let solved = localization.solve(time);
@@ -195,7 +170,7 @@ fn lost_localization(with_vo: bool) -> (Localization, LocalizationEstimate) {
 }
 
 #[test]
-fn startup_preserves_delayed_imu_brackets_and_waits_for_missing_samples() {
+fn startup_preserves_delayed_imu_brackets_and_waits_for_missing_samples() -> Result<()> {
     for delayed in [false, true] {
         let mut localization = new_localization();
         let last = if delayed { 20 } else { 5 };
@@ -204,11 +179,7 @@ fn startup_preserves_delayed_imu_brackets_and_waits_for_missing_samples() {
         }
         let mut startup = frame(0.055, false);
         startup.inner.generation = 0;
-        assert!(
-            localization
-                .ingest_visual_localization_frame(startup)
-                .unwrap()
-        );
+        assert!(localization.ingest_visual_localization_frame(startup)?);
         if !delayed {
             localization.solve(Time::from_nanos(1_055_000_000));
             assert_eq!(localization.lifecycle.state, LocalizationState::Startup);
@@ -226,27 +197,116 @@ fn startup_preserves_delayed_imu_brackets_and_waits_for_missing_samples() {
         );
         let estimate = output.estimate.unwrap();
         assert_eq!(estimate.time, Time::from_nanos(1_200_000_000));
+        let pose = estimate.robot_to_field.unwrap().pose.inner;
+        assert!((pose.translation.vector - truth(0.2).translation.vector).norm() < 0.03);
         assert!(
-            (estimate
-                .robot_to_field
-                .unwrap()
-                .pose
-                .inner
-                .translation
-                .vector
-                - truth(0.2).translation.vector)
-                .norm()
-                < 0.03
-        );
-        let status = localization.status();
-        let snapshot = status
-            .heading
-            .expect("publish trusted reference with lifecycle");
-        assert!(
-            snapshot.time < status.time,
-            "reference time is not the state-entry time"
+            localization.status().heading.is_none(),
+            "initialization alone cannot constrain recovery heading"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn global_frames_confirm_startup_after_alignment() -> Result<()> {
+    let mut localization = new_localization();
+    for index in 0..=20 {
+        ingest_motion(&mut localization, index, false);
+    }
+    let now = Time::from_nanos(1_200_000_000);
+    localization.solve(now);
+    for (exposure, expected) in [
+        (0.0, LocalizationState::Startup),
+        (0.2, LocalizationState::Tracking),
+    ] {
+        let mut source = frame(exposure, false);
+        source.inner.generation = localization.status().generation;
+        assert!(localization.ingest_visual_localization_frame(source)?);
+        let output = localization.solve(now);
+        assert_eq!(localization.status().generation, 1);
+        assert_eq!(
+            localization.status().state,
+            expected,
+            "{:?}",
+            output.diagnostics
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn global_confirmation_retains_the_graph_and_corroborates_heading() -> Result<()> {
+    let mut localization = new_localization();
+    for index in 0..=20 {
+        ingest_motion(&mut localization, index, false);
+    }
+    localization.solve(Time::from_nanos(1_200_000_000));
+    assert_eq!(localization.status().state, LocalizationState::Startup);
+    let prediction = localization
+        .height_prediction(Time::from_nanos(1_200_000_000))
+        .ok_or_else(|| eyre!("startup local height must be available without field alignment"))?;
+    assert!((prediction.height - 0.55).abs() < 0.01);
+    assert!(prediction.variance.is_finite() && prediction.variance > 0.0);
+    assert!(localization.ingest_visual_localization_frame(frame(0.0, false))?);
+    localization.solve(Time::from_nanos(1_200_000_000));
+    assert_eq!(localization.status().state, LocalizationState::Startup);
+    assert_eq!(localization.status().generation, 1);
+    let mut initial = frame(0.2, false);
+    initial.inner.generation = localization.status().generation;
+    assert!(localization.ingest_visual_localization_frame(initial)?);
+    localization.solve(Time::from_nanos(1_200_000_000));
+    assert_eq!(localization.status().state, LocalizationState::Tracking);
+    assert!(localization.status().heading.is_none());
+
+    for (end, count) in [(25, 1), (30, 3)] {
+        for index in end - 4..=end {
+            ingest_motion(&mut localization, index, false);
+        }
+        let mut observation = frame(end as f64 * 0.01, false);
+        observation.inner.source = if count == 1 {
+            VisualAssociationSource::Tracking
+        } else {
+            VisualAssociationSource::Global
+        };
+        observation.inner.associations.truncate(count);
+        let time = observation.time;
+        assert!(localization.ingest_visual_localization_frame(observation)?);
+        let output = localization.solve(time);
+        assert_eq!(
+            localization.status().heading.is_some(),
+            count == 3,
+            "{:?}, latest={:?}",
+            output.diagnostics,
+            localization.lifecycle.latest_visual
+        );
+        assert_eq!(localization.status().generation, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn sparse_frames_restore_tracking_only_after_non_collinear_window_evidence() -> Result<()> {
+    for batched in [false, true] {
+        let (mut localization, _) = lost_localization(false);
+        for (start, end, landmark) in [(361, 365, 0), (366, 370, 1), (371, 375, 2)] {
+            for index in start..=end {
+                ingest_motion(&mut localization, index, false);
+            }
+            let mut sparse = frame(end as f64 * 0.01, false);
+            sparse.inner.source = VisualAssociationSource::Tracking;
+            sparse.inner.associations = vec![sparse.inner.associations[landmark]];
+            let time = sparse.time;
+            assert!(localization.ingest_visual_localization_frame(sparse)?);
+            if !batched || landmark == 2 {
+                localization.solve(time);
+            }
+            assert_eq!(
+                localization.status().state == LocalizationState::Tracking,
+                landmark == 2
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]
