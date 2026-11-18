@@ -19,31 +19,49 @@ pub(super) fn estimator() -> Localization {
         7,
         nalgebra::Isometry3::identity().framed_transform(),
         &camera.intrinsics,
-        Localization3dParameters {
-            timing: Default::default(),
-            model: Default::default(),
-            solver: Default::default(),
-            visual: Default::default(),
-            inputs: Default::default(),
-            imu_preintegration: Default::default(),
-            imu_bias: Default::default(),
-            kinematic_odometry_noise: Some(Default::default()),
-            accelerometer: None,
-            initial_height_sigma: 1.0,
-            initial_velocity_sigma: 5.0,
-            recovery_height_gate: 9.0,
-            max_tilt_error: 20.0_f64.to_radians(),
-            accelerometer_process_noise_variance: 10.0,
-            visual_feature_noise_variance: 100.0,
-            field_containment_sigma: 1.0,
-            max_heading_error: 20.0_f64.to_radians(),
-            max_heading_reference_drift_per_second: 0.5_f64.to_radians(),
-            tracking_timeout: Duration::from_secs(2),
-            visual_tracking_timeout: Duration::from_secs(2),
-        },
+        crate::test_support::parameters(),
         &FieldDimensions::SPL_2025,
     )
     .unwrap()
+}
+
+#[test]
+fn finite_high_field_posterior_remains_available_without_clamping() -> Result<()> {
+    let mut estimator = estimator();
+    let mut diagnostics = estimator.solve_motion().diagnostics;
+    estimator.alignment = Some(estimator.graph.add(FieldAlignment {
+        local_to_field: nalgebra::Isometry2::identity().framed_transform(),
+    }));
+    let controls = control_keys(&estimator.controls, 0)?;
+    let covariance = covariance::EstimateCovariance {
+        pose: nalgebra::SMatrix::identity() * 0.01,
+        bias: nalgebra::SMatrix::identity() * 0.01,
+    };
+    for height in [-0.01, 0.55, 1.1, 9.338] {
+        for &key in estimator.controls.values() {
+            let mut control = estimator.graph.get(key)?.clone();
+            control.pose.inner.translation.z = height;
+            estimator.graph.set(key, control)?;
+        }
+        let estimate =
+            estimator.estimate_from_covariance(controls, 0.0, &covariance, &mut diagnostics)?;
+        assert!((estimate.robot_to_local.pose.inner.translation.z - height).abs() < 1e-10);
+        assert!((estimate.robot_to_field.unwrap().pose.inner.translation.z - height).abs() < 1e-10);
+    }
+    assert!(
+        estimator
+            .estimate_from_covariance(
+                controls,
+                0.0,
+                &covariance::EstimateCovariance {
+                    pose: -covariance.pose,
+                    bias: -covariance.bias,
+                },
+                &mut diagnostics
+            )
+            .is_err()
+    );
+    Ok(())
 }
 
 #[test]
@@ -64,8 +82,7 @@ fn configured_foot_noise_changes_measurement_weight() {
         estimator
             .insert_feet(
                 estimator.origin,
-                point![0.0, 0.0, -0.02],
-                point![0.0, 0.0, -0.02],
+                [point![0.0, 0.0, -0.02], point![0.0, 0.0, -0.02]],
             )
             .unwrap();
         let evaluate = OptimizeOptions {
@@ -84,40 +101,56 @@ fn configured_foot_noise_changes_measurement_weight() {
 }
 
 #[test]
-fn sustained_fast_turn_preserves_off_grid_camera_estimates() {
+fn sustained_fast_turn_preserves_bounded_availability_and_off_grid_accuracy() -> Result<()> {
     let mut estimator = estimator();
     let mut max_error = 0.0_f64;
     for index in 0..=1500 {
         let t = index as f64 * 0.002;
-        estimator
-            .ingest_imu(
-                estimator.origin + Duration::from_millis(index * 2),
-                ImuState {
-                    roll_pitch_yaw: vector![0.0, 0.0, (4.0 * t) as f32],
-                    angular_velocity: vector![0.0, 0.0, 4.0],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        estimator.ingest_imu(
+            estimator.origin + Duration::from_millis(index * 2),
+            ImuState {
+                roll_pitch_yaw: vector![0.0, 0.0, (4.0 * t) as f32],
+                angular_velocity: vector![0.0, 0.0, 4.0],
+                ..Default::default()
+            },
+        )?;
         if index == 0 || index % 25 != 0 {
             continue;
         }
+        let accepted_time = estimator.last_converged_time;
         let solved = estimator.solve_motion();
-        assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+        // With only an early segment's observations, the unobserved tail can
+        // hit the rotation branch cut. Fresh data must restore output promptly.
+        // Include the interval ending in success, before its timestamp resets
+        // the clock; origin also bounds the wait for the first accepted output.
+        let last_output = accepted_time.unwrap_or(estimator.origin);
+        assert!(
+            estimator.latest_time <= last_output + Duration::from_millis(150),
+            "motion output stalled: {:?}",
+            solved.diagnostics
+        );
+        if solved.estimate.is_none() {
+            assert!(solved.diagnostics.failure.is_some());
+            assert_eq!(estimator.last_converged_time, accepted_time);
+            continue;
+        }
+        assert_eq!(estimator.last_converged_time, Some(estimator.latest_time));
         let exposure = estimator.latest_time - Duration::from_millis(37);
-        let (segment, tau) = estimator.segment_and_tau(exposure).unwrap();
-        let controls = control_keys(&estimator.controls, segment).unwrap();
-        let spline = estimator.spline(controls).unwrap();
-        let sample = spline.linearize().unwrap().pose(tau).unwrap();
+        let (segment, tau) = estimator.segment_and_tau(exposure)?;
+        let controls = control_keys(&estimator.controls, segment)?;
+        let spline = estimator.spline(controls)?;
+        let sample = spline.linearize()?.pose(tau)?;
         let expected = nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, 4.0 * (t - 0.037));
         max_error = max_error.max(sample.pose.inner.rotation.angle_to(&expected));
         let covariance = estimator
             .graph
-            .joint_covariance(&controls.map(|key| key.block_id()))
-            .unwrap();
+            .joint_covariance(&controls.map(|key| key.block_id()))?;
         let covariance = SMatrix::<f64, 24, 24>::from_fn(|r, c| covariance[(r, c)]);
         assert!(sample.covariance(&covariance).cholesky().is_some());
     }
+    // Include an unfinished gap even if the stream ends between solve cycles.
+    let last_output = estimator.last_converged_time.unwrap_or(estimator.origin);
+    assert!(estimator.latest_time <= last_output + Duration::from_millis(150));
     eprintln!(
         "off-grid camera-time fast-turn max error: {:.6} deg",
         max_error.to_degrees()
@@ -125,6 +158,8 @@ fn sustained_fast_turn_preserves_off_grid_camera_estimates() {
     // The unchanged zero-rotation process prior biases sustained blind turns:
     // the raw-IMU baseline reaches 6.351317 degrees in this same experiment.
     assert!(max_error < 6.5_f64.to_radians());
+    assert!(estimator.last_converged_time.is_some());
+    Ok(())
 }
 
 #[test]
