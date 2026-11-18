@@ -80,6 +80,146 @@ fn write_rows<W: Write + Seek>(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ros_z::message::WireDecoder;
+    use std::io::Cursor;
+    use types::localization::{LocalizationState, PoseEstimate};
+
+    #[test]
+    fn comparison_preserves_originals_and_has_indexed_cdr_channels() -> Result<()> {
+        let mut original = Cursor::new(Vec::new());
+        {
+            let mut writer = Writer::new(&mut original)?;
+            let channel = writer.add_channel(
+                0,
+                "camera/raw",
+                "opaque",
+                &BTreeMap::from([("custom".into(), "retained".into())]),
+            )?;
+            writer.write_to_known_channel(
+                &MessageHeader {
+                    channel_id: channel,
+                    sequence: 27,
+                    log_time: 1_000_000_050,
+                    publish_time: 1_000_000_000,
+                },
+                &[1, 2, 3, 4],
+            )?;
+            let typed_channel = add_channel::<u64, _>(&mut writer, "original/typed")?;
+            write_message(
+                &mut writer,
+                typed_channel,
+                7,
+                1_000_000_050,
+                Time::from_nanos(1_000_000_000),
+                &42_u64,
+            )?;
+            writer.finish()?;
+        }
+        let status = LocalizationStatus {
+            time: Time::from_nanos(1_000_000_010),
+            epoch: 2,
+            generation: 3,
+            state: LocalizationState::Tracking,
+            heading: None,
+        };
+        let estimate = LocalizationEstimate {
+            time: Time::from_nanos(1_000_000_020),
+            epoch: 2,
+            generation: 3,
+            robot_to_local: PoseEstimate {
+                pose: linear_algebra::Isometry3::identity(),
+                covariance: nalgebra::SMatrix::identity(),
+            },
+            robot_to_field: None,
+        };
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut writer = Writer::new(&mut output)?;
+            copy_recording(Cursor::new(original.get_ref()), &mut writer)?;
+            write_rows(
+                &mut writer,
+                &[Comparison {
+                    delivery: 1_000_000_060,
+                    status,
+                    estimate: Some(estimate),
+                }],
+                &serde_json::json!({"source": "recorded"}),
+            )?;
+            writer.finish()?;
+        }
+        let bytes = output.get_ref();
+        let summary = mcap::Summary::read(bytes)?.ok_or_else(|| eyre!("missing summary"))?;
+        assert!(!summary.chunk_indexes.is_empty());
+        assert!(
+            summary
+                .chunk_indexes
+                .iter()
+                .all(|chunk| !chunk.message_index_offsets.is_empty())
+        );
+        let messages = mcap::MessageStream::new(bytes)?.collect::<mcap::McapResult<Vec<_>>>()?;
+        assert_eq!(messages.len(), 4);
+        let original_message = &messages[0];
+        assert_eq!(original_message.channel.topic, "camera/raw");
+        assert_eq!(
+            original_message
+                .channel
+                .metadata
+                .get("custom")
+                .map(String::as_str),
+            Some("retained")
+        );
+        assert_eq!(
+            (
+                original_message.sequence,
+                original_message.log_time,
+                original_message.publish_time
+            ),
+            (27, 1_000_000_050, 1_000_000_000)
+        );
+        assert_eq!(original_message.data.as_ref(), &[1, 2, 3, 4]);
+        let original_typed = mcap::MessageStream::new(original.get_ref())?
+            .nth(1)
+            .ok_or_else(|| eyre!("missing original typed message"))??;
+        assert_eq!(messages[1], original_typed);
+        let status_message = &messages[2];
+        assert_eq!(status_message.channel.topic, STATUS_TOPIC);
+        assert_eq!(
+            SerdeCdrCodec::<LocalizationStatus>::deserialize(&status_message.data)?,
+            status
+        );
+        assert_eq!(status_message.publish_time, 1_000_000_060);
+        let estimate_message = &messages[3];
+        assert_eq!(estimate_message.channel.topic, ESTIMATE_TOPIC);
+        assert_eq!(
+            SerdeCdrCodec::<LocalizationEstimate>::deserialize(&estimate_message.data)?,
+            estimate
+        );
+        assert_eq!(
+            (estimate_message.log_time, estimate_message.publish_time),
+            (1_000_000_060, 1_000_000_020)
+        );
+        assert_eq!(estimate_message.channel.message_encoding, "ros-z-cdr");
+        let schema = estimate_message
+            .channel
+            .schema
+            .as_ref()
+            .ok_or_else(|| eyre!("missing schema"))?;
+        assert_eq!(schema.encoding, "ros-z-schema-json");
+        assert_eq!(
+            schema.data.as_ref(),
+            serde_json::to_vec(&LocalizationEstimate::schema())?
+        );
+        assert_eq!(
+            estimate_message.channel.metadata.get("ros_z.schema_hash"),
+            Some(&LocalizationEstimate::schema_hash().to_hash_string())
+        );
+        Ok(())
+    }
+}
+
 fn add_channel<T: Message, W: Write + Seek>(writer: &mut Writer<W>, topic: &str) -> Result<u16> {
     let name = T::type_name();
     let schema = writer.add_schema(
