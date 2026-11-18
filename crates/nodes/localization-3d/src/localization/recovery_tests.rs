@@ -522,16 +522,15 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
 }
 
 #[test]
-fn double_flight_fuses_zero_specific_force_without_ground_contact() {
-    let mut localization = new_localization();
-    let mut parameters = localization.parameters.clone();
+fn double_flight_fuses_zero_specific_force_without_ground_contact() -> Result<()> {
+    let mut parameters = parameters();
     parameters.accelerometer = Some(crate::AccelerometerParameters {
         noise_density: 0.03,
         ..Default::default()
     });
     parameters.kinematic_odometry_noise = None;
     parameters.visual_feature_noise_variance = 4.0;
-    localization = new_localization_with_parameters(&parameters);
+    let mut localization = new_localization_with_parameters(&parameters);
     let flying_pose = |t: f64| {
         let mut pose = truth(t);
         pose.translation.z = 0.55 + 2.0 * t - 0.5 * 9.81 * t * t;
@@ -545,47 +544,39 @@ fn double_flight_fuses_zero_specific_force_without_ground_contact() {
     for index in 0..=200 {
         let t = index as f64 * 0.002;
         let time = Time::from_nanos(1_000_000_000 + index * 2_000_000);
-        localization
-            .ingest_imu(
-                time,
-                ImuState {
-                    roll_pitch_yaw: vector![0.0, 0.0, 2.7],
-                    // Specific force is zero in flight, not +g or a missing measurement.
-                    linear_acceleration: Vector3::zeros(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        localization.ingest_imu(
+            time,
+            ImuState {
+                roll_pitch_yaw: vector![0.0, 0.0, 2.7],
+                // Specific force is zero in flight, not +g or a missing measurement.
+                linear_acceleration: Vector3::zeros(),
+                ..Default::default()
+            },
+        )?;
         if index % 10 != 0 {
             continue;
         }
-        localization
-            .ingest_kinematics(TimeWrapper {
-                time,
-                inner: feet.clone(),
-            })
-            .unwrap();
+        localization.ingest_kinematics(TimeWrapper {
+            time,
+            inner: feet.clone(),
+        })?;
         if index > 0 {
             let delta = flying_pose(t - 0.02).inverse() * flying_pose(t);
-            localization
-                .ingest_visual_odometry(
-                    VisualOdometer {
-                        time,
-                        epoch: 1,
-                        delta: Some(VisualOdometryDelta {
-                            previous_time: time - Duration::from_millis(20),
-                            current_left_camera_to_previous_left_camera: camera
-                                .robot_to_camera
-                                .inner
-                                * delta.cast::<f32>()
-                                * camera.robot_to_camera.inner.inverse(),
-                        }),
-                        current_left_camera_to_visual_odometer: nalgebra::Isometry3::identity(),
-                    },
-                    Some(&camera),
-                    Some(&camera),
-                )
-                .unwrap();
+            localization.ingest_visual_odometry(
+                VisualOdometer {
+                    time,
+                    epoch: 1,
+                    delta: Some(VisualOdometryDelta {
+                        previous_time: time - Duration::from_millis(20),
+                        current_left_camera_to_previous_left_camera: camera.robot_to_camera.inner
+                            * delta.cast::<f32>()
+                            * camera.robot_to_camera.inner.inverse(),
+                    }),
+                    current_left_camera_to_visual_odometer: nalgebra::Isometry3::identity(),
+                },
+                Some(&camera),
+                Some(&camera),
+            )?;
         }
         if index % 50 == 0 {
             let mut image = frame(t, false);
@@ -601,9 +592,7 @@ fn double_flight_fuses_zero_specific_force_without_ground_contact() {
                     * a.field_point.inner;
                 a.detection = camera.intrinsics.project(Vector3::wrap(p.coords));
             }
-            localization
-                .ingest_visual_localization_frame(image)
-                .unwrap();
+            localization.ingest_visual_localization_frame(image)?;
         }
         let output = localization.solve(time);
         if let Some(pose) = output.estimate.and_then(|e| e.robot_to_field) {
@@ -621,6 +610,7 @@ fn double_flight_fuses_zero_specific_force_without_ground_contact() {
         observed_peak > 0.72,
         "the estimator must allow both soles above the floor"
     );
+    Ok(())
 }
 
 #[test]
@@ -646,18 +636,48 @@ fn field_inconsistency_does_not_stop_local_motion_or_forget_heading() {
         assert!(output.estimate.is_some(), "{:?}", output.diagnostics);
     }
     let imu = linear_algebra::Orientation3::from_euler_angles(0.0, 0.0, 3.3);
+    let actual = localization
+        .lifecycle
+        .heading_reference
+        .unwrap()
+        .expected(imu);
+    assert!(reference.expected(imu).rotation_to(actual).angle().abs() < 1e-12);
+}
+
+fn carrying_localization() -> Result<Localization> {
+    let mut parameters = parameters();
+    parameters.visual_feature_noise_variance = 25.0;
+    let mut localization = new_localization_with_parameters(&parameters);
+    for index in 0..=20 {
+        ingest_motion(&mut localization, index, false);
+        if index == 0 || index == 20 {
+            assert!(
+                localization.ingest_visual_localization_frame(frame(index as f64 * 0.01, false))?
+            );
+        }
+        if index > 0 && index % 5 == 0 {
+            localization.solve(Time::from_nanos(1_000_000_000 + index as i64 * 10_000_000));
+        }
+    }
+    assert!(localization.lifecycle.heading_reference.is_some());
+    Ok(localization)
+}
+
+fn ingest_fixed_legs(localization: &mut Localization, index: i64) -> Result<()> {
+    let time = Time::from_nanos(1_000_000_000 + index * 10_000_000);
+    localization.ingest_imu(
+        time,
+        ImuState {
+            roll_pitch_yaw: vector![0.0, 0.0, 2.7],
+            ..Default::default()
+        },
+    )?;
     assert!(
-        reference
-            .expected(imu)
-            .rotation_to(
-                localization
-                    .lifecycle
-                    .heading_reference
-                    .unwrap()
-                    .expected(imu)
-            )
-            .angle()
-            .abs()
-            < 1e-12
+        localization.ingest_kinematic_odometry(KinematicOdometryDelta {
+            previous_time: time - Duration::from_millis(10),
+            time,
+            current_to_previous: linear_algebra::Isometry2::identity(),
+        })?
     );
+    Ok(())
 }
