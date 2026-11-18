@@ -217,13 +217,15 @@ impl OdometryEstimator {
     }
 
     fn clear_contact_tracking(&mut self) {
+        if let Some(delta) = self.pending_delta.take() {
+            self.delta = Some(delta);
+        }
         self.support_side = None;
         self.previous_contacts = None;
         self.last_yaw = None;
-        self.pending_delta = None;
     }
 
-    /// Take the completed contact interval from the latest update, if any.
+    /// Take the completed batch or accepted tail before a reset from the latest update.
     pub fn take_delta(&mut self) -> Option<KinematicOdometryDelta> {
         self.delta.take()
     }
@@ -236,7 +238,7 @@ impl OdometryEstimator {
         time: Time,
         double_support: bool,
     ) {
-        self.pending_delta = None;
+        self.clear_contact_tracking();
         self.support_side = Some(support_side);
         self.previous_contacts = Some(contacts);
         self.previous_double_support = double_support;
@@ -286,14 +288,8 @@ fn is_upright(fall_detection: Option<&FallDetection>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use booster::ImuState;
-    use coordinate_systems::{LeftSole, RightSole};
-    use kinematics::robot_kinematics::{
-        RobotKinematics, RobotLeftLegKinematics, RobotRightLegKinematics,
-    };
+    use kinematics::robot_kinematics::{RobotLeftLegKinematics, RobotRightLegKinematics};
     use linear_algebra::{IntoTransform, point, vector};
-    use ros_z::time::Time;
-    use types::fall_detection::{FallDetection, Posture};
 
     use super::*;
 
@@ -379,21 +375,39 @@ mod tests {
         }
     }
 
+    fn input<'a>(
+        imu_state: &'a ImuState,
+        feet: &'a TimeWrapper<RobotKinematics>,
+        fall_detection: Option<&'a FallDetection>,
+    ) -> EstimatorInput<'a> {
+        EstimatorInput {
+            time: feet.time,
+            imu_state,
+            robot_kinematics: Some(feet),
+            fall_detection,
+        }
+    }
+
+    fn anchored_estimator(parameters: &Parameters) -> OdometryEstimator {
+        let mut estimator = OdometryEstimator::default();
+        estimator.update(
+            input(
+                &imu(0.0),
+                &sample(1000, kinematics(0.0, 0.0)),
+                Some(&upright()),
+            ),
+            parameters,
+        );
+        estimator
+    }
+
     #[test]
     fn first_valid_frame_anchors_without_translation() {
         let mut estimator = OdometryEstimator::default();
         let imu = imu(1.0);
         let kinematics = sample(1000, kinematics(0.0, 0.0));
         let pose = estimator
-            .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_000_000_000),
-                    imu_state: &imu,
-                    robot_kinematics: Some(&kinematics),
-                    fall_detection: Some(&upright()),
-                },
-                &parameters(),
-            )
+            .update(input(&imu, &kinematics, Some(&upright())), &parameters())
             .expect("valid frame publishes");
 
         assert!(pose.position().x().abs() < 1.0e-6);
@@ -403,31 +417,13 @@ mod tests {
 
     #[test]
     fn support_contact_motion_integrates_opposite_robot_motion() {
-        let mut estimator = OdometryEstimator::default();
         let parameters = parameters();
+        let mut estimator = anchored_estimator(&parameters);
         let imu = imu(0.0);
-        let first = sample(1000, kinematics(0.0, 0.0));
-        estimator.update(
-            EstimatorInput {
-                time: Time::from_nanos(1_000_000_000),
-                imu_state: &imu,
-                robot_kinematics: Some(&first),
-                fall_detection: Some(&upright()),
-            },
-            &parameters,
-        );
 
         let second = sample(1010, kinematics(0.05, 0.0));
         let pose = estimator
-            .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_010_000_000),
-                    imu_state: &imu,
-                    robot_kinematics: Some(&second),
-                    fall_detection: Some(&upright()),
-                },
-                &parameters,
-            )
+            .update(input(&imu, &second, Some(&upright())), &parameters)
             .expect("second frame publishes");
 
         assert!(pose.position().x() < -0.049);
@@ -435,31 +431,13 @@ mod tests {
 
     #[test]
     fn support_switch_reanchors_without_translation_jump() {
-        let mut estimator = OdometryEstimator::default();
         let parameters = parameters();
+        let mut estimator = anchored_estimator(&parameters);
         let imu = imu(0.0);
-        let first = sample(1000, kinematics_with_heights(0.0, -0.02, 0.0, 0.0));
-        estimator.update(
-            EstimatorInput {
-                time: Time::from_nanos(1_000_000_000),
-                imu_state: &imu,
-                robot_kinematics: Some(&first),
-                fall_detection: Some(&upright()),
-            },
-            &parameters,
-        );
 
         let second = sample(1010, kinematics_with_heights(0.5, 0.0, 0.5, -0.02));
         let pose = estimator
-            .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_010_000_000),
-                    imu_state: &imu,
-                    robot_kinematics: Some(&second),
-                    fall_detection: Some(&upright()),
-                },
-                &parameters,
-            )
+            .update(input(&imu, &second, Some(&upright())), &parameters)
             .expect("support switch frame publishes");
 
         assert!(pose.position().x().abs() < 1.0e-6);
@@ -468,32 +446,14 @@ mod tests {
 
     #[test]
     fn excessive_delta_rejection_keeps_last_valid_pose_and_reanchors() {
-        let mut estimator = OdometryEstimator::default();
         let mut parameters = parameters();
         parameters.max_linear_speed = 0.1;
+        let mut estimator = anchored_estimator(&parameters);
         let imu = imu(0.0);
-        let first = sample(1000, kinematics(0.0, 0.0));
-        estimator.update(
-            EstimatorInput {
-                time: Time::from_nanos(1_000_000_000),
-                imu_state: &imu,
-                robot_kinematics: Some(&first),
-                fall_detection: Some(&upright()),
-            },
-            &parameters,
-        );
 
         let second = sample(1010, kinematics(1.0, 0.0));
         let pose = estimator
-            .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_010_000_000),
-                    imu_state: &imu,
-                    robot_kinematics: Some(&second),
-                    fall_detection: Some(&upright()),
-                },
-                &parameters,
-            )
+            .update(input(&imu, &second, Some(&upright())), &parameters)
             .expect("rejected-delta frame still publishes last pose");
 
         assert!(pose.position().x().abs() < 1.0e-6);
@@ -501,67 +461,15 @@ mod tests {
     }
 
     #[test]
-    fn falling_state_clears_anchor_and_suppresses_translation() {
-        let mut estimator = OdometryEstimator::default();
+    fn fallen_or_missing_fall_state_clears_anchor_and_suppresses_translation() {
         let parameters = parameters();
         let imu = imu(0.0);
-        let first = sample(1000, kinematics(0.0, 0.0));
-        estimator.update(
-            EstimatorInput {
-                time: Time::from_nanos(1_000_000_000),
-                imu_state: &imu,
-                robot_kinematics: Some(&first),
-                fall_detection: Some(&upright()),
-            },
-            &parameters,
-        );
-
         let second = sample(1010, kinematics(0.5, 0.0));
-        let pose = estimator
-            .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_010_000_000),
-                    imu_state: &imu,
-                    robot_kinematics: Some(&second),
-                    fall_detection: Some(&fallen()),
-                },
-                &parameters,
-            )
-            .expect("falling frame publishes unchanged pose");
-
-        assert!(pose.position().x().abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn missing_fall_state_clears_anchor_and_suppresses_translation() {
-        let mut estimator = OdometryEstimator::default();
-        let parameters = parameters();
-        let imu = imu(0.0);
-        let first = sample(1000, kinematics(0.0, 0.0));
-        estimator.update(
-            EstimatorInput {
-                time: Time::from_nanos(1_000_000_000),
-                imu_state: &imu,
-                robot_kinematics: Some(&first),
-                fall_detection: Some(&upright()),
-            },
-            &parameters,
-        );
-
-        let second = sample(1010, kinematics(0.5, 0.0));
-        let pose = estimator
-            .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_010_000_000),
-                    imu_state: &imu,
-                    robot_kinematics: Some(&second),
-                    fall_detection: None,
-                },
-                &parameters,
-            )
-            .expect("missing fall state publishes unchanged pose");
-
-        assert!(pose.position().x().abs() < 1.0e-6);
+        for state in [Some(fallen()), None] {
+            let mut estimator = anchored_estimator(&parameters);
+            let pose = estimator.update(input(&imu, &second, state.as_ref()), &parameters);
+            assert!(pose.is_some_and(|pose| pose.position().x().abs() < 1.0e-6));
+        }
     }
 
     #[test]
@@ -602,12 +510,7 @@ mod tests {
         let kinematics = sample(1010, kinematics(0.0, 0.0));
         let pose = estimator
             .update(
-                EstimatorInput {
-                    time: Time::from_nanos(1_010_000_000),
-                    imu_state: &valid_imu,
-                    robot_kinematics: Some(&kinematics),
-                    fall_detection: Some(&upright()),
-                },
+                input(&valid_imu, &kinematics, Some(&upright())),
                 &parameters(),
             )
             .expect("first valid frame publishes");
@@ -657,7 +560,6 @@ mod tests {
         assert!(delta.is_none());
         assert!(matches!(update(1060, 1154, -0.04), (None, None)));
     }
-
     #[test]
     fn measured_stops_in_double_support_are_distinct_from_rejected_intervals() {
         let mut estimator = OdometryEstimator::default();
@@ -703,7 +605,12 @@ mod tests {
         let resumed = update(1850, -0.1, -5.0, 0.02, true, &ready).unwrap();
         assert_eq!(resumed.previous_time, Time::from_nanos(1_800_000_000));
         assert!(update(1860, -0.1, -5.0, 0.02, true, &ready).is_none());
-        assert!(update(1870, -0.1, -5.0, 0.02, false, &ready).is_none());
+        let tail = update(1870, -0.1, -5.0, 0.02, false, &ready);
+        assert!(
+            matches!(tail, Some(delta) if delta.previous_time == Time::from_nanos(1_850_000_000)
+            && delta.time == Time::from_nanos(1_860_000_000)
+            && delta.current_to_previous == Isometry2::identity())
+        );
         assert!(update(1880, -0.1, -5.0, 0.02, true, &ready).is_none());
         let resumed = update(1930, -0.1, -5.0, 0.02, true, &ready).unwrap();
         assert_eq!(resumed.previous_time, Time::from_nanos(1_880_000_000));
