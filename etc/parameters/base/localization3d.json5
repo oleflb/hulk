@@ -57,8 +57,12 @@
     kinematics_cache: 1000,
     field_cache: 1,
   },
-  // Leg odometry assumes a stationary support foot. Enable only with justified stance evidence.
-  kinematic_odometry_noise: null,
+  // Our odometry/kinematic_delta assumes a stationary support foot.
+  // Existing estimator defaults, not hardware-calibrated; validate slip/noise on recordings.
+  kinematic_odometry_noise: {
+    position_sigma: [0.005, 0.005], // forward/lateral displacement floor per delta, m
+    translation_variance_per_second: [0.001, 0.001], // forward/lateral variance growth, m²/s
+  },
   imu_preintegration: {
     gyroscope_noise_density: 0.00447213595499958,
     integration_noise_density: 0.0001,
