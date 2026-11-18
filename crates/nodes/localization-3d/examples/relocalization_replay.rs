@@ -724,6 +724,80 @@ mod tests {
     }
 
     #[test]
+    fn late_delivered_camera_allows_next_imu_to_initialize_after_unready_solve() -> Result<()> {
+        let parameters: Localization3dParameters = json5::from_str(include_str!(
+            "../../../../etc/parameters/base/localization3d.json5"
+        ))?;
+        let first = Time::from_nanos(1_000_000_000);
+        let camera_time = first.saturating_add(Duration::from_millis(5));
+        let second = first.saturating_add(Duration::from_millis(6));
+        let events = [
+            Event::Feet(Box::new(TimeWrapper {
+                time: first,
+                inner: RobotKinematics::default(),
+            })),
+            Event::Imu(first, ImuState::default()),
+            Event::Solve,
+            Event::Camera(TimeWrapper {
+                time: camera_time,
+                inner: CameraGeometry::default(),
+            }),
+            Event::Imu(second, ImuState::default()),
+            Event::Solve,
+        ];
+        let mut cameras = BTreeMap::new();
+        let mut feet = BTreeMap::new();
+        let mut pending = None;
+        let mut readiness = Vec::new();
+        let mut initialized_time = None;
+        for event in events {
+            match event {
+                Event::Feet(sample) => {
+                    feet.insert(sample.time, *sample);
+                }
+                Event::Camera(sample) => {
+                    cameras.insert(sample.time, sample);
+                }
+                Event::Imu(time, imu) => pending = Some((time, imu)),
+                Event::Solve => {
+                    let (time, imu) = pending.take().ok_or_else(|| eyre!("missing test IMU"))?;
+                    let initialized = initialize_from_imu(
+                        time,
+                        &imu,
+                        7,
+                        &parameters,
+                        &FieldDimensions::SPL_2025,
+                        &cameras,
+                        &feet,
+                    );
+                    readiness.push(initialized.is_some());
+                    if let Some(localization) = initialized {
+                        initialized_time = Some(localization?.status().time);
+                    }
+                }
+                _ => return Err(eyre!("unexpected test event")),
+            }
+        }
+        assert_eq!(readiness, [false, true]);
+        assert_eq!(initialized_time, Some(second));
+        Ok(())
+    }
+
+    #[test]
+    fn initialization_uses_nearest_delivered_sample_with_freshness_limit() {
+        let time = Time::from_nanos(1_000_000_000);
+        let future = time.saturating_add(Duration::from_millis(5));
+        let past = time.saturating_sub(Duration::from_millis(30));
+        let cache = BTreeMap::from([(past, "stale"), (future, "ready")]);
+        assert_eq!(
+            nearest_sample(&cache, time, Duration::from_millis(20)),
+            Some(&"ready")
+        );
+        assert!(nearest_sample(&cache, time, Duration::from_millis(4)).is_none());
+        assert!(nearest_sample::<()>(&BTreeMap::new(), time, Duration::from_millis(20)).is_none());
+    }
+
+    #[test]
     fn every_required_topic_needs_messages() {
         let mut seen: BTreeSet<_> = REQUIRED_TOPICS.iter().map(|s| s.to_string()).collect();
         assert!(require_topics(&seen).is_ok());
