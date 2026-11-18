@@ -681,3 +681,142 @@ fn ingest_fixed_legs(localization: &mut Localization, index: i64) -> Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn carrying_requires_two_global_images_before_overriding_fixed_legs() -> Result<()> {
+    for offset in [0, 5_000_000] {
+        let mut localization = carrying_localization()?;
+        for index in 21..=100 {
+            ingest_fixed_legs(&mut localization, index)?;
+            if index == 60 || index == 100 {
+                assert!(localization.ingest_visual_localization_frame(frame(
+                    index as f64 * 0.01 - offset as f64 * 1e-9,
+                    false
+                ))?);
+            }
+            if index % 5 == 0 {
+                let output =
+                    localization.solve(Time::from_nanos(1_000_000_000 + index * 10_000_000));
+                if index == 60 {
+                    assert_eq!(
+                        localization.lifecycle.latest_visual,
+                        Some(Time::from_nanos(1_200_000_000))
+                    );
+                    assert!(localization.lifecycle.rejected_global.is_some());
+                }
+                if index == 100 {
+                    assert_eq!(
+                        localization.lifecycle.latest_visual,
+                        Some(Time::from_nanos(2_000_000_000 - offset)),
+                        "{:?}",
+                        output.diagnostics
+                    );
+                    let pose = output
+                        .estimate
+                        .and_then(|e| e.robot_to_field)
+                        .ok_or_else(|| eyre!("missing recovery pose"))?
+                        .pose
+                        .inner;
+                    assert!(
+                        (pose.translation.vector - truth(1.0).translation.vector).norm() < 0.05,
+                        "{pose:?}"
+                    );
+                    assert_eq!(localization.generation, 1);
+                    assert!(localization.lifecycle.rejected_global.is_none());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_offset_with_correct_relative_motion_cannot_override_live_legs() -> Result<()> {
+    let mut localization = carrying_localization()?;
+    for index in 21..=100 {
+        ingest_motion(&mut localization, index, false);
+        if index == 60 || index == 100 {
+            let mut wrong = frame(index as f64 * 0.01, false);
+            for association in &mut wrong.inner.associations {
+                association.field_point.inner.x += 2.0;
+            }
+            assert!(localization.ingest_visual_localization_frame(wrong)?);
+        }
+        if index % 5 == 0 {
+            let output =
+                localization.solve(Time::from_nanos(1_000_000_000 + index as i64 * 10_000_000));
+            assert_eq!(
+                localization.lifecycle.latest_visual,
+                Some(Time::from_nanos(1_200_000_000))
+            );
+            let pose = output
+                .estimate
+                .and_then(|e| e.robot_to_field)
+                .ok_or_else(|| eyre!("missing grounded motion pose"))?
+                .pose
+                .inner;
+            assert!(
+                (pose.translation.vector - truth(index as f64 * 0.01).translation.vector).norm()
+                    < 0.03
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_tracking_trial_preserves_the_first_conflicting_global_image() -> Result<()> {
+    let mut localization = carrying_localization()?;
+    let parameters = localization.parameters.clone();
+    for index in 21..=100 {
+        ingest_fixed_legs(&mut localization, index)?;
+        let time = Time::from_nanos(1_000_000_000 + index * 10_000_000);
+        if index == 60 || index == 100 {
+            assert!(
+                localization.ingest_visual_localization_frame(frame(index as f64 * 0.01, false))?
+            );
+        }
+        if index == 80 {
+            let mut tracking = frame(0.25, false);
+            tracking.time = time;
+            tracking.inner.source = VisualAssociationSource::Tracking;
+            assert!(localization.ingest_visual_localization_frame(tracking)?);
+            assert_eq!(
+                localization
+                    .lifecycle
+                    .rejected_global
+                    .as_ref()
+                    .map(|frame| frame.time),
+                Some(Time::from_nanos(1_600_000_000))
+            );
+            let mut limited = parameters.clone();
+            limited.solver.max_iterations = 1;
+            localization.set_parameters(&limited)?;
+        }
+        if index % 5 == 0 {
+            localization.solve(time);
+        }
+        if index == 80 {
+            assert!(localization.lifecycle.pending_visual.is_none());
+            assert_eq!(
+                localization.lifecycle.latest_visual,
+                Some(Time::from_nanos(1_200_000_000))
+            );
+            assert_eq!(
+                localization
+                    .lifecycle
+                    .rejected_global
+                    .as_ref()
+                    .map(|frame| frame.time),
+                Some(Time::from_nanos(1_600_000_000))
+            );
+            localization.set_parameters(&parameters)?;
+        }
+    }
+    assert_eq!(
+        localization.lifecycle.latest_visual,
+        Some(Time::from_nanos(2_000_000_000))
+    );
+    assert!(localization.lifecycle.rejected_global.is_none());
+    Ok(())
+}
