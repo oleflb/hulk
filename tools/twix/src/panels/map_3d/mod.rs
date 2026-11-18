@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bevy::{camera_controller::pan_orbit_camera::prelude::PanOrbitCamera, prelude::*};
+use color_eyre::Result;
 use coordinate_systems::{Field, Robot};
 use eframe::egui::Ui;
 use egui_bevy::BevyWidget;
@@ -11,15 +12,25 @@ use ros_z::{
     qos::{QosDurability, QosProfile},
     time::Time,
 };
-use ros_z_debug::{ObservationPolicy, SampleRecord};
+use ros_z_debug::{
+    ObservationPolicy, SampleRecord, TargetIdentity,
+    query::{
+        TimeEncoding, TimeProjection,
+        plan::{self, Frame, InputSpec, Selection, Source},
+    },
+};
 use ros2::sensor_msgs::image::Image as RosImage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use types::{
-    field_dimensions::FieldDimensions, time_wrapper::TimeWrapper,
-    visual_localization::VisualLocalizationFrame as FieldMarkAssociations, world_state::BallState,
+    field_dimensions::FieldDimensions,
+    localization::{LocalizationEstimate, LocalizationStatus},
+    time_wrapper::TimeWrapper,
+    visual_localization::VisualLocalizationFrame as FieldMarkAssociations,
+    world_state::BallState,
 };
 
+use super::map_observation::{MapObservation, input, nearest, source};
 use crate::{
     panel::{Panel, PanelCreationContext, PanelUiContext},
     repaint::ObservationContext,
@@ -37,7 +48,7 @@ mod observation;
 mod robot;
 mod transforms;
 
-#[derive(Clone, Resource, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Resource, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
     field: bool,
@@ -68,6 +79,207 @@ struct ViewerData {
     camera_frame: Option<Arc<SampleRecord<RosImage>>>,
     field_mark_associations: Option<Arc<SampleRecord<TimeWrapper<FieldMarkAssociations>>>>,
     ball: Option<BallState>,
+}
+
+struct FrameObservations {
+    settings: Settings,
+    frame: MapObservation,
+}
+
+impl FrameObservations {
+    fn new(context: &impl ObservationContext, settings: &Settings) -> Result<Self> {
+        let target = TargetIdentity::new(context.backend().namespace())?;
+        let payload_time = TimeProjection::field(".time", TimeEncoding::RosZTime)?;
+        let estimate =
+            source::<LocalizationEstimate>(&target, "localization/estimate", payload_time.clone())?;
+        let mut dimensions =
+            source::<FieldDimensions>(&target, "field_dimensions", TimeProjection::SourceTime)?;
+        let mut status =
+            source::<LocalizationStatus>(&target, "localization/status", payload_time.clone())?;
+        let latched = ObservationPolicy::default().with_subscriber_qos(QosProfile {
+            durability: QosDurability::TransientLocal,
+            ..Default::default()
+        });
+        dimensions.live_policy = latched;
+        status.live_policy = latched;
+        let mut primary = Source::from(estimate.clone())
+            .latest(plan::cursor())
+            .or_else(Source::from(dimensions.clone()).latest(plan::cursor()));
+        let mut inputs = vec![
+            InputSpec {
+                source: dimensions.into(),
+                selection: Selection::latest(),
+            },
+            InputSpec {
+                source: status.into(),
+                selection: Selection::latest(),
+            },
+            InputSpec {
+                source: estimate.into(),
+                selection: Selection::Bracket {
+                    max_gap: Duration::from_secs(2),
+                },
+            },
+            InputSpec {
+                source: source::<TimeWrapper<RobotKinematics>>(
+                    &target,
+                    "robot_kinematics",
+                    payload_time.clone(),
+                )?
+                .into(),
+                selection: Selection::Bracket {
+                    max_gap: Duration::from_millis(200),
+                },
+            },
+        ];
+        if settings.camera || settings.associations {
+            inputs.push(InputSpec {
+                source: source::<TimeWrapper<CameraMatrix>>(
+                    &target,
+                    "camera_matrix",
+                    payload_time.clone(),
+                )?
+                .into(),
+                selection: Selection::Bracket {
+                    max_gap: Duration::from_millis(200),
+                },
+            });
+        }
+        if settings.camera {
+            let images = source::<RosImage>(
+                &target,
+                "inputs/left_image",
+                TimeProjection::field(".header.stamp", TimeEncoding::RosTime)?,
+            )?;
+            primary = Source::from(images).latest(plan::cursor()).or_else(primary);
+        }
+        if settings.associations {
+            inputs.push(InputSpec {
+                source: source::<TimeWrapper<FieldMarkAssociations>>(
+                    &target,
+                    "field_mark_association/visual_localization_local",
+                    payload_time,
+                )?
+                .into(),
+                selection: Selection::Exact,
+            });
+        }
+        if settings.ball {
+            inputs.push(InputSpec {
+                source: source::<Option<BallState>>(
+                    &target,
+                    "ball_state",
+                    TimeProjection::SourceTime,
+                )?
+                .into(),
+                selection: Selection::latest(),
+            });
+        }
+        Ok(Self {
+            settings: settings.clone(),
+            frame: MapObservation::new(context, primary.attach(inputs))?,
+        })
+    }
+}
+
+impl ViewerData {
+    fn from_frame(frame: &Frame, settings: &Settings) -> Result<Self> {
+        let time = frame.primary.record.time;
+        let status = input::<LocalizationStatus>(frame, 1)?;
+        let frame_id = status
+            .last()
+            .map(|record| (record.value.epoch, record.value.generation));
+        let estimates = input::<LocalizationEstimate>(frame, 2)?;
+        let robot_kinematics = nearest(
+            input::<TimeWrapper<RobotKinematics>>(frame, 3)?,
+            time,
+            Duration::from_millis(100),
+            |record| record.value.time,
+        );
+        let mut slot = 4;
+        let camera_matrix = if settings.camera || settings.associations {
+            slot += 1;
+            nearest(
+                input::<TimeWrapper<CameraMatrix>>(frame, slot - 1)?,
+                time,
+                Duration::from_millis(100),
+                |record| record.value.time,
+            )
+            .map(|record| record.value.inner.clone())
+        } else {
+            None
+        };
+        let field_mark_associations = if settings.associations {
+            slot += 1;
+            input::<TimeWrapper<FieldMarkAssociations>>(frame, slot - 1)?
+                .pop()
+                .filter(|record| {
+                    Some((record.value.inner.epoch, record.value.inner.generation)) == frame_id
+                })
+        } else {
+            None
+        };
+        let ball = if settings.ball {
+            input::<Option<BallState>>(frame, slot)?
+                .last()
+                .and_then(|record| record.value)
+        } else {
+            None
+        };
+        let camera_frame =
+            if frame.primary.topic.type_info == <RosImage as ros_z::Message>::type_info() {
+                Some(ros_z_debug::query::decode_record(
+                    &frame.primary.record,
+                    &frame.primary.topic,
+                )?)
+            } else {
+                None
+            };
+        Ok(Self {
+            field_dimensions: input::<FieldDimensions>(frame, 0)?.pop(),
+            localization: localization_at(
+                estimates.iter().map(|record| &record.value),
+                time,
+                frame_id,
+            ),
+            robot_kinematics,
+            camera_matrix,
+            camera_frame,
+            field_mark_associations,
+            ball,
+        })
+    }
+}
+
+fn localization_at<'a>(
+    estimates: impl Iterator<Item = &'a LocalizationEstimate> + Clone,
+    anchor: Time,
+    frame_id: Option<(u64, u64)>,
+) -> Option<Isometry3<Field, Robot>> {
+    let estimates =
+        estimates.filter(|estimate| frame_id == Some((estimate.epoch, estimate.generation)));
+    let before = estimates
+        .clone()
+        .filter(|estimate| estimate.time <= anchor)
+        .max_by_key(|estimate| estimate.time)?;
+    let after = estimates
+        .filter(|estimate| estimate.time >= anchor)
+        .min_by_key(|estimate| estimate.time)?;
+    let gap = after.time.duration_since(before.time);
+    if gap > Duration::from_secs(2) {
+        return None;
+    }
+    let fraction = if gap.is_zero() {
+        0.0
+    } else {
+        anchor.duration_since(before.time).as_secs_f64() / gap.as_secs_f64()
+    };
+    let pose = before
+        .robot_to_field?
+        .pose
+        .inner
+        .lerp_slerp(&after.robot_to_field?.pose.inner, fraction);
+    Some(Isometry3::wrap(pose.cast::<f32>().inverse()))
 }
 
 struct Observations {
