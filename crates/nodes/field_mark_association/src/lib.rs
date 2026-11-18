@@ -1,5 +1,6 @@
 mod api;
 mod assignment;
+mod exposure;
 mod features;
 mod frame_processing;
 mod global_association;
@@ -13,6 +14,7 @@ pub use api::{
     TrackingAssociationInput, associate_global_visual_features, associate_tracking_visual_features,
     associate_visual_features,
 };
+pub use exposure::{exposure_attitude, geometry_for_image, interpolate_attitude};
 pub use features::{
     DetectedVisualFeature, DetectedVisualFeatures, VisualFeatureClass,
     find_detected_visual_features, raw_detections,
