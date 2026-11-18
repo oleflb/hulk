@@ -1,8 +1,8 @@
 use coordinate_systems::{Camera, Local, Robot};
 use field_mark_association::{
-    FieldMarkAssociationParameters, GlobalAssociationInput, GlobalLocalizerParameters,
-    TrackingAssociationInput as AssociationInput, associate_global_visual_features,
-    associate_tracking_visual_features, find_detected_visual_features,
+    AssociationInput, FieldMarkAssociationParameters, GlobalAssociationInput,
+    GlobalLocalizerParameters, associate_global_visual_features, associate_visual_features,
+    find_detected_visual_features,
 };
 use linear_algebra::{IntoTransform, Isometry3};
 use projection::camera_matrix::CameraMatrix;
@@ -10,6 +10,7 @@ use ros_z::time::Time;
 use serde::Deserialize;
 use types::{
     field_dimensions::FieldDimensions,
+    localization::{LocalizationState, LocalizationStatus},
     object_detection::{Object, RobocupObjectLabel},
     visual_localization::AssociationGeometry,
 };
@@ -115,11 +116,19 @@ fn real_recording_tracking_fixtures_match_all_expected_landmarks() {
         assert!((metrics.free_height_scale - 1.0242).abs() < 0.001);
         assert!(metrics.metric_rms < 0.16);
         assert!(metrics.pixel_rms < 6.0);
-        let localization = associate_tracking_visual_features(
+        let localization = associate_visual_features(
             AssociationInput {
+                status: &LocalizationStatus {
+                    time: geometry.last_successful_solve,
+                    epoch: geometry.epoch,
+                    generation: geometry.generation,
+                    state: LocalizationState::Tracking,
+                    heading: None,
+                },
+                attitude: None,
                 visual_features: &features,
                 robot_to_camera: robot_to_camera(&fixture.camera_matrix),
-                geometry: &geometry,
+                tracking: Some(&geometry),
                 camera_intrinsic: fixture.camera_matrix.intrinsics,
                 field_dimensions: &FieldDimensions::SPL_2025,
                 time: Time::from_nanos(0),

@@ -5,16 +5,15 @@ use projection::intrinsic::Intrinsic;
 use ros_z::time::Time;
 use types::{
     field_dimensions::{FieldDimensions, Half, Side},
-    localization::PoseEstimate,
+    localization::{LocalizationState, LocalizationStatus, PoseEstimate},
     visual_localization::AssociationGeometry,
 };
 
 use super::{GlobalAssociationConfig, solver};
 use crate::{
-    AssociationResult, DetectedVisualFeature, DetectedVisualFeatures,
-    FieldMarkAssociationParameters, GlobalAssociationInput,
-    TrackingAssociationInput as AssociationInput, VisualFeatureClass,
-    associate_global_visual_features, associate_tracking_visual_features, map::LandmarkMap,
+    AssociationInput, AssociationResult, DetectedVisualFeature, DetectedVisualFeatures,
+    FieldMarkAssociationParameters, GlobalAssociationInput, VisualFeatureClass,
+    associate_global_visual_features, associate_visual_features, map::LandmarkMap,
 };
 
 fn geometry() -> AssociationGeometry {
@@ -44,10 +43,20 @@ fn input<'a>(
     features: &'a DetectedVisualFeatures,
     geometry: &'a AssociationGeometry,
 ) -> AssociationInput<'a> {
+    static STATUS: std::sync::LazyLock<LocalizationStatus> =
+        std::sync::LazyLock::new(|| LocalizationStatus {
+            time: Time::zero(),
+            epoch: 0,
+            generation: 0,
+            state: LocalizationState::Tracking,
+            heading: None,
+        });
     AssociationInput {
+        status: &STATUS,
+        attitude: None,
         visual_features: features,
         robot_to_camera: robot_to_camera(),
-        geometry,
+        tracking: Some(geometry),
         camera_intrinsic: intrinsic(),
         field_dimensions: &FieldDimensions::SPL_2025,
         time: Time::from_nanos(1_000_000_000),
@@ -58,7 +67,11 @@ fn global_input<'a>(
     input: AssociationInput<'a>,
     parameters: &'a GlobalAssociationConfig,
 ) -> GlobalAssociationInput<'a> {
-    let (roll, pitch, _) = input.geometry.estimate.pose.inner.rotation.euler_angles();
+    let (roll, pitch, _) = input
+        .tracking
+        .map_or((f64::NAN, f64::NAN, f64::NAN), |geometry| {
+            geometry.estimate.pose.inner.rotation.euler_angles()
+        });
     GlobalAssociationInput {
         visual_features: input.visual_features,
         robot_to_ground: linear_algebra::Rotation3::from_euler_angles(
@@ -160,8 +173,7 @@ fn lost_tracking_reuses_the_motion_posterior_without_global_reinitialization() {
     assert_eq!(result.associations.len(), 3);
     for count in 1..=2 {
         let sparse = project(stationary_three().into_iter().take(count), &geometry);
-        let result =
-            associate_tracking_visual_features(input(&sparse, &geometry), &parameters).unwrap();
+        let result = associate_visual_features(input(&sparse, &geometry), &parameters).unwrap();
         assert_eq!(result.associations.len(), count);
     }
     status.generation += 1;
@@ -634,7 +646,7 @@ fn tracking_keeps_opponent_half_prediction() {
     let mut geometry = geometry();
     geometry.estimate = tracking_estimate(0.0001);
     let features = project(stationary_three(), &geometry);
-    let result = associate_tracking_visual_features(
+    let result = associate_visual_features(
         input(&features, &geometry),
         &FieldMarkAssociationParameters::default(),
     )
@@ -643,7 +655,7 @@ fn tracking_keeps_opponent_half_prediction() {
     assert!(result.associations.iter().all(|a| a.field_point.x() > 0.0));
     geometry.estimate.pose.inner.translation.x = f64::NAN;
     assert!(
-        associate_tracking_visual_features(
+        associate_visual_features(
             input(&features, &geometry),
             &FieldMarkAssociationParameters::default()
         )
@@ -660,14 +672,12 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
         let mut parameters = calibrated_parameters();
         // Generate observations from truth before shifting the single prior by 20 pixels.
         geometry.estimate.pose.inner.translation.x += 20.0 * 0.55 / 500.0;
-        assert!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none()
-        );
+        assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
         // Keep stored covariance zero; age-dependent noise alone must explain the offset.
         let mut older = input(&features, &geometry);
         older.time = Time::from_nanos(2_000_000_000);
         assert_eq!(
-            associate_tracking_visual_features(older, &parameters)
+            associate_visual_features(older, &parameters)
                 .unwrap()
                 .associations
                 .len(),
@@ -676,7 +686,7 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
         );
         geometry.estimate.covariance = SMatrix::identity() * 0.001;
         assert_eq!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters)
+            associate_visual_features(input(&features, &geometry), &parameters)
                 .unwrap()
                 .associations
                 .len(),
@@ -684,9 +694,7 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
             "robot x {robot_x}"
         );
         parameters.tracking.max_pixel_distance = 19.0;
-        assert!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none()
-        );
+        assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
     }
 }
 
@@ -973,16 +981,25 @@ fn tracking_rejects_invalid_covariance_future_solve_and_ambiguous_assignment() {
     indefinite[(0, 1)] = 2.0;
     indefinite[(1, 0)] = 2.0;
     invalid_covariances.push(indefinite);
+    let overflow = DetectedVisualFeatures {
+        penalty_spots: (0..=parameters.global_localizer.max_retained_detections)
+            .map(|index| DetectedVisualFeature {
+                pixel: point![index as f32 * 10.0, 100.0],
+                confidence: 1.0,
+            })
+            .collect(),
+        ..Default::default()
+    };
     for covariance in invalid_covariances {
         geometry.estimate.covariance = covariance;
-        assert!(
-            associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none()
-        );
+        assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
+        assert!(associate_visual_features(input(&overflow, &geometry), &parameters).is_none());
     }
     geometry.estimate = tracking_estimate(0.0001);
+    assert!(associate_visual_features(input(&overflow, &geometry), &parameters).is_none());
     let mut future = input(&features, &geometry);
     future.time = Time::from_nanos(999_999_999);
-    assert!(associate_tracking_visual_features(future, &parameters).is_none());
+    assert!(associate_visual_features(future, &parameters).is_none());
     geometry.estimate = tracking_estimate(1.0);
     let field = FieldDimensions::SPL_2025;
     let features = project(
@@ -996,7 +1013,7 @@ fn tracking_rejects_invalid_covariance_future_solve_and_ambiguous_assignment() {
         ],
         &geometry,
     );
-    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
+    assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
 }
 
 #[test]
@@ -1062,7 +1079,7 @@ fn tracking_joint_assignment_keeps_plausible_rivals_outside_the_distance_limit()
     // Pruning that rival at the output ceiling would falsely certify the center match.
     geometry.estimate = tracking_estimate(1.0);
     geometry.estimate.pose.inner.translation.vector.y = 0.375;
-    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
+    assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
 }
 
 #[test]
@@ -1090,7 +1107,7 @@ fn tracking_high_covariance_keeps_distinct_opponent_landmarks_and_exact_age_hori
     ] {
         let mut input = input(&features, &geometry);
         input.time = input.time + age;
-        let result = associate_tracking_visual_features(input, &parameters);
+        let result = associate_visual_features(input, &parameters);
         if expected_count == 0 {
             assert!(result.is_none(), "age={age:?}");
             continue;
@@ -1170,8 +1187,7 @@ fn tracking_uses_raw_image_features_even_when_their_rays_reach_the_horizon() {
             .is_empty()
     );
     let result =
-        associate_tracking_visual_features(input, &FieldMarkAssociationParameters::default())
-            .unwrap();
+        associate_visual_features(input, &FieldMarkAssociationParameters::default()).unwrap();
     assert_eq!(result.associations.len(), 3);
     assert!(result.associations.iter().all(|a| a.field_point.x() > 0.0));
     assert!(
@@ -1189,7 +1205,7 @@ fn tracking_filters_duplicates_but_rejects_input_and_retained_overflow() {
     let duplicate = features.goalposts[0];
     features.goalposts.push(duplicate);
     assert_eq!(
-        associate_tracking_visual_features(input(&features, &geometry), &parameters)
+        associate_visual_features(input(&features, &geometry), &parameters)
             .unwrap()
             .associations
             .len(),
@@ -1199,7 +1215,7 @@ fn tracking_filters_duplicates_but_rejects_input_and_retained_overflow() {
         .goalposts
         .extend(std::iter::repeat_n(duplicate, 125));
     assert_eq!(features.supported_feature_count(), 129);
-    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
+    assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
     let mut features = project(stationary_three(), &geometry);
     features
         .goalposts
