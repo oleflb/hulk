@@ -22,6 +22,7 @@ use types::{
 };
 
 use crate::{localization::Lifecycle, parameters::Localization3dParameters};
+pub(crate) use recovery::ConflictRecovery;
 pub(crate) use solve::SolveResult;
 
 mod attitude;
@@ -91,6 +92,7 @@ pub struct Localization {
     pub(super) lifecycle: Lifecycle,
     field_half_extents: Vector2<Field, f64>,
     history: recovery::MotionHistory,
+    supported_legs: Option<recovery::SupportedLegs>,
     kinematic_factors: BTreeMap<Time, (Time, kinematic_odometry::KinematicFactor)>,
 }
 
@@ -178,6 +180,7 @@ impl Localization {
             parameters,
             field_half_extents,
             history: recovery::MotionHistory::new(origin),
+            supported_legs: None,
             kinematic_factors: BTreeMap::new(),
             lifecycle: Lifecycle::new(origin),
         })
