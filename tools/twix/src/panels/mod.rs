@@ -4,6 +4,7 @@ mod field_markings;
 mod image;
 mod map;
 mod map_3d;
+mod map_observation;
 mod parameter;
 mod plot;
 mod text;
