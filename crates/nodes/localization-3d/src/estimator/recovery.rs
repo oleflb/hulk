@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use color_eyre::Result;
-use coordinate_systems::{ImuReference, Robot};
+use coordinate_systems::{Field, ImuReference, Robot};
 use linear_algebra::{IntoTransform, Isometry3, Orientation3, Point3, Vector3};
 use localization_fagra::variables::{FieldAlignment, PoseControl, TrajectoryState};
 use nalgebra::{Matrix2, UnitQuaternion};
@@ -21,6 +21,7 @@ pub(super) struct MotionHistory {
     pub records: Vec<MotionRecord>,
     pub start: Time,
     pub attitudes: BTreeMap<Time, Orientation3<ImuReference, f64>>,
+    pub landmarks: BTreeMap<Time, Vec<Point3<Field>>>,
     pub latest_vo_epoch: Option<u64>,
     pub latest_kinematic_time: Option<Time>,
 }
@@ -31,6 +32,7 @@ impl MotionHistory {
             records: Vec::new(),
             start,
             attitudes: BTreeMap::new(),
+            landmarks: BTreeMap::new(),
             latest_vo_epoch: None,
             latest_kinematic_time: None,
         }
@@ -143,6 +145,19 @@ impl MotionRecord {
 }
 
 impl Localization {
+    pub(crate) fn informative_visual_window(&mut self, since: Option<Time>) -> bool {
+        let cutoff = self.latest_time - self.parameters.timing.optimization_window;
+        self.history.landmarks.retain(|time, _| *time >= cutoff);
+        let points = self
+            .history
+            .landmarks
+            .iter()
+            .filter(|(time, _)| since.is_none_or(|since| **time > since))
+            .flat_map(|(_, points)| points.iter().copied())
+            .collect::<Vec<_>>();
+        crate::alignment::informative_landmarks(&points, &self.parameters.visual)
+    }
+
     /// Resolve the global match's half-turn convention, then update the retained graph.
     /// Its marginalized history, alignment and motion factors must explain recovery.
     pub(crate) fn ingest_recovery(
