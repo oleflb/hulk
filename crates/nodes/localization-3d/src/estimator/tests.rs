@@ -576,18 +576,7 @@ fn rejected_visual_frame_does_not_advance_output_time() {
     assert_eq!(estimator.latest_time, Time::from_nanos(1_000_000_000));
 }
 
-fn recovery_camera() -> CameraGeometry {
-    CameraGeometry {
-        robot_to_camera: Isometry3::wrap(
-            nalgebra::Isometry3::from_parts(
-                nalgebra::Translation3::new(0.12, -0.04, 0.2),
-                nalgebra::UnitQuaternion::from_euler_angles(std::f32::consts::PI, 0.0, 0.0),
-            )
-            .inverse(),
-        ),
-        intrinsics: Intrinsic::new(nalgebra::vector![300.0, 300.0], point![160.0, 120.0]),
-    }
-}
+use crate::test_support::camera as recovery_camera;
 
 #[test]
 fn startup_replaces_drifted_height_prior_with_landmark_fit() {
@@ -685,16 +674,25 @@ fn startup_replaces_drifted_height_prior_with_landmark_fit() {
     }
 }
 
-fn recovery_fixture() -> (
+pub(super) fn recovery_fixture() -> (
     Localization,
     TimeWrapper<VisualLocalizationFrame>,
     HeadingReference,
 ) {
-    recovery_fixture_with_timing(Default::default())
+    recovery_fixture_with_timing(Default::default(), 0.55)
+}
+
+pub(super) fn bootstrap_fixture() -> Result<(Localization, HeadingReference)> {
+    let (mut estimator, frame, heading) = recovery_fixture();
+    let candidate = estimator
+        .bootstrap_candidate(frame)?
+        .ok_or_else(|| eyre!("missing bootstrap candidate"))?;
+    Ok((candidate, heading))
 }
 
 fn recovery_fixture_with_timing(
     timing: crate::TimingParameters,
+    height: f32,
 ) -> (
     Localization,
     TimeWrapper<VisualLocalizationFrame>,
@@ -703,7 +701,7 @@ fn recovery_fixture_with_timing(
     use types::visual_localization::{FieldMarkAssociation, VisualAssociationSource};
     let camera = recovery_camera();
     let truth = nalgebra::Isometry3::from_parts(
-        nalgebra::Translation3::new(-2.0, 1.0, 0.55),
+        nalgebra::Translation3::new(-2.0, 1.0, height),
         nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 0.4),
     );
     let field_points: [linear_algebra::Point3<coordinate_systems::Field>; 3] = [
@@ -808,7 +806,7 @@ fn recovery_fixture_with_timing(
             .unwrap()
     );
     let mut feet = kinematics::robot_kinematics::RobotKinematics::default();
-    let offset = wrong_pose.inner.rotation.inverse() * nalgebra::Vector3::new(0.0, 0.0, -0.55);
+    let offset = wrong_pose.inner.rotation.inverse() * nalgebra::Vector3::new(0.0, 0.0, -height);
     feet.left_leg.sole_to_robot.inner.translation.vector = offset;
     feet.right_leg.sole_to_robot.inner.translation.vector = offset;
     assert!(
