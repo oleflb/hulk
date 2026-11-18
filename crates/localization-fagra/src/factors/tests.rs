@@ -387,8 +387,10 @@ impl TestFactorBatch for FootCase {
                 .into_iter()
                 .map(|tau| FootObservation {
                     tau: c(tau),
-                    left_sole: Framed::wrap(nalgebra::Point3::new(c(0.1), c(0.15), c(-2.0))),
-                    right_sole: Framed::wrap(nalgebra::Point3::new(c(-0.1), c(-0.15), c(1.0))),
+                    vertices: [
+                        Framed::wrap(nalgebra::Point3::new(c(0.1), c(0.15), c(-2.0))),
+                        Framed::wrap(nalgebra::Point3::new(c(-0.1), c(-0.15), c(1.0))),
+                    ],
                 })
                 .collect(),
         )
@@ -850,31 +852,25 @@ fn exact_static_measurements_and_one_sided_constraints() {
         duration: 0.25,
         sigma: 0.1,
     });
-    let foot = scene
-        .graph
-        .add_factor_to(
-            feet,
-            FootObservation {
-                tau: 0.5,
-                left_sole: Framed::wrap(nalgebra::Point3::new(0.0, 0.0, -0.2)),
-                right_sole: Framed::wrap(nalgebra::Point3::new(0.0, 0.0, 0.2)),
-            },
-        )
-        .unwrap();
-    assert!((scene.graph.factor_cost(foot).unwrap() - 2.0).abs() < 1e-12);
-    // Contact and the inactive branch both give zero, without constraining a lifted foot.
-    let contact = scene
-        .graph
-        .add_factor_to(
-            feet,
-            FootObservation {
-                tau: 0.5,
-                left_sole: Framed::wrap(nalgebra::Point3::origin()),
-                right_sole: Framed::wrap(nalgebra::Point3::new(0.0, 0.0, 1.0)),
-            },
-        )
-        .unwrap();
-    assert_eq!(scene.graph.factor_cost(contact).unwrap(), 0.0);
+    // Penetration is penalized; contact and airborne feet are unconstrained.
+    for (heights, expected) in [([-0.2, 0.2], 2.0), ([0.0, 1.0], 0.0), ([0.2, 1.0], 0.0)] {
+        let key = scene
+            .graph
+            .add_factor_to(
+                feet,
+                FootObservation {
+                    tau: 0.5,
+                    vertices: heights.map(|z| Framed::wrap(nalgebra::Point3::new(0.0, 0.0, z))),
+                },
+            )
+            .unwrap();
+        let actual = scene.graph.factor_cost(key).unwrap();
+        if expected == 0.0 {
+            assert_eq!(actual, expected, "heights={heights:?}");
+        } else {
+            assert!((actual - expected).abs() < 1e-12, "heights={heights:?}");
+        }
+    }
 
     let containment = FieldContainment {
         controls,
