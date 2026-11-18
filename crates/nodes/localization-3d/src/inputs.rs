@@ -3,7 +3,9 @@ use booster::ImuState;
 use color_eyre::{Result, eyre::OptionExt as _};
 use kinematics::robot_kinematics::RobotKinematics;
 use ros_z::{
+    Message,
     cache::Cache,
+    message::WireDecoder,
     node::Node,
     pubsub::{QueueOverflowReporting, Subscriber},
     time::Time,
@@ -51,51 +53,26 @@ impl Inputs {
         parameters: &crate::parameters::InputParameters,
     ) -> Result<Self> {
         Ok(Self {
-            kinematic_odometry: node
-                .subscriber("odometry/kinematic_delta")
-                .queue_capacity(
-                    NonZeroUsize::new(parameters.kinematic_odometry_queue)
-                        .ok_or_eyre("inputs.kinematic_odometry_queue must be > 0")?,
-                )
-                .queue_overflow_reporting(QueueOverflowReporting::Warn)
-                .build()
-                .await?,
-            imu: node
-                .subscriber("inputs/imu_state")
-                .queue_capacity(
-                    NonZeroUsize::new(parameters.imu_queue)
-                        .ok_or_eyre("inputs.imu_queue must be > 0")?,
-                )
-                .queue_overflow_reporting(QueueOverflowReporting::Warn)
-                .build()
-                .await?,
-            kinematics: node
-                .subscriber("robot_kinematics")
-                .queue_capacity(
-                    NonZeroUsize::new(parameters.kinematics_queue)
-                        .ok_or_eyre("inputs.kinematics_queue must be > 0")?,
-                )
-                .queue_overflow_reporting(QueueOverflowReporting::Warn)
-                .build()
-                .await?,
-            visual: node
-                .subscriber("field_mark_association/visual_localization_local")
-                .queue_capacity(
-                    NonZeroUsize::new(parameters.visual_queue)
-                        .ok_or_eyre("inputs.visual_queue must be > 0")?,
-                )
-                .queue_overflow_reporting(QueueOverflowReporting::Warn)
-                .build()
-                .await?,
-            odometry: node
-                .subscriber("visual_odometry/current_left_camera_to_visual_odometer")
-                .queue_capacity(
-                    NonZeroUsize::new(parameters.visual_odometry_queue)
-                        .ok_or_eyre("inputs.visual_odometry_queue must be > 0")?,
-                )
-                .queue_overflow_reporting(QueueOverflowReporting::Warn)
-                .build()
-                .await?,
+            kinematic_odometry: subscriber(
+                node,
+                "odometry/kinematic_delta",
+                parameters.kinematic_odometry_queue,
+            )
+            .await?,
+            imu: subscriber(node, "inputs/imu_state", parameters.imu_queue).await?,
+            kinematics: subscriber(node, "robot_kinematics", parameters.kinematics_queue).await?,
+            visual: subscriber(
+                node,
+                "field_mark_association/visual_localization_local",
+                parameters.visual_queue,
+            )
+            .await?,
+            odometry: subscriber(
+                node,
+                "visual_odometry/current_left_camera_to_visual_odometer",
+                parameters.visual_odometry_queue,
+            )
+            .await?,
             cameras: node
                 .subscriber::<TimeWrapper<CameraGeometry>>("camera_geometry")
                 .cache(parameters.camera_cache)
@@ -181,4 +158,19 @@ impl Inputs {
             }
         }
     }
+}
+
+async fn subscriber<T: Message>(node: &Node, topic: &str, capacity: usize) -> Result<Subscriber<T>>
+where
+    T::Codec: WireDecoder,
+{
+    node.subscriber(topic)
+        .queue_capacity(
+            NonZeroUsize::new(capacity)
+                .ok_or_eyre(format!("{topic} queue capacity must be > 0"))?,
+        )
+        .queue_overflow_reporting(QueueOverflowReporting::Warn)
+        .build()
+        .await
+        .map_err(Into::into)
 }
