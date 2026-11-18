@@ -158,6 +158,11 @@ impl MotionRecord {
 }
 
 impl Localization {
+    #[cfg(test)]
+    pub(crate) fn has_supported_leg_admission(&self) -> bool {
+        self.supported_legs.is_some()
+    }
+
     /// Global frames must have passed association's ambiguity checks; motion agreement is not uniqueness.
     /// Both intervals must contradict live leg factors; no evidence already in a prior is removable.
     pub(crate) fn recover_conflict(
@@ -871,7 +876,6 @@ impl Localization {
         time: Time,
         anchor: TrajectoryState,
         intrinsics: &Intrinsic,
-        height_sigma: Option<f64>,
     ) -> Result<Self> {
         let mut candidate = Self::empty(
             self.origin,
@@ -915,7 +919,7 @@ impl Localization {
                 .controls
                 .insert(index, candidate.graph.add(control));
         }
-        candidate.add_anchor(time, anchor, height_sigma)?;
+        candidate.add_anchor(time, anchor, None)?;
         for segment in first..=last {
             candidate.add_motion_prior(segment, false)?;
         }
@@ -987,5 +991,136 @@ impl ConflictFit {
         let distance = error.dot(&root.solve(&error));
         // Fail closed on changing translation: a single displaced image must not explain away legs.
         distance.is_finite() && distance <= 2.0 + 2.0 * 18.0_f64.sqrt() + 18.0
+    }
+}
+
+#[cfg(test)]
+mod supported_leg_tests {
+    use super::*;
+    use types::odometry::KinematicOdometryDelta;
+
+    #[test]
+    fn relative_leg_jacobians_match_independent_endpoint_perturbations() -> Result<()> {
+        let poses = [
+            nalgebra::Isometry3::new(
+                nalgebra::vector![1.0, -2.0, 0.5],
+                nalgebra::vector![0.2, -0.3, 0.7],
+            ),
+            nalgebra::Isometry3::new(
+                nalgebra::vector![1.5, -1.9, 0.8],
+                nalgebra::vector![-0.3, 0.1, 0.8],
+            ),
+        ];
+        let displacement = nalgebra::vector![0.3, -0.2];
+        let residual = |poses: &[nalgebra::Isometry3<f64>; 2]| {
+            (poses[1].translation.vector - poses[0].translation.vector).xy()
+                - nalgebra::Rotation2::new(poses[0].rotation.euler_angles().2) * displacement
+        };
+        let jacobians = leg_endpoint_jacobians(
+            &poses[0],
+            &poses[1],
+            nalgebra::Rotation2::new(poses[0].rotation.euler_angles().2) * displacement,
+        )
+        .ok_or_else(|| eyre!("invalid test heading"))?;
+        for endpoint in 0..2 {
+            for column in 0..6 {
+                let perturb = |step| {
+                    let mut shifted = poses;
+                    let mut axis = nalgebra::Vector3::zeros();
+                    axis[column % 3] = step;
+                    if column < 3 {
+                        shifted[endpoint].rotation *= UnitQuaternion::from_scaled_axis(axis);
+                    } else {
+                        shifted[endpoint].translation.vector += poses[endpoint].rotation * axis;
+                    }
+                    residual(&shifted)
+                };
+                let numerical = (perturb(1e-6) - perturb(-1e-6)) / 2e-6;
+                assert!((numerical - jacobians[endpoint].column(column)).norm() < 1e-8);
+            }
+        }
+        Ok(())
+    }
+
+    fn supported_estimator() -> Localization {
+        let mut estimator = super::super::tests::estimator();
+        estimator.parameters.accelerometer = Some(Default::default());
+        estimator.supported_legs = Some(SupportedLegs {
+            visual_time: estimator.origin,
+            pending: Vec::new(),
+        });
+        estimator
+    }
+
+    fn leg(start: Time, end: Time) -> KinematicOdometryDelta {
+        KinematicOdometryDelta {
+            previous_time: start,
+            time: end,
+            current_to_previous: linear_algebra::Isometry2::identity(),
+        }
+    }
+
+    #[test]
+    fn expiry_heading_loss_and_imu_gaps_restore_undecided_legs() -> Result<()> {
+        for reason in ["fresh", "stale", "heading", "gap"] {
+            let mut estimator = supported_estimator();
+            let origin = estimator.origin;
+            let heading = HeadingReference::new(
+                origin,
+                linear_algebra::Orientation2::new(0.0),
+                Orientation3::from_euler_angles(0.0, 0.0, 0.0),
+            );
+            let end = origin + Duration::from_millis(100);
+            assert!(estimator.ingest_kinematic_odometry(leg(origin, end))?);
+            let duration = if reason == "stale" { 402 } else { 100 };
+            for milliseconds in (0..=duration).step_by(2) {
+                if reason == "gap" && milliseconds > 20 && milliseconds < 60 {
+                    continue;
+                }
+                estimator.ingest_imu(
+                    origin + Duration::from_millis(milliseconds),
+                    booster::ImuState {
+                        linear_acceleration: linear_algebra::vector![0.0, 0.0, 9.81],
+                        ..Default::default()
+                    },
+                )?;
+            }
+            assert!(estimator.kinematic_factors.is_empty());
+            estimator.expire_supported_legs((reason != "heading").then_some(&heading))?;
+            if reason == "fresh" {
+                assert!(estimator.has_supported_leg_admission());
+                assert!(estimator.kinematic_factors.is_empty());
+            } else {
+                assert!(!estimator.has_supported_leg_admission(), "{reason}");
+                assert_eq!(estimator.kinematic_factors.len(), 1, "{reason}");
+                assert!(estimator.history.records.iter().any(|record| matches!(record,
+                    MotionRecord::Kinematic { previous_time, time, .. } if *previous_time == origin && *time == end)));
+            }
+            assert_eq!(estimator.history.latest_kinematic_time, Some(end));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn buffer_exhaustion_restores_every_record_and_resumes_normal_admission() -> Result<()> {
+        let mut estimator = supported_estimator();
+        let origin = estimator.origin;
+        for index in 0..66 {
+            assert!(estimator.ingest_kinematic_odometry(leg(
+                origin + Duration::from_millis(index),
+                origin + Duration::from_millis(index + 1),
+            ))?);
+            if index < 64 {
+                assert!(estimator.kinematic_factors.is_empty());
+            }
+        }
+        assert!(!estimator.has_supported_leg_admission());
+        assert_eq!(estimator.kinematic_factors.len(), 66);
+        assert_eq!(estimator.history.records.len(), 66);
+        assert_eq!(
+            estimator.history.latest_kinematic_time,
+            Some(origin + Duration::from_millis(66))
+        );
+        Ok(())
     }
 }

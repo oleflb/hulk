@@ -70,7 +70,7 @@ fagra::factors! {
 
 type Graph = Problem<States, Factors>;
 
-/// Owns optimization and accepted lifecycle for live and deterministic replay.
+/// Owns optimization and accepted lifecycle for both ROS and deterministic replay.
 pub struct Localization {
     graph: Graph,
     optimizer: LevenbergMarquardt<DenseNormalCholesky>,
@@ -92,8 +92,8 @@ pub struct Localization {
     pub(super) lifecycle: Lifecycle,
     field_half_extents: Vector2<Field, f64>,
     history: recovery::MotionHistory,
-    supported_legs: Option<recovery::SupportedLegs>,
     kinematic_factors: BTreeMap<Time, (Time, kinematic_odometry::KinematicFactor)>,
+    supported_legs: Option<recovery::SupportedLegs>,
 }
 
 impl Localization {
@@ -178,11 +178,11 @@ impl Localization {
             latest_visual_frame: None,
             pending_visuals: Vec::new(),
             parameters,
+            lifecycle: Lifecycle::new(origin),
             field_half_extents,
             history: recovery::MotionHistory::new(origin),
-            supported_legs: None,
             kinematic_factors: BTreeMap::new(),
-            lifecycle: Lifecycle::new(origin),
+            supported_legs: None,
         })
     }
 
