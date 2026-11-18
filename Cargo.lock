@@ -3911,7 +3911,7 @@ dependencies = [
 [[package]]
 name = "fagra"
 version = "0.1.0"
-source = "git+https://github.com/oleflb/fagra?rev=7b37df61ed615c85f5d59265f5df53ff5d5dc1be#7b37df61ed615c85f5d59265f5df53ff5d5dc1be"
+source = "git+https://github.com/oleflb/fagra?rev=5a22e73b08c95d0505d0ea918275c1c1f924e572#5a22e73b08c95d0505d0ea918275c1c1f924e572"
 dependencies = [
  "faer 0.24.4",
  "faer-ext",
