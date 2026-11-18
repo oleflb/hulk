@@ -140,7 +140,45 @@ struct Search<'a> {
     used_landmarks: Vec<bool>,
 }
 
-impl Search<'_> {
+impl<'a> Search<'a> {
+    fn new(
+        input: GlobalAssociationInput<'a>,
+        map: &'a LandmarkMap,
+        detections: &'a [Detection],
+        observation_count: usize,
+    ) -> Option<Self> {
+        let camera_to_level = (input.robot_to_ground.inner
+            * input.robot_to_camera.inner.rotation.inverse())
+        .cast::<f64>();
+        let body_offset_z = (input.robot_to_ground.inner.cast::<f64>()
+            * input
+                .robot_to_camera
+                .inner
+                .inverse()
+                .translation
+                .vector
+                .cast::<f64>())
+        .z;
+        Some(Self {
+            input,
+            map,
+            detections,
+            observation_count,
+            camera: GravityCamera::new(
+                camera_to_level.to_rotation_matrix().into_inner(),
+                input.camera_intrinsic.focals.cast(),
+                input.camera_intrinsic.optical_center.inner.coords.cast(),
+                f64::from(input.parameters.min_reprojection_depth),
+            )?,
+            body_offset_z,
+            remaining_work: input.parameters.max_work,
+            predictions: (0..map.landmarks.len()).map(|_| None).collect(),
+            edges: Vec::with_capacity(detections.len() * map.landmarks.len()),
+            used_detections: vec![false; detections.len()],
+            used_landmarks: vec![false; map.landmarks.len()],
+        })
+    }
+
     fn spend(&mut self, work: usize) -> Option<()> {
         self.remaining_work = self.remaining_work.checked_sub(work)?;
         Some(())
@@ -465,36 +503,7 @@ pub(crate) fn associate(input: GlobalAssociationInput<'_>) -> Option<Association
     if detections.len() < minimum || map.landmarks.len() < minimum {
         return None;
     }
-    let camera_to_level = (input.robot_to_ground.inner
-        * input.robot_to_camera.inner.rotation.inverse())
-    .cast::<f64>();
-    let body_offset_z = (input.robot_to_ground.inner.cast::<f64>()
-        * input
-            .robot_to_camera
-            .inner
-            .inverse()
-            .translation
-            .vector
-            .cast::<f64>())
-    .z;
-    let mut search = Search {
-        input,
-        map: &map,
-        detections: &detections,
-        observation_count,
-        camera: GravityCamera::new(
-            camera_to_level.to_rotation_matrix().into_inner(),
-            input.camera_intrinsic.focals.cast(),
-            input.camera_intrinsic.optical_center.inner.coords.cast(),
-            f64::from(input.parameters.min_reprojection_depth),
-        )?,
-        body_offset_z,
-        remaining_work: input.parameters.max_work,
-        predictions: (0..map.landmarks.len()).map(|_| None).collect(),
-        edges: Vec::with_capacity(detections.len() * map.landmarks.len()),
-        used_detections: vec![false; detections.len()],
-        used_landmarks: vec![false; map.landmarks.len()],
-    };
+    let mut search = Search::new(input, &map, &detections, observation_count)?;
     let mut pool = Vec::new();
     let mut weight = 0.0;
     for a in 0..detections.len() {
