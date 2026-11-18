@@ -24,6 +24,52 @@ pub(super) struct PendingVisual {
 }
 
 impl Localization {
+    pub(super) fn admits_visual_innovation(
+        &mut self,
+        time: Time,
+        frame: &VisualLocalizationFrame,
+    ) -> Result<bool> {
+        let Some(alignment) = self.alignment else {
+            return Ok(true);
+        };
+        // A newly bootstrapped graph has no independent field prediction yet.
+        if self.latest_visual_frame.is_none() {
+            return Ok(true);
+        }
+        let (segment, tau) = self.segment_and_tau(time)?;
+        let controls = self.ensure_segment(segment)?;
+        let mut blocks: Vec<_> = controls.iter().map(|key| key.block_id()).collect();
+        blocks.push(alignment.block_id());
+        let covariance = match self.graph.joint_covariance(&blocks) {
+            Ok(covariance) => covariance,
+            Err(
+                error @ (fagra::SolverError::SingularInformation
+                | fagra::SolverError::InvalidInformation
+                | fagra::SolverError::LinearSolveFailed
+                | fagra::SolverError::Evaluation(fagra::EvaluationError::InvalidEvaluation)),
+            ) => {
+                tracing::warn!(?time, source = ?frame.source, %error,
+                    "discarding visual frame: motion innovation covariance unavailable");
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let covariance = SMatrix::<f64, 27, 27>::from_fn(|r, c| covariance[(r, c)]);
+        let sample = self.spline(controls)?.linearize()?.pose(tau)?;
+        let pose = self.graph.get(alignment)?.local_to_field.to_3d().inner * sample.pose.inner;
+        let admitted = bearing_innovation_agrees(
+            frame,
+            pose,
+            sample.field_covariance(&covariance),
+            self.parameters.visual_feature_noise_variance,
+            self.parameters.model.min_landmark_range,
+        );
+        if !admitted {
+            tracing::warn!(?time, source = ?frame.source, "discarding visual motion innovation");
+        }
+        Ok(admitted)
+    }
+
     pub(super) fn pending_visual_cost(&self) -> Result<f64> {
         let mut cost = 0.0;
         for pending in &self.pending_visuals {
@@ -198,12 +244,13 @@ impl Localization {
         &mut self,
         frame: TimeWrapper<VisualLocalizationFrame>,
     ) -> Result<bool> {
-        self.insert_visual(frame)
+        self.insert_visual(frame, true)
     }
 
     pub(super) fn insert_visual(
         &mut self,
         frame: TimeWrapper<VisualLocalizationFrame>,
+        gate_innovation: bool,
     ) -> Result<bool> {
         let time = frame.time;
         let Some((segment, tau)) = self.check_time(time, "visual localization")? else {
@@ -219,6 +266,9 @@ impl Localization {
         let Some(alignment_key) = self.alignment else {
             return Ok(false);
         };
+        if gate_innovation && !self.admits_visual_innovation(time, &frame)? {
+            return Ok(false);
+        }
         let controls = self.ensure_segment(segment)?;
         let pose = self.spline(controls)?.pose(tau)?;
         let alignment = self.graph.get(alignment_key)?;
@@ -407,5 +457,123 @@ impl Localization {
             .or_default()
             .measurements += 1;
         Ok(())
+    }
+}
+
+fn bearing_innovation_agrees(
+    frame: &VisualLocalizationFrame,
+    robot_to_field: nalgebra::Isometry3<f64>,
+    covariance: nalgebra::Matrix6<f64>,
+    pixel_variance: f64,
+    min_range: f64,
+) -> bool {
+    use nalgebra::{Matrix3, SMatrix};
+
+    // Same fixed angular noise as FrameReprojections, without robust downweighting.
+    let variance = pixel_variance
+        / (f64::from(frame.camera_intrinsic.focals.x) * f64::from(frame.camera_intrinsic.focals.y));
+    // Marginal gates avoid treating correlated landmarks as independent evidence.
+    // Chi-square tail bound with a union bound over the frame, P(reject) <= exp(-9).
+    let tail = 9.0 + (frame.associations.len().max(1) as f64).ln();
+    let gate = 3.0 + 2.0 * (3.0 * tail).sqrt() + 2.0 * tail;
+    let camera = frame.robot_to_camera.inner.cast::<f64>();
+    let rotation = camera.rotation.to_rotation_matrix();
+    for association in &frame.associations {
+        let robot = robot_to_field.inverse() * association.field_point.inner.cast::<f64>();
+        let point = camera * robot;
+        let range = point.coords.norm();
+        if !range.is_finite() || range <= min_range {
+            return false;
+        }
+        let predicted = point.coords / range;
+        let observed = frame
+            .camera_intrinsic
+            .bearing(association.detection)
+            .inner
+            .cast::<f64>();
+        let observed = observed.normalize();
+        // Angular tangent residual stays meaningful for uncertain global corrections;
+        // a bearing chord would spuriously penalize its unobservable radial component.
+        let cosine = predicted.dot(&observed).clamp(-1.0, 1.0);
+        let tangent = observed - predicted * cosine;
+        let sine = tangent.norm();
+        if sine <= f64::EPSILON && cosine < 0.0 {
+            return false;
+        }
+        let error = if sine > f64::EPSILON {
+            tangent * (sine.atan2(cosine) / sine)
+        } else {
+            tangent
+        };
+        let mut inverse_pose = SMatrix::<f64, 3, 6>::zeros();
+        inverse_pose
+            .fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&robot.coords.cross_matrix());
+        inverse_pose
+            .fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&-Matrix3::identity());
+        let projection = (Matrix3::identity() - predicted * predicted.transpose()) / range;
+        let jacobian = projection * rotation.matrix() * inverse_pose;
+        let innovation =
+            jacobian * covariance * jacobian.transpose() + Matrix3::identity() * variance;
+        let Some(cholesky) = innovation.cholesky() else {
+            return false;
+        };
+        let squared_error = error.dot(&cholesky.solve(&error));
+        if !squared_error.is_finite() || squared_error < 0.0 || squared_error > gate {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use linear_algebra::{point, vector};
+    use nalgebra::{Matrix6, Translation3, UnitQuaternion};
+    use projection::intrinsic::Intrinsic;
+    use types::visual_localization::{FieldMarkAssociation, VisualAssociationSource};
+
+    #[test]
+    fn uncertain_motion_allows_large_global_correction() {
+        let camera = nalgebra::Isometry3::from_parts(
+            Translation3::identity(),
+            UnitQuaternion::from_euler_angles(std::f32::consts::PI, 0.0, 0.0),
+        );
+        let intrinsic = Intrinsic::new(nalgebra::vector![300.0, 300.0], point![160.0, 120.0]);
+        let mut frame = VisualLocalizationFrame {
+            epoch: 0,
+            generation: 0,
+            source: VisualAssociationSource::Global,
+            robot_to_camera: camera.framed_transform(),
+            camera_intrinsic: intrinsic,
+            associations: vec![],
+        };
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            frame.associations.push(FieldMarkAssociation {
+                field_point: point![x + 5.7, y, 0.0],
+                detection: intrinsic.project(vector![x, -y, 0.55]),
+            });
+        }
+        let pose = nalgebra::Isometry3::translation(0.0, 0.0, 0.55);
+        assert!(!bearing_innovation_agrees(
+            &frame,
+            pose,
+            Matrix6::identity() * 1e-6,
+            1.0,
+            0.01
+        ));
+        let mut uncertain = Matrix6::identity() * 1e-6;
+        uncertain
+            .fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&(nalgebra::Matrix3::identity() * 100.0));
+        assert!(bearing_innovation_agrees(
+            &frame, pose, uncertain, 1.0, 0.01
+        ));
+        uncertain[(0, 0)] = f64::NAN;
+        assert!(!bearing_innovation_agrees(
+            &frame, pose, uncertain, 1.0, 0.01
+        ));
     }
 }
