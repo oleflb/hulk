@@ -332,3 +332,282 @@ start time. Reconstructed odometry and subscriber scheduling are approximations.
 Not checked: robot end-to-end latency, repeated-run variability, full repository
 tests, or absolute recording accuracy. Incomplete reconstructed odometry and
 approximate scheduling must be identical across variants and explicitly reported.
+
+## Current implementation: verified integration points
+
+Paths below are relative to the repository root.
+
+| Component | Existing behavior | Consequence for the redesign |
+| --- | --- | --- |
+| `crates/linear_sum_assignment/src/lib.rs` | Reusable dense rectangular shortest-augmenting-path solver following Crouse/SciPy; generic float scalar, forbidden edges, deterministic ties | Reuse `AssignmentSolver<f64>`; benchmark before changing algorithms |
+| `crates/nodes/field_mark_association/src/assignment.rs` | Solves assignment, then excludes each winning edge and resolves to certify uniqueness | Do not run this full certification wrapper on every factor evaluation |
+| `crates/nodes/field_mark_association/src/tracking.rs` | Pose-covariance gating; joint likelihood for up to five detections; marginal assignment for larger frames | Replace tracking-time committed identities, not merely append another matching pass |
+| `crates/nodes/field_mark_association/src/global_association/solver.rs` | Bounded hypotheses, two rounds of refinement/reassociation, rival checks, exact final assignment | Retain as initialization/recovery proposal generation initially |
+| `crates/nodes/field_mark_association/src/map.rs` | Fixed class-labelled planar map and half-turn partners | Build once per immutable field configuration; preserve a single map definition |
+| `crates/nodes/field_mark_association/src/frame_processing.rs` | Exposure-time preparation, latest-frame scheduling, epoch/generation checks, late-job rejection | Preserve these semantics when transporting observations |
+| `crates/types/src/visual_localization.rs` | Wire message contains fixed correspondences | Add an explicit observation message; do not reinterpret old recorded messages |
+| `crates/localization-fagra/src/factors/reprojection.rs` | Shared frame geometry; robust oriented-bearing residual and analytic Jacobians | Reuse this actual objective, not a newly invented pixel likelihood |
+| `crates/nodes/localization-3d/src/estimator/vision.rs` | Innovation checks, fixed observation insertion, pending visual acceptance/rejection | Admit and validate observation frames without treating a minimum-cost assignment as uniqueness evidence |
+| `crates/nodes/localization-3d/src/estimator/window.rs` | Marginalizes old controls and retires associated factors | Finalize or exclude unresolved visual factors before marginalization |
+| `crates/nodes/localization-3d/src/heading.rs` | Independent IMU-to-field heading reference; no recovery-driven drift ratcheting | Keep this reference and its update restrictions |
+
+Pinned `fagra` revision: `7b37df61ed615c85f5d59265f5df53ff5d5dc1be`.
+Its `Factor` trait explicitly permits multiple residual blocks under one factor
+identity. Separate `cost` and `linearize` methods permit unmatched costs to be
+constant contributions with no Jacobian. A custom hybrid solver is unnecessary.
+
+## Objective and numerical contract
+
+For a frame with detections D and compatible map landmarks L:
+
+```text
+frame_cost(state) = min over valid one-to-one assignments A:
+    sum(pair_cost(detection, landmark, state) for matched pairs)
+  + sum(clutter_cost(detection) for unmatched detections)
+```
+
+- Each detection selects at most one landmark; each landmark is used at most once
+  within this camera frame. Uniqueness is not imposed across different frames.
+- Real field points are `Point2<Field, f64>`, lifted to z = 0 only at the camera
+  geometry boundary. Full 3D body/camera motion is retained.
+- Pair cost is the existing Huber cost of the whitened oriented-bearing residual.
+  Matching and graph evaluation use the same units, normalization, and objective.
+- Initially preserve explicit class compatibility, including intentional existing
+  global-recovery substitution rules. Do not silently broaden tracking to all
+  classes. Any later class penalty is fixed during a solve and must be calibrated.
+- Each detection has a finite positive clutter cost. Start with a calibrated
+  constant; detector confidence is not a calibrated probability by default.
+- Unobserved map landmarks incur no cost. No visibility-based missed-detection
+  penalty is introduced without a detection-probability model.
+- Pose uncertainty may be used for conservative proposal/admission logic. Do not
+  add the graph pose posterior to independent measurement noise inside each
+  factor: pose uncertainty is already represented by graph variables and priors.
+- This is not numerically identical to the current tracking matcher's joint
+  marginalized pixel likelihood. Equivalence claims apply to always-solve versus
+  certified-fast-path evaluation of the new objective, not to old versus new
+  association decisions. Preserve old quality requirements through replay and
+  acceptance checks; do not copy `score_ratio` into a new cost-gap test without
+  deriving its meaning in the new units.
+- All-clutter is a valid frame assignment, but is not evidence of visual tracking
+  or recovery and must not refresh the last successful visual timestamp.
+- A tiny residual or a minimum assignment cost is not proof of a unique global
+  pose. Existing recovery corroboration and observability checks remain relevant.
+
+### Evaluation and linearization
+
+`cost(states)` computes the current minimum assignment and returns its complete
+cost, including unmatched and any fixed class penalties.
+
+`linearize(states)` selects the same deterministic optimum and emits residuals
+and Jacobians only for selected real edges. Huber weights use the existing frozen
+IRLS convention. Away from assignment ties, these rows give the active branch's
+gradient. At ties, the objective can be nonsmooth; correctness checks must not
+pretend a unique derivative exists there.
+
+Every LM trial evaluates this same minimized objective at its trial state. Do not
+freeze the previous matching for acceptance, cache by timestamp alone, or omit
+the cost of unmatched detections. Rejected trials must not modify committed
+diagnostics, accepted associations, heading references, or visual freshness.
+
+Use one standalone `Factor` for the whole frame, rather than a batch of mutually
+dependent detection factors. Partial `FactorSelection` evaluation would otherwise
+change which observations compete for a landmark. Removal and marginalization
+must act on the same atomic frame identity.
+
+### Ground-plane computation
+
+For a field landmark (x, y, 0) and current field-to-camera transform:
+
+```text
+camera_point = rotation.column(0) * x + rotation.column(1) * y + translation
+```
+
+Compute each predicted unit bearing once per landmark, each observed bearing once
+per detection, and pair costs from their dot products. Compute analytic Jacobians
+only for selected real matches. Do not introduce ray-to-ground intersection into
+the tracking likelihood; it is ill-conditioned near the horizon and changes the
+noise model. Ground-planarity alone cannot identify a false detection.
+
+Validate finite input geometry at ingestion. Handle invalid range/projection
+candidates explicitly as forbidden edges where justified; malformed graph states
+must remain evaluation errors rather than being disguised as all-clutter frames.
+Preserve the existing oriented-bearing model's smooth behavior around optical
+depth zero; final physical visibility checks remain separate acceptance criteria.
+
+## Matching and exact fast path
+
+Construct a D x (L + D) matrix. Real columns contain pair costs; dummy columns
+represent clutter. The private result is `Matched(LandmarkId)` or `Unmatched`,
+not a sentinel column number exposed to callers.
+
+Before invoking the rectangular solver:
+
+1. Find each row's cheapest compatible real landmark or its own dummy option.
+2. If the chosen real landmarks are all distinct, the sum of row minima attains
+   the assignment lower bound: this is a globally optimal matching.
+3. Otherwise invoke `AssignmentSolver<f64>` with `Objective::Minimize`.
+
+For reuse of an old matching, the same sufficient certificate is valid if every
+old selected edge remains a row minimum. Low reprojection error alone is not a
+certificate. Equal-cost assignments may differ between exact implementations;
+test equal costs and constraints, not identical IDs at genuine ties. Make tie
+handling deterministic and prefer unmatched at a clutter tie where practical.
+
+Pair-cost calculation is still needed for this certificate. Initial complexity
+is O(DL) for pair costs and approximately O(D^2(L + D)) worst case for rectangular
+assignment. Do not add a spatial index, assignment warm-start machinery, or sparse
+solver before profiling this small fixed map.
+
+An additional exact simplification is available: a real edge with cost greater
+than its row's private clutter cost is dominated by leaving that detection
+unmatched. It may be excluded without changing the optimum. This is different
+from a stale pose-based radius gate that could remove a future correct match.
+The initial reference implementation should use all structurally compatible
+landmarks so candidate pruning cannot hide correctness differences.
+
+### Allocation and ownership decision
+
+Preallocate matrix and assignment scratch to validated detection/map bounds.
+Reuse capacity, never numerical results from a different graph state.
+
+`fagra::Factor` currently evaluates through `&self` and does not pass a mutable
+workspace. Resolve this explicitly in milestone M1 rather than hiding shared
+mutation. Preferred small option, if estimator ownership permits: private
+per-factor `RefCell<MatchingWorkspace>` with `try_borrow_mut`, used only as scratch
+by a single-owner evaluator; return a meaningful error on an invalid reentrant
+borrow. Confirm actual Send/Sync requirements first. If Sync is required, evaluate
+a narrow explicit workspace API against local scratch allocation; do not add a
+global mutex or thread-local cache by default. Any upstream API change requires a
+separate scoped decision. Parallel evaluation is not assumed or newly introduced.
+
+## Strict Rust types and module boundaries
+
+The implementation must follow the Writing Rust skill; this section is a design
+contract, not production code or a request to add all types immediately.
+
+- Keep `Point2<Pixel>`, `Point2<Field>`, typed transforms, `Time`, and typed
+  `StateKey`/`FactorKey` through all public interfaces. Use f64 for the numerical
+  assignment/factor; convert detector f32 values once at ingestion.
+- Put the shared wire feature-class enum and observation record in `types`.
+  Reexport where needed instead of duplicating class definitions.
+- Keep map geometry, private `LandmarkId`, `DetectionIndex`, assignment choices,
+  and validated candidate relationships in a small numerical domain module in
+  `localization-fagra`. Keep raw solver row/column indices inside its adapter.
+  Map IDs are scoped to the immutable map owned by the estimator; do not transmit
+  unversioned numeric IDs as if they were globally stable identifiers.
+- Keep field-dimension/class-aware map construction and global search in the
+  existing association module initially. It can populate typed numerical map
+  entries and candidate lists without making `localization-fagra` depend on a ROS
+  node or on the broad `types` crate. One map construction path serves both.
+- The observation message carries detections, exposure-time camera geometry, and
+  epoch/generation identity, not optimizer-owned graph handles or pose guesses.
+  Reuse `TimeWrapper` rather than introducing a second timestamp convention.
+- Give initialization/recovery proposals a separate explicit type from raw
+  observations. A proposal seeds optimization; it is not an extra independent
+  measurement and must not double-count its source image.
+- Use existing lifecycle types where sufficient. Introduce new epoch/generation
+  wrappers only at touched boundaries if needed to prevent real mixing errors;
+  do not perform an unrelated repository-wide type migration.
+- Public constructors validate finite pixels/geometry, confidence bounds, candidate
+  membership, size limits, and calibration. Keep invariants private afterward.
+- Distinguish valid unmatched results from malformed input, arithmetic failure,
+  and invalid state. Propagate contextual errors with `?`; no new `unwrap`,
+  `expect`, `unreachable!`, unsafe code, or silent fallback to fake matches.
+- Prefer local mutation, borrowed immutable maps, and focused functions. Share
+  the existing bearing calculation/Jacobian helper instead of copying it.
+- Reuse existing dependencies (`linear_sum_assignment`, `ndarray` as needed).
+  No new third-party matching library, blanket generic framework, or new crate is
+  justified by this design.
+
+### Observation delivery
+
+The current association node becomes a preparer/proposal producer: all validated
+raw frames can reach localization without first passing tracking uniqueness.
+Retain its exposure-time interpolation, backpressure, bounded latest-frame queue,
+and stale epoch/generation rejection. Global proposals remain available for
+startup and recovery. Specify deduplication by frame identity so proposal delivery
+and observation delivery cannot insert the same image twice.
+
+Do not rename the node or move all subscriptions merely for architectural purity.
+Use an explicit new message/topic or other schema-safe migration; old MCAP payloads
+must continue to decode through an explicit replay adapter. Acceptance comparisons
+must run both approaches from the same upstream detections, not feed the new
+approach only observations already accepted by the old matcher.
+
+### Startup anchor is a deliberate exception
+
+Do not immediately replace every startup correspondence with a symmetric
+min-assignment factor. Before any field-conditioned marginal prior exists,
+transforming `FieldAlignment` by a half-turn and permuting all landmark choices
+can leave the visual objective unchanged while leaving local motion untouched.
+Warm-starting one branch is not an explicit record of the own-half evidence.
+
+Smallest initial policy: use the current validated own-half bootstrap to establish
+the branch, and keep its accepted source image as fixed-correspondence anchor
+evidence using the existing factor path. That image is inserted exactly once,
+not also as an association-aware factor or as a separately derived pose prior.
+Subsequent frames use revisable matching. Retain the fixed anchor until its
+information passes into the ordinary field-conditioned marginal prior. Reusing
+the existing fixed factor for this specific purpose is not a second tracking
+association implementation.
+
+The own-half assumption applies to the reset-time pose, not arbitrarily to a
+much later camera pose after movement. Preserve reset-to-exposure motion when
+selecting the startup branch; explicitly audit the existing exposure-time
+canonicalization behavior. If available motion/geometry cannot establish that
+branch, do not invent certainty. This boundary and the provisional-to-corroborated
+heading transition are M4 acceptance cases.
+
+The fixed bootstrap image is still subject to the existing initialization
+validation and corroboration requirements; do not anchor on a forced match or an
+all-clutter frame. Correcting an erroneous bootstrap must use explicit validated
+recovery semantics, not silently delete the only field anchor.
+
+## Symmetry and retained history
+
+1. Only an explicit localization reset creates a new initialization epoch and
+   permits the assumption that the robot starts in its own half. It supplies no
+   additional heading information. Boundary/underconstrained cases may abstain.
+2. Crossing midfield after initialization must never invoke own-half
+   canonicalization. Matching remains free to select landmarks in either half.
+3. Losing visual track preserves field alignment, propagated motion uncertainty,
+   marginal priors, and the established IMU-to-field heading reference.
+4. A non-reset recovery proposal is evaluated against that retained history.
+   Identical visual costs under a half-turn do not justify a symmetry switch.
+5. Do not freely transform both the retained anchor and the candidate trajectory
+   into a mirrored explanation. A local/global seed is only an initial iterate;
+   every retained prior remains part of acceptance.
+6. Ordinary uncertainty growth does not erase history. Broader uncertainty can
+   weaken discrimination, but must not silently trigger fresh own-half startup.
+
+Verified current behavior: `Localization::try_bootstrap` routes established
+generations through `Estimator::ingest_recovery`; `apply_recovery_seed` leaves
+priors and motion factors in force. `HeadingReference` is updated only by fresh
+accepted tracking evidence, not recovery or repeated solves.
+
+Important distinction: `bootstrap_candidate` explicitly reconstructs motion
+without field-conditioned marginal priors, but its caller currently uses it for
+generation-zero bootstrap. Do not accidentally extend it to ordinary recovery.
+Conflict recovery has its own transactional handling of contradicted live leg
+factors. Preserve its independent evidence requirements; a newly selected graph
+matching is not by itself independent corroboration against those motion factors.
+
+## Acceptance, covariance, and marginalization
+
+Cheapest assignment is a numerical step, not an assertion of visual certainty.
+Track frame support, physical visibility, geometric conditioning, and ambiguity
+separately from factor cost. Retain safe last-good state and transaction semantics
+on rejected updates. A single ambiguous mark must not declare global recovery.
+
+Covariance from the active assignment is conditional on that branch, not a full
+association-marginal covariance. Do not advertise it as resolving a tied rival.
+Initially retain conservative ambiguity checks at visual acceptance/recovery and
+at marginalization boundaries, not every LM cost call. Conditional assignment
+gaps do not prove absence of a distant rival pose.
+
+Before marginalizing a frame that still has materially ambiguous alternatives:
+either establish sufficient support for its branch or remove its visual factor
+and re-optimize the remaining active graph before constructing the prior. Keep
+motion factors and the previous anchor. Do not merely delete a factor after its
+information has been absorbed, and do not solve ambiguity by unbounded window
+growth. The exact support policy and its runtime are an explicit M4 gate.
