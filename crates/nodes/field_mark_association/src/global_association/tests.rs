@@ -193,6 +193,165 @@ fn tracking_estimate(covariance: f64) -> PoseEstimate<Robot, Field> {
     }
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct RecordedStartup {
+    time_ns: u64,
+    imu_before: (u64, [f32; 3]),
+    imu_after: (u64, [f32; 3]),
+    robot_to_camera: Isometry3<Robot, Camera>,
+    camera_intrinsic: Intrinsic,
+    field_dimensions: FieldDimensions,
+    goalposts: Vec<[f32; 3]>,
+    l_spots: Vec<[f32; 3]>,
+    t_spots: Vec<[f32; 3]>,
+    #[serde(default)]
+    penalty_spots: Vec<[f32; 3]>,
+}
+
+impl RecordedStartup {
+    pub(super) fn epoch4() -> Self {
+        serde_json::from_str(include_str!("robot45_epoch4_startup.json")).unwrap()
+    }
+    pub(super) fn load() -> Self {
+        serde_json::from_str(include_str!("robot45_startup.json")).unwrap()
+    }
+
+    pub(super) fn features(&self) -> DetectedVisualFeatures {
+        let features = |values: &[[f32; 3]]| {
+            values
+                .iter()
+                .map(|&[x, y, confidence]| DetectedVisualFeature {
+                    pixel: point![x, y],
+                    confidence,
+                })
+                .collect()
+        };
+        DetectedVisualFeatures {
+            goalposts: features(&self.goalposts),
+            l_spots: features(&self.l_spots),
+            t_spots: features(&self.t_spots),
+            penalty_spots: features(&self.penalty_spots),
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn input<'a>(
+        &'a self,
+        features: &'a DetectedVisualFeatures,
+        parameters: &'a GlobalAssociationConfig,
+    ) -> GlobalAssociationInput<'a> {
+        let rotation = |(_, [r, p, y]): (u64, [f32; 3])| UnitQuaternion::from_euler_angles(r, p, y);
+        let fraction = (self.time_ns - self.imu_before.0) as f32
+            / (self.imu_after.0 - self.imu_before.0) as f32;
+        let (roll, pitch, _) = rotation(self.imu_before)
+            .slerp(&rotation(self.imu_after), fraction)
+            .euler_angles();
+        GlobalAssociationInput {
+            visual_features: features,
+            robot_to_ground: linear_algebra::Rotation3::from_euler_angles(roll, pitch, 0.0),
+            robot_to_camera: self.robot_to_camera,
+            camera_intrinsic: self.camera_intrinsic,
+            field_dimensions: &self.field_dimensions,
+            parameters,
+            heading: None,
+        }
+    }
+}
+
+#[test]
+fn recorded_epoch4_later_crossing_consensus_remains_available() {
+    let frame: RecordedStartup =
+        serde_json::from_str(include_str!("robot45_epoch4_good.json")).unwrap();
+    let features = frame.features();
+    let result = associate_global_visual_features(
+        frame.input(&features, &GlobalAssociationConfig::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        key(&result),
+        vec![
+            ([496.75, 140.84375], [-6.045, -3.95]),
+            ([305.5, 90.53125], [-9.035, -2.45]),
+            ([48.140625, 130.53125], [-10.955, -6.965]),
+            ([200.4375, 96.3125], [-10.955, -3.95]),
+            ([245.75, 85.90625], [-10.955, -2.45]),
+        ]
+    );
+}
+
+#[test]
+fn recorded_robot45_startup_prefers_goalpost_supported_arrangement() {
+    // Original robot45 MCAP, epoch 9, elapsed 466.496024 s; IMU interpolated at exposure.
+    let frame = RecordedStartup::load();
+    let features = frame.features();
+    let config = GlobalAssociationConfig::default();
+    let input = frame.input(&features, &config);
+    let (_, retained, observations) = solver::preprocess(input).unwrap();
+    assert_eq!((retained.len(), observations), (5, 5));
+    let result = associate_global_visual_features(input).unwrap();
+    assert_eq!(
+        key(&result),
+        vec![
+            ([443.0, 222.0], [-10.955, 1.55]),
+            ([187.8125, 225.3125], [-6.045, 3.95]),
+            ([350.5, 222.0], [-9.035, 2.45]),
+            ([326.375, 201.4375], [-9.035, -2.45]),
+        ]
+    );
+    assert_eq!(
+        key(&associate_global_visual_features(input).unwrap()),
+        key(&result)
+    );
+}
+
+#[test]
+fn recorded_robot45_startup_rejects_near_tied_arrangements() {
+    let frame = RecordedStartup::load();
+    let mut features = frame.features();
+    features.goalposts[0].confidence = 0.35;
+    features.t_spots[0].confidence = 0.95;
+    assert!(
+        associate_global_visual_features(
+            frame.input(&features, &GlobalAssociationConfig::default())
+        )
+        .is_none()
+    );
+    let relaxed = GlobalAssociationConfig {
+        score_ratio: 1.001,
+        ..Default::default()
+    };
+    assert!(associate_global_visual_features(frame.input(&features, &relaxed)).is_some());
+}
+
+#[test]
+fn rare_false_positive_does_not_require_a_goalpost_match() {
+    let geometry = geometry();
+    let config = calibrated_parameters().global_localizer;
+    let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
+    let landmarks = map
+        .landmarks
+        .iter()
+        .filter(|l| l.class != VisualFeatureClass::GoalPost);
+    let mut features = project(landmarks.map(|l| (l.class, l.xy)), &geometry);
+    let mut false_positive = project(
+        [(VisualFeatureClass::GoalPost, point![15.0, 7.0])],
+        &geometry,
+    )
+    .goalposts[0];
+    false_positive.confidence = 1.0;
+    features.goalposts.push(false_positive);
+    let result =
+        associate_global_visual_features(global_input(input(&features, &geometry), &config))
+            .unwrap();
+    assert_eq!(result.associations.len(), map.landmarks.len() - 4);
+    assert!(
+        result
+            .associations
+            .iter()
+            .all(|a| a.detection != false_positive.pixel)
+    );
+}
+
 #[test]
 fn three_stationary_features_certify_without_history_or_pose() {
     let geometry = geometry();

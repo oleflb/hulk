@@ -1,0 +1,21 @@
+{
+  "time_ns": 1792936911325443068,
+  "imu_before": [1792936911325053663, [0.006264483090490103, 0.0780595988035202, -2.507079601287842]],
+  "imu_after": [1792936911327077715, [0.006199686322361231, 0.07782375812530518, -2.507141590118408]],
+  "robot_to_camera": {
+    "rotation": [0.8630224466323853, -0.34684401750564575, 0.13695919513702393, 0.3407839834690094],
+    "translation": [-0.004022508859634399, 0.27090591192245483, 0.12005895376205444]
+  },
+  "camera_intrinsic": {"focals": [207.8302764892578, 207.8302764892578], "optical_center": [228.54579162597656, 214.11181640625]},
+  "field_dimensions": {
+    "ball_radius": 0.105, "border_strip_width": 1.05, "center_circle_diameter": 3.9,
+    "corner_arc_radius": 0.0, "goal_box_area_length": 1.92, "goal_box_area_width": 4.9,
+    "goal_depth": 1.0, "goal_inner_width": 3.0, "goal_post_diameter": 0.1,
+    "length": 21.91, "line_width": 0.09, "penalty_area_length": 4.91,
+    "penalty_area_width": 7.9, "penalty_marker_distance": 3.45,
+    "penalty_marker_size": 0.3, "width": 13.93
+  },
+  "goalposts": [[322.75, 9.1328125, 0.498046875]],
+  "l_spots": [[375.125, 20.390625, 0.857421875], [86.875, 72.59375, 0.83984375]],
+  "t_spots": [[241.3125, 31.578125, 0.87841796875], [298.25, 16.390625, 0.80419921875]]
+}
