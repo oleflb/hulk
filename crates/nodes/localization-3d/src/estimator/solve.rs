@@ -45,25 +45,7 @@ impl Localization {
         let had_visual_update = !self.pending_visuals.is_empty();
         let mut visual_rejected = false;
         let start = Instant::now();
-        let mut diagnostics = SolveDiagnostics {
-            time: self.latest_time,
-            epoch: self.epoch,
-            duration: Duration::ZERO,
-            estimation_duration: Duration::ZERO,
-            ingestion_duration: Duration::ZERO,
-            iterations: None,
-            lm_attempts: 0,
-            lm_rejected_steps: 0,
-            gradient_norm: None,
-            motion_rebuilt: false,
-            initial_cost: None,
-            final_cost: None,
-            termination: "failed".into(),
-            state_count: 0,
-            measurement_count: 0,
-            failure: None,
-            imu_bias: None,
-        };
+        let mut diagnostics = self.solve_diagnostics();
         let result = (|| -> Result<_> {
             let mut current_yaw = None;
             let result = self
@@ -93,16 +75,44 @@ impl Localization {
             self.retire_old_segments()?;
             result
         })();
-        let (estimate, converged) = match result {
-            Ok((estimate, converged)) => (Some(estimate), converged),
-            Err(error) => {
-                diagnostics.failure = Some(format!("{error:#}"));
-                (None, false)
-            }
-        };
-        if converged {
+        if result.is_ok() {
             self.last_converged_time = Some(self.latest_time);
         }
+        self.finish_solve(result, diagnostics, start, visual_rejected)
+    }
+
+    pub(super) fn solve_diagnostics(&self) -> SolveDiagnostics {
+        SolveDiagnostics {
+            time: self.latest_time,
+            epoch: self.epoch,
+            duration: Duration::ZERO,
+            estimation_duration: Duration::ZERO,
+            ingestion_duration: Duration::ZERO,
+            iterations: None,
+            lm_attempts: 0,
+            lm_rejected_steps: 0,
+            gradient_norm: None,
+            initial_cost: None,
+            final_cost: None,
+            termination: "failed".into(),
+            state_count: 0,
+            measurement_count: 0,
+            failure: None,
+            imu_bias: None,
+            motion_rebuilt: false,
+        }
+    }
+
+    pub(super) fn finish_solve(
+        &self,
+        result: Result<LocalizationEstimate>,
+        mut diagnostics: SolveDiagnostics,
+        start: Instant,
+        visual_rejected: bool,
+    ) -> SolveResult {
+        let estimate = result
+            .inspect_err(|error| diagnostics.failure = Some(format!("{error:#}")))
+            .ok();
         if estimate.is_none() {
             diagnostics.imu_bias = None;
         }
@@ -111,18 +121,18 @@ impl Localization {
             self.controls.len() + self.biases.len() + 1 + usize::from(self.alignment.is_some());
         diagnostics.measurement_count = self.segment_factors.values().map(|f| f.measurements).sum();
         SolveResult {
+            converged: estimate.is_some(),
             estimate,
             diagnostics,
-            converged,
             visual_rejected,
         }
     }
 
-    fn solve_graph(
+    pub(super) fn solve_graph(
         &mut self,
         diagnostics: &mut SolveDiagnostics,
         heading: Option<&HeadingReference>,
-    ) -> Result<(LocalizationEstimate, bool)> {
+    ) -> Result<LocalizationEstimate> {
         let (segment, tau) = self.segment_and_tau(self.latest_time)?;
         let controls = self.ensure_segment(segment)?;
         self.ensure_biases(self.latest_time)?;
@@ -142,11 +152,15 @@ impl Localization {
             self.validate_tilt()?;
             let mut estimate =
                 self.estimate_from_covariance(controls, tau, &covariance, diagnostics)?;
+            color_eyre::eyre::ensure!(
+                self.pending_visuals.is_empty() || estimate.robot_to_field.is_some(),
+                "visual update has invalid field pose or covariance"
+            );
             if heading.is_some_and(|heading| self.validate_heading(heading).is_err()) {
                 // Field inconsistency cannot erase motion evidence or stop local odometry.
                 estimate.robot_to_field = None;
             }
-            Ok((estimate, true))
+            Ok(estimate)
         })();
         if let Err(error) = &checked {
             tracing::debug!(time = ?self.latest_time, %error, visual_frames = self.pending_visuals.len(), final_cost = ?diagnostics.final_cost, "rolling back inconsistent trajectory update");
