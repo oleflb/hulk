@@ -3,6 +3,29 @@ use linear_algebra::{Isometry3, Point2, Point3};
 use ros_z::Message;
 use serde::{Deserialize, Serialize};
 
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Message,
+)]
+pub enum VisualFeatureClass {
+    GoalPost,
+    LSpot,
+    TSpot,
+    XSpot,
+    PenaltySpot,
+}
+
+impl VisualFeatureClass {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::GoalPost => 0,
+            Self::LSpot => 1,
+            Self::TSpot => 2,
+            Self::XSpot => 3,
+            Self::PenaltySpot => 4,
+        }
+    }
+}
+
 /// How associations were obtained. Global recovery must preserve the existing
 /// field-symmetry branch before its correspondences enter localization.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Message, PartialEq, Eq)]
