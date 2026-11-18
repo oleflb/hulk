@@ -761,6 +761,126 @@ fn failed_conflict_trial_restores_motion_factors_states_and_admission() -> Resul
 }
 
 #[test]
+fn recovery_rejects_a_delivery_tail_with_a_support_reset_gap() -> Result<()> {
+    let (mut estimator, first, second, heading) = conflict_fixture_with_accelerometer(true)?;
+    let start = estimator.latest_time;
+    for index in 1..=10 {
+        let time = start + Duration::from_millis(index * 20);
+        estimator.ingest_imu(
+            time,
+            ImuState {
+                roll_pitch_yaw: vector![0.1, -0.05, 2.0],
+                linear_acceleration: Vector3::wrap(
+                    nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 2.0).inverse()
+                        * nalgebra::vector![0.0, 0.0, 9.81],
+                ),
+                ..Default::default()
+            },
+        )?;
+        // A contact/support reset leaves an unobserved interval between valid deltas.
+        if index == 1 || index >= 5 {
+            assert!(estimator.ingest_kinematic_odometry(
+                types::odometry::KinematicOdometryDelta {
+                    previous_time: time - Duration::from_millis(20),
+                    time,
+                    current_to_previous: linear_algebra::Isometry2::identity(),
+                }
+            )?);
+        }
+        let solved = estimator.solve_with_heading(Some(&heading));
+        assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    }
+    let records = estimator.history.records.len();
+    let factors: Vec<_> = estimator.kinematic_factors.keys().copied().collect();
+    let solved_cost = estimator.optimizer.statistics().cost;
+    let controls = estimator
+        .controls
+        .values()
+        .map(|&key| Ok((key, estimator.graph.get(key)?.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    assert!(matches!(
+        estimator.recover_conflict(first, second, &heading)?,
+        ConflictRecovery::Rejected
+    ));
+    assert_eq!(
+        estimator.optimizer.statistics().cost,
+        solved_cost,
+        "a gapped tail must reject before a trial solve"
+    );
+    assert!(!estimator.has_supported_leg_admission());
+    assert_eq!(estimator.history.records.len(), records);
+    assert_eq!(
+        estimator
+            .kinematic_factors
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        factors
+    );
+    for (key, value) in controls {
+        assert_eq!(estimator.graph.get(key)?.pose, value.pose);
+    }
+    Ok(())
+}
+
+#[test]
+fn conflict_recovery_rejects_intervals_already_in_marginal_priors() -> Result<()> {
+    let (mut estimator, first, second, heading) = conflict_fixture()?;
+    // Retire controls while keeping raw observations available: replay alone is not evidence
+    // that their factors can still be removed from the accepted marginal prior.
+    estimator.parameters.timing.optimization_window = Duration::from_millis(600);
+    let count = estimator.history.records.len();
+    let factors = estimator.kinematic_factors.len();
+    estimator.retire_old_segments()?;
+    assert!(estimator.kinematic_factors.len() < factors);
+    assert!(estimator.attitude_at(first.time).is_some());
+    assert!(estimator.attitude_at(second.time).is_some());
+    assert!(matches!(
+        estimator.recover_conflict(first, second, &heading)?,
+        ConflictRecovery::Rejected
+    ));
+    assert_eq!(estimator.history.records.len(), count);
+    assert!(estimator.pending_visuals.is_empty());
+    Ok(())
+}
+
+#[test]
+fn conflict_recovery_requires_independent_geometry_and_trusted_heading() -> Result<()> {
+    let (mut estimator, first, second, heading) = conflict_fixture()?;
+    let count = estimator.kinematic_factors.len();
+    for invalid in 0..5 {
+        let mut first = first.clone();
+        match invalid {
+            0 => first.time = second.time,
+            1 => {
+                for association in &mut first.inner.associations {
+                    association.field_point.inner.y = 0.0;
+                }
+            }
+            2 => {
+                for association in &mut first.inner.associations {
+                    let point = &mut association.field_point.inner;
+                    (point.x, point.y) = (-point.y, point.x);
+                }
+            }
+            3 => first.inner.associations[0].detection.inner.x += 200.0,
+            _ => {
+                for association in &mut first.inner.associations {
+                    association.field_point.inner.x += 2.0;
+                }
+            }
+        }
+        assert!(matches!(
+            estimator.recover_conflict(first, second.clone(), &heading)?,
+            ConflictRecovery::Rejected
+        ));
+        assert_eq!(estimator.kinematic_factors.len(), count);
+        assert!(estimator.pending_visuals.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn startup_replaces_drifted_height_prior_with_landmark_fit() {
     use types::visual_localization::FieldMarkAssociation;
     let camera = recovery_camera();
