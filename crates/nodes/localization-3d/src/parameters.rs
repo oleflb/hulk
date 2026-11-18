@@ -60,7 +60,7 @@ pub struct ModelParameters {
     /// Gauge standard deviations, metres and radians respectively.
     pub anchor_xy_sigma: f64,
     pub anchor_yaw_sigma: f64,
-    /// Ground contact standard deviation, metres.
+    /// Sole penetration standard deviation, metres.
     pub foot_sigma: f64,
     /// VO standard deviation, metres/radians.
     pub visual_odometry_sigma: f64,
@@ -258,7 +258,7 @@ impl Default for AccelerometerParameters {
 #[derive(Clone, Debug, Deserialize, Serialize, Message, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct KinematicOdometryNoise {
-    /// Forward/lateral displacement noise floor, in metres.
+    /// Forward/lateral displacement noise floor per delta, in metres.
     pub position_sigma: nalgebra::Vector2<f64>,
     /// Forward/lateral displacement variance growth, in m²/s.
     pub translation_variance_per_second: nalgebra::Vector2<f64>,
