@@ -236,7 +236,9 @@ impl<'a> Search<'a> {
         Some(Edge {
             detection,
             landmark,
-            benefit: (gate - distance) * f64::from(observation.confidence),
+            // Reuse the seed sampler's class-rarity heuristic; unmatched detections still score zero.
+            benefit: (gate - distance)
+                * f64::from(observation.confidence * self.map.rarity_weight(observation.class)),
             squared_error: error.norm_squared(),
         })
     }
@@ -346,6 +348,14 @@ impl<'a> Search<'a> {
                 break;
             };
             let next = self.score(pose)?;
+            // Unweighted fitting must not erase stronger admissible evidence, including partial rivals.
+            if self.admissible_rival(&candidate)
+                && (!self.admissible_rival(&next)
+                    || next.score < candidate.score
+                    || (self.consensus(&candidate) && !self.consensus(&next)))
+            {
+                break;
+            }
             let unchanged = next.pairs == candidate.pairs;
             candidate = next;
             if unchanged {
@@ -367,6 +377,12 @@ impl<'a> Search<'a> {
                 candidate.pose.height,
                 config,
             )
+    }
+
+    fn admissible_rival(&self, candidate: &Candidate) -> bool {
+        self.valid_pose(candidate.pose)
+            && candidate.pairs.len() >= 3
+            && candidate.rms <= f64::from(self.input.parameters.max_rms_px)
     }
 
     fn certify(&mut self, winner: Candidate) -> Option<Candidate> {
@@ -456,22 +472,27 @@ fn spread(
     false
 }
 
+fn same_arrangement(candidate: &Candidate, other: &Candidate) -> bool {
+    let compatible = candidate
+        .pairs
+        .iter()
+        .all(|&(d, m)| other.pairs.iter().all(|&(e, n)| d != e || m == n));
+    let yaw = candidate.pose.yaw - other.pose.yaw;
+    candidate.pairs == other.pairs
+        || (compatible
+            && (candidate.pose.position - other.pose.position).norm() <= 0.4
+            && yaw.sin().atan2(yaw.cos()).abs() <= 0.12
+            && (candidate.pose.height - other.pose.height).abs() <= 0.12)
+}
+
 fn keep(candidates: &mut Vec<Candidate>, candidate: Candidate) {
     if candidate.pairs.len() < 3 {
         return;
     }
-    if let Some(index) = candidates.iter().position(|other| {
-        let compatible = candidate
-            .pairs
-            .iter()
-            .all(|&(d, m)| other.pairs.iter().all(|&(e, n)| d != e || m == n));
-        let yaw = candidate.pose.yaw - other.pose.yaw;
-        candidate.pairs == other.pairs
-            || (compatible
-                && (candidate.pose.position - other.pose.position).norm() <= 0.4
-                && yaw.sin().atan2(yaw.cos()).abs() <= 0.12
-                && (candidate.pose.height - other.pose.height).abs() <= 0.12)
-    }) {
+    if let Some(index) = candidates
+        .iter()
+        .position(|other| same_arrangement(&candidate, other))
+    {
         if candidates[index].score >= candidate.score {
             return;
         }
@@ -574,17 +595,21 @@ pub(crate) fn associate(input: GlobalAssociationInput<'_>) -> Option<Association
         keep(&mut candidates, search.score(pose)?);
     }
     let mut refined = Vec::with_capacity(CANDIDATES + 1);
+    let mut partial_rivals = Vec::new();
     for candidate in candidates {
         let candidate = search.refine(candidate)?;
         if search.consensus(&candidate) {
             keep(&mut refined, candidate);
+        } else if search.admissible_rival(&candidate) {
+            // Insufficient consensus cannot initialize, but can contradict a different arrangement.
+            keep(&mut partial_rivals, candidate);
         }
     }
     let winner = refined.first()?;
-    if refined
-        .get(1)
-        .is_some_and(|rival| winner.score <= rival.score * f64::from(input.parameters.score_ratio))
-    {
+    if refined.iter().skip(1).chain(&partial_rivals).any(|rival| {
+        !same_arrangement(winner, rival)
+            && winner.score <= rival.score * f64::from(input.parameters.score_ratio)
+    }) {
         return None;
     }
     // Exact assignment checks the winning pose only. RANSAC does not prove absence of unsampled poses.
