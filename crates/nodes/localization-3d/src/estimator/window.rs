@@ -1,4 +1,4 @@
-use super::{Estimator, control_keys};
+use super::{Localization, control_keys};
 use color_eyre::{Result, eyre::eyre};
 use fagra::{BatchKey, FactorKey, StateKey};
 use localization_fagra::{
@@ -20,7 +20,7 @@ pub(super) struct SegmentFactors {
     pub reprojections: Vec<BatchKey<FrameReprojections>>,
 }
 
-impl Estimator {
+impl Localization {
     pub(super) fn check_time(
         &self,
         time: Time,

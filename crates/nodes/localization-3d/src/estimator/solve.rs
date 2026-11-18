@@ -5,7 +5,7 @@ use fagra::{BlockId, OptimizeOptions, SolverError, StateKey};
 use localization_fagra::variables::{CameraIntrinsics, FieldAlignment, ImuBias, PoseControl};
 use types::localization::LocalizationEstimate;
 
-use super::{Estimator, Graph, covariance::EstimateCovariance};
+use super::{Graph, Localization, covariance::EstimateCovariance};
 use crate::{diagnostics::SolveDiagnostics, heading::HeadingReference};
 
 pub(crate) struct SolveResult {
@@ -24,7 +24,7 @@ struct StateSnapshot {
 }
 
 impl StateSnapshot {
-    fn capture(estimator: &Estimator) -> Result<Self> {
+    fn capture(estimator: &Localization) -> Result<Self> {
         let graph = &estimator.graph;
         Ok(Self {
             controls: estimator
@@ -63,7 +63,7 @@ impl StateSnapshot {
     }
 }
 
-impl Estimator {
+impl Localization {
     fn trace_factor_costs(&self, stage: &str, total: Option<f64>) {
         if self.pending_visuals.is_empty() || !tracing::enabled!(tracing::Level::TRACE) {
             return;

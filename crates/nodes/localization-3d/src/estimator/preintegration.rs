@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Estimator, bias::bias_segment_and_tau};
+use super::{Localization, bias::bias_segment_and_tau};
 use crate::parameters::TimingParameters;
 use color_eyre::{Result, eyre::WrapErr};
 use coordinate_systems::{ImuReference, Robot};
@@ -104,7 +104,7 @@ impl ImuIntervals {
     }
 }
 
-impl Estimator {
+impl Localization {
     pub(super) fn imu_factor_costs(&self) -> Result<(f64, f64)> {
         let mut integrated = 0.0;
         let mut boundary = 0.0;
@@ -462,7 +462,7 @@ mod tests {
     use booster::ImuState;
     use std::time::Duration;
 
-    fn ingest(estimator: &mut Estimator, millis: u64, force: f32) {
+    fn ingest(estimator: &mut Localization, millis: u64, force: f32) {
         estimator
             .ingest_imu(
                 estimator.origin + Duration::from_millis(millis),

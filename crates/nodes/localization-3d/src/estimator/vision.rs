@@ -1,4 +1,4 @@
-use super::{Estimator, control_keys, recovery::MotionRecord};
+use super::{Localization, control_keys, recovery::MotionRecord};
 use crate::alignment::{reprojection_rms, valid_visual_frame, valid_visual_rms};
 use crate::heading::HeadingReference;
 use color_eyre::{Result, eyre::eyre};
@@ -23,7 +23,7 @@ pub(super) struct PendingVisual {
     frame: TimeWrapper<VisualLocalizationFrame>,
 }
 
-impl Estimator {
+impl Localization {
     pub(super) fn pending_visual_cost(&self) -> Result<f64> {
         let mut cost = 0.0;
         for pending in &self.pending_visuals {
