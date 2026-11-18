@@ -1,4 +1,4 @@
-use super::Estimator;
+use super::Localization;
 use color_eyre::{Result, eyre::eyre};
 use fagra::{StateKey, Variable};
 use localization_fagra::{
@@ -26,7 +26,7 @@ fn root(gyro_sigma: f64, accel_sigma: f64) -> SMatrix<f64, 6, 6> {
     }))
 }
 
-impl Estimator {
+impl Localization {
     pub(super) fn initialize_biases(&mut self, time: Time, guess: ImuBias) -> Result<()> {
         let (index, _) = bias_segment_and_tau(self.origin, time, self.parameters.timing.bias_ns());
         let key = self.graph.add(guess);

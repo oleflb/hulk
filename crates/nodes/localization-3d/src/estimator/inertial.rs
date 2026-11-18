@@ -1,4 +1,4 @@
-use super::{Estimator, recovery::MotionRecord};
+use super::{Localization, recovery::MotionRecord};
 use booster::ImuState;
 use color_eyre::Result;
 use coordinate_systems::{ImuReference, Robot};
@@ -8,7 +8,7 @@ use localization_fagra::factors::{FootGround, FootObservation};
 use ros_z::time::Time;
 use types::time_wrapper::TimeWrapper;
 
-impl Estimator {
+impl Localization {
     pub fn ingest_imu(&mut self, time: Time, imu: ImuState) -> Result<bool> {
         if !imu
             .roll_pitch_yaw

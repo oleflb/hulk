@@ -9,12 +9,12 @@ use types::camera_geometry::CameraGeometry;
 
 use super::*;
 
-pub(super) fn estimator() -> Estimator {
+pub(super) fn estimator() -> Localization {
     let camera = CameraGeometry {
         intrinsics: Intrinsic::new(nalgebra::vector![300.0, 300.0], point![160.0, 120.0]),
         ..Default::default()
     };
-    Estimator::new_motion(
+    Localization::new_motion(
         Time::from_nanos(1_000_000_000),
         7,
         nalgebra::Isometry3::identity().framed_transform(),
@@ -52,7 +52,7 @@ fn configured_foot_noise_changes_measurement_weight() {
     let costs = [0.01, 0.04].map(|sigma| {
         let mut parameters = template.parameters.clone();
         parameters.model.foot_sigma = sigma;
-        let mut estimator = Estimator::new_motion(
+        let mut estimator = Localization::new_motion(
             template.origin,
             template.epoch,
             Isometry3::identity(),
@@ -578,7 +578,7 @@ fn startup_replaces_drifted_height_prior_with_landmark_fit() {
             nalgebra::Translation3::new(100.0, -50.0, wrong_height),
             nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 0.0),
         ));
-        estimator = Estimator::new_motion(
+        estimator = Localization::new_motion(
             estimator.origin,
             estimator.epoch,
             wrong_pose,
@@ -650,7 +650,7 @@ fn startup_replaces_drifted_height_prior_with_landmark_fit() {
 }
 
 fn recovery_fixture() -> (
-    Estimator,
+    Localization,
     TimeWrapper<VisualLocalizationFrame>,
     HeadingReference,
 ) {
@@ -660,7 +660,7 @@ fn recovery_fixture() -> (
 fn recovery_fixture_with_timing(
     timing: crate::TimingParameters,
 ) -> (
-    Estimator,
+    Localization,
     TimeWrapper<VisualLocalizationFrame>,
     HeadingReference,
 ) {
@@ -692,7 +692,7 @@ fn recovery_fixture_with_timing(
         nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 2.0),
     ));
     estimator.parameters.timing = timing;
-    estimator = Estimator::new_motion(
+    estimator = Localization::new_motion(
         estimator.origin,
         7,
         wrong_pose,

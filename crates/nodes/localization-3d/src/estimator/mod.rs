@@ -93,8 +93,6 @@ pub struct Localization {
     history: recovery::MotionHistory,
 }
 
-pub(crate) type Estimator = Localization;
-
 impl Localization {
     pub(super) fn new_motion(
         origin: Time,

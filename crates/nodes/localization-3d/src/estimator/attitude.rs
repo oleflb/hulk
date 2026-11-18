@@ -1,11 +1,11 @@
-use super::{Estimator, control_keys};
+use super::{Localization, control_keys};
 use color_eyre::Result;
 use coordinate_systems::ImuReference;
 use linear_algebra::Orientation3;
 use localization_fagra::factors::RelativeYaw;
 use ros_z::time::Time;
 
-impl Estimator {
+impl Localization {
     /// Boundary attitudes summarize the source-time IMU stream. Relative headings
     /// carry no absolute-yaw anchor. Rebuilding the small active set handles late samples.
     pub(super) fn prepare_attitude(&mut self) -> Result<Option<fagra::FactorKey<RelativeYaw>>> {

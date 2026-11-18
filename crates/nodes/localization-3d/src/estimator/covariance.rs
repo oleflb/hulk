@@ -5,7 +5,7 @@ use localization_fagra::variables::PoseControl;
 use nalgebra::SMatrix;
 use types::localization::{LocalizationEstimate, PoseEstimate};
 
-use super::{Estimator, control_keys};
+use super::{Localization, control_keys};
 
 // Four pose controls, optional planar alignment, and two six-dimensional bias knots.
 // The last three rows/columns are unused when no alignment exists.
@@ -25,7 +25,7 @@ impl HeightPrediction {
     }
 }
 
-impl Estimator {
+impl Localization {
     /// Source-time marginal, available only within a successfully solved trajectory.
     /// Used as an innovation check, never reinserted alongside replayed measurements.
     pub(crate) fn height_prediction(

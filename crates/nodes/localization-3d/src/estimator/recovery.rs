@@ -9,7 +9,7 @@ use projection::intrinsic::Intrinsic;
 use ros_z::time::Time;
 use types::{time_wrapper::TimeWrapper, visual_localization::VisualLocalizationFrame};
 
-use super::{Estimator, control_keys};
+use super::{Localization, control_keys};
 use crate::{
     alignment::{seed_alignment, seed_recovery_alignment, valid_visual_frame},
     heading::HeadingReference,
@@ -114,7 +114,7 @@ impl MotionRecord {
         }
     }
 
-    fn insert(self, estimator: &mut Estimator) -> Result<()> {
+    fn insert(self, estimator: &mut Localization) -> Result<()> {
         match self {
             Self::Imu {
                 time,
@@ -143,7 +143,7 @@ impl MotionRecord {
     }
 }
 
-impl Estimator {
+impl Localization {
     /// Resolve the global match's half-turn convention, then update the retained graph.
     /// Its marginalized history, alignment and motion factors must explain recovery.
     pub(crate) fn ingest_recovery(
