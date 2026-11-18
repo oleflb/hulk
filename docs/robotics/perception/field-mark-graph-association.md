@@ -611,3 +611,251 @@ and re-optimize the remaining active graph before constructing the prior. Keep
 motion factors and the previous anchor. Do not merely delete a factor after its
 information has been absorbed, and do not solve ambiguity by unbounded window
 growth. The exact support policy and its runtime are an explicit M4 gate.
+
+## Tasks and milestones
+
+The user explicitly authorized implementation and the proposed checks with Go.
+The numerical kernel/factor, observation delivery and lifecycle integration are
+implemented. The five-recording integrated comparison is complete, but M5's full
+validation and acceptance gates have not passed; see the results above.
+
+### Implementation checkpoint
+
+`crates/localization-fagra/src/factors/association.rs` now provides:
+
+- `FieldLandmarkMap`: shared immutable, finite, distinct ground-plane points.
+- `FieldMarkDetection`: typed pixels and structurally compatible field points.
+  Construction of the factor resolves those points against its own map into
+  private `LandmarkId`s, rejecting unknown points; foreign numeric IDs cannot
+  leak across maps. Candidates are deduplicated once at ingestion.
+- `AssociatedFieldMarks`: one ordinary fagra factor, with exact optional
+  one-to-one assignment, per-detection clutter cost, and the certified
+  collision-free row-minimum fast path. It recomputes matching at every cost and
+  linearization state. Costs include unmatched detections; only matched edges
+  emit Jacobians.
+- Bounded, preallocated per-factor scratch via `RefCell::try_borrow_mut`.
+  The factor is single-owner/Send, not Sync; fagra requires no Sync bound.
+  No optimizer-state or accepted-association cache is stored in scratch.
+  Limits are 256 detections, 256 map points and 256 input candidates per detection.
+- Each map bearing is computed once per evaluation, each observed bearing once
+  per detection. The existing oriented-bearing residual and analytic Jacobian
+  code is shared through `reprojection.rs`; it is not copied into a second model.
+  Finite zero/near-zero-range edges are forbidden; malformed geometry remains an
+  evaluation error even if the result would otherwise be all clutter.
+
+Only existing workspace dependencies `linear_sum_assignment` and `ndarray` were
+added to `localization-fagra`. The fixed-correspondence path remains available for
+the bootstrap anchor. The new factor is installed in the opt-in live/replay path.
+The wire protocol, bookkeeping and initial retirement policy are implemented;
+calibration and acceptance work remain. Do not infer an accuracy improvement from
+the kernel tests or increased recording availability.
+
+Verification completed:
+
+- `cargo test --locked -p localization-fagra --quiet`: 157 unit tests, two
+  integration tests and one doctest passed; four timing tests ignored normally.
+- Exhaustive 3-by-2 assignment oracle across 15625 weighted/forbidden-edge
+  matrices, including clutter ties: fast-path and always-solve costs agree.
+- Trial-state reassociation/restoration, additive clutter cost, all-clutter
+  emission, invalid inputs, and finite-difference cost-gradient checks covering
+  all four pose controls, alignment, and camera intrinsics.
+- Atomic graph insertion and retirement: marginalizing an incident control
+  removes the complete frame factor while preserving other controls.
+- `cargo test --locked --release -p localization-3d --lib --quiet`: 67 existing
+  tests passed, three ignored. This checks regression of the shared residual
+  refactor, not integration of the new factor.
+- `cargo clippy --locked -p localization-fagra --all-targets -- -D warnings`
+  and scoped formatting passed.
+
+### Matching microbenchmark
+
+Command:
+
+```sh
+cargo test --locked --release -p localization-fagra benchmark_exact_matching -- --ignored --nocapture --test-threads=1
+```
+
+On the same desktop host, 100000 calls per case, precomputed synthetic costs,
+31 real landmark columns plus one private clutter column per detection. Sizes
+1–11 cover baseline **queued correspondence counts**, not the unfiltered raw
+detection distribution. Across the five baseline reports those counts were:
+1:18711, 2:17827, 3:22985, 4:21511, 5:24636, 6:9233, 7:2702, 8:858, 9:334,
+10:325, 11:6. Costs are synthetic; these are not recording-derived assignments.
+
+Mean nanoseconds per matching call (one run, no confidence intervals):
+
+| Detections | Distinct minima: always solve / certificate | Colliding minima: always solve / certificate + fallback |
+| --- | ---: | ---: |
+| 1 | 188 / 36 | 180 / 36 (one row cannot collide) |
+| 3 | 539 / 95 | 623 / 718 |
+| 5 | 899 / 188 | 983 / 1149 |
+| 8 | 1485 / 254 | 1578 / 1931 |
+| 11 | 1681 / 279 | 1610 / 1893 |
+
+The 32-detection stress case necessarily collides with only 31 real landmarks:
+always-solve 6041–6103 ns, certificate + fallback 6769–6842 ns. The certificate
+helps collision-free cases and adds work on collisions, as expected. Timing
+excludes bearing/pair-cost preparation, Jacobians, ingestion and graph solving;
+**this is not an end-to-end speedup or runtime-parity result**.
+
+### M0 — Reproducible current-pipeline baseline (this task)
+
+- [x] Inventory original MCAPs and distinguish derived/replayed artifacts.
+- [x] Record source revision, dirty state, configuration, build profile, hardware,
+  commands, timing definitions, and artifact paths.
+- [x] Run existing replay on available raw inputs; report coverage and failures.
+- [x] Report accuracy/latency limits honestly when ground truth, arrival timing,
+  or target hardware is absent.
+- [x] Insert measured baseline results into this document.
+
+Exit: reproducible reference results with no new association implementation.
+
+### M1 — Typed contracts and evaluator feasibility
+
+- [x] Finalize observation/proposal lifecycle and immutable map ownership.
+- [x] Resolve numerical-domain versus wire-domain types without node dependencies
+  in the factor crate.
+- [x] Confirm atomic multi-residual factor insertion/removal and empty-support
+  behavior, including constant cost handling in LM and marginalization.
+- [x] Resolve scratch ownership under the actual `&self`/Send/Sync contracts.
+- [x] Enumerate all consumers, schemas, replay adapters, and parameter changes.
+
+Exit: precise interfaces and no unresolved solver-contract blocker. If a broad
+solver rewrite is required, stop and revisit the design rather than hiding it.
+
+### M2 — Exact matching kernel, isolated from live localization
+
+- [x] Implement typed pair-cost/assignment adapter using existing solver.
+- [x] Add the collision-free row-minimum certificate.
+- [x] Bound detections, candidates, memory growth, and work; reserve scratch.
+- [ ] Benchmark representative recording-derived matrix sizes and collision cases.
+- [x] Proposed checks: small brute-force oracle, forbidden edges, all clutter,
+  missed detections, conflicting row minima, ties, arithmetic errors.
+
+Exit: always-solve and fast-path variants have equal optimal costs and valid
+one-to-one choices, allowing different optimal choices at ties.
+
+### M3 — Association-aware frame factor
+
+- [x] Share existing bearing geometry, residuals, and analytic Jacobians.
+- [x] Implement full min-assignment cost and active-branch linearization.
+- [x] Keep matched/unmatched choices local to evaluation; commit diagnostics
+  only at accepted state.
+- [ ] Proposed checks: cost/local-model gradient away from ties, unmatched
+  constant cost, changed trial-state assignment, rejected trial rollback,
+  class constraints, horizon/visibility and invalid-range behavior.
+
+Exit: correct factor cost/model contract, unchanged continuous graph variables,
+and no hidden allocation or state mutation in normal evaluation.
+
+### M4 — Lifecycle and temporal integration
+
+- [x] Connect raw frames for established tracking and coasting.
+- [x] Retain startup/global proposal search and independent acceptance checks.
+- [x] Retain a single-counted fixed bootstrap anchor until a field-conditioned
+  marginal prior exists; do not rely on warm starts to record the symmetry choice.
+- [x] Adapt pending/accepted visual bookkeeping, graph handles, diagnostics, and
+  motion-conflict evidence to frame-owned matching.
+- [x] Implement bounded ambiguous-frame retirement before marginalization;
+  initial support threshold still requires empirical calibration.
+- [x] Preserve stale-message, reset, generation, heading, and timing behavior.
+- [ ] Proposed checks: a later frame corrects an earlier match; no marks/all
+  clutter; own-half reset; legal midfield crossing; dropout followed by mirrored
+  recovery proposal; recovery without reset; marginalization preserves branch;
+  false motion factors require independent corroboration.
+
+Exit: no symmetry regression, no false visual freshness, no duplicated image
+evidence, and no removal of information already frozen into a prior.
+
+### M5 — End-to-end comparison and decision
+
+- [ ] Replay baseline, exact always-solve factor, and certified-fast-path factor
+  on identical upstream detections and sensor schedules.
+- [x] Include association, preparation, ingestion, solve retries, covariance,
+  acceptance checks, and marginalization in total compute accounting.
+- [ ] Report total CPU, median/p95/p99/max update wall time, match counts, solver
+  iterations/rejected trials, assignment calls and fast-path hit rate.
+- [ ] Check coverage, false-lock events, symmetry flips, dropout/recovery duration,
+  and available independent accuracy annotations. Reduced tracking availability
+  or discarded input is not a valid speedup.
+- [ ] Repeat timing on target hardware with controlled load; characterize both
+  fixed-event replay and live/latest-frame scheduling if behavior differs.
+- [x] Run formatting, scoped Clippy, existing relevant tests, and approved new
+  checks. Record failures and checks not possible in this environment.
+- [ ] Remove obsolete tracking path only after a successful decision; preserve
+  explicit legacy recording decoding where still needed.
+
+Exit: same-hardware total compute and latency meet the baseline budget without
+quality/availability regression. If not, retain the current approach and report
+the limiting component. No runtime-parity claim based solely on a LAP benchmark.
+
+### Existing verification to preserve
+
+Reuse current coverage before adding tests with overlapping purpose:
+
+- `crates/linear_sum_assignment/tests/{solutions,errors,capacity,scipy_cases}.rs`
+  already exercise rectangular shapes, optional matching, f64, forbidden edges,
+  overflow, deterministic ties, workspace reuse, and SciPy reference cases.
+  New matching tests should focus on the typed adapter and fast-path certificate.
+- `crates/localization-fagra/src/factors/tests.rs` already checks robust local
+  models, bearing range/cost behavior, and monotonicity through the side plane.
+  Extend the property harness for the atomic association factor rather than
+  duplicating the bearing model tests.
+- `crates/nodes/localization-3d/src/localization/recovery_tests.rs` already covers
+  retained history, delayed recovery, sparse-frame observability, wrong-half
+  updates, rejected trials, heading retention, and independent carry evidence.
+  M4 must adapt these to the observation interface and add only missing behaviors.
+
+## Research analysis (2023–2026)
+
+This is a targeted assessment, not a claim of a universal state-of-the-art winner.
+Dates refer to the cited publication/preprint versions. Published runtimes use
+different hardware, observations, problem sizes, and timing scopes.
+
+| Work | Evidence and mechanism | Relevance to HULK |
+| --- | --- | --- |
+| [Iterative Landmark Matching, 2025](https://arxiv.org/html/2503.11020v2) | ARTEMIS soccer deployment; one-to-one LAP alternating with planar pose estimation; reports 0.901 ms for four iterations with DLT on i7-13650HX, excluding vision; about 0.19–0.21 m field-test position RMSE | Strongest direct application evidence for bounded reassociation; current global search already has related refinement; stereo Cartesian observations/planar solve differ from HULK |
+| [Hessian-Sum-Mixture, RA-L 2024](https://arxiv.org/html/2404.05452v2) | Improved curvature for sum-mixture likelihoods; simulation gains; similar real-data accuracy/iterations to max-mixtures, with max-mixtures faster in reported real-data timing; Python implementation caveat | Reference if hard switching fails; not evidence that soft associations are cheaper; per-observation mixtures do not enforce one-to-one matching |
+| [riSAM, ICRA 2023](https://arxiv.org/html/2209.14359v2) | Incremental graduated non-convexity improves resistance to false loop closures and poor initialization; specialized iSAM2 and update machinery | Conditional option for demonstrated outlier failures; rejects bad constraints rather than recovering discarded landmark alternatives; full port is out of initial scope |
+| [DAF-SLAM, ICRA 2023](https://arxiv.org/abs/2302.13264) | Alternates clustering and SLAM, searches landmark count | Mostly solves unknown-map problems absent from the fixed soccer field |
+| [Semantic Semi-Incremental DAF-SLAM, July 2026 preprint](https://arxiv.org/html/2607.23384v1) | Clusters geometry plus semantics, optimizes segments, repeats global optimization; real-world settings use 15 inner rounds and LM iteration setting 100; kitchen runs 321–364 s for proposed variants | Borrow revisable association; skip landmark learning/count search; no evidence of HULK-budget parity; false-positive handling remains limited |
+| [TACO, June 2026 preprint](https://arxiv.org/abs/2606.29851) | Incoming consistency checks plus periodic sanitization of accepted loop closures; abstract reports approximately 45/100 ms mean convergence in 2D/3D | Supports revisiting accepted evidence; different problem/timing scope, not a drop-in solver recommendation; abstract-level assessment only |
+
+Supporting older references: [Crouse 2016 rectangular assignment](https://doi.org/10.1109/TAES.2016.140952)
+is already implemented locally; [max-mixture semantic SLAM](https://arxiv.org/abs/1909.11213)
+motivates retained alternatives plus a null hypothesis; [DC-SAM](https://arxiv.org/abs/2204.11936)
+motivates alternating discrete/continuous optimization. These are foundations,
+not new 2023–2026 contributions.
+
+## Next steps
+
+**Immediate:** integrated replay complete; keep the candidate opt-in. Profile
+recording 44's extra estimation work, including repeated frame evaluation and
+accepted-history refresh; inspect the 44/45 discontinuities against independent
+annotations before making accuracy claims. Calibrate clutter/retirement support,
+complete the delayed-reset own-half audit, and repeat the acceptance comparison
+after justified changes. Preserve all raw artifacts before temporary cleanup.
+
+The initial design intentionally leaves more expensive methods conditional on
+observed failure modes:
+
+| Observed failure | Diagnose first | Next action if confirmed |
+| --- | --- | --- |
+| Matching dominates compute | Separate pair costs, LAP time, uniqueness certification, allocation | Use certified fast path/preallocation; consider dual certificates or sparse matching only after profiling |
+| Graph/Jacobians dominate compute | Measure bearing preparation, selected-edge derivatives, LM trials, covariance | Share per-frame geometry; reduce repeated numerical work without changing objective; do not optimize LAP unnecessarily |
+| Fast path rarely succeeds | Count actual landmark collisions and clutter choices | Keep exact LAP; low hit rate alone does not justify approximate matching |
+| Low-residual wrong association persists | Check candidate coverage, independent motion consistency, delayed evidence | Revisit active-window frames; use existing global proposals when outside the local basin |
+| Hard assignment oscillates | Inspect near ties, accepted cost sequence, rejected trials | Consider a small mixture over valid joint assignments using the 2024 Hessian analysis; no sticky hysteresis hidden outside the objective |
+| All-clutter plateau blocks recovery | Compare predicted geometry, clutter cost, and surviving global proposals | Use global seed search; calibrate clutter model on held-out data, not by forcing every detection to match |
+| False positives corrupt pose | Inspect residuals and calibration before blaming solver | Strengthen calibrated clutter/robust handling; consider bounded GNC inspired by riSAM if needed |
+| False negatives cause tracking loss | Check support geometry and motion-only continuity | Continue motion-conditioned posterior; do not penalize invisible landmarks or declare reset |
+| Detector class confusion rejects true edges | Measure confusion by class/range | Add calibrated allowed substitutions/penalties; preserve one-to-one matching and uncertainty checks |
+| Symmetry flip after dropout | Audit epoch/generation, own-half application, retained priors, heading updates | Fix lifecycle/anchoring first; never treat exact symmetry as resolvable by symmetric visual evidence alone |
+| Motion and visual evidence conflict | Determine whether disagreement is from association or actual slipping/bad motion | Preserve independent corroboration and transactional conflict recovery; do not simply force matches to satisfy wrong odometry |
+| Marginal prior freezes a wrong match | Inspect confidence at retirement and retained raw evidence | Exclude unresolved visual frame before marginalization and re-solve; consider bounded alternatives only if lost information is material |
+| Reported covariance is too confident | Separate active-branch covariance from association ambiguity | Keep ambiguity-aware validity; evaluate mixture covariance only if needed, not arbitrary inflation |
+| Benchmark looks faster but loses observations | Compare delivery/drop counters and tracking availability | Reject the apparent speedup; equalize input schedules and account for latest-frame policy |
+| No ground truth | Inspect available independent annotations/reference sensors | Report consistency and lifecycle metrics only; annotate representative failures before claiming accuracy improvements |
+
+Do not pursue general hybrid inference, whole-map clustering, learned descriptors,
+or a solver replacement unless a measured failure justifies the additional cost.
