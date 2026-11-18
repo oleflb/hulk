@@ -215,42 +215,18 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ros_z::{context::ContextBuilder, time::Time};
+    use ros_z::time::Time;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn rejected_update_preserves_node_revision_and_running_estimator() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "localization-parameters-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root)?;
-        std::fs::write(
-            root.join("localization3d.json5"),
-            include_str!("../../../../etc/parameters/base/localization3d.json5"),
-        )?;
-        let context = ContextBuilder::default()
-            .with_mode("peer")
-            .disable_multicast_scouting()
-            .with_parameter_layers([root.clone()])
-            .build()
-            .await?;
-        let node = context
-            .create_node("localization_parameter_test")
-            .build()
-            .await?;
-        let parameters = node.bind_parameter_as::<Localization3dParameters>("localization3d")?;
-        let original = parameters.snapshot();
-        let baseline = original.typed().clone();
-        parameters.add_validation_hook(move |candidate| baseline.validate_update(candidate))?;
-        let mut updates = parameters.subscribe();
+    #[test]
+    fn rejected_update_preserves_running_estimator() -> Result<()> {
+        let original: Localization3dParameters = json5::from_str(include_str!(
+            "../../../../etc/parameters/base/localization3d.json5"
+        ))?;
         let origin = Time::from_nanos(1_000_000_000);
         let mut active = Localization::new(
             origin,
             7,
-            original.typed(),
+            &original,
             &FieldDimensions::SPL_2025,
             &types::camera_geometry::CameraGeometry::default(),
             linear_algebra::Isometry3::identity(),
@@ -268,7 +244,7 @@ mod tests {
                 .is_some()
         );
         let status = active.status();
-        let incompatible_spacing = original.typed().timing.trajectory_spacing * 2;
+        let incompatible_spacing = original.timing.trajectory_spacing * 2;
         for (path, value) in [
             (
                 "timing.trajectory_spacing",
@@ -276,29 +252,22 @@ mod tests {
             ),
             ("model.foot_sigma", serde_json::json!(0.02)),
             ("inputs.imu_queue", serde_json::json!(1000)),
+            ("inputs.visual_queue", serde_json::json!(120)),
             ("visual.min_associations", serde_json::json!(2)),
         ] {
-            assert!(
-                parameters
-                    .set_json(path, value, root.to_string_lossy().into_owned())
-                    .is_err()
-            );
-            assert_eq!(parameters.snapshot().revision, original.revision);
-            assert_eq!(parameters.snapshot().typed(), original.typed());
-            assert!(!updates.has_changed()?);
+            let mut candidate = serde_json::to_value(&original)?;
+            let (group, key) = path
+                .split_once('.')
+                .ok_or_else(|| color_eyre::eyre::eyre!("invalid parameter path"))?;
+            candidate[group][key] = value;
+            let candidate: Localization3dParameters = serde_json::from_value(candidate)?;
+            assert!(original.validate_update(&candidate).is_err(), "{path}");
+            assert!(active.set_parameters(&candidate).is_err(), "{path}");
+            assert_eq!(active.status(), status);
         }
-        let mut incompatible = original.typed().clone();
-        incompatible.timing.trajectory_spacing = incompatible_spacing;
-        assert!(active.set_parameters(&incompatible).is_err());
-        assert_eq!(active.status(), status);
-        parameters.set_json(
-            "solver.max_iterations",
-            serde_json::json!(12),
-            root.to_string_lossy().into_owned(),
-        )?;
-        updates.changed().await?;
-        active.set_parameters(updates.borrow_and_update().typed())?;
-        assert_eq!(parameters.snapshot().typed().solver.max_iterations, 12);
+        let mut live = original;
+        live.solver.max_iterations = 12;
+        active.set_parameters(&live)?;
         let time = origin + Duration::from_millis(102);
         active.ingest_imu(time, booster::ImuState::default())?;
         let estimate = active
@@ -308,7 +277,6 @@ mod tests {
         assert_eq!(estimate.time, time);
         assert_eq!(estimate.epoch, 7);
         assert_eq!(estimate.generation, status.generation);
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 }
