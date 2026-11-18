@@ -350,7 +350,7 @@ fn kinematic_odometry_stops_blind_motion_and_survives_marginalization() {
                 let delta = KinematicOdometryDelta {
                     previous_time: time - Duration::from_millis(50),
                     time,
-                    current_to_previous: linear_algebra::Isometry2::from_parts(
+                    current_to_previous: linear_algebra::Isometry2::new(
                         vector![if index <= 20 { 0.02 } else { 0.0 }, 0.0],
                         0.0,
                     ),
@@ -881,6 +881,169 @@ fn conflict_recovery_requires_independent_geometry_and_trusted_heading() -> Resu
 }
 
 #[test]
+fn visual_innovation_rejects_correspondence_jumps_before_seeding() -> Result<()> {
+    let (mut candidate, heading) = bootstrap_fixture()?;
+    let solved = candidate.solve_with_heading(Some(&heading));
+    assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    let accepted = candidate
+        .latest_visual_frame
+        .clone()
+        .ok_or_else(|| eyre!("missing accepted frame"))?;
+    for distance in [3.68, 5.7] {
+        let mut changed = accepted.clone();
+        for association in &mut changed.inner.associations {
+            association.field_point.inner.x += distance;
+        }
+        assert!(!candidate.ingest_visual(changed.clone())?);
+        assert!(!candidate.ingest_recovery(changed.clone(), &heading)?);
+        assert!(candidate.pending_visuals.is_empty());
+        assert!(candidate.recovery_seed.is_none());
+    }
+    let mut nearby = accepted;
+    for association in &mut nearby.inner.associations {
+        association.field_point.inner.x += 0.01;
+    }
+    assert!(candidate.ingest_recovery(nearby, &heading)?);
+    Ok(())
+}
+
+fn aligned_visual_fixture() -> Result<(
+    Localization,
+    TimeWrapper<VisualLocalizationFrame>,
+    HeadingReference,
+)> {
+    let (mut estimator, frame, heading) = recovery_fixture_with_timing(Default::default(), 1.55);
+    let mut candidate = estimator
+        .bootstrap_candidate(frame)?
+        .ok_or_else(|| eyre!("missing bootstrap candidate"))?;
+    let solved = candidate.solve_with_heading(Some(&heading));
+    assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    let accepted = candidate
+        .latest_visual_frame
+        .clone()
+        .ok_or_else(|| eyre!("missing accepted frame"))?;
+    Ok((candidate, accepted, heading))
+}
+
+#[test]
+fn unavailable_visual_covariance_rejects_without_stopping_motion() -> Result<()> {
+    let (mut estimator, frame, heading) = aligned_visual_fixture()?;
+    let intrinsics = estimator.graph.get(estimator.intrinsics)?.clone();
+    let mut invalid = intrinsics.clone();
+    invalid.focal_lengths.inner.x = f64::NAN;
+    estimator.graph.set(estimator.intrinsics, invalid)?;
+    // Fault injection makes covariance evaluation unavailable, not a bad visual innovation.
+    let (segment, _) = estimator.segment_and_tau(frame.time)?;
+    let blocks =
+        estimator.estimate_covariance_blocks(control_keys(&estimator.controls, segment)?)?;
+    assert!(matches!(
+        estimator.graph.joint_covariance(&blocks),
+        Err(
+            fagra::SolverError::Evaluation(fagra::EvaluationError::InvalidEvaluation)
+                | fagra::SolverError::InvalidInformation
+        )
+    ));
+    assert!(!estimator.ingest_visual(frame.clone())?);
+    assert!(!estimator.ingest_recovery(frame.clone(), &heading)?);
+    assert!(estimator.pending_visuals.is_empty());
+    assert!(estimator.recovery_seed.is_none());
+    estimator.graph.set(estimator.intrinsics, intrinsics)?;
+    let time = estimator.latest_time + Duration::from_millis(2);
+    assert!(estimator.ingest_imu(
+        time,
+        ImuState {
+            roll_pitch_yaw: vector![0.1, -0.05, 2.0],
+            ..Default::default()
+        }
+    )?);
+    let solved = estimator.solve_with_heading(Some(&heading));
+    assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    assert!(estimator.ingest_visual(frame)?);
+    Ok(())
+}
+
+#[test]
+fn sparse_high_visual_correction_survives_input_batching_without_rebootstrap() -> Result<()> {
+    let mut results = Vec::new();
+    for solve_between in [false, true] {
+        let (mut estimator, mut frame, heading) = aligned_visual_fixture()?;
+        frame.inner.source = types::visual_localization::VisualAssociationSource::Tracking;
+        frame.inner.associations.truncate(1);
+        let start = estimator.latest_time;
+        let (segment, tau) = estimator.segment_and_tau(start)?;
+        let alignment = estimator
+            .alignment
+            .ok_or_else(|| eyre!("missing alignment"))?;
+        let initial_pose = estimator.graph.get(alignment)?.local_to_field.to_3d().inner
+            * estimator
+                .spline(control_keys(&estimator.controls, segment)?)?
+                .pose(tau)?
+                .inner;
+        let attitude = nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 2.0);
+        let mut queued_frames = Vec::new();
+        for step in 1..=2 {
+            for index in (step - 1) * 25 + 1..=step * 25 {
+                estimator.ingest_imu(
+                    start + Duration::from_millis(index * 2),
+                    ImuState {
+                        roll_pitch_yaw: vector![0.1, -0.05, 2.0],
+                        linear_acceleration: Vector3::wrap(
+                            (attitude.inverse() * nalgebra::vector![0.0, 0.0, 9.81]).cast(),
+                        ),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            frame.time = start + Duration::from_millis(step * 50);
+            let previous_time = start + Duration::from_millis((step - 1) * 50);
+            estimator.accept_motion(super::recovery::MotionRecord::Visual {
+                previous_time,
+                time: frame.time,
+                transform: nalgebra::Isometry3::translation(0.05, 0.0, 0.0).framed_transform(),
+            })?;
+            let pose =
+                initial_pose * nalgebra::Isometry3::translation(step as f64 * 0.051, 0.0, 0.0);
+            for association in &mut frame.inner.associations {
+                let point = frame.inner.robot_to_camera.inner.cast::<f64>()
+                    * pose.inverse()
+                    * association.field_point.inner.cast::<f64>();
+                association.detection = frame
+                    .inner
+                    .camera_intrinsic
+                    .project(Vector3::wrap(point.coords.cast()));
+            }
+            if solve_between {
+                assert!(
+                    estimator.ingest_visual(frame.clone())?,
+                    "separate step={step}"
+                );
+                let solved = estimator.solve_with_heading(Some(&heading));
+                assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+            } else {
+                queued_frames.push(frame.clone());
+            }
+        }
+        // Match input draining: all motion first, then both frames before a solve.
+        for frame in queued_frames {
+            assert!(estimator.ingest_visual(frame)?, "batched admission");
+        }
+        let solved = estimator.solve_with_heading(Some(&heading));
+        let estimate = solved
+            .estimate
+            .ok_or_else(|| eyre!("{:?}", solved.diagnostics))?;
+        let field = estimate
+            .robot_to_field
+            .ok_or_else(|| eyre!("missing field estimate"))?;
+        assert!(field.pose.inner.translation.z > 1.0);
+        assert_eq!(estimate.generation, frame.inner.generation);
+        results.push(field.pose.inner);
+    }
+    assert!((results[0].translation.vector - results[1].translation.vector).norm() < 0.01);
+    assert!(results[0].rotation.angle_to(&results[1].rotation) < 0.01);
+    Ok(())
+}
+
+#[test]
 fn startup_replaces_drifted_height_prior_with_landmark_fit() {
     use types::visual_localization::FieldMarkAssociation;
     let camera = recovery_camera();
@@ -1136,7 +1299,7 @@ fn nondefault_grids_survive_bias_retirement_and_recovery() {
         optimization_window: Duration::from_millis(2400),
         ..Default::default()
     };
-    let (estimator, frame, heading) = recovery_fixture_with_timing(timing.clone());
+    let (mut estimator, frame, heading) = recovery_fixture_with_timing(timing.clone(), 0.55);
     let origin = estimator.origin;
     let latest = estimator.latest_time;
     let (segment, tau) = estimator.segment_and_tau(frame.time).unwrap();
@@ -1182,7 +1345,7 @@ fn fractional_window_retains_support_for_late_samples_and_recovery() {
         optimization_window: Duration::from_millis(2500),
         ..Default::default()
     };
-    let (mut estimator, frame, heading) = recovery_fixture_with_timing(timing.clone());
+    let (mut estimator, frame, heading) = recovery_fixture_with_timing(timing.clone(), 0.55);
     let latest = estimator.latest_time;
     let cutoff = latest - timing.optimization_window;
     let imu = ImuState {
@@ -1212,8 +1375,7 @@ fn fractional_window_retains_support_for_late_samples_and_recovery() {
 
 #[test]
 fn imu_preparation_failure_does_not_retry_a_stale_graph_without_visuals() {
-    let (estimator, frame, heading) = recovery_fixture();
-    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
+    let (mut candidate, _) = bootstrap_fixture().unwrap();
     assert!(!candidate.pending_visuals.is_empty());
     let mut parameters = candidate.parameters.clone();
     parameters.accelerometer = Some(crate::parameters::AccelerometerParameters {
@@ -1255,14 +1417,14 @@ fn imu_preparation_failure_does_not_retry_a_stale_graph_without_visuals() {
 
 #[test]
 fn reconstruction_preserves_motion_and_admission_state() {
-    let (mut estimator, frame, heading) = recovery_fixture();
+    let (mut estimator, frame, _) = recovery_fixture();
     estimator.parameters.accelerometer = Some(Default::default());
     for nanos in [4_490_000_000, 4_590_000_000] {
         let time = Time::from_nanos(nanos);
         let force = estimator
             .attitude_at(time)
             .unwrap()
-            .rotation::<Robot>()
+            .as_transform::<Robot>()
             .inverse()
             * vector![0.0, 0.0, 9.81];
         estimator
@@ -1318,8 +1480,7 @@ fn reconstruction_preserves_motion_and_admission_state() {
 
 #[test]
 fn bootstrap_height_is_not_a_millimetre_prior() {
-    let (estimator, frame, heading) = recovery_fixture();
-    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
+    let (mut candidate, _) = bootstrap_fixture().unwrap();
     let evaluate = OptimizeOptions {
         gradient_tolerance: f64::MAX,
         ..candidate.solve_options()
@@ -1349,8 +1510,7 @@ fn bootstrap_height_is_not_a_millimetre_prior() {
 
 #[test]
 fn repeated_heading_rejection_keeps_the_window_bounded() {
-    let (estimator, frame, heading) = recovery_fixture();
-    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
+    let (mut candidate, _) = bootstrap_fixture().unwrap();
     candidate.solve_motion().estimate.unwrap();
     let wrong_heading = HeadingReference::new(
         candidate.latest_time,
@@ -1372,6 +1532,7 @@ fn repeated_heading_rejection_keeps_the_window_bounded() {
             )
             .unwrap();
         let rejected = candidate.solve_with_heading(Some(&wrong_heading));
+        assert!(rejected.estimate.is_some(), "{:?}", rejected.diagnostics);
         assert!(rejected.estimate.unwrap().robot_to_field.is_none());
         assert!(
             candidate.alignment.is_some(),
@@ -1403,7 +1564,7 @@ fn visual_ingestion_accepts_behind_camera_predictions_but_not_zero_range() {
             epoch: 7,
             source: types::visual_localization::VisualAssociationSource::Tracking,
             generation: 0,
-            robot_to_camera: Isometry3::from_translation(0.0, 0.0, -1.0),
+            robot_to_camera: Isometry3::from_translation(vector![0.0, 0.0, -1.0]),
             camera_intrinsic: Intrinsic::new(nalgebra::vector![300.0, 300.0], point![160.0, 120.0]),
             associations: [
                 (point![-1.0, -1.0, 0.0], point![150.0, 110.0]),
