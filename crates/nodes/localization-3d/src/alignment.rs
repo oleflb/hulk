@@ -1,4 +1,5 @@
 use coordinate_systems::{Camera, Field, Local, Robot};
+use itertools::Itertools;
 use linear_algebra::{IntoTransform, Isometry2, Isometry3, Orientation2, Rotation3, Vector3};
 use localization_fagra::alignment::{GravityCamera, fit_ground_similarity};
 use projection::intrinsic::Intrinsic;
@@ -10,6 +11,23 @@ use crate::parameters::VisualParameters;
 
 pub(crate) fn valid_visual_rms(rms: Option<f64>, parameters: &VisualParameters) -> bool {
     rms.is_some_and(|rms| rms.is_finite() && rms <= parameters.max_rms_px)
+}
+
+/// Require non-collinear field geometry, whether acquired together or over time.
+pub(crate) fn informative_landmarks(
+    points: &[linear_algebra::Point3<Field>],
+    parameters: &VisualParameters,
+) -> bool {
+    let points = points
+        .iter()
+        .copied()
+        .unique_by(|point| point.inner.coords.map(f32::to_bits))
+        .collect::<Vec<_>>();
+    points.iter().tuple_combinations().any(|(origin, a, b)| {
+        let u = (*a - *origin).inner.xy();
+        let v = (*b - *origin).inner.xy();
+        (u.x * v.y - u.y * v.x).abs() > parameters.min_landmark_separation_m.powi(2)
+    })
 }
 
 pub(crate) fn reprojection_rms(
@@ -38,17 +56,21 @@ pub(crate) fn reprojection_rms(
 pub(crate) fn seed_recovery_alignment(
     frame: &mut VisualLocalizationFrame,
     robot_to_local: Rotation3<Robot, Local>,
-    heading: HeadingConstraint,
+    heading: impl Into<Option<HeadingConstraint>>,
     parameters: &VisualParameters,
 ) -> Option<(Isometry3<Robot, Local>, Isometry2<Local, Field>)> {
+    let heading = heading.into();
     let (pose, mut alignment) = seed_alignment(
         robot_to_local,
         frame.robot_to_camera,
         frame.camera_intrinsic,
         &mut frame.associations,
-        false,
+        heading.is_none(),
         parameters,
     )?;
+    let Some(heading) = heading else {
+        return Some((pose, alignment));
+    };
     let field_heading = Orientation2::new(
         (alignment.to_3d().inner.rotation * pose.inner.rotation)
             .euler_angles()
@@ -228,7 +250,32 @@ mod tests {
             }],
         };
         let parameters = VisualParameters::default();
+        let informative = |frame: &VisualLocalizationFrame| {
+            informative_landmarks(
+                &frame
+                    .associations
+                    .iter()
+                    .map(|a| a.field_point)
+                    .collect::<Vec<_>>(),
+                &parameters,
+            )
+        };
         assert!(valid_visual_frame(&frame, &parameters));
+        assert!(!informative(&frame));
+        frame.associations.extend([
+            FieldMarkAssociation {
+                detection: point![30.0, 20.0],
+                field_point: point![2.0, 0.0, 0.0],
+            },
+            FieldMarkAssociation {
+                detection: point![50.0, 20.0],
+                field_point: point![3.0, 0.0, 0.0],
+            },
+        ]);
+        assert!(!informative(&frame));
+        frame.associations[2].field_point = point![3.0, 1.0, 0.0];
+        assert!(informative(&frame));
+        frame.associations.truncate(1);
         frame.source = VisualAssociationSource::Global;
         assert!(!valid_visual_frame(&frame, &parameters));
         frame.source = VisualAssociationSource::Tracking;
