@@ -11,7 +11,6 @@ use crate::{diagnostics::SolveDiagnostics, heading::HeadingReference};
 pub(crate) struct SolveResult {
     pub estimate: Option<LocalizationEstimate>,
     pub diagnostics: SolveDiagnostics,
-    pub converged: bool,
     pub visual_rejected: bool,
 }
 
@@ -119,7 +118,7 @@ impl Localization {
             measurement_count: 0,
             failure: None,
             imu_bias: None,
-            motion_rebuilt: false,
+            tracking: None,
         }
     }
 
@@ -141,7 +140,6 @@ impl Localization {
             self.controls.len() + self.biases.len() + 1 + usize::from(self.alignment.is_some());
         diagnostics.measurement_count = self.segment_factors.values().map(|f| f.measurements).sum();
         SolveResult {
-            converged: estimate.is_some(),
             estimate,
             diagnostics,
             visual_rejected,
