@@ -1,4 +1,4 @@
-use color_eyre::Result;
+use color_eyre::{Result, eyre::ensure};
 use fagra::{BlockId, StateKey};
 use linear_algebra::IntoTransform;
 use localization_fagra::variables::PoseControl;
@@ -32,7 +32,7 @@ impl Localization {
         &mut self,
         time: ros_z::time::Time,
     ) -> Option<HeightPrediction> {
-        self.alignment?;
+        // Height is a Local quantity: support observations constrain it before field alignment.
         if time > self.last_converged_time? {
             return None;
         }
@@ -118,12 +118,24 @@ impl Localization {
             pose: sample.pose.inner.framed_transform(),
             covariance: sample.covariance(&joint.fixed_view::<24, 24>(0, 0).into_owned()),
         };
+        ensure!(
+            local
+                .pose
+                .inner
+                .to_homogeneous()
+                .iter()
+                .all(|v| v.is_finite())
+                && local.covariance.iter().all(|v| v.is_finite())
+                && local.covariance.cholesky().is_some(),
+            "invalid local pose or covariance"
+        );
         let field = if let Some(key) = self.alignment {
             let alignment = self.graph.get(key)?;
             Some(PoseEstimate {
                 pose: alignment.local_to_field.to_3d() * local.pose,
                 covariance: sample.field_covariance(&joint),
             })
+            .filter(usable_field_pose)
         } else {
             None
         };
@@ -137,9 +149,48 @@ impl Localization {
     }
 }
 
+fn usable_field_pose(
+    pose: &PoseEstimate<coordinate_systems::Robot, coordinate_systems::Field>,
+) -> bool {
+    pose.pose
+        .inner
+        .to_homogeneous()
+        .iter()
+        .all(|v| v.is_finite())
+        && pose.covariance.iter().all(|v| v.is_finite())
+        && pose.covariance.cholesky().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_usability_requires_finite_pose_and_positive_definite_covariance() {
+        let mut pose = PoseEstimate {
+            pose: nalgebra::Isometry3::translation(0.0, 0.0, 0.55).framed_transform(),
+            covariance: nalgebra::Matrix6::identity() * 0.01,
+        };
+        assert!(usable_field_pose(&pose));
+        for height in [-0.01, 1.001, 9.338] {
+            pose.pose.inner.translation.z = height;
+            assert!(usable_field_pose(&pose), "height {height}");
+        }
+        for height in [f64::NAN, f64::INFINITY] {
+            pose.pose.inner.translation.z = height;
+            assert!(!usable_field_pose(&pose), "height {height}");
+        }
+        pose.pose.inner.translation.z = 1.0;
+        assert!(usable_field_pose(&pose));
+        for variance in [-0.01, 0.0, f64::NAN, f64::INFINITY] {
+            pose.covariance[(5, 5)] = variance;
+            assert!(!usable_field_pose(&pose), "height variance {variance}");
+        }
+        pose.covariance[(5, 5)] = 0.01;
+        pose.covariance[(0, 1)] = 1.0;
+        pose.covariance[(1, 0)] = 1.0;
+        assert!(!usable_field_pose(&pose));
+    }
 
     #[test]
     fn height_gate_uses_uncertainty_not_standing_height() {
