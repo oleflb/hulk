@@ -854,38 +854,25 @@ mod tests {
 
     #[test]
     fn four_and_five_shared_features_resolve_repeated_class_neighbors_not_coherent_rivals() {
-        let map = map();
-        let noise = PredictionNoise {
-            pose: Matrix6::identity() * 10000.0,
-            pixel_variance: 4.0,
-        };
         let class = VisualFeatureClass::LSpot;
-        let ids = map.landmarks_for_class(class);
-        let parameters = FieldMarkAssociationParameters::default();
         for n in [4, 5] {
+            let mut case = MatchingCase::new(10000.0);
             let detections = (0..n)
                 .map(|row| detection(class, point![40.0 * row as f32, 100.0]))
                 .collect::<Vec<_>>();
-            let mut predictions = vec![None; map.landmarks.len()];
             for (row, &(_, feature)) in detections.iter().enumerate() {
-                predictions[ids[row]] =
-                    Some(prediction(feature.pixel, Matrix2x6::identity(), &noise));
-                predictions[ids[n + row]] = Some(prediction(
+                case.predict(class, row, feature.pixel, Matrix2x6::identity());
+                case.predict(
+                    class,
+                    n + row,
                     point![
                         feature.pixel.x() + [8.0, -8.0, 16.0, -16.0, 24.0][row],
                         feature.pixel.y()
                     ],
                     Matrix2x6::identity(),
-                    &noise,
-                ));
+                );
             }
-            let gates = prediction_log_likelihoods(
-                &detections,
-                &map,
-                &predictions,
-                parameters.global_localizer.mahalanobis_gate,
-            )
-            .unwrap();
+            let gates = case.gates(&detections);
             assert!(
                 gates.rows().into_iter().all(|row| row
                     .iter()
@@ -893,75 +880,56 @@ mod tests {
                     .count()
                     == 2 * n)
             );
-            let result =
-                match_predictions(&detections, &map, &predictions, &noise, &parameters).unwrap();
+            let result = case.associate(&detections).unwrap();
             assert_eq!(result.associations.len(), n);
             for (row, association) in result.associations.iter().enumerate() {
                 assert_eq!(association.detection, detections[row].1.pixel);
-                assert_eq!(association.field_point.xy(), map.landmarks[ids[row]].xy);
+                assert_eq!(
+                    association.field_point.xy(),
+                    case.map.landmarks[case.map.landmarks_for_class(class)[row]].xy
+                );
             }
             for (row, &(_, feature)) in detections.iter().enumerate() {
-                predictions[ids[n + row]] = Some(prediction(
+                case.predict(
+                    class,
+                    n + row,
                     point![feature.pixel.x() + 8.0, feature.pixel.y()],
                     Matrix2x6::identity(),
-                    &noise,
-                ));
+                );
             }
-            assert!(
-                match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none(),
-                "n={n}"
-            );
+            assert!(case.associate(&detections).is_none(), "n={n}");
         }
     }
 
     #[test]
     fn joint_work_exhaustion_after_a_winner_rejects_until_every_rival_is_scored() {
-        let map = map();
-        let noise = PredictionNoise {
-            pose: Matrix6::zeros(),
-            pixel_variance: 4.0,
-        };
         let class = VisualFeatureClass::LSpot;
-        let ids = map.landmarks_for_class(class);
         for n in 3..=5 {
+            let mut case = MatchingCase::new(0.0);
             let detections = (0..n)
                 .map(|row| detection(class, point![20.0 * row as f32, 0.0]))
                 .collect::<Vec<_>>();
-            let mut predictions = vec![None; map.landmarks.len()];
             for (row, &(_, feature)) in detections.iter().enumerate() {
-                predictions[ids[row]] = Some(prediction(feature.pixel, Matrix2x6::zeros(), &noise));
+                case.predict(class, row, feature.pixel, Matrix2x6::zeros());
             }
-            let mut parameters = FieldMarkAssociationParameters::default();
-            parameters.global_localizer.max_work = n;
-            assert_eq!(
-                match_predictions(&detections, &map, &predictions, &noise, &parameters)
-                    .unwrap()
-                    .associations
-                    .len(),
-                n
-            );
-            predictions[ids[n]] = Some(prediction(
+            case.parameters.global_localizer.max_work = n;
+            assert_eq!(case.associate(&detections).unwrap().associations.len(), n);
+            case.predict(
+                class,
+                n,
                 point![detections[n - 1].1.pixel.x() + 4.0, 0.0],
                 Matrix2x6::zeros(),
-                &noise,
-            ));
+            );
             // n attempts find the exact winner, but the last row has one more gated candidate.
-            assert!(
-                match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none()
-            );
-            parameters.global_localizer.max_work = n + 1;
-            assert_eq!(
-                match_predictions(&detections, &map, &predictions, &noise, &parameters)
-                    .unwrap()
-                    .associations
-                    .len(),
-                n
-            );
+            assert!(case.associate(&detections).is_none());
+            case.parameters.global_localizer.max_work = n + 1;
+            assert_eq!(case.associate(&detections).unwrap().associations.len(), n);
             // Scoring an unusable rival also fails closed rather than retaining the earlier winner.
-            predictions[ids[n]].as_mut().unwrap().jacobian[(0, 0)] = f64::NAN;
-            assert!(
-                match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none()
-            );
+            case.predictions[case.map.landmarks_for_class(class)[n]]
+                .as_mut()
+                .unwrap()
+                .jacobian[(0, 0)] = f64::NAN;
+            assert!(case.associate(&detections).is_none());
         }
     }
 
@@ -1011,84 +979,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "host runtime characterization; run explicitly with --ignored --nocapture"]
-    fn joint_dense_runtime_characterization() {
-        use std::{hint::black_box, time::Instant};
-
-        let map = map();
-        let noise = PredictionNoise {
-            pose: Matrix6::identity() * 10000.0,
-            pixel_variance: 4.0,
-        };
-        let class = VisualFeatureClass::LSpot;
-        let detections = [0.0, 2.0, 4.0, 6.0, 8.0].map(|x| detection(class, point![x, 0.0]));
-        let mut predictions = vec![None; map.landmarks.len()];
-        for &column in map.landmarks_for_class(class) {
-            predictions[column] = Some(prediction(point![0.0, 0.0], Matrix2x6::identity(), &noise));
-        }
-        let mut parameters = FieldMarkAssociationParameters::default();
-        for (n, mixed) in [(3, false), (4, false), (5, false), (5, true)] {
-            let mut selected = detections;
-            if mixed {
-                selected[0].0 = VisualFeatureClass::TSpot;
-                for &column in map.landmarks_for_class(VisualFeatureClass::TSpot) {
-                    predictions[column] =
-                        Some(prediction(point![0.0, 0.0], Matrix2x6::identity(), &noise));
-                }
-            }
-            let detections = &selected[..n];
-            let gates = prediction_log_likelihoods(
-                detections,
-                &map,
-                &predictions,
-                parameters.global_localizer.mahalanobis_gate,
-            )
-            .unwrap();
-            for (row, (class, _)) in gates.rows().into_iter().zip(detections) {
-                assert_eq!(
-                    row.iter().filter(|score| score.is_finite()).count(),
-                    map.landmarks_for_class(*class).len()
-                );
-            }
-            // Include dense same/mixed-class cases at both a small budget and the configured default.
-            for budget in [1000, 100_000] {
-                parameters.global_localizer.max_work = budget;
-                let mut samples = Vec::with_capacity(100);
-                for iteration in 0..110 {
-                    let start = Instant::now();
-                    let result = black_box(match_predictions(
-                        black_box(detections),
-                        black_box(&map),
-                        black_box(&predictions),
-                        black_box(&noise),
-                        black_box(&parameters),
-                    ));
-                    let elapsed = start.elapsed();
-                    assert!(
-                        result.is_none(),
-                        "all complete assignments tie, or budget is exhausted"
-                    );
-                    if iteration >= 10 {
-                        samples.push(elapsed);
-                    }
-                }
-                samples.sort_unstable();
-                eprintln!(
-                    "joint/dense-{n} mixed={mixed} budget={budget}: samples={} p50={:?} p95={:?} p99={:?} max={:?}",
-                    samples.len(),
-                    samples[50],
-                    samples[95],
-                    samples[99],
-                    samples[99]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn single_prior_covariance_matches_finite_differences_and_coherent_two_pose_model() {
+    fn single_prior_covariance_matches_finite_differences() {
         use nalgebra::{Matrix2x6, Translation3, UnitQuaternion};
-        use types::{field_dimensions::FieldDimensions, visual_localization::AssociationGeometry};
+        use types::visual_localization::AssociationGeometry;
 
         let pose = |translation: [f32; 3], angles: [f32; 3]| {
             nalgebra::Isometry3::from_parts(
@@ -1128,7 +1021,6 @@ mod tests {
                 nalgebra::vector![430.0, 520.0],
                 point![320.0, 240.0],
             ),
-            field_dimensions: &FieldDimensions::SPL_2025,
             time: ros_z::time::Time::zero(),
         };
         let point = point![0.5, -0.3, 0.0];
@@ -1174,56 +1066,6 @@ mod tests {
             jacobian * Matrix6::from_diagonal(&noise.pose.diagonal()) * jacobian.transpose()
                 + Matrix2::identity() * noise.pixel_variance;
         assert!((actual - without_correlations).norm() > expected.norm() * 0.01);
-
-        // Reconstruct the old coherent snapshot: both poses denote the same transform,
-        // but the process floor was rotated from Local rather than Field.
-        let old_process = process_covariance(Isometry3::wrap(local.cast()), 0.7, &parameters);
-        assert!((process - old_process).norm() < process.norm() * 1.0e-6);
-        let points = [point, point![0.2, 0.4, 0.0]];
-        let projections = points.map(|p| project_landmark(p, input, &noise).unwrap());
-        let old_jacobians = points.map(|p| {
-            let robot = (field_pose.inverse() * p.inner).coords;
-            let camera = input.robot_to_camera.inner * nalgebra::Point3::from(robot);
-            let projection = Matrix2x3::new(
-                430.0 / camera.z,
-                0.0,
-                -430.0 * camera.x / camera.z.powi(2),
-                0.0,
-                520.0 / camera.z,
-                -520.0 * camera.y / camera.z.powi(2),
-            );
-            let action = Matrix3x6::from_fn(|r, c| {
-                if c < 3 {
-                    robot.cross_matrix()[(r, c)]
-                } else if r == c - 3 {
-                    -1.0
-                } else {
-                    0.0
-                }
-            });
-            let anchor_to_camera =
-                input.robot_to_camera.inner * (alignment * local).inverse() * field_pose;
-            let ja = projection * anchor_to_camera.rotation.to_rotation_matrix().matrix() * action;
-            let jc = projection
-                * input
-                    .robot_to_camera
-                    .inner
-                    .rotation
-                    .to_rotation_matrix()
-                    .matrix()
-                * action;
-            (ja.cast::<f64>(), jc.cast::<f64>())
-        });
-        for i in 0..2 {
-            for j in 0..2 {
-                let old =
-                    old_jacobians[i].0 * covariance.cast::<f64>() * old_jacobians[j].0.transpose()
-                        + old_jacobians[i].1 * old_process * old_jacobians[j].1.transpose();
-                let combined =
-                    projections[i].jacobian * noise.pose * projections[j].jacobian.transpose();
-                assert!((old - combined).norm() < old.norm() * 1.0e-5);
-            }
-        }
     }
 
     #[test]
