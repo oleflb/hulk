@@ -1,11 +1,13 @@
 //! Replay current association/localization with recorded solve times and resets.
-//! Usage: relocalization_replay recording.mcap
+//! Usage: relocalization_replay recording.mcap [comparison.mcap]
+//! `audit_frames_queued` pairs frames with queue admission, not visual commitment.
 mod replay;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Read,
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -164,14 +166,24 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
-        .ok_or_else(|| eyre!("usage: relocalization_replay recording.mcap"))?;
+    let path = args.next().ok_or_else(|| eyre!("missing recording path"))?;
+    if let Some(value) = path.to_str()
+        && value.starts_with("--")
+    {
+        return Err(eyre!("unknown replay option {value}"));
+    }
+    let output_path = args.next();
     ensure!(
         args.next().is_none(),
-        "usage: relocalization_replay recording.mcap"
+        "usage: relocalization_replay recording.mcap [comparison.mcap]"
     );
-    let mut file = File::open(path)?;
+    if let Some(output) = &output_path {
+        ensure!(
+            !Path::new(output).try_exists()?,
+            "output already exists; choose a new comparison path"
+        );
+    }
+    let mut file = File::open(&path)?;
     let mut reader = LinearReader::new();
     let mut topics = BTreeMap::new();
     let mut events = Vec::new();
@@ -260,6 +272,7 @@ fn main() -> Result<()> {
     let mut pending = Vec::new();
     let mut estimates: BTreeMap<Time, LocalizationEstimate> = BTreeMap::new();
     let mut output = Vec::new();
+    let mut comparison = Vec::new();
     let mut audit_frames = Vec::new();
     let mut solve_us = Vec::new();
     let mut association_us = Vec::new();
@@ -463,6 +476,11 @@ fn main() -> Result<()> {
                 if let Some(l) = active.as_mut() {
                     let solved = l.solve(now);
                     let status = l.status();
+                    comparison.push(replay::Comparison {
+                        delivery,
+                        status,
+                        estimate: solved.estimate,
+                    });
                     let key = (status.epoch, status.generation, status.state);
                     if previous_status != Some(key) {
                         lifecycle.push(status);
@@ -533,6 +551,14 @@ fn main() -> Result<()> {
             "lifecycle": lifecycle, "audit_frames": audit_frames, "audit_estimates": output,
         }))?
     );
+    if let Some(output_path) = output_path {
+        replay::write_comparison(
+            Path::new(&path),
+            Path::new(&output_path),
+            &comparison,
+            &kinematic_audit,
+        )?;
+    }
     Ok(())
 }
 
