@@ -1,17 +1,19 @@
 use std::{sync::Arc, time::Duration};
 
-use color_eyre::{Result, eyre::OptionExt};
+use color_eyre::Result;
 use eframe::epaint::Color32;
 
 use coordinate_systems::{Field, Ground};
 use linear_algebra::Isometry2;
 use ros_z_debug::{RetentionPolicy, SampleRecord, TopicObservation};
 use types::field_dimensions::FieldDimensions;
+use types::world_state::{BallSource, BallState};
 
 use crate::{backend::RobotBackend, panels::map::layer::Layer};
 use twix_visualization::twix_painter::TwixPainter;
 
 pub struct BallPosition {
+    ball_state: TopicObservation<Option<BallState>>,
     ground_to_field: TopicObservation<Isometry2<Ground, Field>>,
     ball_position: TopicObservation<Option<types::ball_position::BallPosition<Ground>>>,
     team_ball: TopicObservation<Option<types::ball_position::BallPosition<Field>>>,
@@ -19,7 +21,8 @@ pub struct BallPosition {
 
 impl Layer<Field> for BallPosition {
     fn is_querying(&self) -> bool {
-        crate::panel::query_pending(self.ground_to_field.query_status())
+        crate::panel::query_pending(self.ball_state.query_status())
+            || crate::panel::query_pending(self.ground_to_field.query_status())
             || crate::panel::query_pending(self.ball_position.query_status())
             || crate::panel::query_pending(self.team_ball.query_status())
     }
@@ -29,6 +32,11 @@ impl Layer<Field> for BallPosition {
     fn new(backend: Arc<RobotBackend>) -> Self {
         let _runtime_handle = backend.runtime_handle().enter();
 
+        let ball_state = backend
+            .observer()
+            .observe_typed("ball_state")
+            .expect("failed to construct ball_state observer")
+            .spawn();
         let ground_to_field = backend
             .observer()
             .observe_typed("ground_to_field")
@@ -50,6 +58,7 @@ impl Layer<Field> for BallPosition {
             .spawn();
 
         Self {
+            ball_state,
             ground_to_field,
             ball_position,
             team_ball,
@@ -61,6 +70,23 @@ impl Layer<Field> for BallPosition {
         painter: &TwixPainter<Field>,
         field_dimensions: &FieldDimensions,
     ) -> Result<()> {
+        if self.ball_position.latest().is_none()
+            && self.team_ball.latest().is_none()
+            && let Some(sample) = self.ball_state.latest()
+        {
+            if let Some(ball) = &sample.value {
+                painter.ball(
+                    ball.ball_in_field,
+                    field_dimensions.ball_radius,
+                    if ball.source == BallSource::Team {
+                        Color32::RED
+                    } else {
+                        Color32::WHITE
+                    },
+                );
+            }
+            return Ok(());
+        }
         for ball_position_sample in self.ball_position.get_all() {
             let SampleRecord {
                 value: Some(ball),
@@ -71,11 +97,13 @@ impl Layer<Field> for BallPosition {
                 continue;
             };
 
-            let ground_to_field = self
+            let Some(ground_to_field) = self
                 .ground_to_field
                 .get_nearest(source_time)
-                .ok_or_eyre("failed to find matching ground_to_field")?
-                .value;
+                .map(|record| record.value)
+            else {
+                continue;
+            };
 
             painter.circle_filled(
                 ground_to_field * ball.position,
