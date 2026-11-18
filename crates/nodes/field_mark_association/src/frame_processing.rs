@@ -4,7 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::{Result, eyre::Context as _};
+use color_eyre::{
+    Result,
+    eyre::{Context as _, eyre},
+};
 use coordinate_systems::{Camera, ImuReference, Robot};
 use linear_algebra::{Isometry3, Orientation3};
 use projection::intrinsic::Intrinsic;
@@ -28,6 +31,7 @@ use types::{
 
 use crate::{
     api::{AssociationInput, associate_visual_features},
+    exposure::{exposure_attitude, geometry_for_image, interpolate_attitude},
     parameters::FieldMarkAssociationParameters,
 };
 
@@ -40,27 +44,31 @@ pub(crate) struct DetectionProcessingContext<'a> {
     pub(crate) estimates: &'a Cache<LocalizationEstimate>,
     pub(crate) status: &'a Cache<LocalizationStatus>,
     pub(crate) attitudes: std::sync::Mutex<CacheInner<TimeWrapper<Orientation3<ImuReference>>>>,
-    pub(crate) associations_publisher: Arc<Publisher<TimeWrapper<VisualLocalizationFrame>>>,
+    pub(crate) fixed_publisher: Arc<Publisher<TimeWrapper<VisualLocalizationFrame>>>,
     pub(crate) global_localization_publisher: Arc<Publisher<Option<GlobalLocalizationDebug>>>,
     pub(crate) clock: &'a Clock,
 }
 
 impl DetectionProcessingContext<'_> {
-    pub(crate) fn record_attitude(&self, time: Time, imu: &booster::ImuState) {
+    pub(crate) fn record_attitude(&self, time: Time, imu: &booster::ImuState) -> Result<()> {
         let rpy = imu.roll_pitch_yaw.inner;
-        if rpy.iter().all(|v| v.is_finite()) {
-            self.attitudes.lock().unwrap().insert(
-                time,
-                TimeWrapper {
+        if let Some(attitude) = exposure_attitude(rpy.x, rpy.y, rpy.z) {
+            self.attitudes
+                .lock()
+                .map_err(|_| eyre!("association attitude cache poisoned"))?
+                .insert(
                     time,
-                    inner: Orientation3::from_euler_angles(rpy.x, rpy.y, rpy.z),
-                },
-            );
+                    TimeWrapper {
+                        time,
+                        inner: attitude,
+                    },
+                );
         }
+        Ok(())
     }
 
     fn attitude_at(&self, time: Time, max_gap: Duration) -> Option<Orientation3<ImuReference>> {
-        let attitudes = self.attitudes.lock().unwrap();
+        let attitudes = self.attitudes.lock().ok()?;
         let before = attitudes.get_before(time)?;
         let after = attitudes.get_after(time)?;
         interpolate_attitude(&before, &after, time, max_gap)
@@ -100,21 +108,31 @@ pub(crate) async fn process_detected_objects(
         return Ok(());
     };
     let started = Instant::now();
-    let (frame, mut localization) = tokio::task::spawn_blocking(move || {
+    let (frame, localization) = tokio::task::spawn_blocking(move || {
         let visual_features = crate::find_detected_visual_features(&frame.objects);
-        let localization = associate_visual_features(
-            AssociationInput {
-                status: &frame.status,
-                attitude: frame.attitude,
-                tracking: frame.tracking.as_ref(),
-                visual_features: &visual_features,
-                robot_to_camera: frame.robot_to_camera,
-                camera_intrinsic: frame.camera_intrinsic,
-                field_dimensions: &frame.field_dimensions,
-                time: frame.image_time,
-            },
-            &frame.parameters,
-        );
+        let input = AssociationInput {
+            status: &frame.status,
+            attitude: frame.attitude,
+            tracking: frame.tracking.as_ref(),
+            visual_features: &visual_features,
+            robot_to_camera: frame.robot_to_camera,
+            camera_intrinsic: frame.camera_intrinsic,
+            field_dimensions: &frame.field_dimensions,
+            time: frame.image_time,
+        };
+        let localization = associate_visual_features(input, &frame.parameters).map(|result| {
+            (
+                VisualLocalizationFrame {
+                    epoch: frame.status.epoch,
+                    generation: frame.status.generation,
+                    source: result.source,
+                    robot_to_camera: frame.robot_to_camera,
+                    camera_intrinsic: frame.camera_intrinsic,
+                    associations: result.associations,
+                },
+                result.debug,
+            )
+        });
         (frame, localization)
     })
     .await
@@ -123,35 +141,42 @@ pub(crate) async fn process_detected_objects(
     // A blocking job cannot be cancelled: retain its slot until it returns, then discard late work.
     // Reuse the calibrated age limit for the wall-time budget, including blocking-pool queue time.
     let max_age = frame.parameters.max_pose_hint_age;
-    let source = localization.as_ref().map(|result| result.source);
+    let source = localization.as_ref().map(|(frame, _)| frame.source);
     if started.elapsed() > max_age || !frame_is_current(&frame, ctx, max_age, source) {
         return Ok(());
     }
-    let debug = localization.as_mut().and_then(|result| result.debug.take());
+    let (localization, debug) = match localization {
+        Some((localization, debug)) => (Some(localization), debug),
+        None => (None, None),
+    };
     if let Some(localization) = localization {
-        let publisher = Arc::clone(&ctx.associations_publisher);
-        let message = TimeWrapper {
-            time: frame.image_time,
-            inner: VisualLocalizationFrame {
-                epoch: frame.status.epoch,
-                generation: frame.status.generation,
-                source: localization.source,
-                robot_to_camera: frame.robot_to_camera,
-                camera_intrinsic: frame.camera_intrinsic,
-                associations: localization.associations,
-            },
-        };
         let runtime = tokio::runtime::Handle::current();
         // Await each blocking send before starting another: publication keeps the single frame
         // slot, but never occupies an ingestion worker. Cancellation cannot abort an active send.
-        tokio::task::spawn_blocking(move || runtime.block_on(publisher.publish(&message)))
-            .await
-            .wrap_err("field-mark association publisher failed")??;
+        let time = frame.image_time;
+        let publisher = Arc::clone(&ctx.fixed_publisher);
+        let clock = ctx.clock.clone();
+        tokio::task::spawn_blocking(move || {
+            if started.elapsed() > max_age || time.abs_diff(clock.now()) > max_age {
+                return Ok(());
+            }
+            runtime.block_on(publisher.publish(&TimeWrapper {
+                time,
+                inner: localization,
+            }))
+        })
+        .await
+        .wrap_err("field-mark association publisher failed")??;
     }
     if started.elapsed() <= max_age && frame_is_current(&frame, ctx, max_age, source) {
         let publisher = Arc::clone(&ctx.global_localization_publisher);
         let runtime = tokio::runtime::Handle::current();
+        let time = frame.image_time;
+        let clock = ctx.clock.clone();
         tokio::task::spawn_blocking(move || {
+            if started.elapsed() > max_age || time.abs_diff(clock.now()) > max_age {
+                return Ok(false);
+            }
             runtime.block_on(publisher.publish_if_subscribed(|| ready(debug)))
         })
         .await
@@ -200,60 +225,14 @@ fn tracking_geometry(
 ) -> Option<AssociationGeometry> {
     let latest_estimate = ctx.estimates.get_latest()?;
     let latest = AssociationGeometry::from_estimate(&latest_estimate, status)?;
-    let history = ctx.estimates.get_interval(image_time - max_age, image_time);
+    let history = ctx
+        .estimates
+        .get_interval(image_time.saturating_sub(max_age), image_time);
     let snapshots = history
         .iter()
         .rev()
         .filter_map(|estimate| AssociationGeometry::from_estimate(estimate, status));
     geometry_for_image(image_time, snapshots, &latest, max_age)
-}
-
-fn interpolate_attitude(
-    before: &TimeWrapper<Orientation3<ImuReference>>,
-    after: &TimeWrapper<Orientation3<ImuReference>>,
-    time: Time,
-    max_gap: Duration,
-) -> Option<Orientation3<ImuReference>> {
-    if time < before.time || time > after.time {
-        return None;
-    }
-    let gap = after.time.duration_since(before.time);
-    if gap > max_gap {
-        return None;
-    }
-    let mut orientation = if gap.is_zero() {
-        before.inner
-    } else {
-        before.inner.slerp(
-            after.inner,
-            time.duration_since(before.time).as_secs_f32() / gap.as_secs_f32(),
-        )
-    };
-    orientation.inner.renormalize();
-    Some(orientation)
-}
-
-fn geometry_for_image(
-    image_time: Time,
-    history: impl IntoIterator<Item = AssociationGeometry>,
-    latest: &AssociationGeometry,
-    max_age: Duration,
-) -> Option<AssociationGeometry> {
-    // Select complete snapshots; never attach a new state/covariance to an old branch's pose.
-    // Include latest because the independently populated history may not contain it yet.
-    std::iter::once(latest.clone())
-        .chain(history)
-        .filter(|geometry| {
-            geometry.last_successful_solve <= image_time
-                && geometry.last_successful_solve.abs_diff(image_time) <= max_age
-                && same_lifecycle(geometry, latest)
-        })
-        .min_by_key(|geometry| {
-            (
-                geometry.last_successful_solve.abs_diff(image_time),
-                geometry.last_successful_solve,
-            )
-        })
 }
 
 fn lifecycle_is_current(
@@ -270,13 +249,22 @@ fn lifecycle_is_current(
     {
         return false;
     }
-    frame.image_time.abs_diff(ctx.clock.now()) <= max_age
-        && ctx.status.get_latest().is_some_and(|status| {
-            status.epoch == frame.status.epoch
-                && status.generation == frame.status.generation
-                && status.state == frame.status.state
-                && status.time == frame.status.time
+    let now = ctx.clock.now();
+    frame.image_time <= now
+        && frame.image_time.abs_diff(now) <= max_age
+        && camera_geometry_at(
+            ctx.camera_geometry_cache,
+            frame.image_time,
+            frame.parameters.max_camera_gap,
+        )
+        .is_some_and(|camera| {
+            camera.robot_to_camera == frame.robot_to_camera
+                && camera.intrinsics == frame.camera_intrinsic
         })
+        && ctx
+            .status
+            .get_latest()
+            .is_some_and(|status| same_status(&frame.status, &status))
 }
 
 fn frame_is_current(
@@ -345,49 +333,23 @@ fn same_lifecycle(geometry: &AssociationGeometry, latest: &AssociationGeometry) 
     geometry.epoch == latest.epoch && geometry.generation == latest.generation
 }
 
+fn same_status(before: &LocalizationStatus, after: &LocalizationStatus) -> bool {
+    before.epoch == after.epoch
+        && before.generation == after.generation
+        && before.state == after.state
+        && before.time == after.time
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use linear_algebra::{Isometry3, vector};
     use types::localization::{LocalizationState, PoseEstimate};
-
-    #[test]
-    fn failed_global_attempt_clears_debug_without_tracking_geometry() {
-        let result = associate_visual_features(
-            AssociationInput {
-                status: &LocalizationStatus {
-                    time: Time::zero(),
-                    epoch: 0,
-                    generation: 0,
-                    state: LocalizationState::Startup,
-                    heading: None,
-                },
-                attitude: Some(Orientation3::from_euler_angles(0.0, 0.0, 0.0)),
-                tracking: None,
-                visual_features: &crate::DetectedVisualFeatures::default(),
-                robot_to_camera: Isometry3::identity(),
-                camera_intrinsic: Intrinsic::new(
-                    nalgebra::vector![500.0, 500.0],
-                    linear_algebra::point![320.0, 240.0],
-                ),
-                field_dimensions: &FieldDimensions::SPL_2025,
-                time: Time::zero(),
-            },
-            &FieldMarkAssociationParameters::default(),
-        );
-        assert!(result.is_none());
-        let mut debug = Some(GlobalLocalizationDebug {
-            association_count: 3,
-            pairwise_distance_rms: 0.0,
-        });
-        if publication_is_current(true, result.as_ref().map(|result| result.source), |_| false) {
-            debug = result.and_then(|result| result.debug);
-        }
-        assert!(debug.is_none());
-    }
 
     #[test]
     fn publications_require_current_lifecycle_and_successful_source() {
         assert!(!publication_is_current(false, None, |_| true));
+        assert!(publication_is_current(true, None, |_| false));
         for source in [
             VisualAssociationSource::Global,
             VisualAssociationSource::Tracking,
@@ -401,7 +363,7 @@ mod tests {
     #[test]
     fn snapshot_selection_uses_preceding_pose_from_the_same_generation() {
         let pose = PoseEstimate {
-            pose: Isometry3::from_translation(1.0, 0.0, 0.0),
+            pose: Isometry3::from_translation(vector![1.0, 0.0, 0.0]),
             covariance: nalgebra::SMatrix::identity(),
         };
         let previous = AssociationGeometry {
@@ -426,27 +388,52 @@ mod tests {
     #[test]
     fn attitude_interpolation_requires_bracketing_samples() {
         let before = TimeWrapper {
-            time: Time::from_nanos(0),
+            time: Time::from_nanos(1_000_000_000),
             inner: Orientation3::from_euler_angles(0.0, 0.0, 0.0),
         };
         let after = TimeWrapper {
-            time: Time::from_nanos(10_000_000),
+            time: Time::from_nanos(1_010_000_000),
             inner: Orientation3::from_euler_angles(0.2, 0.0, 0.0),
         };
-        let time = Time::from_nanos(5_000_000);
+        let time = Time::from_nanos(1_005_000_000);
         let gap = Duration::from_millis(10);
         let attitude = interpolate_attitude(&before, &after, time, gap).unwrap();
         assert!((attitude.euler_angles().0 - 0.1).abs() < 1e-6);
-        assert!(interpolate_attitude(&before, &after, Time::from_nanos(11_000_000), gap).is_none());
+        assert!(
+            interpolate_attitude(&before, &after, Time::from_nanos(1_011_000_000), gap).is_none()
+        );
         assert!(
             interpolate_attitude(&before, &after, time, gap - Duration::from_nanos(1)).is_none()
         );
         let late = TimeWrapper {
-            time: Time::from_nanos(30_000_000),
-            ..after
+            time: Time::from_nanos(1_030_000_000),
+            ..after.clone()
         };
         assert!(interpolate_attitude(&before, &late, time, gap).is_none());
         assert!(interpolate_attitude(&before, &late, time, Duration::from_millis(30)).is_some());
+        assert!(interpolate_attitude(&after, &before, time, gap).is_none());
+        assert!(
+            interpolate_attitude(&before, &after, before.time - Duration::from_nanos(1), gap)
+                .is_none()
+        );
+        assert_eq!(
+            interpolate_attitude(&before, &before, before.time, Duration::ZERO),
+            Some(before.inner)
+        );
+        assert!((attitude.inner.norm() - 1.0).abs() < 1e-6);
+        assert!(exposure_attitude(0.1, -0.2, 0.3).is_some());
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(exposure_attitude(invalid, 0.0, 0.0).is_none());
+            assert!(exposure_attitude(0.0, invalid, 0.0).is_none());
+            assert!(exposure_attitude(0.0, 0.0, invalid).is_none());
+            let mut invalid_sample = after.clone();
+            invalid_sample.inner.inner = nalgebra::UnitQuaternion::new_unchecked(
+                nalgebra::Quaternion::new(invalid, 0.0, 0.0, 0.0),
+            );
+            assert!(interpolate_attitude(&before, &invalid_sample, time, gap).is_none());
+            invalid_sample.time = before.time;
+            assert!(interpolate_attitude(&invalid_sample, &after, time, gap).is_none());
+        }
     }
 
     #[test]
@@ -466,8 +453,6 @@ mod tests {
 
     #[test]
     fn newer_generation_with_older_pose_invalidates_tracking_and_supplies_coherent_geometry() {
-        use ros_z::cache::CacheInner;
-
         let time = Time::from_nanos(1_000_000_000);
         let age = Duration::from_millis(250);
         let estimate = PoseEstimate {
@@ -484,8 +469,7 @@ mod tests {
         replacement.last_successful_solve = time - Duration::from_millis(100);
         replacement.generation += 1;
         replacement.estimate.covariance *= 2.0;
-        replacement.estimate.pose = Isometry3::from_translation(1.0, 2.0, 0.0);
-
+        replacement.estimate.pose = Isometry3::from_translation(vector![1.0, 2.0, 0.0]);
         let mut history = CacheInner::new(128);
         history.insert(tracking.last_successful_solve, tracking.clone());
         history.insert(replacement.last_successful_solve, replacement.clone());
@@ -507,7 +491,6 @@ mod tests {
             time,
             age
         ));
-
         let selected = geometry_for_image(
             time,
             history
@@ -524,7 +507,6 @@ mod tests {
             selected.last_successful_solve,
             replacement.last_successful_solve
         );
-        // Latest remains usable before the history subscriber receives the transition.
         let old_branch = [Arc::new(tracking)];
         assert_eq!(
             geometry_for_image(time, old_branch.iter().map(|g| (**g).clone()), &latest, age)
@@ -594,5 +576,17 @@ mod tests {
         latest.epoch = geometry.epoch;
         latest.generation += 1;
         assert!(!valid(Some(&latest), time));
+        let mut changed = status;
+        changed.epoch += 1;
+        assert!(!same_status(&status, &changed));
+        changed = status;
+        changed.generation += 1;
+        assert!(!same_status(&status, &changed));
+        changed = status;
+        changed.time = changed.time + Duration::from_nanos(1);
+        assert!(!same_status(&status, &changed));
+        changed = status;
+        changed.state = LocalizationState::Tracking;
+        assert!(!same_status(&status, &changed));
     }
 }
