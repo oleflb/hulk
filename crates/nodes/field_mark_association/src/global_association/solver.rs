@@ -658,3 +658,180 @@ pub(crate) fn associate(
         }),
     })
 }
+
+#[cfg(test)]
+mod class_tests {
+    use super::*;
+    use crate::associate_global_visual_features as associate;
+
+    #[test]
+    fn geometric_numerical_guards_are_applied() -> Result<(), &'static str> {
+        let frame = super::super::tests::RecordedStartup::load();
+        let features = frame.features();
+        let config = GlobalAssociationConfig::default();
+        let input = frame.input(&features, &config);
+        assert!(associate(input).is_some());
+        let (mut map, mut detections, _) =
+            preprocess(input).ok_or("valid frame must preprocess")?;
+        let config = GlobalAssociationConfig {
+            min_detection_baseline: 1.0e-10,
+            min_seed_quality: 0.1,
+            ..config
+        };
+        let pairs = [(0, 0), (1, 1), (2, 2)];
+        for (edge, accepted) in [(1.0e-7, false), (1.0e-5, true)] {
+            let points = [
+                Vector2::zeros(),
+                Vector2::new(edge, 0.0),
+                Vector2::new(0.0, edge),
+            ];
+            for (index, point) in points.into_iter().enumerate() {
+                detections[index].xy = point;
+                map.landmarks[index].xy = Point2::wrap(nalgebra::Point2::from(point));
+            }
+            assert_eq!(spread(&pairs, &detections, &map, 1.0, &config), accepted);
+        }
+        let minimum_distance = f64::from(MIN_PAIR_DISTANCE);
+        for (distance, accepted) in [
+            (minimum_distance * 0.5, false),
+            (minimum_distance, false),
+            (minimum_distance * 2.0, true),
+        ] {
+            let short_pair = [Vector2::zeros(), Vector2::new(distance, 0.0)];
+            let long_pair = [Vector2::zeros(), Vector2::new(1.0, 0.0)];
+            for (ground, field) in [(short_pair, long_pair), (long_pair, short_pair)] {
+                assert_eq!(
+                    GroundPose::from_pair(ground, field, minimum_distance).is_some(),
+                    accepted
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_epoch4_partial_rival_prevents_premature_bootstrap() {
+        let frame = super::super::tests::RecordedStartup::epoch4();
+        let features = frame.features();
+        let config = GlobalAssociationConfig::default();
+        let input = frame.input(&features, &config);
+        let (map, detections, count) = preprocess(input).unwrap();
+        let mut search = search(input, &map, &detections, count);
+        let full = search
+            .score(GroundPose {
+                position: Vector2::new(-4.601895614567558, -7.938509619684166),
+                yaw: -4.632751174974506,
+                height: 1.3267912878609447,
+            })
+            .unwrap();
+        let partial = search
+            .score(GroundPose {
+                position: Vector2::new(-13.915020687608415, 7.0236171418658335),
+                yaw: -1.5705612536087687,
+                height: 0.6476457036716181,
+            })
+            .unwrap();
+        assert_eq!((count, full.pairs.len(), partial.pairs.len()), (5, 4, 3));
+        assert!(search.consensus(&full));
+        assert!(!search.consensus(&partial));
+        assert!(!same_arrangement(&full, &partial));
+        assert!(partial.score > full.score * f64::from(config.score_ratio));
+        assert!(partial.rms < full.rms);
+        assert!(search.certify(full).is_some());
+        assert!(associate(input).is_none());
+    }
+
+    fn search<'a>(
+        input: GlobalAssociationInput<'a>,
+        map: &'a LandmarkMap,
+        detections: &'a [Detection],
+        observation_count: usize,
+    ) -> Search<'a> {
+        Search::new(input, map, detections, observation_count).unwrap()
+    }
+
+    #[test]
+    fn sparse_false_goalpost_rival_is_eligible_but_ambiguity_rejects() {
+        // Generate genuine crossings at one recorded alternative; retain the recorded post as false.
+        let frame = super::super::tests::RecordedStartup::load();
+        let mut features = frame.features();
+        let config = GlobalAssociationConfig::default();
+        let input = frame.input(&features, &config);
+        let (map, detections, count) = preprocess(input).unwrap();
+        let search = search(input, &map, &detections, count);
+        let camera = search.camera;
+        let genuine = GroundPose {
+            position: Vector2::new(-7.67597453935008, -12.394319462659013),
+            yaw: 1.8384661871553563,
+            height: 1.5556739711951002,
+        };
+        for (feature, id) in features.l_spots.iter_mut().zip([13, 15, 12]) {
+            feature.pixel = Point2::wrap(nalgebra::Point2::from(
+                camera
+                    .project(genuine, map.landmarks[id].xy.inner.coords.cast())
+                    .unwrap()
+                    .pixel
+                    .cast::<f32>(),
+            ));
+            feature.confidence = 0.95;
+        }
+        features.l_spots.truncate(3);
+        features.t_spots[0].pixel = Point2::wrap(nalgebra::Point2::from(
+            camera
+                .project(genuine, map.landmarks[23].xy.inner.coords.cast())
+                .unwrap()
+                .pixel
+                .cast::<f32>(),
+        ));
+        features.t_spots[0].confidence = 1.0;
+        features.t_spots.truncate(1);
+        features.goalposts.truncate(1);
+        let input = frame.input(&features, &config);
+        let (map, detections, count) = preprocess(input).unwrap();
+        let mut search = self::search(input, &map, &detections, count);
+        let truth = search.score(genuine).unwrap();
+        let rival = search
+            .score(GroundPose {
+                position: Vector2::new(-8.000824211352004, 7.273020272621388),
+                yaw: -1.3174329555743935,
+                height: 0.9091956199452956,
+            })
+            .unwrap();
+        let rival = search.refine(rival).unwrap();
+        assert_eq!((count, detections.len()), (5, 5));
+        assert_eq!(truth.pairs.len(), 4);
+        assert_eq!(rival.pairs.len(), 4);
+        assert!(search.consensus(&truth) && search.consensus(&rival));
+        assert!(
+            truth
+                .pairs
+                .iter()
+                .all(|&(d, _)| detections[d].class != VisualFeatureClass::GoalPost)
+        );
+        assert!(
+            rival
+                .pairs
+                .iter()
+                .any(|&(d, _)| detections[d].class == VisualFeatureClass::GoalPost)
+        );
+        assert_ne!(truth.pairs, rival.pairs);
+        assert!(!same_arrangement(&truth, &rival));
+        // A plausible false goalpost actually outscores the genuine four-crossing arrangement.
+        assert!(rival.score > truth.score);
+        assert!(rival.score < truth.score * f64::from(config.score_ratio));
+        assert!(associate(input).is_none());
+        let relaxed = GlobalAssociationConfig {
+            score_ratio: 1.001,
+            ..config
+        };
+        assert!(
+            associate(GlobalAssociationInput {
+                parameters: &relaxed,
+                ..input
+            })
+            .is_some()
+        );
+    }
+
+    #[test]
+}
