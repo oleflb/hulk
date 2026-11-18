@@ -834,4 +834,197 @@ mod class_tests {
     }
 
     #[test]
+    fn unweighted_refinement_preserves_higher_scoring_eligible_seed() {
+        let frame = super::super::tests::RecordedStartup::load();
+        let mut features = frame.features();
+        let config = GlobalAssociationConfig {
+            imu_tilt_sigma: 0.001,
+            ..Default::default()
+        };
+        let input = frame.input(&features, &config);
+        let (map, detections, count) = preprocess(input).unwrap();
+        let search = search(input, &map, &detections, count);
+        let pose = GroundPose {
+            position: Vector2::new(-8.0, 7.27),
+            yaw: -1.3174,
+            height: 0.91,
+        };
+        let feature = |id: usize, noise: Vector2<f64>, confidence| crate::DetectedVisualFeature {
+            pixel: Point2::wrap(nalgebra::Point2::from(
+                (search
+                    .camera
+                    .project(pose, map.landmarks[id].xy.inner.coords.cast())
+                    .unwrap()
+                    .pixel
+                    + noise)
+                    .cast::<f32>(),
+            )),
+            confidence,
+        };
+        let goal = feature(2, Vector2::zeros(), 1.0);
+        let penalty = feature(30, Vector2::zeros(), 1.0);
+        let crossing = feature(4, Vector2::new(0.0, 4.0), 0.35);
+        features.goalposts = vec![goal];
+        features.penalty_spots = vec![penalty];
+        features.l_spots = vec![crossing];
+        features.t_spots.clear();
+        let input = frame.input(&features, &config);
+        let (map, detections, count) = preprocess(input).unwrap();
+        let mut search = self::search(input, &map, &detections, count);
+        let pose = GroundPose::from_pair(
+            [detections[0].xy.cast(), detections[1].xy.cast()],
+            [
+                map.landmarks[30].xy.inner.coords.cast(),
+                map.landmarks[2].xy.inner.coords.cast(),
+            ],
+            f64::from(MIN_PAIR_DISTANCE),
+        )
+        .unwrap();
+        let before = search.score(pose).unwrap();
+        assert!(search.valid_pose(before.pose) && search.consensus(&before));
+        let observations = before
+            .pairs
+            .iter()
+            .map(|&(d, m)| {
+                (
+                    map.landmarks[m].xy.inner.coords.cast(),
+                    detections[d].pixel.inner.coords.cast(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let trial_pose = search
+            .camera
+            .refine(before.pose, &observations, |pose| search.valid_pose(pose))
+            .unwrap();
+        let trial = search.score(trial_pose).unwrap();
+        assert!(search.consensus(&trial));
+        assert!(trial.rms < before.rms);
+        assert!(trial.score < before.score - 0.2);
+        let after = search.refine(before.clone()).unwrap();
+        assert_eq!(after.score, before.score);
+        assert_eq!(after.pose.position, before.pose.position);
+        assert_eq!(after.pairs, before.pairs);
+    }
+
+    #[test]
+    fn partial_rival_survives_refinement_and_blocks_a_conflicting_full_consensus() {
+        let frame = super::super::tests::RecordedStartup::load();
+        let original = frame.features();
+        let config = GlobalAssociationConfig {
+            imu_tilt_sigma: 0.001,
+            ..Default::default()
+        };
+        let input = frame.input(&original, &config);
+        let (map, detections, count) = preprocess(input).unwrap();
+        let camera = search(input, &map, &detections, count).camera;
+        let rival_pose = GroundPose {
+            position: Vector2::new(-8.0, 7.27),
+            yaw: -1.3174,
+            height: 0.91,
+        };
+        let feature = |pose, id: usize, noise: Vector2<f64>, confidence| {
+            camera
+                .project(pose, map.landmarks[id].xy.inner.coords.cast())
+                .map(|p| crate::DetectedVisualFeature {
+                    pixel: Point2::wrap(nalgebra::Point2::from((p.pixel + noise).cast::<f32>())),
+                    confidence,
+                })
+        };
+        let goal = feature(rival_pose, 2, Vector2::zeros(), 1.0).unwrap();
+        let penalty = feature(rival_pose, 30, Vector2::zeros(), 1.0).unwrap();
+        let noisy = feature(rival_pose, 4, Vector2::new(0.0, 4.0), 0.35).unwrap();
+        let mut features = crate::DetectedVisualFeatures {
+            goalposts: vec![goal],
+            penalty_spots: vec![penalty],
+            l_spots: vec![noisy],
+            ..Default::default()
+        };
+        let input = frame.input(&features, &config);
+        let (_, d, _) = preprocess(input).unwrap();
+        let full_pose = GroundPose::from_pair(
+            [d[0].xy.cast(), d[1].xy.cast()],
+            [
+                map.landmarks[30].xy.inner.coords.cast(),
+                map.landmarks[3].xy.inner.coords.cast(),
+            ],
+            f64::from(MIN_PAIR_DISTANCE),
+        )
+        .unwrap();
+        let left = feature(full_pose, 4, Vector2::new(0.0, 2.0), 0.35).unwrap();
+        let right = feature(full_pose, 5, Vector2::new(0.0, 2.0), 0.35).unwrap();
+        features.l_spots = vec![noisy, left, right];
+        let input = frame.input(&features, &config);
+        let (map, d, count) = preprocess(input).unwrap();
+        let mut search = search(input, &map, &d, count);
+        let rival = search.score(rival_pose).unwrap();
+        let observations = rival
+            .pairs
+            .iter()
+            .map(|&(d, m)| {
+                (
+                    map.landmarks[m].xy.inner.coords.cast(),
+                    search.detections[d].pixel.inner.coords.cast(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let trial_pose = search
+            .camera
+            .refine(rival.pose, &observations, |pose| search.valid_pose(pose))
+            .unwrap();
+        let trial = search.score(trial_pose).unwrap();
+        let full = search.score(full_pose).unwrap();
+        assert_eq!(
+            (count, d.len(), rival.pairs.len(), full.pairs.len()),
+            (5, 5, 3, 4)
+        );
+        assert!(search.admissible_rival(&rival) && search.admissible_rival(&trial));
+        assert!(!search.consensus(&rival) && search.consensus(&full));
+        assert!(!same_arrangement(&full, &rival));
+        let cutoff = full.score / f64::from(config.score_ratio);
+        // Dropping this stronger partial incorrectly enabled the full arrangement before the guard.
+        assert!(rival.score >= cutoff && trial.score < cutoff);
+        assert!(search.certify(full).is_some());
+        let retained = search.refine(rival.clone()).unwrap();
+        assert_eq!(retained.score, rival.score);
+        assert!(!search.consensus(&retained));
+        assert!(associate(input).is_none());
+
+        let mut inadmissible = rival.clone();
+        inadmissible.rms = f64::from(config.max_rms_px) + 1.0;
+        assert!(!search.admissible_rival(&inadmissible));
+        inadmissible = rival.clone();
+        inadmissible.pose.height = f64::from(config.min_camera_height) * 0.5;
+        assert!(!search.admissible_rival(&inadmissible));
+        inadmissible = rival;
+        inadmissible.pairs.truncate(2);
+        assert!(!search.admissible_rival(&inadmissible));
+    }
+
+    #[test]
+    fn only_headed_recovery_can_substitute_crossing_classes() {
+        let config = GlobalAssociationConfig::default();
+        let crossings = [
+            VisualFeatureClass::LSpot,
+            VisualFeatureClass::TSpot,
+            VisualFeatureClass::XSpot,
+        ];
+        for observed in crossings {
+            for landmark in crossings {
+                assert_eq!(
+                    class_penalty(observed, landmark, &config, false).is_some(),
+                    observed == landmark
+                );
+                assert!(class_penalty(observed, landmark, &config, true).is_some());
+            }
+        }
+        assert!(
+            class_penalty(
+                VisualFeatureClass::LSpot,
+                VisualFeatureClass::PenaltySpot,
+                &config,
+                true
+            )
+            .is_none()
+        );
+    }
 }
