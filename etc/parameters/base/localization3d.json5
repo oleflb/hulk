@@ -20,6 +20,7 @@
     anchor_xy_sigma: 0.001, // m
     anchor_yaw_sigma: 0.001, // rad
     foot_sigma: 0.01, // m
+    // Same sole polygons as odometry; the minimum vertex height is constrained to zero.
     visual_odometry_sigma: 0.1, // m/rad
     relative_yaw_variance: 0.00002, // rad² per observation
     rotation_process_variance: 0.01, // rad²/s

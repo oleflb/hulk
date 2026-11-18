@@ -79,8 +79,7 @@ pub(super) enum MotionRecord {
     },
     Feet {
         time: Time,
-        left: Point3<Robot, f64>,
-        right: Point3<Robot, f64>,
+        vertices: [Point3<Robot, f64>; 2],
     },
     Kinematic {
         previous_time: Time,
@@ -122,7 +121,7 @@ impl MotionRecord {
                 attitude,
                 force,
             } => estimator.insert_imu(time, angular_velocity, attitude, force),
-            Self::Feet { time, left, right } => estimator.insert_feet(time, left, right),
+            Self::Feet { time, vertices } => estimator.insert_feet(time, vertices),
             Self::Kinematic {
                 previous_time,
                 time,

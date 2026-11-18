@@ -56,15 +56,51 @@ impl Localization {
     }
 
     pub fn ingest_kinematics(&mut self, sample: TimeWrapper<RobotKinematics>) -> Result<bool> {
-        let left = sample.inner.left_leg.sole_to_robot.inner.translation.vector;
-        let right = sample
-            .inner
-            .right_leg
-            .sole_to_robot
-            .inner
-            .translation
-            .vector;
-        if !left.iter().chain(right.iter()).all(|v| v.is_finite()) {
+        // Sample the penetration guard at odometry cadence, before allocating/history storage.
+        // It remains an inequality: airborne soles are not pulled onto the ground.
+        if self
+            .history
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                MotionRecord::Feet { time, .. } => Some(*time),
+                _ => None,
+            })
+            .is_some_and(|last| {
+                sample.time < last.saturating_add(std::time::Duration::from_millis(50))
+            })
+        {
+            return Ok(false);
+        }
+        let vertices: [Point3<Robot, f64>; 2] = [
+            Point3::wrap(
+                sample
+                    .inner
+                    .left_leg
+                    .sole_to_robot
+                    .inner
+                    .translation
+                    .vector
+                    .cast()
+                    .into(),
+            ),
+            Point3::wrap(
+                sample
+                    .inner
+                    .right_leg
+                    .sole_to_robot
+                    .inner
+                    .translation
+                    .vector
+                    .cast()
+                    .into(),
+            ),
+        ];
+        if !vertices
+            .iter()
+            .all(|point| point.inner.iter().all(|v| v.is_finite()))
+        {
             tracing::warn!(time = ?sample.time, "discarding nonfinite foot measurement");
             return Ok(false);
         }
@@ -73,16 +109,14 @@ impl Localization {
         }
         self.accept_motion(MotionRecord::Feet {
             time: sample.time,
-            left: Point3::wrap(left.cast().into()),
-            right: Point3::wrap(right.cast().into()),
+            vertices,
         })
     }
 
     pub(super) fn insert_feet(
         &mut self,
         time: Time,
-        left: Point3<Robot, f64>,
-        right: Point3<Robot, f64>,
+        vertices: [Point3<Robot, f64>; 2],
     ) -> Result<()> {
         let (segment, tau) = self.segment_and_tau(time)?;
         let controls = self.ensure_segment(segment)?;
@@ -98,13 +132,8 @@ impl Localization {
                     sigma: self.parameters.model.foot_sigma,
                 })
             });
-        self.graph.add_factor_to(
-            batch,
-            FootObservation {
-                tau,
-                vertices: [left, right],
-            },
-        )?;
+        self.graph
+            .add_factor_to(batch, FootObservation { tau, vertices })?;
         self.segment_factors
             .entry(segment)
             .or_default()
