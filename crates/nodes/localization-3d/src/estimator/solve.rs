@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
-use color_eyre::{Result, eyre::eyre};
+use color_eyre::Result;
 use fagra::{BlockId, OptimizeOptions, SolverError, StateKey};
-use localization_fagra::variables::{CameraIntrinsics, FieldAlignment, ImuBias, PoseControl};
+use localization_fagra::variables::{ImuBias, PoseControl};
 use types::localization::LocalizationEstimate;
 
-use super::{Graph, Localization, covariance::EstimateCovariance};
+use super::{Localization, covariance::EstimateCovariance};
 use crate::{diagnostics::SolveDiagnostics, heading::HeadingReference};
 
 pub(crate) struct SolveResult {
@@ -13,54 +13,6 @@ pub(crate) struct SolveResult {
     pub diagnostics: SolveDiagnostics,
     pub converged: bool,
     pub visual_rejected: bool,
-}
-
-/// LM rejects individual trials; application validation can still reject the whole update.
-struct StateSnapshot {
-    controls: Vec<(StateKey<PoseControl>, PoseControl)>,
-    alignment: Option<(StateKey<FieldAlignment>, FieldAlignment)>,
-    intrinsics: (StateKey<CameraIntrinsics>, CameraIntrinsics),
-    biases: Vec<(StateKey<ImuBias>, ImuBias)>,
-}
-
-impl StateSnapshot {
-    fn capture(estimator: &Localization) -> Result<Self> {
-        let graph = &estimator.graph;
-        Ok(Self {
-            controls: estimator
-                .controls
-                .values()
-                .map(|&key| Ok((key, graph.get(key)?.clone())))
-                .collect::<Result<_>>()?,
-            alignment: estimator
-                .alignment
-                .map(|key| Ok::<_, color_eyre::Report>((key, graph.get(key)?.clone())))
-                .transpose()?,
-            intrinsics: (
-                estimator.intrinsics,
-                graph.get(estimator.intrinsics)?.clone(),
-            ),
-            biases: estimator
-                .biases
-                .values()
-                .map(|&key| Ok((key, graph.get(key)?.clone())))
-                .collect::<Result<_>>()?,
-        })
-    }
-
-    fn restore(self, graph: &mut Graph) -> Result<()> {
-        for (key, value) in self.controls {
-            graph.set(key, value)?;
-        }
-        if let Some((key, value)) = self.alignment {
-            graph.set(key, value)?;
-        }
-        graph.set(self.intrinsics.0, self.intrinsics.1)?;
-        for (key, value) in self.biases {
-            graph.set(key, value)?;
-        }
-        Ok(())
-    }
 }
 
 impl Localization {
@@ -174,7 +126,7 @@ impl Localization {
         let (segment, tau) = self.segment_and_tau(self.latest_time)?;
         let controls = self.ensure_segment(segment)?;
         self.ensure_biases(self.latest_time)?;
-        let snapshot = StateSnapshot::capture(self)?;
+        let snapshot = self.graph.checkpoint_states();
         let checked = (|| -> Result<_> {
             self.trace_factor_costs("before_seed", None);
             self.apply_recovery_seed()?;
@@ -198,7 +150,7 @@ impl Localization {
         })();
         if let Err(error) = &checked {
             tracing::debug!(time = ?self.latest_time, %error, visual_frames = self.pending_visuals.len(), final_cost = ?diagnostics.final_cost, "rolling back inconsistent trajectory update");
-            snapshot.restore(&mut self.graph)?;
+            self.graph.restore_states(snapshot)?;
         }
         checked
     }
@@ -299,59 +251,5 @@ impl Localization {
             }
         }
         Ok((report, EstimateCovariance { pose, bias }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fagra::Variable;
-    use linear_algebra::IntoTransform;
-
-    #[test]
-    fn snapshot_restores_all_optimized_state_families() -> Result<()> {
-        let mut estimator = super::super::tests::estimator();
-        let alignment = estimator.graph.add(FieldAlignment::identity());
-        estimator.alignment = Some(alignment);
-        let snapshot = StateSnapshot::capture(&estimator)?;
-        for &(key, ref value) in &snapshot.controls {
-            let mut changed = value.clone();
-            changed.pose.inner.translation.x += 1.0;
-            estimator.graph.set(key, changed)?;
-        }
-        estimator.graph.set(
-            alignment,
-            FieldAlignment {
-                local_to_field: nalgebra::Isometry2::translation(1.0, 2.0).framed_transform(),
-            },
-        )?;
-        let mut changed = snapshot.intrinsics.1.clone();
-        changed.focal_lengths.inner.x += 1.0;
-        estimator.graph.set(snapshot.intrinsics.0, changed)?;
-        for &(key, ref value) in &snapshot.biases {
-            let mut changed = value.clone();
-            changed.gyroscope.inner.x += 1.0;
-            estimator.graph.set(key, changed)?;
-        }
-        let expected = StateSnapshot::capture(&super::super::tests::estimator())?;
-        let expected_intrinsics = snapshot.intrinsics.1.clone();
-        snapshot.restore(&mut estimator.graph)?;
-        for ((_, expected), &key) in expected.controls.iter().zip(estimator.controls.values()) {
-            assert_eq!(estimator.graph.get(key)?.pose, expected.pose);
-        }
-        assert_eq!(
-            estimator.graph.get(alignment)?.local_to_field,
-            FieldAlignment::<f64>::identity().local_to_field
-        );
-        assert_eq!(
-            estimator.graph.get(estimator.intrinsics)?.focal_lengths,
-            expected_intrinsics.focal_lengths
-        );
-        for ((_, expected), &key) in expected.biases.iter().zip(estimator.biases.values()) {
-            let actual = estimator.graph.get(key)?;
-            assert_eq!(actual.gyroscope, expected.gyroscope);
-            assert_eq!(actual.accelerometer, expected.accelerometer);
-        }
-        Ok(())
     }
 }
