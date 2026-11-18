@@ -291,7 +291,7 @@ impl Localization {
             }
             return Some(solved);
         }
-        let candidate = self.bootstrap_candidate(frame, heading.as_ref());
+        let candidate = self.bootstrap_candidate(frame);
         let predicted_height = self.height_prediction(time);
         let mut candidate = candidate
             .inspect_err(|error| tracing::warn!(%error, "discarding recovery candidate"))

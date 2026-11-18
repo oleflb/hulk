@@ -11,7 +11,7 @@ use types::{time_wrapper::TimeWrapper, visual_localization::VisualLocalizationFr
 
 use super::{Localization, control_keys};
 use crate::{
-    alignment::{seed_alignment, seed_recovery_alignment, valid_visual_frame},
+    alignment::{seed_recovery_alignment, valid_visual_frame},
     heading::HeadingReference,
 };
 
@@ -503,22 +503,32 @@ impl Localization {
 
     /// Resolve the global match's half-turn convention, then update the retained graph.
     /// Its marginalized history, alignment and motion factors must explain recovery.
-    pub(crate) fn ingest_recovery(
+    pub(crate) fn ingest_recovery<'a>(
         &mut self,
         mut frame: TimeWrapper<VisualLocalizationFrame>,
-        heading: &HeadingReference,
+        heading: impl Into<Option<&'a HeadingReference>>,
     ) -> Result<bool> {
+        let heading = heading.into();
         let Some(attitude) = self.attitude_at(frame.time) else {
+            return Ok(false);
+        };
+        let Some(expected) = heading
+            .map(|heading| heading.expected(attitude))
+            .or_else(|| self.field_heading_at(frame.time))
+        else {
             return Ok(false);
         };
         let (roll, pitch, _) = attitude.euler_angles();
         let Some((pose, alignment)) = seed_recovery_alignment(
             &mut frame.inner,
             linear_algebra::Rotation3::from_euler_angles(roll as f32, pitch as f32, 0.0),
-            types::localization::HeadingConstraint {
-                expected: heading.expected(attitude),
-                max_error: self.parameters.max_heading_error,
-            },
+            Some(types::localization::HeadingConstraint {
+                expected,
+                // Without corroboration, the posterior selects the half but cannot veto heading.
+                max_error: heading.map_or(std::f64::consts::FRAC_PI_2.next_down(), |_| {
+                    self.parameters.max_heading_error
+                }),
+            }),
             &self.parameters.visual,
         ) else {
             return Ok(false);
@@ -552,20 +562,15 @@ impl Localization {
             .inverse()
             * field_pose;
         let correction = local_pose * old.inverse();
-        let first = *self.controls.first_key_value().unwrap().0;
+        let Some((&first, _)) = self.controls.first_key_value() else {
+            return Ok(());
+        };
         // This only seeds optimization; every prior and motion factor remains in force.
         for (&index, &key) in &self.controls {
             let weight = ((index - first) as f64 / (segment + 1 - first) as f64).clamp(0.0, 1.0);
             let mut control = self.graph.get(key)?.clone();
             let target = correction * control.pose.inner;
-            control.pose.inner.translation.vector = control
-                .pose
-                .inner
-                .translation
-                .vector
-                .lerp(&target.translation.vector, weight);
-            control.pose.inner.rotation =
-                control.pose.inner.rotation.slerp(&target.rotation, weight);
+            control.pose.inner = control.pose.inner.lerp_slerp(&target, weight);
             self.graph.set(key, control)?;
         }
         Ok(())
@@ -802,11 +807,10 @@ impl Localization {
     }
 
     /// Rebootstrap recent motion without carrying field-conditioned marginal priors.
-    /// The active estimator is untouched until Localization validates this candidate.
+    /// The active graph and lifecycle are untouched until the candidate is validated.
     pub(crate) fn bootstrap_candidate(
-        &self,
+        &mut self,
         mut frame: TimeWrapper<VisualLocalizationFrame>,
-        heading: Option<&HeadingReference>,
     ) -> Result<Option<Self>> {
         let Some((segment, tau)) = self.check_time(frame.time, "global recovery")? else {
             return Ok(None);
@@ -830,26 +834,12 @@ impl Localization {
         let robot_to_local = linear_algebra::Rotation3::wrap(
             UnitQuaternion::from_euler_angles(roll, pitch, yaw).cast(),
         );
-        let seed = match heading {
-            Some(heading) => seed_recovery_alignment(
-                &mut frame.inner,
-                robot_to_local,
-                types::localization::HeadingConstraint {
-                    expected: heading.expected(attitude),
-                    max_error: self.parameters.max_heading_error,
-                },
-                &self.parameters.visual,
-            ),
-            None => seed_alignment(
-                robot_to_local,
-                frame.inner.robot_to_camera,
-                frame.inner.camera_intrinsic,
-                &mut frame.inner.associations,
-                true,
-                &self.parameters.visual,
-            ),
-        };
-        let Some((pose, seed)) = seed else {
+        let Some((pose, seed)) = seed_recovery_alignment(
+            &mut frame.inner,
+            robot_to_local,
+            None,
+            &self.parameters.visual,
+        ) else {
             return Ok(None);
         };
         let alignment = FieldAlignment {
@@ -863,7 +853,6 @@ impl Localization {
                 velocity: Vector3::wrap(correction.rotation * old.velocity.inner),
             },
             &frame.inner.camera_intrinsic,
-            None,
         )?;
         candidate.generation = self.generation.wrapping_add(1);
         candidate.alignment = Some(candidate.graph.add(alignment));
