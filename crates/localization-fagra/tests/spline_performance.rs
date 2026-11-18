@@ -1,11 +1,9 @@
-//! Reproduce timings with:
-//! cargo test -p localization-fagra --release --test spline_performance -- --ignored --nocapture --test-threads=1
+//! Allocation regressions for the spline and factor evaluators.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
     hint::black_box,
-    time::Instant,
 };
 
 use linear_algebra::Pose3;
@@ -93,83 +91,6 @@ fn preparation_and_evaluation_allocate_nothing() {
     exercise::<f64>();
     let count = ALLOCATIONS.with(|count| count.replace(None).unwrap());
     assert_eq!(count, 0, "spline preparation/evaluation allocated");
-}
-
-fn measure<T>(name: &str, mut operation: impl FnMut(usize) -> T) {
-    const ITERATIONS: usize = 20_000;
-    for i in 0..1000 {
-        black_box(operation(i));
-    }
-    let mut timings = [0.0; 7];
-    for timing in &mut timings {
-        let start = Instant::now();
-        for i in 0..ITERATIONS {
-            black_box(operation(i));
-        }
-        *timing = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
-    }
-    timings.sort_by(f64::total_cmp);
-    println!("{name:24} {:8.1} ns (median of 7)", timings[3]);
-}
-
-fn timings<R: RealField + Copy>() {
-    let c = |x| R::from_f64(x).unwrap();
-    for scale in [0.02, 0.6] {
-        println!("\n{} rotation scale={scale}", std::any::type_name::<R>());
-        let controls = controls::<R>(scale);
-        let spline = PoseSpline::new(controls.each_ref(), c(0.2)).unwrap();
-        let linearized = spline.linearize().unwrap();
-        let taus: [_; 32] = std::array::from_fn(|i| c(i as f64 / 31.0));
-        measure("prepare spline", |_| {
-            PoseSpline::new(black_box(controls.each_ref()), black_box(c(0.2))).unwrap()
-        });
-        measure("prepare derivatives", |_| {
-            black_box(&spline).linearize().unwrap()
-        });
-        measure("pose", |i| {
-            black_box(&spline).pose(black_box(taus[i % 32])).unwrap()
-        });
-        measure("velocity", |i| {
-            black_box(&spline)
-                .velocity(black_box(taus[i % 32]))
-                .unwrap()
-        });
-        measure("state", |i| {
-            black_box(&spline).state(black_box(taus[i % 32])).unwrap()
-        });
-        measure("kinematics", |i| {
-            black_box(&spline)
-                .kinematics(black_box(taus[i % 32]))
-                .unwrap()
-        });
-        measure("pose + Jacobians", |i| {
-            black_box(&linearized)
-                .pose(black_box(taus[i % 32]))
-                .unwrap()
-        });
-        measure("velocity + Jacobians", |i| {
-            black_box(&linearized)
-                .velocity(black_box(taus[i % 32]))
-                .unwrap()
-        });
-        measure("state + Jacobians", |i| {
-            black_box(&linearized)
-                .state(black_box(taus[i % 32]))
-                .unwrap()
-        });
-        measure("kinematics + Jacobians", |i| {
-            black_box(&linearized)
-                .kinematics(black_box(taus[i % 32]))
-                .unwrap()
-        });
-    }
-}
-
-#[test]
-#[ignore = "release microbenchmark; use --release --ignored --nocapture --test-threads=1"]
-fn release_timings() {
-    timings::<f32>();
-    timings::<f64>();
 }
 
 mod factor_workload {
@@ -445,17 +366,4 @@ mod factor_workload {
         check_allocations::<f64>();
     }
 
-    #[test]
-    #[ignore = "release microbenchmark; cost + Jacobians + dense assembly, no solve"]
-    fn all_factor_timings() {
-        let mut graph = graph::<f64>();
-        let mut method = fagra::GaussNewton::default();
-        let options = fagra::OptimizeOptions {
-            gradient_tolerance: 1e30,
-            ..Default::default()
-        };
-        measure("factor workload (f64)", |_| {
-            graph.optimize_with(&mut method, &options).unwrap()
-        });
-    }
 }
