@@ -820,3 +820,204 @@ fn rejected_tracking_trial_preserves_the_first_conflicting_global_image() -> Res
     assert!(localization.lifecycle.rejected_global.is_none());
     Ok(())
 }
+
+fn physical_carry(
+    t: f64,
+) -> (
+    nalgebra::Isometry3<f64>,
+    nalgebra::Vector3<f64>,
+    nalgebra::Vector3<f64>,
+) {
+    let ramp = |start: f64| {
+        let u = ((t - start) / 0.4).clamp(0.0, 1.0);
+        let position = if t >= start + 0.4 {
+            t - start - 0.2
+        } else {
+            0.4 * (u.powi(3) - 0.5 * u.powi(4))
+        };
+        (position, u * u * (3.0 - 2.0 * u), 6.0 * u * (1.0 - u) / 0.4)
+    };
+    let (up, speed_up, acceleration_up) = ramp(0.4);
+    let (down, speed_down, acceleration_down) = ramp(3.4);
+    let u = ((t - 0.4) / 0.4).clamp(0.0, 1.0);
+    let lift = 0.2 * (10.0 * u.powi(3) - 15.0 * u.powi(4) + 6.0 * u.powi(5));
+    let lift_velocity = 0.2 * (30.0 * u.powi(2) - 60.0 * u.powi(3) + 30.0 * u.powi(4)) / 0.4;
+    let lift_acceleration =
+        0.2 * (60.0 * u - 180.0 * u.powi(2) + 120.0 * u.powi(3)) / 0.4_f64.powi(2);
+    (
+        nalgebra::Isometry3::from_parts(
+            Translation3::new(-2.0 + 0.9 * (up - down), 1.0, 0.55 + lift),
+            UnitQuaternion::from_euler_angles(0.0, 0.0, 0.4),
+        ),
+        nalgebra::vector![0.9 * (speed_up - speed_down), 0.0, lift_velocity],
+        nalgebra::vector![
+            0.9 * (acceleration_up - acceleration_down),
+            0.0,
+            lift_acceleration
+        ],
+    )
+}
+
+// Robot 46, 2026-10-25T21:59:26.505+08:00/recording.mcap: first 12
+// visual_localization_local log_time - payload exposure times, starting at
+// 1792936823055828134 ns. Repeat the measured latency pattern at our 10 Hz exposures.
+const RECORDED_IMAGE_LATENCY_NS: [i64; 12] = [
+    44_257_199, 63_489_929, 46_559_460, 50_937_318, 59_277_147, 47_182_476, 51_737_652, 69_855_658,
+    39_963_199, 42_824_351, 54_343_463, 43_103_080,
+];
+
+#[test]
+fn shipped_imu_carry_recovers_with_batched_legs_and_image_latency() -> Result<()> {
+    for leg_period_ms in [20, 50] {
+        for image_latency_ns in [&[0][..], &RECORDED_IMAGE_LATENCY_NS[..]] {
+            run_shipped_imu_carry(leg_period_ms, image_latency_ns)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_shipped_imu_carry(leg_period_ms: i64, image_latency_ns: &[i64]) -> Result<()> {
+    let parameters: Localization3dParameters = json5::from_str(include_str!(
+        "../../../../../etc/parameters/base/localization3d.json5"
+    ))?;
+    let accelerometer = parameters
+        .accelerometer
+        .as_ref()
+        .ok_or_else(|| eyre!("shipped accelerometer must be enabled"))?;
+    let mut localization = new_localization_with_parameters(&parameters);
+    let camera = camera();
+    let mut feet = RobotKinematics::default();
+    feet.left_leg.sole_to_robot = Isometry3::from_translation(0.0, 0.05, -0.55);
+    feet.right_leg.sole_to_robot = Isometry3::from_translation(0.0, -0.05, -0.55);
+    let mut recovered = false;
+    let mut confirmations = 0;
+    let mut maximum_tracking_error = 0.0_f64;
+    let mut missing_estimates = 0;
+    let mut maximum_recovered_position_error = 0.0_f64;
+    let mut maximum_recovered_velocity_error = 0.0_f64;
+    let mut maximum_anchor_velocity_error = 0.0_f64;
+    let mut pending_images = std::collections::VecDeque::new();
+    let mut image_index = 0;
+    for index in 0..=2301 {
+        let t = index as f64 * 0.002;
+        let time = Time::from_nanos(1_000_000_000 + index * 2_000_000);
+        let (pose, velocity, acceleration) = physical_carry(t);
+        let force = pose.rotation.inverse()
+            * (acceleration + nalgebra::vector![0.0, 0.0, parameters.model.gravity]);
+        let raw_force = force.component_div(&accelerometer.scale) + accelerometer.bias.inner;
+        localization.ingest_imu(
+            time,
+            ImuState {
+                roll_pitch_yaw: vector![0.0, 0.0, 2.7],
+                linear_acceleration: Vector3::wrap(raw_force.cast()),
+                ..Default::default()
+            },
+        )?;
+        if index % 10 == 0 {
+            localization.ingest_kinematics(TimeWrapper {
+                time,
+                inner: feet.clone(),
+            })?;
+        }
+        if index > 0 && index * 2 % leg_period_ms == 0 {
+            assert!(
+                localization.ingest_kinematic_odometry(KinematicOdometryDelta {
+                    previous_time: Time::from_nanos(time.as_nanos() - leg_period_ms * 1_000_000),
+                    time,
+                    current_to_previous: linear_algebra::Isometry2::identity(),
+                })?
+            );
+        }
+        if index == 0 || (index >= 63 && index % 50 == 13) {
+            let exposure = if index == 0 { 0.0 } else { t - 0.001 };
+            let mut image = frame(exposure, false);
+            image.inner.generation = localization.generation;
+            for field_point in [
+                point![-4.5, -3.0, 0.0],
+                point![-4.5, 3.0, 0.0],
+                point![4.5, -3.0, 0.0],
+                point![4.5, 3.0, 0.0],
+                point![0.0, -3.0, 0.0],
+            ] {
+                image.inner.associations.push(FieldMarkAssociation {
+                    field_point,
+                    detection: point![0.0, 0.0],
+                });
+            }
+            for association in &mut image.inner.associations {
+                let point = camera.robot_to_camera.inner
+                    * physical_carry(exposure).0.cast::<f32>().inverse()
+                    * association.field_point.inner;
+                association.detection = camera.intrinsics.project(Vector3::wrap(point.coords));
+            }
+            let delivery = Time::from_nanos(
+                image.time.as_nanos() + image_latency_ns[image_index % image_latency_ns.len()],
+            );
+            pending_images.push_back((delivery, image));
+            image_index += 1;
+        }
+        // Deliver after newer IMU/leg samples, retaining exposure time and capture generation.
+        while pending_images
+            .front()
+            .is_some_and(|(delivery, _)| *delivery <= time)
+        {
+            if let Some((_, image)) = pending_images.pop_front() {
+                assert!(localization.ingest_visual_localization_frame(image)?);
+            }
+        }
+        if index <= 1 || index % 25 != 1 {
+            continue;
+        }
+        let anchor = localization.lifecycle.latest_visual;
+        let output = localization.solve(time);
+        if t >= 1.0 && localization.lifecycle.latest_visual > anchor {
+            recovered = true;
+            confirmations += 1;
+            let estimate = output
+                .estimate
+                .and_then(|estimate| estimate.robot_to_field)
+                .ok_or_else(|| eyre!("missing carried field pose"))?;
+            maximum_recovered_position_error = maximum_recovered_position_error
+                .max((estimate.pose.inner.translation.vector - pose.translation.vector).norm());
+            let actual_velocity = localization
+                .field_velocity_at(time)
+                .ok_or_else(|| eyre!("missing carried velocity"))?;
+            maximum_recovered_velocity_error =
+                maximum_recovered_velocity_error.max((actual_velocity - velocity).norm());
+            if let Some(anchor) = anchor {
+                let anchor_t = (anchor.as_nanos() - 1_000_000_000) as f64 * 1e-9;
+                let actual = localization
+                    .field_velocity_at(anchor)
+                    .ok_or_else(|| eyre!("missing retained anchor velocity"))?;
+                maximum_anchor_velocity_error =
+                    maximum_anchor_velocity_error.max((actual - physical_carry(anchor_t).1).norm());
+            }
+        }
+        if t >= 2.0 {
+            assert!(
+                recovered,
+                "no recovery by {t}s with shipped IMU settings, leg period={leg_period_ms} ms, image latency={image_latency_ns:?} ns; {:?}",
+                output.diagnostics
+            );
+            if let Some(estimate) = output.estimate.and_then(|estimate| estimate.robot_to_field) {
+                maximum_tracking_error = maximum_tracking_error
+                    .max((estimate.pose.inner.translation.vector - pose.translation.vector).norm());
+            } else {
+                missing_estimates += 1;
+            }
+        }
+    }
+    assert!(
+        confirmations >= 8
+            && !localization.has_supported_leg_admission()
+            && localization.lifecycle.state == LocalizationState::Tracking
+            && missing_estimates == 0
+            && maximum_tracking_error < 0.15
+            && maximum_recovered_position_error < 0.08
+            && maximum_recovered_velocity_error < 0.15
+            && maximum_anchor_velocity_error < 0.15,
+        "leg period={leg_period_ms} ms, image latency={image_latency_ns:?} ns, confirmations={confirmations}, state={:?}, missing={missing_estimates}, tracking position error={maximum_tracking_error}, recovered position error={maximum_recovered_position_error}, recovered velocity error={maximum_recovered_velocity_error}, anchor velocity error={maximum_anchor_velocity_error}",
+        localization.lifecycle.state
+    );
+    Ok(())
+}
