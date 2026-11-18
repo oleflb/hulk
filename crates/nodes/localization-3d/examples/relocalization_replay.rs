@@ -14,10 +14,10 @@ use color_eyre::{
 };
 use field_mark_association::{
     AssociationGeometry, AssociationInput, FieldMarkAssociationParameters,
-    associate_visual_features, find_detected_visual_features,
+    associate_visual_features, exposure_attitude, find_detected_visual_features,
+    geometry_for_image, interpolate_attitude,
 };
 use kinematics::robot_kinematics::RobotKinematics;
-use linear_algebra::Orientation3;
 use localization_3d::{Localization, Localization3dParameters, initial_robot_to_local_from_imu};
 use mcap::{
     records::Record,
@@ -88,23 +88,64 @@ impl Measurement {
 fn camera_at(
     cache: &BTreeMap<Time, TimeWrapper<CameraGeometry>>,
     t: Time,
-) -> Result<CameraGeometry> {
+    max_gap: Duration,
+) -> Option<CameraGeometry> {
     interpolate_camera_geometry(
-        cache
-            .range(..=t)
-            .next_back()
-            .ok_or_else(|| eyre!("missing camera geometry before {t:?}"))?
-            .1,
-        cache
-            .range(t..)
-            .next()
-            .ok_or_else(|| eyre!("missing camera geometry after {t:?}"))?
-            .1,
+        cache.range(..=t).next_back()?.1,
+        cache.range(t..).next()?.1,
         t,
-        Duration::from_millis(20),
+        max_gap,
     )
-    .ok_or_else(|| eyre!("invalid camera geometry bracket at {t:?}"))
 }
+
+fn nearest_sample<T>(cache: &BTreeMap<Time, T>, time: Time, max_gap: Duration) -> Option<&T> {
+    cache
+        .range(..=time)
+        .next_back()
+        .into_iter()
+        .chain(cache.range(time..).next())
+        .min_by_key(|(stamp, _)| stamp.abs_diff(time))
+        .filter(|(stamp, _)| stamp.abs_diff(time) <= max_gap)
+        .map(|(_, sample)| sample)
+}
+
+fn initialize_from_imu(
+    time: Time,
+    imu: &ImuState,
+    epoch: u64,
+    parameters: &Localization3dParameters,
+    field: &FieldDimensions,
+    cameras: &BTreeMap<Time, TimeWrapper<CameraGeometry>>,
+    feet: &BTreeMap<Time, TimeWrapper<RobotKinematics>>,
+) -> Option<Result<Localization>> {
+    let camera = nearest_sample(cameras, time, parameters.timing.max_camera_gap)?;
+    let feet = nearest_sample(feet, time, parameters.timing.startup_kinematics_freshness)?;
+    Some(Localization::new(
+        time,
+        epoch,
+        parameters,
+        field,
+        &camera.inner,
+        initial_robot_to_local_from_imu(imu, &feet.inner),
+    ))
+}
+
+fn tracking_geometry(
+    latest: &LocalizationEstimate,
+    history: &BTreeMap<Time, LocalizationEstimate>,
+    status: &LocalizationStatus,
+    image_time: Time,
+    max_age: Duration,
+) -> Option<AssociationGeometry> {
+    // A newer ineligible output invalidates older hints, as in live frame processing.
+    let latest = AssociationGeometry::from_estimate(latest, status)?;
+    let snapshots = history
+        .range(image_time.saturating_sub(max_age)..=image_time)
+        .rev()
+        .filter_map(|(_, estimate)| AssociationGeometry::from_estimate(estimate, status));
+    geometry_for_image(image_time, snapshots, &latest, max_age)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
@@ -203,7 +244,13 @@ fn main() -> Result<()> {
     let mut reset: Option<LocalizationStatus> = None;
     let mut cameras = BTreeMap::new();
     let mut attitudes = BTreeMap::new();
-    let mut feet: Option<TimeWrapper<RobotKinematics>> = None;
+    let mut feet = BTreeMap::new();
+    let mut initialization_not_ready = 0;
+    let mut invalid_initializations = 0;
+    let mut detection_camera_unavailable = 0;
+    let mut detection_geometry_unavailable = 0;
+    let mut vo_camera_unavailable = 0;
+    let mut admitted_vo = 0;
     let mut pending = Vec::new();
     let mut estimates: BTreeMap<Time, LocalizationEstimate> = BTreeMap::new();
     let mut output = Vec::new();
@@ -232,12 +279,21 @@ fn main() -> Result<()> {
                 cameras.retain(|t, _| t.saturating_add(Duration::from_secs(4)) >= now);
             }
             Event::Feet(f) => {
-                feet = Some((*f).clone());
+                feet.insert(f.time, (*f).clone());
+                feet.retain(|t, _| t.saturating_add(Duration::from_secs(4)) >= now);
                 pending.push(Measurement::Feet(f));
             }
             Event::Imu(t, imu) => {
                 let rpy = imu.roll_pitch_yaw.inner;
-                attitudes.insert(t, Orientation3::from_euler_angles(rpy.x, rpy.y, rpy.z));
+                if let Some(attitude) = exposure_attitude(rpy.x, rpy.y, rpy.z) {
+                    attitudes.insert(
+                        t,
+                        TimeWrapper {
+                            time: t,
+                            inner: attitude,
+                        },
+                    );
+                }
                 attitudes.retain(|t, _| t.saturating_add(Duration::from_secs(4)) >= now);
                 pending.push(Measurement::Imu(t, imu));
             }
@@ -256,36 +312,37 @@ fn main() -> Result<()> {
                 if t < epoch.time || t.saturating_add(Duration::from_millis(250)) < now {
                     continue;
                 }
-                let camera = camera_at(&cameras, t)?;
+                let Some(camera) = camera_at(&cameras, t, association_parameters.max_camera_gap)
+                else {
+                    detection_camera_unavailable += 1;
+                    continue;
+                };
                 let attitude = attitudes
                     .range(..=t)
                     .next_back()
                     .zip(attitudes.range(t..).next())
-                    .and_then(|((a, ra), (b, rb))| {
-                        let gap = b.duration_since(*a);
-                        (gap <= Duration::from_millis(20)).then(|| {
-                            if gap.is_zero() {
-                                *ra
-                            } else {
-                                ra.slerp(
-                                    *rb,
-                                    t.duration_since(*a).as_secs_f32() / gap.as_secs_f32(),
-                                )
-                            }
-                        })
-                    })
-                    .ok_or_else(|| eyre!("missing IMU attitude bracket within 20 ms at {t:?}"))?;
-                let geometry = estimates
-                    .range(..=t)
-                    .next_back()
-                    .filter(|(stamp, _)| stamp.saturating_add(Duration::from_millis(250)) >= t)
-                    .and_then(|(_, e)| AssociationGeometry::from_estimate(e, &status));
+                    .and_then(|((_, before), (_, after))| {
+                        interpolate_attitude(before, after, t, association_parameters.max_imu_gap)
+                    });
+                let geometry = output.last().and_then(|(latest, _)| {
+                    tracking_geometry(
+                        latest,
+                        &estimates,
+                        &status,
+                        t,
+                        association_parameters.max_pose_hint_age,
+                    )
+                });
+                if attitude.is_none() && geometry.is_none() {
+                    detection_geometry_unavailable += 1;
+                    continue;
+                }
                 let features = find_detected_visual_features(&objects.inner);
                 let timer = Instant::now();
                 let result = associate_visual_features(
                     AssociationInput {
                         status: &status,
-                        attitude: Some(attitude),
+                        attitude,
                         tracking: geometry.as_ref(),
                         visual_features: &features,
                         robot_to_camera: camera.robot_to_camera,
@@ -327,24 +384,26 @@ fn main() -> Result<()> {
                         let Measurement::Imu(_, ref imu) = m else {
                             continue;
                         };
-                        let (_, camera) = cameras
-                            .range(..=t)
-                            .next_back()
-                            .filter(|(stamp, _)| stamp.abs_diff(t) <= Duration::from_millis(20))
-                            .ok_or_else(|| {
-                                eyre!("missing initialization camera geometry at {t:?}")
-                            })?;
-                        let feet = feet.as_ref().ok_or_else(|| {
-                            eyre!("missing initialization robot kinematics at {t:?}")
-                        })?;
-                        active.insert(Localization::new(
+                        let Some(initialized) = initialize_from_imu(
                             t,
+                            imu,
                             epoch.epoch,
                             &parameters,
                             &field,
-                            &camera.inner,
-                            initial_robot_to_local_from_imu(imu, &feet.inner),
-                        )?)
+                            &cameras,
+                            &feet,
+                        ) else {
+                            initialization_not_ready += 1;
+                            continue;
+                        };
+                        match initialized {
+                            Ok(localization) => active.insert(localization),
+                            Err(error) => {
+                                invalid_initializations += 1;
+                                tracing::warn!(%error, "discarding invalid initialization sample");
+                                continue;
+                            }
+                        }
                     };
                     match m {
                         Measurement::Imu(t, imu) => {
@@ -359,13 +418,23 @@ fn main() -> Result<()> {
                             audit_frames.push((audit, admitted));
                         }
                         Measurement::Vo(v) => {
-                            let previous = v
-                                .delta
-                                .as_ref()
-                                .map(|d| camera_at(&cameras, d.previous_time))
-                                .transpose()?;
-                            let current = camera_at(&cameras, v.time)?;
-                            l.ingest_visual_odometry(v, previous.as_ref(), Some(&current))?;
+                            let previous = v.delta.as_ref().and_then(|d| {
+                                camera_at(
+                                    &cameras,
+                                    d.previous_time,
+                                    parameters.timing.max_camera_gap,
+                                )
+                            });
+                            let current =
+                                camera_at(&cameras, v.time, parameters.timing.max_camera_gap);
+                            if v.delta.is_some() && (previous.is_none() || current.is_none()) {
+                                vo_camera_unavailable += 1;
+                            }
+                            admitted_vo += usize::from(l.ingest_visual_odometry(
+                                v,
+                                previous.as_ref(),
+                                current.as_ref(),
+                            )?);
                         }
                     }
                 }
@@ -408,6 +477,12 @@ fn main() -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "field_dimensions": field, "wall_s": started.elapsed().as_secs_f64(),
+            "initialization_not_ready": initialization_not_ready,
+            "invalid_initializations": invalid_initializations,
+            "detection_camera_unavailable": detection_camera_unavailable,
+            "detection_geometry_unavailable": detection_geometry_unavailable,
+            "vo_camera_unavailable": vo_camera_unavailable,
+            "admitted_vo": admitted_vo,
             "association": timing(&mut association_us), "localization": timing(&mut solve_us),
             "field_estimates": field_estimates.len(),
             "longest_field_output_gap_s": transitions.iter().map(|(gap, _)| *gap).reduce(f64::max),
@@ -449,6 +524,6 @@ mod tests {
 
     #[test]
     fn camera_geometry_has_no_missing_data_fallback() {
-        assert!(camera_at(&BTreeMap::new(), Time::from_nanos(1)).is_err());
+        assert!(camera_at(&BTreeMap::new(), Time::from_nanos(1), Duration::ZERO).is_none());
     }
 }
