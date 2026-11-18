@@ -40,23 +40,7 @@ impl Localization {
         }
         for pending in &self.pending_visuals {
             let time = pending.frame.time;
-            let pose = (|| {
-                let (segment, tau) = self.segment_and_tau(time).ok()?;
-                Some(
-                    self.graph
-                        .get(self.alignment?)
-                        .ok()?
-                        .local_to_field
-                        .to_3d()
-                        .inner
-                        * self
-                            .spline(control_keys(&self.controls, segment).ok()?)
-                            .ok()?
-                            .pose(tau)
-                            .ok()?
-                            .inner,
-                )
-            })();
+            let pose = self.field_pose_at(time);
             tracing::debug!(?time, stage, source = ?pending.frame.inner.source,
                 features = pending.frame.inner.associations.len(),
                 rms_px = ?self.frame_rms(&pending.frame), ?pose,
@@ -65,6 +49,24 @@ impl Localization {
     }
 
     pub(crate) fn field_heading_at(&self, time: Time) -> Option<Orientation2<Field, f64>> {
+        Some(Orientation2::new(
+            self.field_pose_at(time)?.rotation.euler_angles().2,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn field_velocity_at(&self, time: Time) -> Option<nalgebra::Vector3<f64>> {
+        let (segment, tau) = self.segment_and_tau(time).ok()?;
+        let velocity = self
+            .spline(control_keys(&self.controls, segment).ok()?)
+            .ok()?
+            .velocity(tau)
+            .ok()?;
+        let alignment = self.graph.get(self.alignment?).ok()?;
+        Some(alignment.local_to_field.to_3d().inner.rotation * velocity.inner)
+    }
+
+    fn field_pose_at(&self, time: Time) -> Option<nalgebra::Isometry3<f64>> {
         let (segment, tau) = self.segment_and_tau(time).ok()?;
         let pose = self
             .spline(control_keys(&self.controls, segment).ok()?)
@@ -72,29 +74,17 @@ impl Localization {
             .pose(tau)
             .ok()?;
         let alignment = self.graph.get(self.alignment?).ok()?;
-        Some(Orientation2::new(
-            (alignment.local_to_field.to_3d().inner.rotation * pose.inner.rotation)
-                .euler_angles()
-                .2,
-        ))
+        Some(alignment.local_to_field.to_3d().inner * pose.inner)
     }
 
     pub(crate) fn accepted_visual_rms(&self) -> Option<f64> {
         self.frame_rms(self.latest_visual_frame.as_ref()?)
     }
 
-    fn frame_rms(&self, frame: &TimeWrapper<VisualLocalizationFrame>) -> Option<f64> {
-        let (segment, tau) = self.segment_and_tau(frame.time).ok()?;
-        let pose = self
-            .spline(control_keys(&self.controls, segment).ok()?)
-            .ok()?
-            .pose(tau)
-            .ok()?;
-        let alignment = self.graph.get(self.alignment?).ok()?;
+    pub(super) fn frame_rms(&self, frame: &TimeWrapper<VisualLocalizationFrame>) -> Option<f64> {
+        let pose = self.field_pose_at(frame.time)?;
         let camera = self.graph.get(self.intrinsics).ok()?;
-        let transform = frame.inner.robot_to_camera.inner.cast::<f64>()
-            * pose.inner.inverse()
-            * alignment.local_to_field.to_3d().inner.inverse();
+        let transform = frame.inner.robot_to_camera.inner.cast::<f64>() * pose.inverse();
         reprojection_rms(
             &frame.inner.associations,
             &transform,
@@ -168,11 +158,18 @@ impl Localization {
     pub(super) fn accept_visuals(&mut self) {
         self.trace_visual_audit("accepted");
         for pending in self.pending_visuals.drain(..) {
-            self.segment_factors
-                .entry(pending.segment)
-                .or_default()
-                .reprojections
-                .push(pending.batch);
+            let frame = &pending.frame;
+            self.history.landmarks.insert(
+                frame.time,
+                frame
+                    .inner
+                    .associations
+                    .iter()
+                    .map(|a| a.field_point)
+                    .collect(),
+            );
+            let segment = self.segment_factors.entry(pending.segment).or_default();
+            segment.reprojections.push(pending.batch);
             if self
                 .latest_visual_frame
                 .as_ref()
@@ -198,6 +195,13 @@ impl Localization {
     }
 
     pub(crate) fn ingest_visual(
+        &mut self,
+        frame: TimeWrapper<VisualLocalizationFrame>,
+    ) -> Result<bool> {
+        self.insert_visual(frame)
+    }
+
+    pub(super) fn insert_visual(
         &mut self,
         frame: TimeWrapper<VisualLocalizationFrame>,
     ) -> Result<bool> {
@@ -236,22 +240,9 @@ impl Localization {
             tracing::warn!(?time, "discarding visual frame with invalid landmark range");
             return Ok(false);
         }
-        let batch = self.graph.add_batch(FrameReprojections {
-            controls,
-            alignment: alignment_key,
-            intrinsics: self.intrinsics,
-            duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
-            tau,
-            robot_to_camera: frame.robot_to_camera.inner.cast().framed_transform(),
-            // Fixed calibration-based conversion; do not let optimized focal lengths
-            // change measurement strength during a solve.
-            information_root: (f64::from(frame.camera_intrinsic.focals.x)
-                * f64::from(frame.camera_intrinsic.focals.y))
-            .sqrt()
-                / self.parameters.visual_feature_noise_variance.sqrt(),
-            huber_threshold: self.parameters.model.huber_threshold,
-            min_range: self.parameters.model.min_landmark_range,
-        });
+        let batch = self
+            .graph
+            .add_batch(self.visual_model(&frame, controls, alignment_key, tau));
         let mut factors = Vec::with_capacity(frame.associations.len());
         for association in &frame.associations {
             factors.push(self.graph.add_factor_to(
@@ -275,6 +266,29 @@ impl Localization {
         self.trace_visual_audit("before");
         self.commit_time(time);
         Ok(true)
+    }
+
+    fn visual_model(
+        &self,
+        frame: &VisualLocalizationFrame,
+        controls: [fagra::StateKey<localization_fagra::variables::PoseControl>; 4],
+        alignment_key: fagra::StateKey<localization_fagra::variables::FieldAlignment>,
+        tau: f64,
+    ) -> FrameReprojections {
+        FrameReprojections {
+            controls,
+            alignment: alignment_key,
+            intrinsics: self.intrinsics,
+            duration: self.parameters.timing.trajectory_spacing.as_secs_f64(),
+            tau,
+            robot_to_camera: frame.robot_to_camera.inner.cast().framed_transform(),
+            information_root: (f64::from(frame.camera_intrinsic.focals.x)
+                * f64::from(frame.camera_intrinsic.focals.y))
+            .sqrt()
+                / self.parameters.visual_feature_noise_variance.sqrt(),
+            huber_threshold: self.parameters.model.huber_threshold,
+            min_range: self.parameters.model.min_landmark_range,
+        }
     }
 
     pub fn ingest_visual_odometry(
