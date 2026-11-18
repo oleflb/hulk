@@ -578,6 +578,188 @@ fn rejected_visual_frame_does_not_advance_output_time() {
 
 use crate::test_support::camera as recovery_camera;
 
+fn conflict_fixture() -> Result<(
+    Localization,
+    TimeWrapper<VisualLocalizationFrame>,
+    TimeWrapper<VisualLocalizationFrame>,
+    HeadingReference,
+)> {
+    conflict_fixture_with_accelerometer(false)
+}
+
+fn conflict_fixture_with_accelerometer(
+    accelerometer: bool,
+) -> Result<(
+    Localization,
+    TimeWrapper<VisualLocalizationFrame>,
+    TimeWrapper<VisualLocalizationFrame>,
+    HeadingReference,
+)> {
+    let (mut estimator, frame, heading) = recovery_fixture();
+    if accelerometer {
+        estimator.parameters.accelerometer = Some(Default::default());
+    }
+    let mut estimator = estimator
+        .bootstrap_candidate(frame)?
+        .ok_or_else(|| eyre!("missing bootstrap candidate"))?;
+    let solved = estimator.solve_with_heading(Some(&heading));
+    assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    let mut anchor = estimator
+        .latest_visual_frame
+        .clone()
+        .ok_or_else(|| eyre!("missing anchor"))?;
+    anchor.time = estimator.latest_time;
+    assert!(estimator.ingest_visual(anchor.clone())?);
+    let solved = estimator.solve_with_heading(Some(&heading));
+    assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    let image = |time, x: f32| {
+        let mut frame = anchor.clone();
+        frame.time = time;
+        let pose = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(-2.0 + x, 1.0, 0.55),
+            nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 0.4),
+        );
+        for association in &mut frame.inner.associations {
+            let point =
+                frame.inner.robot_to_camera.inner * pose.inverse() * association.field_point.inner;
+            association.detection = frame
+                .inner
+                .camera_intrinsic
+                .project(Vector3::wrap(point.coords));
+        }
+        frame
+    };
+    let start = anchor.time;
+    for index in 1..=40 {
+        let time = start + Duration::from_millis(index * 20);
+        estimator.ingest_imu(
+            time,
+            ImuState {
+                roll_pitch_yaw: vector![0.1, -0.05, 2.0],
+                linear_acceleration: Vector3::wrap(
+                    nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 2.0).inverse()
+                        * nalgebra::vector![0.0, 0.0, 9.81],
+                ),
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            estimator.ingest_kinematic_odometry(types::odometry::KinematicOdometryDelta {
+                previous_time: time - Duration::from_millis(20),
+                time,
+                current_to_previous: linear_algebra::Isometry2::identity(),
+            })?
+        );
+        let solved = estimator.solve_with_heading(Some(&heading));
+        assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+    }
+    Ok((
+        estimator,
+        image(start + Duration::from_millis(400), 0.8),
+        image(start + Duration::from_millis(800), 1.6),
+        heading,
+    ))
+}
+
+#[test]
+fn failed_conflict_trial_restores_motion_factors_states_and_admission() -> Result<()> {
+    let (mut estimator, first, second, heading) = conflict_fixture()?;
+    let before = estimator.solve_with_heading(Some(&heading));
+    let records = estimator.history.records.len();
+    let factors = estimator.kinematic_factors.len();
+    let factor_handles = estimator.kinematic_factors.clone();
+    let cursor = estimator.history.latest_kinematic_time;
+    let anchor_time = estimator
+        .latest_visual_frame
+        .as_ref()
+        .map(|frame| frame.time);
+    let controls = estimator
+        .controls
+        .iter()
+        .map(|(&index, &key)| Ok((index, estimator.graph.get(key)?.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    let budget = estimator.parameters.solver.max_iterations;
+    estimator.parameters.solver.max_iterations = 1;
+    assert!(matches!(
+        estimator.recover_conflict(first.clone(), second.clone(), &heading)?,
+        ConflictRecovery::Rejected
+    ));
+    assert_eq!(estimator.history.records.len(), records);
+    assert_eq!(estimator.kinematic_factors.len(), factors);
+    for (_, factor) in factor_handles.values() {
+        let cost = match factor {
+            kinematic_odometry::KinematicFactor::Same(key) => estimator.graph.factor_cost(*key)?,
+            kinematic_odometry::KinematicFactor::Adjacent(key) => {
+                estimator.graph.factor_cost(*key)?
+            }
+        };
+        assert!(
+            cost.is_finite(),
+            "rollback must restore the original factor identities"
+        );
+    }
+    assert_eq!(estimator.history.latest_kinematic_time, cursor);
+    assert_eq!(
+        estimator
+            .latest_visual_frame
+            .as_ref()
+            .map(|frame| frame.time),
+        anchor_time
+    );
+    assert!(estimator.pending_visuals.is_empty());
+    for (index, control) in controls {
+        assert_eq!(
+            estimator.graph.get(estimator.controls[&index])?.pose,
+            control.pose
+        );
+    }
+    estimator.parameters.solver.max_iterations = budget;
+    let after = estimator.solve_with_heading(Some(&heading));
+    assert!(after.estimate.is_some());
+    assert_eq!(
+        before.diagnostics.measurement_count,
+        after.diagnostics.measurement_count
+    );
+    let (Some(before_cost), Some(after_cost)) =
+        (before.diagnostics.final_cost, after.diagnostics.final_cost)
+    else {
+        return Err(eyre!("missing solved cost"));
+    };
+    assert!((before_cost - after_cost).abs() < 1e-8);
+    let imu_and_vo = estimator
+        .history
+        .records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                recovery::MotionRecord::Imu { .. } | recovery::MotionRecord::Visual { .. }
+            )
+        })
+        .count();
+    assert!(
+        matches!(
+            estimator.recover_conflict(first, second, &heading)?,
+            ConflictRecovery::Recovered(_)
+        ),
+        "restored factors must support a later successful trial"
+    );
+    assert!(estimator.kinematic_factors.len() < factors);
+    assert_eq!(
+        estimator
+            .history
+            .records
+            .iter()
+            .filter(|record| matches!(
+                record,
+                recovery::MotionRecord::Imu { .. } | recovery::MotionRecord::Visual { .. }
+            ))
+            .count(),
+        imu_and_vo
+    );
+    Ok(())
+}
+
 #[test]
 fn startup_replaces_drifted_height_prior_with_landmark_fit() {
     use types::visual_localization::FieldMarkAssociation;
