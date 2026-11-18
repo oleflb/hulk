@@ -1123,4 +1123,125 @@ mod supported_leg_tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn stopped_leg_stream_expires_despite_accepted_images_before_retirement() -> Result<()> {
+        let (mut estimator, heading) = super::super::tests::bootstrap_fixture()?;
+        let solved = estimator.solve_with_heading(Some(&heading));
+        assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+        estimator.parameters.accelerometer = Some(Default::default());
+        let template = estimator
+            .latest_visual_frame
+            .clone()
+            .ok_or_else(|| eyre!("missing image"))?;
+        let start = estimator.latest_time;
+        let pending_deadline = start + estimator.parameters.timing.trajectory_spacing * 6;
+        estimator.supported_legs = Some(SupportedLegs {
+            visual_time: start,
+            pending: Vec::new(),
+        });
+        let attitude = UnitQuaternion::from_euler_angles(0.1, -0.05, 2.0);
+        let mut accepted_images = 0;
+        for index in 1..=1601 {
+            let time = start + Duration::from_millis(index * 2);
+            estimator.ingest_imu(
+                time,
+                booster::ImuState {
+                    roll_pitch_yaw: linear_algebra::vector![0.1, -0.05, 2.0],
+                    linear_acceleration: Vector3::wrap(
+                        (attitude.inverse() * nalgebra::vector![0.0, 0.0, 9.81]).cast(),
+                    ),
+                    ..Default::default()
+                },
+            )?;
+            if index == 25 {
+                assert!(estimator.ingest_kinematic_odometry(leg(start, time))?);
+                assert!(!estimator.kinematic_factors.contains_key(&start));
+            }
+            if index % 50 == 13 {
+                let mut image = template.clone();
+                image.time = time - Duration::from_millis(1);
+                assert!(estimator.ingest_visual(image)?);
+            }
+            if index % 25 == 1 {
+                let had_image = !estimator.pending_visuals.is_empty();
+                let solved = estimator.solve_with_heading(Some(&heading));
+                assert!(
+                    solved.estimate.is_some() && !solved.visual_rejected,
+                    "{:?}",
+                    solved.diagnostics
+                );
+                accepted_images += usize::from(had_image);
+                if time > pending_deadline
+                    && time.duration_since(pending_deadline) <= Duration::from_millis(50)
+                {
+                    assert!(
+                        !estimator.has_supported_leg_admission(),
+                        "fresh images must not keep an old short leg batch pending"
+                    );
+                    assert!(estimator.kinematic_factors.contains_key(&start));
+                }
+            }
+        }
+        assert!(accepted_images >= 30);
+        assert!(
+            !estimator.kinematic_factors.contains_key(&start),
+            "the restored interval should now be retired"
+        );
+        let end = estimator.latest_time;
+        assert!(estimator.ingest_kinematic_odometry(leg(end - Duration::from_millis(50), end))?);
+        let solved = estimator.solve_with_heading(Some(&heading));
+        assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
+        assert!(
+            estimator
+                .kinematic_factors
+                .contains_key(&(end - Duration::from_millis(50)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_readmission_restores_states_before_the_independent_solve() -> Result<()> {
+        let mut estimator = supported_estimator();
+        estimator.supported_legs = None;
+        let origin = estimator.origin;
+        for milliseconds in (0..=702).step_by(2) {
+            estimator.ingest_imu(
+                origin + Duration::from_millis(milliseconds),
+                booster::ImuState {
+                    linear_acceleration: linear_algebra::vector![0.0, 0.0, 9.81],
+                    ..Default::default()
+                },
+            )?;
+        }
+        assert!(estimator.solve_motion().estimate.is_some());
+        let start = origin + Duration::from_millis(600);
+        estimator.supported_legs = Some(SupportedLegs {
+            visual_time: start,
+            pending: Vec::new(),
+        });
+        let mut sample = leg(start, origin + Duration::from_millis(700));
+        sample.current_to_previous.inner.translation.x = 0.5;
+        assert!(estimator.ingest_kinematic_odometry(sample)?);
+        let controls = estimator
+            .controls
+            .values()
+            .map(|&key| Ok((key, estimator.graph.get(key)?.clone())))
+            .collect::<Result<Vec<_>>>()?;
+        estimator.parameters.solver.max_iterations = 1;
+        let heading = HeadingReference::new(
+            origin,
+            linear_algebra::Orientation2::new(0.0),
+            Orientation3::from_euler_angles(0.0, 0.0, 0.0),
+        );
+        // Missing field heading forces readmission after the independent local solve.
+        let solved = estimator.solve_with_heading(Some(&heading));
+        assert!(solved.estimate.is_none());
+        assert!(!estimator.has_supported_leg_admission());
+        assert_eq!(estimator.kinematic_factors.len(), 1);
+        for (key, value) in controls {
+            assert_eq!(estimator.graph.get(key)?.pose, value.pose);
+        }
+        Ok(())
+    }
 }
