@@ -28,6 +28,7 @@ where
     backend: Arc<RobotBackend>,
     layer: Option<T>,
     frame: PhantomData<Frame>,
+    error: Option<String>,
 }
 
 impl<T, Frame> EnabledLayer<T, Frame>
@@ -49,12 +50,14 @@ where
             backend,
             layer,
             frame: PhantomData,
+            error: None,
         }
     }
 
     pub fn checkbox(&mut self, ui: &mut Ui) {
         let mut active = self.layer.is_some();
         if ui.checkbox(&mut active, T::NAME).changed() {
+            self.error = None;
             match self.layer.is_some() {
                 false => self.layer = Some(T::new(self.backend.clone())),
                 true => self.layer = None,
@@ -62,20 +65,22 @@ where
         }
     }
 
-    pub fn paint_or_disable(
-        &mut self,
-        painter: &TwixPainter<Frame>,
-        field_dimensions: &FieldDimensions,
-    ) {
-        if let Some(layer) = &self.layer
-            && let Err(error) = layer.paint(painter, field_dimensions)
-        {
-            error!(
-                "map panel: failed to paint map overlay {}: {:#}",
-                T::NAME,
-                error
-            );
-            self.layer = None;
+    pub fn paint(&mut self, painter: &TwixPainter<Frame>, field_dimensions: &FieldDimensions) {
+        if let Some(layer) = &self.layer {
+            let error = layer
+                .paint(painter, field_dimensions)
+                .err()
+                .map(|error| format!("{error:#}"));
+            if self.error != error {
+                if let Some(error) = &error {
+                    error!(
+                        "map panel: failed to paint map overlay {}: {}",
+                        T::NAME,
+                        error
+                    );
+                }
+                self.error = error;
+            }
         }
     }
 
