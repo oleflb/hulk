@@ -1,5 +1,7 @@
 //! Replay current association/localization with recorded solve times and resets.
 //! Usage: relocalization_replay recording.mcap
+mod replay;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -29,9 +31,11 @@ use ros_z::{
 };
 use types::{
     camera_geometry::{CameraGeometry, interpolate_camera_geometry},
+    fall_detection::FallDetection,
     field_dimensions::FieldDimensions,
     localization::{LocalizationEstimate, LocalizationStatus},
     object_detection::{Object, RobocupObjectLabel},
+    odometry::{KINEMATIC_ODOMETRY_TOPIC, KinematicOdometryDelta},
     time_wrapper::TimeWrapper,
     visual_localization::VisualLocalizationFrame,
     visual_odometry::VisualOdometer,
@@ -60,7 +64,13 @@ fn require_topics(seen: &BTreeSet<String>) -> Result<()> {
     Ok(())
 }
 
+fn decode<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
+    Ok(SerdeCdrCodec::<T>::deserialize(data)?)
+}
+
 enum Event {
+    KinematicDelta(KinematicOdometryDelta),
+    Fall(FallDetection),
     Imu(Time, ImuState),
     Feet(Box<TimeWrapper<RobotKinematics>>),
     Camera(TimeWrapper<CameraGeometry>),
@@ -70,6 +80,7 @@ enum Event {
     Solve,
 }
 enum Measurement {
+    KinematicDelta(KinematicOdometryDelta),
     Imu(Time, ImuState),
     Feet(Box<TimeWrapper<RobotKinematics>>),
     Vo(VisualOdometer),
@@ -78,6 +89,7 @@ enum Measurement {
 impl Measurement {
     fn time(&self) -> Time {
         match self {
+            Self::KinematicDelta(v) => v.time,
             Self::Imu(t, _) => *t,
             Self::Feet(v) => v.time,
             Self::Vo(v) => v.time,
@@ -181,8 +193,10 @@ fn main() -> Result<()> {
                         .get(&header.channel_id)
                         .ok_or_else(|| eyre!("unknown MCAP channel {}", header.channel_id))?;
                     let event = match topic.as_str() {
+                        KINEMATIC_ODOMETRY_TOPIC => Some(Event::KinematicDelta(decode(&data)?)),
+                        "fall_detection/status" => Some(Event::Fall(decode(&data)?)),
                         "field_dimensions" => {
-                            let dimensions = SerdeCdrCodec::<FieldDimensions>::deserialize(&data)?;
+                            let dimensions: FieldDimensions = decode(&data)?;
                             ensure!(
                                 field
                                     .as_ref()
@@ -193,32 +207,16 @@ fn main() -> Result<()> {
                             None
                         }
                         "inputs/low_state" => Some(Event::Imu(
-                            Time::from_nanos(header.publish_time as i64),
-                            SerdeCdrCodec::<LowState>::deserialize(&data)?.imu_state,
+                            Time::from_nanos(i64::try_from(header.publish_time)?),
+                            decode::<LowState>(&data)?.imu_state,
                         )),
-                        "robot_kinematics" => Some(Event::Feet(Box::new(SerdeCdrCodec::<
-                            TimeWrapper<RobotKinematics>,
-                        >::deserialize(
-                            &data
-                        )?))),
-                        "camera_geometry" => {
-                            Some(Event::Camera(
-                                SerdeCdrCodec::<TimeWrapper<CameraGeometry>>::deserialize(&data)?,
-                            ))
+                        "robot_kinematics" => Some(Event::Feet(Box::new(decode(&data)?))),
+                        "camera_geometry" => Some(Event::Camera(decode(&data)?)),
+                        "visual_odometry/current_left_camera_to_visual_odometer" => {
+                            Some(Event::Vo(decode(&data)?))
                         }
-                        "visual_odometry/current_left_camera_to_visual_odometer" => Some(
-                            Event::Vo(SerdeCdrCodec::<VisualOdometer>::deserialize(&data)?),
-                        ),
-                        "detected_objects" => Some(Event::Objects(SerdeCdrCodec::<
-                            TimeWrapper<Vec<Object<RobocupObjectLabel>>>,
-                        >::deserialize(
-                            &data
-                        )?)),
-                        "localization/status" => {
-                            Some(Event::Reset(
-                                SerdeCdrCodec::<LocalizationStatus>::deserialize(&data)?,
-                            ))
-                        }
+                        "detected_objects" => Some(Event::Objects(decode(&data)?)),
+                        "localization/status" => Some(Event::Reset(decode(&data)?)),
                         "debug/solve_diagnostics" => Some(Event::Solve),
                         _ => continue,
                     };
@@ -232,6 +230,14 @@ fn main() -> Result<()> {
         }
     }
     require_topics(&seen)?;
+    let reconstruct_odometry = !seen.contains(KINEMATIC_ODOMETRY_TOPIC);
+    ensure!(
+        !reconstruct_odometry || seen.contains("fall_detection/status"),
+        "kinematic replay incomplete: no odometry/kinematic_delta and no fall_detection/status for reconstruction"
+    );
+    let mut odometry = replay::odometry::OdometryReplay::new()?;
+    let mut kinematic_deltas = 0;
+    let mut admitted_kinematic_deltas = 0;
     let field = field.ok_or_else(|| eyre!("missing field_dimensions"))?;
     events.sort_by_key(|e| e.0);
     let parameters: Localization3dParameters = json5::from_str(include_str!(
@@ -261,8 +267,13 @@ fn main() -> Result<()> {
     let mut lifecycle = Vec::new();
     let started = Instant::now();
     for (delivery, event) in events {
-        let now = Time::from_nanos(delivery as i64);
+        let now = Time::from_nanos(i64::try_from(delivery)?);
         match event {
+            Event::Fall(fall) => odometry.falls.insert(now, fall),
+            Event::KinematicDelta(delta) => {
+                kinematic_deltas += 1;
+                pending.push(Measurement::KinematicDelta(delta));
+            }
             Event::Reset(s) => {
                 if reset
                     .as_ref()
@@ -279,11 +290,18 @@ fn main() -> Result<()> {
                 cameras.retain(|t, _| t.saturating_add(Duration::from_secs(4)) >= now);
             }
             Event::Feet(f) => {
+                if reconstruct_odometry {
+                    odometry.feet.insert(f.time, (*f).clone());
+                }
                 feet.insert(f.time, (*f).clone());
                 feet.retain(|t, _| t.saturating_add(Duration::from_secs(4)) >= now);
                 pending.push(Measurement::Feet(f));
             }
             Event::Imu(t, imu) => {
+                if reconstruct_odometry && let Some(delta) = odometry.update(t, now, imu) {
+                    kinematic_deltas += 1;
+                    pending.push(Measurement::KinematicDelta(delta));
+                }
                 let rpy = imu.roll_pitch_yaw.inner;
                 if let Some(attitude) = exposure_attitude(rpy.x, rpy.y, rpy.z) {
                     attitudes.insert(
@@ -406,6 +424,10 @@ fn main() -> Result<()> {
                         }
                     };
                     match m {
+                        Measurement::KinematicDelta(delta) => {
+                            admitted_kinematic_deltas +=
+                                usize::from(l.ingest_kinematic_odometry(delta)?);
+                        }
                         Measurement::Imu(t, imu) => {
                             l.ingest_imu(t, imu)?;
                         }
@@ -457,6 +479,26 @@ fn main() -> Result<()> {
         }
     }
     ensure!(!output.is_empty(), "replay produced no estimates");
+    ensure!(
+        admitted_kinematic_deltas > 0,
+        "kinematic replay incomplete: {kinematic_deltas} deltas available, none admitted"
+    );
+    let kinematic_audit = serde_json::json!({
+        "source": if reconstruct_odometry { "reconstructed" } else { "recorded" },
+        "available_deltas": kinematic_deltas,
+        "admitted_deltas": admitted_kinematic_deltas,
+        "missing_aligned_input_updates": odometry.missing_aligned_inputs,
+        "incomplete_reconstruction_inputs": reconstruct_odometry && odometry.missing_aligned_inputs > 0,
+        "reconstruction_limitation": reconstruct_odometry.then_some(
+            "Current base odometry parameters; LowState IMU and recorder delivery order approximate live subscriber scheduling. Missing/stale inputs break delta continuity."
+        ),
+    });
+    if reconstruct_odometry && odometry.missing_aligned_inputs > 0 {
+        eprintln!(
+            "Kinematic reconstruction has {} missing/stale aligned input updates; those intervals are not fused. See kinematic_odometry in the JSON report and comparison/replay MCAP metadata.",
+            odometry.missing_aligned_inputs
+        );
+    }
     let field_estimates: Vec<_> = output
         .iter()
         .filter_map(|(estimate, _)| estimate.robot_to_field.map(|pose| (estimate, pose)))
@@ -477,6 +519,7 @@ fn main() -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "field_dimensions": field, "wall_s": started.elapsed().as_secs_f64(),
+            "kinematic_odometry": kinematic_audit,
             "initialization_not_ready": initialization_not_ready,
             "invalid_initializations": invalid_initializations,
             "detection_camera_unavailable": detection_camera_unavailable,
