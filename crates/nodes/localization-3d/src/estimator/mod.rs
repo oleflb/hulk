@@ -21,7 +21,7 @@ use types::{
     visual_localization::VisualLocalizationFrame,
 };
 
-use crate::parameters::Localization3dParameters;
+use crate::{localization::Lifecycle, parameters::Localization3dParameters};
 pub(crate) use solve::SolveResult;
 
 mod attitude;
@@ -69,30 +69,34 @@ fagra::factors! {
 
 type Graph = Problem<States, Factors>;
 
-pub(crate) struct Estimator {
+/// Owns optimization and accepted lifecycle for live and deterministic replay.
+pub struct Localization {
     graph: Graph,
     optimizer: LevenbergMarquardt<DenseNormalCholesky>,
     origin: Time,
-    epoch: u64,
-    generation: u64,
+    pub(super) epoch: u64,
+    pub(super) generation: u64,
     controls: BTreeMap<i64, StateKey<PoseControl<f64>>>,
     biases: BTreeMap<i64, StateKey<ImuBias>>,
     preintegration: preintegration::ImuIntervals,
     segment_factors: BTreeMap<i64, window::SegmentFactors>,
     alignment: Option<StateKey<FieldAlignment<f64>>>,
     intrinsics: StateKey<CameraIntrinsics<f64>>,
-    latest_time: Time,
+    pub(super) latest_time: Time,
     last_converged_time: Option<Time>,
     recovery_seed: Option<(Time, nalgebra::Isometry3<f64>)>,
     latest_visual_frame: Option<TimeWrapper<VisualLocalizationFrame>>,
     pending_visuals: Vec<vision::PendingVisual>,
-    parameters: Localization3dParameters,
+    pub(super) parameters: Localization3dParameters,
+    pub(super) lifecycle: Lifecycle,
     field_half_extents: Vector2<Field, f64>,
     history: recovery::MotionHistory,
 }
 
-impl Estimator {
-    pub(crate) fn new(
+pub(crate) type Estimator = Localization;
+
+impl Localization {
+    pub(super) fn new_motion(
         origin: Time,
         epoch: u64,
         initial_pose: Isometry3<Robot, Local>,
@@ -175,6 +179,7 @@ impl Estimator {
             parameters,
             field_half_extents,
             history: recovery::MotionHistory::new(origin),
+            lifecycle: Lifecycle::new(origin),
         })
     }
 
@@ -216,10 +221,6 @@ impl Estimator {
         self.latest_time
     }
 
-    pub(super) fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -236,6 +237,10 @@ impl Estimator {
             .last_key_value()
             .map_or(0, |(&index, _)| index - 1);
         start..end
+    }
+
+    pub fn set_parameters(&mut self, parameters: &Localization3dParameters) -> Result<()> {
+        self.update_parameters(parameters.clone())
     }
 
     pub(crate) fn update_parameters(&mut self, parameters: Localization3dParameters) -> Result<()> {

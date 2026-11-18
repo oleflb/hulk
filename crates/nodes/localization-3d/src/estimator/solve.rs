@@ -85,7 +85,7 @@ impl Estimator {
     }
 
     #[cfg(test)]
-    pub(crate) fn solve(&mut self) -> SolveResult {
+    pub(crate) fn solve_motion(&mut self) -> SolveResult {
         self.solve_with_heading(None)
     }
 

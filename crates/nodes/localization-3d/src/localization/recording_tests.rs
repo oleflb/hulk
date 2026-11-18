@@ -1,5 +1,6 @@
 //! Source-time fixtures from the real flip; see recovered_frames.json for provenance.
 use super::*;
+use booster::ImuState;
 use coordinate_systems::{Camera, Field, Ground, ImuReference, Local, Robot};
 use field_mark_association::{
     DetectedVisualFeature, DetectedVisualFeatures, GlobalAssociationInput,

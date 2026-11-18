@@ -1,11 +1,14 @@
 use super::*;
+use booster::ImuState;
+use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::{IntoTransform, Vector3, point, vector};
 use nalgebra::{Translation3, UnitQuaternion};
 use projection::intrinsic::Intrinsic;
 use std::time::Duration;
 use types::{
-    odometry::KinematicOdometryDelta, visual_localization::FieldMarkAssociation,
-    visual_odometry::VisualOdometryDelta,
+    odometry::KinematicOdometryDelta,
+    visual_localization::FieldMarkAssociation,
+    visual_odometry::{VisualOdometer, VisualOdometryDelta},
 };
 
 fn camera() -> CameraGeometry {
@@ -259,7 +262,7 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
                 .unwrap()
         );
         assert_eq!(localization.lifecycle.state, LocalizationState::LostTrack);
-        assert_eq!(localization.estimator.latest_time(), before.time);
+        assert_eq!(localization.latest_time(), before.time);
         assert_eq!(localization.status().generation, before.generation);
         ingest_motion(&mut localization, 361, with_vo);
         let now = Time::from_nanos(4_610_000_000);
@@ -305,7 +308,7 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
             ingest_motion(&mut localization, index, with_vo);
         }
         let mut tracking = frame(3.7, false);
-        tracking.inner.generation = localization.estimator.generation();
+        tracking.inner.generation = localization.generation();
         tracking.inner.source = VisualAssociationSource::Tracking;
         assert!(
             localization
@@ -484,7 +487,7 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
         ingest_motion(&mut localization, index, false);
     }
     let mut wrong = frame(3.7, true);
-    wrong.inner.generation = localization.estimator.generation();
+    wrong.inner.generation = localization.generation();
     wrong.inner.source = VisualAssociationSource::Tracking;
     assert!(
         localization

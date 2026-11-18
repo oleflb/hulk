@@ -1,12 +1,9 @@
 use color_eyre::{Result, eyre::eyre};
 
 use crate::{
-    diagnostics::SolveDiagnostics, estimator::Estimator, heading::HeadingReference,
-    parameters::Localization3dParameters,
+    diagnostics::SolveDiagnostics, heading::HeadingReference, parameters::Localization3dParameters,
 };
-use booster::ImuState;
 use coordinate_systems::{Local, Robot};
-use kinematics::robot_kinematics::RobotKinematics;
 use linear_algebra::Isometry3;
 use ros_z::time::Time;
 use types::camera_geometry::CameraGeometry;
@@ -15,7 +12,6 @@ use types::{
     localization::{LocalizationEstimate, LocalizationState, LocalizationStatus},
     time_wrapper::TimeWrapper,
     visual_localization::{VisualAssociationSource, VisualLocalizationFrame},
-    visual_odometry::VisualOdometer,
 };
 
 pub struct SolveOutput {
@@ -53,18 +49,11 @@ impl Lifecycle {
     }
 }
 
-/// Owns the graph and accepted lifecycle. The ROSZ node and deterministic runner
-/// use the same operations; neither maintains another pending-measurement queue.
-pub struct Localization {
-    estimator: Estimator,
-    parameters: Localization3dParameters,
-    lifecycle: Lifecycle,
-}
+pub use crate::estimator::Localization;
 
 impl Localization {
     pub(crate) fn has_measurement_gap(&self, time: Time) -> bool {
         time > self
-            .estimator
             .latest_time()
             .saturating_add(self.parameters.timing.optimization_window)
     }
@@ -86,18 +75,14 @@ impl Localization {
         {
             return Err(eyre!("invalid localization initialization geometry"));
         }
-        Ok(Self {
-            estimator: Estimator::new(
-                time,
-                epoch,
-                initial_pose,
-                &camera.intrinsics,
-                parameters.clone(),
-                field,
-            )?,
-            parameters: parameters.clone(),
-            lifecycle: Lifecycle::new(time),
-        })
+        Self::new_motion(
+            time,
+            epoch,
+            initial_pose,
+            &camera.intrinsics,
+            parameters.clone(),
+            field,
+        )
     }
 
     pub fn status(&self) -> LocalizationStatus {
@@ -107,20 +92,11 @@ impl Localization {
                 .heading_reference
                 .map(|heading| heading.snapshot(self.parameters.max_heading_error)),
             time: self.lifecycle.time,
-            epoch: self.estimator.epoch(),
-            generation: self.estimator.generation(),
+            epoch: self.epoch,
+            generation: self.generation,
             state: self.lifecycle.state,
         }
     }
-    pub fn set_parameters(&mut self, parameters: &Localization3dParameters) -> Result<()> {
-        self.parameters
-            .validate_update(parameters)
-            .map_err(|message| eyre!(message))?;
-        self.estimator.update_parameters(parameters.clone())?;
-        self.parameters = parameters.clone();
-        Ok(())
-    }
-
     pub(crate) fn max_camera_gap(&self) -> std::time::Duration {
         self.parameters.timing.max_camera_gap
     }
@@ -151,38 +127,13 @@ impl Localization {
         }
     }
 
-    pub fn ingest_imu(&mut self, time: Time, imu: ImuState) -> Result<bool> {
-        self.estimator.ingest_imu(time, imu)
-    }
-
-    pub fn ingest_kinematics(&mut self, sample: TimeWrapper<RobotKinematics>) -> Result<bool> {
-        self.estimator.ingest_kinematics(sample)
-    }
-
-    pub fn ingest_kinematic_odometry(
-        &mut self,
-        sample: types::odometry::KinematicOdometryDelta,
-    ) -> Result<bool> {
-        self.estimator.ingest_kinematic_odometry(sample)
-    }
-
-    pub fn ingest_visual_odometry(
-        &mut self,
-        sample: VisualOdometer,
-        previous: Option<&CameraGeometry>,
-        current: Option<&CameraGeometry>,
-    ) -> Result<bool> {
-        self.estimator
-            .ingest_visual_odometry(sample, previous, current)
-    }
-
     pub fn ingest_visual_localization_frame(
         &mut self,
         frame: TimeWrapper<VisualLocalizationFrame>,
     ) -> Result<bool> {
         let time = frame.time;
-        if frame.inner.epoch != self.estimator.epoch()
-            || frame.inner.generation != self.estimator.generation()
+        if frame.inner.epoch != self.epoch
+            || frame.inner.generation != self.generation
             || self
                 .lifecycle
                 .latest_visual
@@ -211,7 +162,7 @@ impl Localization {
             self.lifecycle.pending_bootstrap = Some(frame);
             return Ok(true);
         }
-        let inserted = self.estimator.ingest_visual(frame)?;
+        let inserted = self.ingest_visual(frame)?;
         if inserted {
             self.lifecycle.pending_visual = Some(
                 self.lifecycle
@@ -227,9 +178,8 @@ impl Localization {
         self.advance_time(now);
         // Incorporate this batch's motion before carrying its trajectory/velocity
         // into a bootstrap candidate, especially during moving startup.
-        let solved = self
-            .estimator
-            .solve_with_heading(self.lifecycle.heading_reference.as_ref());
+        let heading = self.lifecycle.heading_reference;
+        let solved = self.solve_with_heading(heading.as_ref());
         if solved.visual_rejected {
             self.lifecycle.pending_visual = None;
         }
@@ -253,17 +203,15 @@ impl Localization {
             // optimized frame agrees with its actual pixel observations.
             let field_valid = estimate.robot_to_field.is_some()
                 && crate::alignment::valid_visual_rms(
-                    self.estimator.accepted_visual_rms(),
+                    self.accepted_visual_rms(),
                     &self.parameters.visual,
                 )
-                && visual_time.is_some_and(|time| self.estimator.attitude_at(time).is_some());
+                && visual_time.is_some_and(|time| self.attitude_at(time).is_some());
             if solved.converged && visual_valid && field_valid {
                 let continuing_tracking = self.lifecycle.state == LocalizationState::Tracking;
                 if let Some(time) = self.lifecycle.pending_visual
-                    && let Some((field, imu)) = self
-                        .estimator
-                        .field_heading_at(time)
-                        .zip(self.estimator.attitude_at(time))
+                    && let Some((field, imu)) =
+                        self.field_heading_at(time).zip(self.attitude_at(time))
                 {
                     match self.lifecycle.heading_reference.as_mut() {
                         None => {
@@ -323,34 +271,32 @@ impl Localization {
         }
         // Source streams arrive independently. Keep the newest recovery image until
         // its IMU bracket is available (or the normal freshness limit expires).
-        self.estimator.attitude_at(frame.time)?;
+        self.attitude_at(frame.time)?;
         let frame = self.lifecycle.pending_bootstrap.take()?;
         let time = frame.time;
+        let heading = self.lifecycle.heading_reference;
         if self.lifecycle.state != LocalizationState::Startup
-            && let Some(heading) = self.lifecycle.heading_reference.as_ref()
+            && let Some(heading) = heading.as_ref()
         {
             if !self
-                .estimator
                 .ingest_recovery(frame, heading)
                 .inspect_err(|error| tracing::warn!(%error, "discarding recovery observations"))
                 .ok()?
             {
                 return None;
             }
-            let solved = self.estimator.solve_with_heading(Some(heading));
+            let solved = self.solve_with_heading(Some(heading));
             if !solved.visual_rejected && solved.converged {
                 self.lifecycle.pending_visual = Some(time);
             }
             return Some(solved);
         }
-        let candidate = self
-            .estimator
-            .bootstrap_candidate(frame, self.lifecycle.heading_reference.as_ref());
-        let predicted_height = self.estimator.height_prediction(time);
+        let candidate = self.bootstrap_candidate(frame, heading.as_ref());
+        let predicted_height = self.height_prediction(time);
         let mut candidate = candidate
             .inspect_err(|error| tracing::warn!(%error, "discarding recovery candidate"))
             .ok()??;
-        let solved = candidate.solve_with_heading(self.lifecycle.heading_reference.as_ref());
+        let solved = candidate.solve_with_heading(heading.as_ref());
         if !solved.converged
             || solved
                 .estimate
@@ -376,7 +322,8 @@ impl Localization {
             }
         }
         // Publish only the validated graph, evaluated through the latest motion sample.
-        self.estimator = candidate;
+        candidate.lifecycle = std::mem::replace(&mut self.lifecycle, Lifecycle::new(now));
+        *self = candidate;
         self.lifecycle.pending_visual = Some(time);
         Some(solved)
     }
