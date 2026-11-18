@@ -458,27 +458,14 @@ fn image_time(record: &SampleRecord<RosImage>) -> Time {
 pub struct Map3DPanel {
     settings: Settings,
     widget: Option<BevyWidget>,
-    observations: Result<Observations, String>,
+    observations: Result<FrameObservations, String>,
 }
 
 impl Panel for Map3DPanel {
     fn is_querying(&self) -> bool {
-        self.observations.as_ref().is_ok_and(|observations| {
-            observations.dimensions.is_querying()
-                || observations.localization.is_querying()
-                || observations.localization_status.is_querying()
-                || observations.kinematics.is_querying()
-                || observations.matrix.is_querying()
-                || observations.ball.is_querying()
-                || observations
-                    .images
-                    .as_ref()
-                    .is_some_and(Observation::is_querying)
-                || observations
-                    .associations
-                    .as_ref()
-                    .is_some_and(Observation::is_querying)
-        })
+        self.observations
+            .as_ref()
+            .is_ok_and(|observations| observations.frame.is_querying())
     }
 
     const STORAGE_ID: &'static str = "map_3d";
@@ -490,7 +477,8 @@ impl Panel for Map3DPanel {
             .value
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default();
-        let observations = Observations::new(&context).map_err(|error| error.to_string());
+        let observations =
+            FrameObservations::new(&context, &settings).map_err(|error| error.to_string());
         let widget = context.render_state.clone().map(|render_state| {
             let mut widget = BevyWidget::new(render_state);
             widget
@@ -541,37 +529,49 @@ impl Panel for Map3DPanel {
         serde_json::to_value(&self.settings).expect("settings serialize")
     }
 
-    fn ui(&mut self, ui: &mut Ui, context: PanelUiContext<'_>) {
-        ui.horizontal(|ui| {
-            ui.menu_button("Layers", |ui| {
-                ui.checkbox(&mut self.settings.field, "Field");
-                ui.checkbox(&mut self.settings.robot, "Robot");
-                ui.checkbox(&mut self.settings.camera, "Camera");
-                ui.checkbox(&mut self.settings.associations, "Associations");
-                ui.checkbox(&mut self.settings.ball, "Ball");
-            });
+    fn header_ui(&mut self, ui: &mut Ui, _context: PanelUiContext<'_>) {
+        ui.menu_button("Layers", |ui| {
+            ui.checkbox(&mut self.settings.field, "Field");
+            ui.checkbox(&mut self.settings.robot, "Robot");
+            ui.checkbox(&mut self.settings.camera, "Camera");
+            ui.checkbox(&mut self.settings.associations, "Associations");
+            ui.checkbox(&mut self.settings.ball, "Ball");
         });
+    }
+
+    fn ui(&mut self, ui: &mut Ui, context: PanelUiContext<'_>) {
         let Some(widget) = &mut self.widget else {
             ui.label("3D rendering requires the WGPU renderer.");
             return;
         };
-        let data = match &mut self.observations {
+        let binding_changed = self
+            .observations
+            .as_ref()
+            .is_ok_and(|observations| !observations.frame.is_bound(&context));
+        if binding_changed {
+            widget
+                .bevy_app
+                .world_mut()
+                .insert_resource(ViewerData::default());
+        }
+        if self.observations.as_ref().map_or(true, |observations| {
+            binding_changed || observations.settings != self.settings
+        }) {
+            self.observations =
+                FrameObservations::new(&context, &self.settings).map_err(|error| error.to_string());
+        }
+        let result = match &mut self.observations {
             Ok(observations) => {
-                if let Err(error) = observations.update_layers(&context, &self.settings) {
-                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                }
-                if observations.presentation_identity != context.backend.presentation_identity() {
-                    observations.presentation_identity = context.backend.presentation_identity();
-                    observations.last_anchor = None;
-                }
-                observations.snapshot(&context.backend.namespace(), &self.settings)
+                let mut data = widget.bevy_app.world_mut().resource_mut::<ViewerData>();
+                observations.frame.update(&mut *data, |frame| {
+                    ViewerData::from_frame(frame, &self.settings)
+                })
             }
-            Err(error) => {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                ViewerData::default()
-            }
+            Err(error) => Err(color_eyre::eyre::eyre!("{error}")),
         };
-        widget.bevy_app.world_mut().insert_resource(data);
+        if let Err(error) = result {
+            ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+        }
         widget
             .bevy_app
             .world_mut()
@@ -599,74 +599,161 @@ fn position_camera_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panels::map_observation::{commit, tests::sample};
+    use ros_z_debug::query::plan::State;
+    use types::localization::LocalizationState;
+    use types::localization::PoseEstimate;
 
-    #[test]
-    fn anchors_only_advance() {
-        let select = |images: &[i64], associations: &[i64], last: Option<i64>| {
-            select_anchor(
-                images.iter().copied().map(Time::from_nanos),
-                associations.iter().copied().map(Time::from_nanos),
-                last.map(Time::from_nanos),
-                &Settings {
-                    associations: true,
-                    ..default()
-                },
-            )
+    fn frame(time: i64, x: f64) -> Frame {
+        let estimate = LocalizationEstimate {
+            time: Time::from_nanos(time),
+            epoch: 1,
+            generation: 2,
+            robot_to_local: PoseEstimate {
+                pose: Isometry3::identity(),
+                covariance: default(),
+            },
+            robot_to_field: Some(PoseEstimate {
+                pose: Isometry3::wrap(nalgebra::Isometry3::translation(x, 0.0, 0.0)),
+                covariance: default(),
+            }),
         };
-        assert_eq!(select(&[10, 20], &[10], None), Some(Time::from_nanos(10)));
-        assert_eq!(
-            select(&[10, 20], &[10], Some(10)),
-            Some(Time::from_nanos(20))
-        );
-        assert_eq!(
-            select(&[10, 20], &[10], Some(20)),
-            Some(Time::from_nanos(20))
-        );
-        assert_eq!(select(&[20], &[20], Some(20)), Some(Time::from_nanos(20)));
-        assert_eq!(
-            select(&[15, 5, 10], &[10], Some(20)),
-            Some(Time::from_nanos(20))
-        );
-        assert_eq!(
-            select(&[], &[10, 30, 20], Some(20)),
-            Some(Time::from_nanos(30))
-        );
-        assert_eq!(select(&[], &[10], Some(20)), Some(Time::from_nanos(20)));
-        assert_eq!(select(&[], &[], Some(20)), Some(Time::from_nanos(20)));
-        assert_eq!(select(&[5], &[5], None), Some(Time::from_nanos(5)));
+        let status = LocalizationStatus {
+            time: estimate.time,
+            epoch: 1,
+            generation: 2,
+            state: LocalizationState::Tracking,
+            heading: None,
+        };
+        let ball = Some(BallState {
+            ball_in_field: linear_algebra::point![x as f32, 1.0],
+            ball_in_ground: linear_algebra::Point2::origin(),
+            ball_in_ground_velocity: linear_algebra::Vector2::zeros(),
+            last_seen_ball: std::time::UNIX_EPOCH,
+            field_side: types::field_dimensions::Side::Left,
+            source: types::world_state::BallSource::Own,
+        });
+        Frame {
+            primary: sample("/image", time as u64, time, &RosImage::default()),
+            inputs: vec![
+                State::Ready(vec![sample(
+                    "/dimensions",
+                    1,
+                    0,
+                    &FieldDimensions::SPL_2025,
+                )]),
+                State::Ready(vec![sample("/status", 2, time, &status)]),
+                State::Ready(vec![sample("/estimate", 3, time, &estimate)]),
+                State::Ready(vec![]),
+                State::Ready(vec![]),
+                State::Ready(vec![sample("/ball", 4, time, &ball)]),
+            ],
+        }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn expensive_observations_follow_layer_preferences() {
-        let context = PanelCreationContext {
-            backend: Arc::new(
-                crate::backend::RobotBackend::new(
-                    tokio::runtime::Handle::current(),
-                    None,
-                    "/".to_string(),
-                )
-                .await
-                .unwrap(),
-            ),
-            value: None,
-            egui_context: eframe::egui::Context::default(),
-            render_state: None,
+    #[test]
+    fn seeks_keep_the_entire_previous_scene_until_the_replacement_resolves() {
+        let settings = Settings::default();
+        let decode = |frame: &Frame| ViewerData::from_frame(frame, &settings);
+        let mut data = ViewerData::default();
+        commit(&mut data, State::Ready(Some(frame(100, 3.0))), decode).unwrap();
+        let previous_image = data.camera_frame.as_ref().unwrap().clone();
+        commit(&mut data, State::Pending, decode).unwrap();
+        assert_eq!(data.localization.unwrap().inner.translation.x, -3.0);
+        assert_eq!(data.ball.unwrap().ball_in_field.x(), 3.0);
+        assert!(Arc::ptr_eq(
+            &previous_image,
+            data.camera_frame.as_ref().unwrap()
+        ));
+        let mut incomplete = frame(10, 1.0);
+        incomplete.inputs[2] = State::Pending;
+        assert!(commit(&mut data, State::Ready(Some(incomplete)), decode).is_err());
+        assert_eq!(data.localization.unwrap().inner.translation.x, -3.0);
+        assert_eq!(data.ball.unwrap().ball_in_field.x(), 3.0);
+        assert!(Arc::ptr_eq(
+            &previous_image,
+            data.camera_frame.as_ref().unwrap()
+        ));
+        commit(&mut data, State::Ready(Some(frame(10, 1.0))), decode).unwrap();
+        assert_eq!(data.localization.unwrap().inner.translation.x, -1.0);
+        assert_eq!(data.ball.unwrap().ball_in_field.x(), 1.0);
+        assert_eq!(
+            data.camera_frame.as_ref().unwrap().effective_time,
+            Time::from_nanos(10)
+        );
+    }
+
+    #[test]
+    fn resolved_missing_pose_clears_it_instead_of_showing_the_origin() {
+        let settings = Settings::default();
+        let mut scene = frame(10, 1.0);
+        scene.inputs[2] = State::Ready(vec![]);
+        scene.inputs[5] = State::Ready(vec![sample("/ball", 4, 10, &None::<BallState>)]);
+        assert!(
+            ViewerData::from_frame(&scene, &settings)
+                .unwrap()
+                .ball
+                .is_none()
+        );
+        assert!(
+            ViewerData::from_frame(&scene, &settings)
+                .unwrap()
+                .localization
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn localization_interpolates_without_crossing_generations_or_missing_poses() {
+        let before = LocalizationEstimate {
+            time: Time::from_nanos(10),
+            epoch: 1,
+            generation: 2,
+            robot_to_local: PoseEstimate {
+                pose: Isometry3::identity(),
+                covariance: default(),
+            },
+            robot_to_field: Some(PoseEstimate {
+                pose: Isometry3::wrap(nalgebra::Isometry3::translation(1.0, 0.0, 0.0)),
+                covariance: default(),
+            }),
         };
-        let mut observations = Observations::new(&context).unwrap();
-        let mut settings = Settings {
-            camera: false,
-            associations: false,
-            ..default()
+        let mut after = LocalizationEstimate {
+            time: Time::from_nanos(20),
+            robot_to_field: before.robot_to_field.map(|mut field| {
+                field.pose.inner.translation.x = 3.0;
+                field
+            }),
+            ..before
         };
-        observations.update_layers(&context, &settings).unwrap();
-        assert!(observations.images.is_none() && observations.associations.is_none());
-        settings.camera = true;
-        settings.associations = true;
-        observations.update_layers(&context, &settings).unwrap();
-        assert!(observations.images.is_some() && observations.associations.is_some());
-        settings.camera = false;
-        settings.associations = false;
-        observations.update_layers(&context, &settings).unwrap();
-        assert!(observations.images.is_none() && observations.associations.is_none());
+        let at = |after: &LocalizationEstimate| {
+            localization_at(
+                [&before, after].into_iter(),
+                Time::from_nanos(15),
+                Some((1, 2)),
+            )
+        };
+        assert_eq!(at(&after).unwrap().inner.translation.x, -2.0);
+        after.generation = 3;
+        assert!(at(&after).is_none());
+        after.generation = 2;
+        after.robot_to_field = None;
+        assert!(at(&after).is_none());
+        after.robot_to_field = before.robot_to_field;
+        after.time = Time::from_nanos(3_000_000_010);
+        assert!(at(&after).is_none());
+    }
+
+    #[test]
+    fn old_layouts_drop_vo_and_default_to_showing_the_ball() {
+        let settings: Settings = serde_json::from_value(
+            serde_json::json!({"pose_source": "VisualOdometer", "robot": false}),
+        )
+        .unwrap();
+        assert!(!settings.robot);
+        assert!(settings.ball);
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.get("pose_source").is_none());
+        assert_eq!(saved["ball"], true);
     }
 }
