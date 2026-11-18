@@ -262,9 +262,9 @@ fn verify_recording(recording: Recording) {
             .unwrap();
             // This two-sample fixture has no prior field trajectory to recover.
             // Initialize with its recorded heading; continuity is tested with full motion history.
-            localization.status.state = LocalizationState::Startup;
-            localization.status.time = Time::from_nanos(recording.reference.time);
-            localization.heading_reference = Some(reference);
+            localization.lifecycle.state = LocalizationState::Startup;
+            localization.lifecycle.time = Time::from_nanos(recording.reference.time);
+            localization.lifecycle.heading_reference = Some(reference);
             for sample in &recorded.imu {
                 localization
                     .ingest_imu(
@@ -289,7 +289,7 @@ fn verify_recording(recording: Recording) {
                 .unwrap();
             let solved = localization.solve(Time::from_nanos(recorded.imu[1].time));
             assert_eq!(
-                localization.status.state,
+                localization.lifecycle.state,
                 LocalizationState::Tracking,
                 "frame {}: {:?}",
                 recorded.sequence,

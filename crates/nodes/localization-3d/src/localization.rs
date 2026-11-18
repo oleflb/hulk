@@ -28,17 +28,37 @@ mod recording_tests;
 #[cfg(test)]
 mod recovery_tests;
 
-/// Owns the graph and accepted lifecycle. The ROSZ node and deterministic runner
-/// use the same operations; neither maintains another pending-measurement queue.
-pub struct Localization {
-    estimator: Estimator,
-    parameters: Localization3dParameters,
-    status: LocalizationStatus,
+/// Survives validated startup graph replacement without copying graph state.
+pub(super) struct Lifecycle {
+    time: Time,
+    state: LocalizationState,
     latest_visual: Option<Time>,
     pending_visual: Option<Time>,
     last_solve: Option<Time>,
     heading_reference: Option<HeadingReference>,
     pending_bootstrap: Option<TimeWrapper<VisualLocalizationFrame>>,
+}
+
+impl Lifecycle {
+    pub(super) fn new(time: Time) -> Self {
+        Self {
+            time,
+            state: LocalizationState::Startup,
+            latest_visual: None,
+            pending_visual: None,
+            last_solve: None,
+            heading_reference: None,
+            pending_bootstrap: None,
+        }
+    }
+}
+
+/// Owns the graph and accepted lifecycle. The ROSZ node and deterministic runner
+/// use the same operations; neither maintains another pending-measurement queue.
+pub struct Localization {
+    estimator: Estimator,
+    parameters: Localization3dParameters,
+    lifecycle: Lifecycle,
 }
 
 impl Localization {
@@ -76,27 +96,20 @@ impl Localization {
                 field,
             )?,
             parameters: parameters.clone(),
-            status: LocalizationStatus {
-                time,
-                epoch,
-                generation: 0,
-                state: LocalizationState::Startup,
-                heading: None,
-            },
-            latest_visual: None,
-            pending_visual: None,
-            last_solve: None,
-            heading_reference: None,
-            pending_bootstrap: None,
+            lifecycle: Lifecycle::new(time),
         })
     }
 
     pub fn status(&self) -> LocalizationStatus {
         LocalizationStatus {
             heading: self
+                .lifecycle
                 .heading_reference
                 .map(|heading| heading.snapshot(self.parameters.max_heading_error)),
-            ..self.status
+            time: self.lifecycle.time,
+            epoch: self.estimator.epoch(),
+            generation: self.estimator.generation(),
+            state: self.lifecycle.state,
         }
     }
     pub fn set_parameters(&mut self, parameters: &Localization3dParameters) -> Result<()> {
@@ -113,14 +126,16 @@ impl Localization {
     }
 
     pub fn deadline(&self) -> Option<Time> {
-        if self.status.state != LocalizationState::Tracking {
+        if self.lifecycle.state != LocalizationState::Tracking {
             return None;
         }
         Some(
-            self.last_solve?
+            self.lifecycle
+                .last_solve?
                 .saturating_add(self.parameters.tracking_timeout)
                 .min(
-                    self.latest_visual?
+                    self.lifecycle
+                        .latest_visual?
                         .saturating_add(self.parameters.visual_tracking_timeout),
                 ),
         )
@@ -128,14 +143,11 @@ impl Localization {
 
     pub fn advance_time(&mut self, now: Time) {
         if self.deadline().is_some_and(|deadline| deadline <= now) {
-            if let Some(heading) = self.heading_reference.as_mut() {
+            if let Some(heading) = self.lifecycle.heading_reference.as_mut() {
                 heading.interrupt_tracking();
             }
-            self.status = LocalizationStatus {
-                time: now,
-                state: LocalizationState::LostTrack,
-                ..self.status
-            };
+            self.lifecycle.time = now;
+            self.lifecycle.state = LocalizationState::LostTrack;
         }
     }
 
@@ -169,34 +181,43 @@ impl Localization {
         frame: TimeWrapper<VisualLocalizationFrame>,
     ) -> Result<bool> {
         let time = frame.time;
-        if frame.inner.epoch != self.status.epoch
-            || frame.inner.generation != self.status.generation
-            || self.latest_visual.is_some_and(|accepted| time <= accepted)
+        if frame.inner.epoch != self.estimator.epoch()
+            || frame.inner.generation != self.estimator.generation()
+            || self
+                .lifecycle
+                .latest_visual
+                .is_some_and(|accepted| time <= accepted)
         {
             return Ok(false);
         }
         // Recovery requires evidence acquired after loss, not delayed pre-loss work.
-        if self.status.state == LocalizationState::LostTrack && time <= self.status.time {
+        if self.lifecycle.state == LocalizationState::LostTrack && time <= self.lifecycle.time {
             return Ok(false);
         }
-        if self.status.state == LocalizationState::Startup
+        if self.lifecycle.state == LocalizationState::Startup
             || frame.inner.source == VisualAssociationSource::Global
         {
-            if (self.status.state != LocalizationState::Startup && self.heading_reference.is_none())
+            if (self.lifecycle.state != LocalizationState::Startup
+                && self.lifecycle.heading_reference.is_none())
                 || !crate::alignment::valid_visual_frame(&frame.inner, &self.parameters.visual)
                 || self
+                    .lifecycle
                     .pending_bootstrap
                     .as_ref()
                     .is_some_and(|old| old.time >= time)
             {
                 return Ok(false);
             }
-            self.pending_bootstrap = Some(frame);
+            self.lifecycle.pending_bootstrap = Some(frame);
             return Ok(true);
         }
         let inserted = self.estimator.ingest_visual(frame)?;
         if inserted {
-            self.pending_visual = Some(self.pending_visual.map_or(time, |old| old.max(time)));
+            self.lifecycle.pending_visual = Some(
+                self.lifecycle
+                    .pending_visual
+                    .map_or(time, |old| old.max(time)),
+            );
         }
         Ok(inserted)
     }
@@ -208,22 +229,25 @@ impl Localization {
         // into a bootstrap candidate, especially during moving startup.
         let solved = self
             .estimator
-            .solve_with_heading(self.heading_reference.as_ref());
+            .solve_with_heading(self.lifecycle.heading_reference.as_ref());
         if solved.visual_rejected {
-            self.pending_visual = None;
+            self.lifecycle.pending_visual = None;
         }
         // Retain the motion-conditioned posterior through visual loss.
         // Global matches are observations, not permission to replace that history.
         let solved = self.try_bootstrap(now).unwrap_or(solved);
         if solved.estimate.is_none() {
-            self.pending_visual = None;
+            self.lifecycle.pending_visual = None;
         }
         let estimate = solved.estimate.map(|mut estimate| {
-            let visual_time = self.pending_visual.or(self.latest_visual);
+            let visual_time = self
+                .lifecycle
+                .pending_visual
+                .or(self.lifecycle.latest_visual);
             let visual_valid = visual_time.is_some_and(|time| {
                 time.saturating_add(self.parameters.visual_tracking_timeout) > now
-                    && (self.status.state != LocalizationState::LostTrack
-                        || time > self.status.time)
+                    && (self.lifecycle.state != LocalizationState::LostTrack
+                        || time > self.lifecycle.time)
             });
             // An initialization candidate is not field localization until the
             // optimized frame agrees with its actual pixel observations.
@@ -234,16 +258,17 @@ impl Localization {
                 )
                 && visual_time.is_some_and(|time| self.estimator.attitude_at(time).is_some());
             if solved.converged && visual_valid && field_valid {
-                let continuing_tracking = self.status.state == LocalizationState::Tracking;
-                if let Some(time) = self.pending_visual
+                let continuing_tracking = self.lifecycle.state == LocalizationState::Tracking;
+                if let Some(time) = self.lifecycle.pending_visual
                     && let Some((field, imu)) = self
                         .estimator
                         .field_heading_at(time)
                         .zip(self.estimator.attitude_at(time))
                 {
-                    match self.heading_reference.as_mut() {
+                    match self.lifecycle.heading_reference.as_mut() {
                         None => {
-                            self.heading_reference = Some(HeadingReference::new(time, field, imu))
+                            self.lifecycle.heading_reference =
+                                Some(HeadingReference::new(time, field, imu))
                         }
                         Some(reference) if continuing_tracking => reference.observe_tracking(
                             time,
@@ -254,21 +279,18 @@ impl Localization {
                         Some(reference) => reference.interrupt_tracking(),
                     }
                 }
-                self.latest_visual = visual_time;
-                self.pending_visual = None;
-                if self.status.state != LocalizationState::Tracking {
-                    self.status = LocalizationStatus {
-                        time: now,
-                        state: LocalizationState::Tracking,
-                        ..self.status
-                    };
+                self.lifecycle.latest_visual = visual_time;
+                self.lifecycle.pending_visual = None;
+                if self.lifecycle.state != LocalizationState::Tracking {
+                    self.lifecycle.time = now;
+                    self.lifecycle.state = LocalizationState::Tracking;
                 }
             }
-            if self.status.state == LocalizationState::Startup {
+            if self.lifecycle.state == LocalizationState::Startup {
                 estimate.robot_to_field = None;
             }
             if solved.converged {
-                self.last_solve = Some(estimate.time);
+                self.lifecycle.last_solve = Some(estimate.time);
             }
             estimate
         });
@@ -282,11 +304,13 @@ impl Localization {
     }
 
     fn try_bootstrap(&mut self, now: Time) -> Option<crate::estimator::SolveResult> {
-        let frame = self.pending_bootstrap.as_ref()?;
-        if (self.status.state == LocalizationState::LostTrack && frame.time <= self.status.time)
+        let frame = self.lifecycle.pending_bootstrap.as_ref()?;
+        if (self.lifecycle.state == LocalizationState::LostTrack
+            && frame.time <= self.lifecycle.time)
             || self
+                .lifecycle
                 .pending_visual
-                .or(self.latest_visual)
+                .or(self.lifecycle.latest_visual)
                 .is_some_and(|time| frame.time <= time)
             || frame.time > now
             || frame
@@ -294,16 +318,16 @@ impl Localization {
                 .saturating_add(self.parameters.visual_tracking_timeout)
                 <= now
         {
-            self.pending_bootstrap = None;
+            self.lifecycle.pending_bootstrap = None;
             return None;
         }
         // Source streams arrive independently. Keep the newest recovery image until
         // its IMU bracket is available (or the normal freshness limit expires).
         self.estimator.attitude_at(frame.time)?;
-        let frame = self.pending_bootstrap.take()?;
+        let frame = self.lifecycle.pending_bootstrap.take()?;
         let time = frame.time;
-        if self.status.state != LocalizationState::Startup
-            && let Some(heading) = self.heading_reference.as_ref()
+        if self.lifecycle.state != LocalizationState::Startup
+            && let Some(heading) = self.lifecycle.heading_reference.as_ref()
         {
             if !self
                 .estimator
@@ -315,18 +339,18 @@ impl Localization {
             }
             let solved = self.estimator.solve_with_heading(Some(heading));
             if !solved.visual_rejected && solved.converged {
-                self.pending_visual = Some(time);
+                self.lifecycle.pending_visual = Some(time);
             }
             return Some(solved);
         }
         let candidate = self
             .estimator
-            .bootstrap_candidate(frame, self.heading_reference.as_ref());
+            .bootstrap_candidate(frame, self.lifecycle.heading_reference.as_ref());
         let predicted_height = self.estimator.height_prediction(time);
         let mut candidate = candidate
             .inspect_err(|error| tracing::warn!(%error, "discarding recovery candidate"))
             .ok()??;
-        let solved = candidate.solve_with_heading(self.heading_reference.as_ref());
+        let solved = candidate.solve_with_heading(self.lifecycle.heading_reference.as_ref());
         if !solved.converged
             || solved
                 .estimate
@@ -352,9 +376,8 @@ impl Localization {
             }
         }
         // Publish only the validated graph, evaluated through the latest motion sample.
-        self.status.generation = candidate.generation();
         self.estimator = candidate;
-        self.pending_visual = Some(time);
+        self.lifecycle.pending_visual = Some(time);
         Some(solved)
     }
 }

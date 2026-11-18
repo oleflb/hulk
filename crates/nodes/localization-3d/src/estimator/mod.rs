@@ -216,6 +216,10 @@ impl Estimator {
         self.latest_time
     }
 
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
