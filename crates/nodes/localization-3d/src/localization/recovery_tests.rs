@@ -310,17 +310,13 @@ fn sparse_frames_restore_tracking_only_after_non_collinear_window_evidence() -> 
 }
 
 #[test]
-fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
+fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() -> Result<()> {
     for with_vo in [false, true] {
         let (mut localization, before) = lost_localization(with_vo);
         // Between IMU samples, and inside both odometry intervals. The turn ends
         // before delivery, so later zero-rate IMU readings cannot reconstruct it.
         let recovery = frame(3.375, true);
-        assert!(
-            localization
-                .ingest_visual_localization_frame(recovery.clone())
-                .unwrap()
-        );
+        assert!(localization.ingest_visual_localization_frame(recovery.clone())?);
         assert_eq!(localization.lifecycle.state, LocalizationState::LostTrack);
         assert_eq!(localization.latest_time, before.time);
         assert_eq!(localization.status().generation, before.generation);
@@ -333,11 +329,17 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
             "{:?}",
             solved.diagnostics
         );
-        let estimate = solved.estimate.unwrap();
+        let estimate = solved
+            .estimate
+            .ok_or_else(|| eyre!("missing recovery estimate"))?;
         assert_eq!(estimate.time, now);
         assert_eq!(estimate.generation, before.generation);
         assert_eq!(estimate.generation, localization.status().generation);
-        let pose = estimate.robot_to_field.unwrap().pose.inner;
+        let pose = estimate
+            .robot_to_field
+            .ok_or_else(|| eyre!("missing field pose"))?
+            .pose
+            .inner;
         assert!(
             (pose.translation.vector - truth(3.61).translation.vector).norm() < 0.03,
             "{pose:?}"
@@ -352,16 +354,8 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
         );
         let mut stale_tracking = recovery.clone();
         stale_tracking.inner.source = VisualAssociationSource::Tracking;
-        assert!(
-            !localization
-                .ingest_visual_localization_frame(stale_tracking)
-                .unwrap()
-        );
-        assert!(
-            !localization
-                .ingest_visual_localization_frame(recovery)
-                .unwrap()
-        );
+        assert!(!localization.ingest_visual_localization_frame(stale_tracking)?);
+        assert!(!localization.ingest_visual_localization_frame(recovery)?);
 
         // Recovery updates the same trajectory, including its marginalized history.
         for index in 362..=370 {
@@ -370,62 +364,40 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
         let mut tracking = frame(3.7, false);
         tracking.inner.generation = localization.generation;
         tracking.inner.source = VisualAssociationSource::Tracking;
-        assert!(
-            localization
-                .ingest_visual_localization_frame(tracking)
-                .unwrap()
-        );
+        assert!(localization.ingest_visual_localization_frame(tracking)?);
         let solved = localization.solve(Time::from_nanos(4_700_000_000));
         let pose = solved.estimate.unwrap().robot_to_field.unwrap().pose.inner;
         assert!((pose.translation.vector - truth(3.7).translation.vector).norm() < 0.03);
         assert_eq!(localization.lifecycle.state, LocalizationState::Tracking);
     }
+    Ok(())
 }
 
 #[test]
-fn rejected_recovery_does_not_replace_the_active_trajectory() {
+fn rejected_recovery_does_not_replace_the_active_trajectory() -> Result<()> {
     let (mut localization, estimate) = lost_localization(false);
     let now = estimate.time;
     let before = estimate.robot_to_local.pose.inner;
     let mut recovery = frame(3.375, true);
     recovery.inner.associations[0].detection.inner.x += 200.0;
-    assert!(
-        localization
-            .ingest_visual_localization_frame(recovery)
-            .unwrap()
-    );
+    assert!(localization.ingest_visual_localization_frame(recovery)?);
     let solved = localization.solve(now);
     assert_eq!(localization.lifecycle.state, LocalizationState::LostTrack);
     let after = solved.estimate.unwrap();
     assert_eq!(after.time, now);
-    assert!(
-        (after.robot_to_local.pose.inner.translation.vector - before.translation.vector).norm()
-            < 0.001
-    );
-    assert!(
-        after
-            .robot_to_local
-            .pose
-            .inner
-            .rotation
-            .angle_to(&before.rotation)
-            < 0.001
-    );
-    assert!(
-        localization
-            .ingest_visual_localization_frame(frame(3.375, true))
-            .unwrap()
-    );
+    let pose = after.robot_to_local.pose.inner;
+    assert!((pose.translation.vector - before.translation.vector).norm() < 0.001);
+    assert!(pose.rotation.angle_to(&before.rotation) < 0.001);
+    assert!(localization.ingest_visual_localization_frame(frame(3.375, true))?);
     localization.solve(now);
     assert_eq!(localization.lifecycle.state, LocalizationState::Tracking);
+    Ok(())
 }
 
 #[test]
-fn global_fallback_while_tracking_preserves_history_and_rejects_a_translated_match() {
+fn global_fallback_while_tracking_preserves_history_and_rejects_a_translated_match() -> Result<()> {
     let (mut localization, before) = lost_localization(true);
-    localization
-        .ingest_visual_localization_frame(frame(3.375, false))
-        .unwrap();
+    localization.ingest_visual_localization_frame(frame(3.375, false))?;
     localization.solve(before.time);
     assert_eq!(localization.lifecycle.state, LocalizationState::Tracking);
     for index in 361..=370 {
@@ -435,11 +407,7 @@ fn global_fallback_while_tracking_preserves_history_and_rejects_a_translated_mat
     for association in &mut wrong.inner.associations {
         association.field_point.inner.x += 22.0;
     }
-    assert!(
-        localization
-            .ingest_visual_localization_frame(wrong)
-            .unwrap()
-    );
+    assert!(localization.ingest_visual_localization_frame(wrong)?);
     let rejected = localization.solve(Time::from_nanos(4_700_000_000));
     let pose = rejected
         .estimate
@@ -453,11 +421,7 @@ fn global_fallback_while_tracking_preserves_history_and_rejects_a_translated_mat
         localization.lifecycle.latest_visual,
         Some(Time::from_nanos(4_375_000_000))
     );
-    assert!(
-        localization
-            .ingest_visual_localization_frame(frame(3.7, false))
-            .unwrap()
-    );
+    assert!(localization.ingest_visual_localization_frame(frame(3.7, false))?);
     let accepted = localization.solve(Time::from_nanos(4_700_000_000));
     let estimate = accepted.estimate.unwrap();
     assert_eq!(estimate.generation, before.generation);
@@ -465,81 +429,54 @@ fn global_fallback_while_tracking_preserves_history_and_rejects_a_translated_mat
         localization.lifecycle.latest_visual,
         Some(Time::from_nanos(4_700_000_000))
     );
-    assert!(
-        (estimate
-            .robot_to_field
-            .unwrap()
-            .pose
-            .inner
-            .translation
-            .vector
-            - truth(3.7).translation.vector)
-            .norm()
-            < 0.03
-    );
+    let pose = estimate.robot_to_field.unwrap().pose.inner;
+    assert!((pose.translation.vector - truth(3.7).translation.vector).norm() < 0.03);
     for index in 371..=380 {
         ingest_motion(&mut localization, index, true);
     }
     // A newer local observation supersedes queued global work before the solve.
-    assert!(
-        localization
-            .ingest_visual_localization_frame(frame(3.75, false))
-            .unwrap()
-    );
+    assert!(localization.ingest_visual_localization_frame(frame(3.75, false))?);
     let mut local = frame(3.8, false);
     local.inner.source = VisualAssociationSource::Tracking;
-    assert!(
-        localization
-            .ingest_visual_localization_frame(local)
-            .unwrap()
-    );
+    assert!(localization.ingest_visual_localization_frame(local)?);
     localization.solve(Time::from_nanos(4_800_000_000));
     assert_eq!(
         localization.lifecycle.latest_visual,
         Some(Time::from_nanos(4_800_000_000))
     );
     assert!(localization.lifecycle.pending_bootstrap.is_none());
+    Ok(())
 }
 
 #[test]
-fn translated_global_match_cannot_discard_the_motion_history() {
+fn repeated_translated_global_matches_cannot_discard_motion_history() -> Result<()> {
     let (mut localization, before) = lost_localization(true);
-    let mut wrong = frame(3.375, false);
-    // Identical image geometry and heading, but a repeated landmark pattern 22 m away.
-    for association in &mut wrong.inner.associations {
-        association.field_point.inner.x += 22.0;
+    // Independent images agree on relative motion, but share the same wrong field offset.
+    for t in [3.375, 3.425, 3.475] {
+        let mut wrong = frame(t, false);
+        for association in &mut wrong.inner.associations {
+            association.field_point.inner.x += 2.0;
+        }
+        assert!(localization.ingest_visual_localization_frame(wrong)?);
+        let output = localization.solve(before.time);
+        let after = output
+            .estimate
+            .ok_or_else(|| eyre!("missing motion solution"))?;
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(localization.lifecycle.state, LocalizationState::LostTrack);
+        let (Some(pose), Some(expected)) = (after.robot_to_field, before.robot_to_field) else {
+            return Err(eyre!("missing field pose"));
+        };
+        assert!((pose.pose.translation() - expected.pose.translation()).norm() < 0.03);
     }
-    assert!(
-        localization
-            .ingest_visual_localization_frame(wrong)
-            .unwrap()
-    );
-    let output = localization.solve(before.time);
-    let after = output.estimate.expect("retain the motion solution");
-    assert_eq!(after.generation, before.generation);
-    assert_eq!(localization.lifecycle.state, LocalizationState::LostTrack);
-    assert!(
-        (after.robot_to_field.unwrap().pose.inner.translation.vector
-            - before.robot_to_field.unwrap().pose.inner.translation.vector)
-            .norm()
-            < 0.03
-    );
-    assert!(
-        localization
-            .ingest_visual_localization_frame(frame(3.375, false))
-            .unwrap()
-    );
-    localization.solve(before.time);
-    assert_eq!(localization.lifecycle.state, LocalizationState::Tracking);
+    Ok(())
 }
 
 #[test]
-fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization() {
+fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization() -> Result<()> {
     let (mut localization, _) = lost_localization(false);
     let now = Time::from_nanos(4_600_000_000);
-    localization
-        .ingest_visual_localization_frame(frame(3.375, true))
-        .unwrap();
+    localization.ingest_visual_localization_frame(frame(3.375, true))?;
     localization.solve(now);
     assert_eq!(localization.lifecycle.state, LocalizationState::Tracking);
     let reference = localization.lifecycle.heading_reference.unwrap();
@@ -549,11 +486,7 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
     let mut wrong = frame(3.7, true);
     wrong.inner.generation = localization.generation;
     wrong.inner.source = VisualAssociationSource::Tracking;
-    assert!(
-        localization
-            .ingest_visual_localization_frame(wrong)
-            .unwrap()
-    );
+    assert!(!localization.ingest_visual_localization_frame(wrong)?);
     let rejected = localization.solve(Time::from_nanos(4_700_000_000));
     assert!(rejected.estimate.is_some(), "{:?}", rejected.diagnostics);
     assert!(localization.lifecycle.pending_visual.is_none());
@@ -561,8 +494,8 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
         localization.lifecycle.latest_visual,
         Some(Time::from_nanos(4_375_000_000))
     );
-    // The failed frame is no longer in the graph: a motion-only solve recovers
-    // immediately, and subsequent marginalization cannot freeze its bad factors.
+    // Admission rejected the frame before insertion, so subsequent marginalization
+    // cannot freeze its bad factors.
     for index in 371..=600 {
         ingest_motion(&mut localization, index, false);
         if index % 5 == 0 {
@@ -579,21 +512,13 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
         }
     }
     let imu = linear_algebra::Orientation3::from_euler_angles(0.0, 0.0, 3.3);
-    assert!(
-        reference
-            .expected(imu)
-            .rotation_to(
-                localization
-                    .lifecycle
-                    .heading_reference
-                    .unwrap()
-                    .expected(imu)
-            )
-            .inner
-            .angle()
-            .abs()
-            < 1e-12
-    );
+    let actual = localization
+        .lifecycle
+        .heading_reference
+        .unwrap()
+        .expected(imu);
+    assert!(reference.expected(imu).rotation_to(actual).angle().abs() < 1e-12);
+    Ok(())
 }
 
 #[test]
