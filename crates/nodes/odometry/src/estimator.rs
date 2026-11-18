@@ -560,6 +560,94 @@ mod tests {
         assert!(delta.is_none());
         assert!(matches!(update(1060, 1154, -0.04), (None, None)));
     }
+
+    #[test]
+    fn reset_tails_compose_without_bridging_rejected_intervals() -> Result<(), &'static str> {
+        for reset in [
+            "support switch",
+            "missing kinematics",
+            "missing fall state",
+            "invalid attitude",
+            "sample gap",
+            "speed rejection",
+            "feet disagree",
+        ] {
+            let parameters = parameters();
+            let mut estimator = anchored_estimator(&parameters);
+            let ready = upright();
+            let reset_ms = if reset == "sample gap" { 1200 } else { 1020 };
+            let feet = |x, z, right_x| kinematics_with_heights(x, z, right_x, 0.0);
+            let mut update = |milliseconds, yaw, feet, valid: bool, state| {
+                let feet = sample(milliseconds, feet);
+                let pose = estimator.update(
+                    EstimatorInput {
+                        time: feet.time,
+                        imu_state: &imu(yaw),
+                        robot_kinematics: valid.then_some(&feet),
+                        fall_detection: state,
+                    },
+                    &parameters,
+                );
+                (pose, estimator.take_delta())
+            };
+            assert!(
+                update(1010, 0.02, feet(-0.01, 0.0, -0.01), true, Some(&ready))
+                    .1
+                    .is_none()
+            );
+            let height = if reset == "support switch" { 0.02 } else { 0.0 };
+            let yaw = if reset == "invalid attitude" {
+                f32::NAN
+            } else {
+                0.02
+            };
+            let right_x = if reset == "feet disagree" { -0.01 } else { 0.5 };
+            let (_, tail) = update(
+                reset_ms,
+                yaw,
+                feet(0.5, height, right_x),
+                reset != "missing kinematics",
+                (reset != "missing fall state").then_some(&ready),
+            );
+            let tail = tail.ok_or("reset lost the accepted tail")?;
+            assert_eq!(tail.previous_time, Time::from_nanos(1_000_000_000));
+            assert_eq!(tail.time, Time::from_nanos(1_010_000_000));
+            assert!(tail.current_to_previous.translation().coords().norm() > 0.0);
+            let (_, delta) = update(
+                reset_ms + 10,
+                0.02,
+                feet(0.5, height, right_x),
+                true,
+                Some(&ready),
+            );
+            assert!(
+                delta.is_none(),
+                "{reset}: reset must not produce a measurement"
+            );
+            let (pose, delta) = update(
+                reset_ms + 60,
+                0.03,
+                feet(0.49, height, right_x - 0.01),
+                true,
+                Some(&ready),
+            );
+            let delta = delta.ok_or("resumed interval missing")?;
+            assert!(delta.previous_time >= Time::from_nanos(reset_ms * 1_000_000));
+            assert_eq!(delta.time, Time::from_nanos((reset_ms + 60) * 1_000_000));
+            let composed = tail.current_to_previous * delta.current_to_previous;
+            let pose = pose.ok_or("resumed pose missing")?;
+            assert!(
+                (composed.translation().inner - pose.position().inner).norm() < 1e-6,
+                "{reset}"
+            );
+            assert!(
+                (composed.inner.rotation.angle() - pose.orientation().angle()).abs() < 1e-6,
+                "{reset}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn measured_stops_in_double_support_are_distinct_from_rejected_intervals() {
         let mut estimator = OdometryEstimator::default();
