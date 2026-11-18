@@ -171,65 +171,69 @@ fn stationary_imu_produces_timestamped_local_estimate() {
 }
 
 #[test]
-fn cached_covariance_matches_fresh_model_and_partial_solves_remain_usable() {
+fn partial_motion_solve_rolls_back_and_later_solve_converges() -> Result<()> {
     let mut estimator = estimator();
     for index in 0..100 {
-        estimator
-            .ingest_imu(
-                estimator.origin + Duration::from_millis(index * 2),
-                ImuState {
-                    roll_pitch_yaw: vector![0.02, -0.01, 0.0],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-    }
-    estimator.prepare_preintegration().unwrap();
-    let current_yaw = estimator.prepare_attitude().unwrap();
-    let (segment, _) = estimator.segment_and_tau(estimator.latest_time).unwrap();
-    let controls = control_keys(&estimator.controls, segment).unwrap();
-    let blocks = estimator.estimate_covariance_blocks(controls).unwrap();
-    let options = estimator.solve_options();
-    let (_, cached) = estimator
-        .optimizer
-        .solve_batch_with_covariance(&mut estimator.graph, &options, &blocks, &Default::default())
-        .unwrap();
-    let cached = covariance::EstimateCovariance::from_fn(|r, c| {
-        if r < cached.nrows() && c < cached.ncols() {
-            cached[(r, c)]
-        } else {
-            0.0
-        }
-    });
-    let fresh = estimator.graph.joint_covariance(&blocks).unwrap();
-    for r in 0..fresh.nrows() {
-        for c in 0..fresh.ncols() {
-            assert!((fresh[(r, c)] - cached[(r, c)]).abs() < 1e-9 * (1.0 + fresh[(r, c)].abs()));
-        }
-    }
-    // Force a cost-decreasing partial result after changing the observation.
-    // That path must compute a fresh covariance and preserve its termination,
-    // rather than treating a gradient-tolerance=MAX probe as convergence.
-    if let Some(key) = current_yaw {
-        estimator.graph.remove_factor(key).unwrap();
-    }
-    estimator
-        .ingest_imu(
-            estimator.latest_time + Duration::from_millis(2),
+        estimator.ingest_imu(
+            estimator.origin + Duration::from_millis(index * 2),
             ImuState {
-                roll_pitch_yaw: vector![0.03, -0.02, 0.0],
+                roll_pitch_yaw: vector![0.02, -0.01, 0.0],
                 ..Default::default()
             },
-        )
-        .unwrap();
+        )?;
+    }
+    let accepted = estimator.solve_motion();
+    assert!(accepted.estimate.is_some(), "{:?}", accepted.diagnostics);
+    let accepted_time = estimator.last_converged_time;
+    estimator.ingest_imu(
+        estimator.latest_time + Duration::from_millis(2),
+        ImuState {
+            roll_pitch_yaw: vector![0.03, -0.02, 0.0],
+            ..Default::default()
+        },
+    )?;
+    let controls = estimator
+        .controls
+        .values()
+        .map(|&key| Ok((key, estimator.graph.get(key)?.pose)))
+        .collect::<Result<Vec<_>>>()?;
+    let solver = estimator.parameters.solver.clone();
+    // Force an accepted LM step that does not reach convergence.
     estimator.parameters.solver.max_iterations = 1;
     estimator.parameters.solver.gradient_tolerance = 1e-30;
     let partial = estimator.solve_motion();
-    assert!(partial.estimate.is_some(), "{:?}", partial.diagnostics);
-    assert!(!partial.converged);
+    assert!(partial.estimate.is_none(), "{:?}", partial.diagnostics);
+    assert!(partial.diagnostics.failure.is_some());
+    assert_eq!(partial.diagnostics.termination, "MaxIterations");
     assert_eq!(partial.diagnostics.iterations, Some(1));
     assert!(partial.diagnostics.final_cost.is_some());
     assert!(partial.diagnostics.initial_cost.is_none());
+    assert_eq!(estimator.last_converged_time, accepted_time);
+    for (key, pose) in controls {
+        assert_eq!(estimator.graph.get(key)?.pose, pose);
+    }
+
+    estimator.parameters.solver = solver;
+    // A premature small-step stop must still meet the gradient criterion
+    // within the remaining budget, rather than publish a partial fit.
+    estimator.parameters.solver.step_tolerance = f64::MAX;
+    estimator.parameters.solver.cost_tolerance = 0.0;
+    let recovered = estimator.solve_motion();
+    assert!(recovered.estimate.is_some(), "{:?}", recovered.diagnostics);
+    assert!(
+        recovered
+            .diagnostics
+            .iterations
+            .is_some_and(|steps| steps > 1 && steps <= estimator.parameters.solver.max_iterations)
+    );
+    assert!(
+        recovered
+            .diagnostics
+            .gradient_norm
+            .is_some_and(|gradient| gradient <= estimator.parameters.solver.gradient_tolerance)
+    );
+    assert_eq!(estimator.last_converged_time, Some(estimator.latest_time));
+    Ok(())
 }
 
 #[test]

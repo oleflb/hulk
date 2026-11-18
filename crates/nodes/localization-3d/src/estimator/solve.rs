@@ -175,45 +175,26 @@ impl Localization {
         let controls = self.ensure_segment(segment)?;
         self.ensure_biases(self.latest_time)?;
         let snapshot = StateSnapshot::capture(self)?;
-        let blocks = self.estimate_covariance_blocks(controls)?;
         let checked = (|| -> Result<_> {
             self.trace_factor_costs("before_seed", None);
             self.apply_recovery_seed()?;
             self.trace_factor_costs("seed", None);
-            let (covariance, converged) = self.optimize(&blocks, diagnostics)?;
+            let covariance = self.optimize(controls, diagnostics)?;
             if let Some(heading) = heading
                 && self.alignment.is_some()
                 && !self.pending_visuals.is_empty()
             {
                 self.validate_heading(heading)?;
             }
-            if !converged && !self.pending_visuals.is_empty() {
-                return Err(eyre!("visual update did not converge"));
-            }
             self.validate_pending_visuals()?;
             self.validate_tilt()?;
-            let covariance = match covariance {
-                Some(covariance) => covariance,
-                None => {
-                    // Accepted partial motion still needs a fresh, undamped
-                    // covariance. Failed optimization has no cached-query API.
-                    let covariance = self.graph.joint_covariance(&blocks)?;
-                    EstimateCovariance::from_fn(|r, c| {
-                        if r < covariance.nrows() && c < covariance.ncols() {
-                            covariance[(r, c)]
-                        } else {
-                            0.0
-                        }
-                    })
-                }
-            };
             let mut estimate =
                 self.estimate_from_covariance(controls, tau, &covariance, diagnostics)?;
             if heading.is_some_and(|heading| self.validate_heading(heading).is_err()) {
                 // Field inconsistency cannot erase motion evidence or stop local odometry.
                 estimate.robot_to_field = None;
             }
-            Ok((estimate, converged))
+            Ok((estimate, true))
         })();
         if let Err(error) = &checked {
             tracing::debug!(time = ?self.latest_time, %error, visual_frames = self.pending_visuals.len(), final_cost = ?diagnostics.final_cost, "rolling back inconsistent trajectory update");
@@ -224,40 +205,46 @@ impl Localization {
 
     fn optimize(
         &mut self,
-        blocks: &[BlockId],
+        controls: [StateKey<PoseControl>; 4],
         diagnostics: &mut SolveDiagnostics,
-    ) -> Result<(Option<EstimateCovariance>, bool)> {
-        let options = self.solve_options();
-        // LM's final gradient check already built the undamped model. Extract the
-        // joint marginal from that model instead of visiting every factor again.
-        let result = self
-            .optimizer
-            .solve_batch_with_covariance(&mut self.graph, &options, blocks, &Default::default())
-            .map(|(report, covariance)| {
-                let joint = EstimateCovariance::from_fn(|r, c| {
-                    if r < covariance.nrows() && c < covariance.ncols() {
-                        covariance[(r, c)]
-                    } else {
-                        0.0
-                    }
-                });
-                (report, joint)
-            });
-        let statistics = self.optimizer.statistics();
-        diagnostics.lm_attempts = statistics.attempts;
-        diagnostics.lm_rejected_steps = statistics.rejected_steps;
+    ) -> Result<EstimateCovariance> {
+        let blocks = self.estimate_covariance_blocks(controls)?;
+        let (biases, fraction) = self.ensure_biases(self.latest_time)?;
+        let mut options = self.solve_options();
+        let mut result = self.optimize_trial(&blocks, biases, fraction, &options);
+        let mut statistics = self.optimizer.statistics();
+        // Failed reports do not expose the initial cost after accepted steps.
+        diagnostics.initial_cost = match &result {
+            Ok((report, _)) => Some(report.initial_cost),
+            Err(_) => statistics.cost.filter(|_| statistics.accepted_steps == 0),
+        };
+        if matches!(result, Err(SolverError::NoProgress))
+            && statistics.accepted_steps > 0
+            && statistics.accepted_steps < options.max_iterations
+            && statistics
+                .step_norm
+                .is_some_and(|step| step <= options.step_tolerance)
+        {
+            // Small steps are not convergence: use the remaining budget to reach
+            // the gradient tolerance before rejecting a numerically stalled solve.
+            options.max_iterations -= statistics.accepted_steps;
+            options.step_tolerance = 0.0;
+            result = self.optimize_trial(&blocks, biases, fraction, &options);
+            let continued = self.optimizer.statistics();
+            let accepted_steps = statistics.accepted_steps + continued.accepted_steps;
+            let attempts = statistics.attempts + continued.attempts;
+            let rejected_steps = statistics.rejected_steps + continued.rejected_steps;
+            statistics = continued;
+            statistics.accepted_steps = accepted_steps;
+            statistics.attempts = attempts;
+            statistics.rejected_steps = rejected_steps;
+        }
+        diagnostics.lm_attempts += statistics.attempts;
+        diagnostics.lm_rejected_steps += statistics.rejected_steps;
         diagnostics.gradient_norm = statistics.gradient_norm;
-        let converged = result.is_ok();
         diagnostics.iterations = statistics.cost.map(|_| statistics.accepted_steps);
         diagnostics.final_cost = statistics.cost;
         self.trace_factor_costs("trial", statistics.cost);
-        // This fagra version returns the initial cost only in a successful report.
-        // On failure after accepted steps it is unknown, not a reason to rebuild H.
-        diagnostics.initial_cost = result
-            .as_ref()
-            .ok()
-            .map(|(report, _)| report.initial_cost)
-            .or_else(|| statistics.cost.filter(|_| statistics.accepted_steps == 0));
         diagnostics.termination = match &result {
             Ok((report, _)) => format!("{:?}", report.termination),
             Err(SolverError::NoProgress) => "NoProgress".into(),
@@ -273,18 +260,45 @@ impl Localization {
             Err(_) => "failed".into(),
         };
         self.trace_visual_audit("trial");
-        let covariance = match result {
-            Ok((_, covariance)) => Some(covariance),
-            // LM only commits cost-decreasing steps. Its recorded accepted
-            // cost replaces the old evaluation-only solve on these paths.
-            Err(SolverError::NoConvergence | SolverError::NoProgress)
-                if statistics.cost.is_some() =>
-            {
-                None
+        // Cost-decreasing steps alone are not safe to publish or marginalize.
+        // Propagate every failure so solve_graph restores the pre-solve state.
+        result.map(|(_, covariance)| covariance).map_err(Into::into)
+    }
+
+    fn optimize_trial(
+        &mut self,
+        blocks: &[BlockId],
+        biases: [StateKey<ImuBias>; 2],
+        fraction: f64,
+        options: &OptimizeOptions<f64>,
+    ) -> std::result::Result<(fagra::OptimizeReport<f64>, EstimateCovariance), SolverError> {
+        // LM's final gradient check already built the undamped model. Extract the
+        // joint marginal from that model instead of visiting every factor again.
+        let pose_dimension = if self.alignment.is_some() { 27 } else { 24 };
+        let (report, covariance) = self.optimizer.solve_batch_with_covariance_view(
+            &mut self.graph,
+            options,
+            blocks,
+            &Default::default(),
+        )?;
+        let pose = nalgebra::SMatrix::from_fn(|r, c| {
+            if r < pose_dimension && c < pose_dimension {
+                covariance.matrix()[(r, c)]
+            } else {
+                0.0
             }
-            Err(error) => return Err(error.into()),
-        };
-        Ok((covariance, converged))
+        });
+        let weights = [1.0 - fraction, fraction];
+        let mut bias = nalgebra::SMatrix::<f64, 6, 6>::zeros();
+        for (i, &row) in biases.iter().enumerate() {
+            for (j, &column) in biases.iter().enumerate() {
+                let block = covariance.block(row, column)?;
+                bias += nalgebra::SMatrix::<f64, 6, 6>::from_fn(|r, c| {
+                    weights[i] * weights[j] * block[(r, c)]
+                });
+            }
+        }
+        Ok((report, EstimateCovariance { pose, bias }))
     }
 }
 
