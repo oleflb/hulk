@@ -23,6 +23,7 @@ pub(super) struct CameraFrustum;
 #[derive(Component)]
 pub(super) struct CameraImagePlane {
     texture: Handle<Image>,
+    size: Option<UVec2>,
     publication: Option<ros_z::pubsub::PublicationId>,
     valid: bool,
 }
@@ -57,6 +58,7 @@ pub(super) fn setup(
     commands.spawn((
         CameraImagePlane {
             texture: camera_image_texture,
+            size: None,
             publication: None,
             valid: false,
         },
@@ -114,8 +116,9 @@ pub(super) fn update_camera_viewport(
 pub(super) fn update_camera_image(
     data: Res<ViewerData>,
     settings: Res<Settings>,
-    mut image_plane: Single<&mut CameraImagePlane>,
+    mut image_plane: Single<(&mut CameraImagePlane, &MeshMaterial3d<StandardMaterial>)>,
     mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     if !settings.camera {
         return;
@@ -123,6 +126,7 @@ pub(super) fn update_camera_image(
     let Some(frame) = &data.camera_frame else {
         return;
     };
+    let (image_plane, material_handle) = &mut *image_plane;
     if image_plane.publication == Some(frame.publication_id) {
         return;
     }
@@ -135,6 +139,7 @@ pub(super) fn update_camera_image(
         return;
     };
     let rgba = image::DynamicImage::ImageRgb8(rgb).into_rgba8();
+    let size = UVec2::new(rgba.width(), rgba.height());
     let image = Image::new(
         Extent3d {
             width: rgba.width(),
@@ -146,9 +151,20 @@ pub(super) fn update_camera_image(
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
-    images
-        .insert(image_plane.texture.id(), image)
-        .expect("camera texture exists");
+    if image_plane.size != Some(size) {
+        let Some(mut material) = materials.get_mut(&material_handle.0) else {
+            log::error!("camera image material is missing");
+            return;
+        };
+        // A resized GPU texture needs a new material binding, not just a new Image asset.
+        image_plane.texture = images.add(image);
+        image_plane.size = Some(size);
+        material.base_color_texture = Some(image_plane.texture.clone());
+    } else {
+        images
+            .insert(image_plane.texture.id(), image)
+            .expect("camera texture exists");
+    }
     image_plane.valid = true;
 }
 fn camera_to_display_transform(
@@ -234,6 +250,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_material_rebinds_only_for_first_frame_and_resolution_changes() {
+        use crate::panels::map_observation::tests::sample;
+        use ros_z_debug::query::decode_record;
+        use ros2::sensor_msgs::image::Image as RosImage;
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .insert_resource(Settings::default())
+            .insert_resource(ViewerData::default())
+            .add_systems(Startup, setup)
+            .add_systems(Update, update_camera_image);
+        app.update();
+        let mut previous_texture = app
+            .world_mut()
+            .query::<&CameraImagePlane>()
+            .single(app.world())
+            .unwrap()
+            .texture
+            .id();
+        for (id, width, rebind) in [(1, 8, true), (2, 8, false), (3, 16, true)] {
+            let image = RosImage {
+                width,
+                height: 8,
+                step: width * 3,
+                encoding: "rgb8".into(),
+                data: vec![128; (width * 8 * 3) as usize].into(),
+                ..default()
+            };
+            let image = sample("/image", id, id as i64, &image);
+            app.world_mut().resource_mut::<ViewerData>().camera_frame =
+                Some(decode_record(&image.record, &image.topic).unwrap());
+            app.update();
+            let (plane, material) = app
+                .world_mut()
+                .query::<(&CameraImagePlane, &MeshMaterial3d<StandardMaterial>)>()
+                .single(app.world())
+                .unwrap();
+            assert!(plane.valid);
+            assert_eq!(plane.texture.id() != previous_texture, rebind);
+            assert_eq!(
+                app.world()
+                    .resource::<Assets<StandardMaterial>>()
+                    .get(&material.0)
+                    .unwrap()
+                    .base_color_texture
+                    .as_ref()
+                    .unwrap()
+                    .id(),
+                plane.texture.id()
+            );
+            previous_texture = plane.texture.id();
+        }
+    }
+
+    #[test]
     fn viewport_meshes_only_rebuild_for_projection_changes() {
         let mut app = App::new();
         app.init_resource::<Assets<Mesh>>()
@@ -241,6 +314,7 @@ mod tests {
             .init_resource::<Assets<Image>>()
             .insert_resource(Settings::default())
             .insert_resource(ViewerData {
+                localization: Some(linear_algebra::Isometry3::identity()),
                 camera_matrix: Some(CameraMatrix::default()),
                 ..default()
             })
@@ -298,5 +372,13 @@ mod tests {
                     .contains_attribute(Mesh::ATTRIBUTE_COLOR)
             );
         }
+        app.world_mut().resource_mut::<ViewerData>().localization = None;
+        app.update();
+        assert!(
+            app.world_mut()
+                .query::<&Visibility>()
+                .iter(app.world())
+                .all(|visibility| *visibility == Visibility::Hidden)
+        );
     }
 }
