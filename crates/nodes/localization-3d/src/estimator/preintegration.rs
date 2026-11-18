@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(pieces[2].2.delta.velocity, Vector3::zeros()); // Flight, not missing data.
         let mut parameters = estimator.parameters.clone();
         parameters.accelerometer = None;
-        assert!(estimator.update_parameters(parameters).is_err());
+        assert!(estimator.set_parameters(&parameters).is_err());
         estimator.prepare_preintegration().unwrap();
         assert_eq!(estimator.preintegration.intervals[&0].pieces.len(), 3);
     }
@@ -597,7 +597,7 @@ mod tests {
         }
         let mut parameters = estimator.parameters.clone();
         parameters.accelerometer.as_mut().unwrap().scale.z = 2.0;
-        assert!(estimator.update_parameters(parameters).is_err());
+        assert!(estimator.set_parameters(&parameters).is_err());
         estimator.prepare_preintegration().unwrap();
         assert!(
             (estimator.preintegration.intervals[&50].pieces[0]

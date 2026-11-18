@@ -240,15 +240,11 @@ impl Localization {
     }
 
     pub fn set_parameters(&mut self, parameters: &Localization3dParameters) -> Result<()> {
-        self.update_parameters(parameters.clone())
-    }
-
-    pub(crate) fn update_parameters(&mut self, parameters: Localization3dParameters) -> Result<()> {
         self.parameters
-            .validate_update(&parameters)
+            .validate_update(parameters)
             .map_err(|message| eyre!(message))?;
         self.optimizer.options.max_trials = parameters.solver.max_trials;
-        self.parameters = parameters;
+        self.parameters = parameters.clone();
         Ok(())
     }
 }
