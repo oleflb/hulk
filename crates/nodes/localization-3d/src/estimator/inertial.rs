@@ -9,7 +9,7 @@ use ros_z::time::Time;
 use types::time_wrapper::TimeWrapper;
 
 impl Estimator {
-    pub(crate) fn ingest_imu(&mut self, time: Time, imu: ImuState) -> Result<bool> {
+    pub fn ingest_imu(&mut self, time: Time, imu: ImuState) -> Result<bool> {
         if !imu
             .roll_pitch_yaw
             .inner
@@ -55,10 +55,7 @@ impl Estimator {
         Ok(())
     }
 
-    pub(crate) fn ingest_kinematics(
-        &mut self,
-        sample: TimeWrapper<RobotKinematics>,
-    ) -> Result<bool> {
+    pub fn ingest_kinematics(&mut self, sample: TimeWrapper<RobotKinematics>) -> Result<bool> {
         let left = sample.inner.left_leg.sole_to_robot.inner.translation.vector;
         let right = sample
             .inner

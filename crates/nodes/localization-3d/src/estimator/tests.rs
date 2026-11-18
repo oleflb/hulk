@@ -14,7 +14,7 @@ pub(super) fn estimator() -> Estimator {
         intrinsics: Intrinsic::new(nalgebra::vector![300.0, 300.0], point![160.0, 120.0]),
         ..Default::default()
     };
-    Estimator::new(
+    Estimator::new_motion(
         Time::from_nanos(1_000_000_000),
         7,
         nalgebra::Isometry3::identity().framed_transform(),
@@ -52,7 +52,7 @@ fn configured_foot_noise_changes_measurement_weight() {
     let costs = [0.01, 0.04].map(|sigma| {
         let mut parameters = template.parameters.clone();
         parameters.model.foot_sigma = sigma;
-        let mut estimator = Estimator::new(
+        let mut estimator = Estimator::new_motion(
             template.origin,
             template.epoch,
             Isometry3::identity(),
@@ -102,7 +102,7 @@ fn sustained_fast_turn_preserves_off_grid_camera_estimates() {
         if index == 0 || index % 25 != 0 {
             continue;
         }
-        let solved = estimator.solve();
+        let solved = estimator.solve_motion();
         assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
         let exposure = estimator.latest_time - Duration::from_millis(37);
         let (segment, tau) = estimator.segment_and_tau(exposure).unwrap();
@@ -132,7 +132,7 @@ fn stationary_imu_produces_timestamped_local_estimate() {
     let mut estimator = estimator();
     // The initial graph is underconstrained: a completed numerical report
     // must survive covariance failure and must not leak into the next attempt.
-    let failed = estimator.solve();
+    let failed = estimator.solve_motion();
     assert!(failed.estimate.is_none());
     assert!(failed.diagnostics.failure.is_some());
     assert_eq!(failed.diagnostics.initial_cost, Some(0.0));
@@ -142,7 +142,7 @@ fn stationary_imu_produces_timestamped_local_estimate() {
         let time = Time::from_nanos(1_000_000_000 + index * 2_000_000);
         assert!(estimator.ingest_imu(time, ImuState::default(),).unwrap());
     }
-    let result = estimator.solve();
+    let result = estimator.solve_motion();
     assert!(
         result.diagnostics.failure.is_none(),
         "{:?}",
@@ -160,14 +160,14 @@ fn stationary_imu_produces_timestamped_local_estimate() {
             .all(|value| value.is_finite())
     );
     // A second solve must not retain the previous temporary yaw constraint.
-    let repeated = estimator.solve().estimate.unwrap();
+    let repeated = estimator.solve_motion().estimate.unwrap();
     assert!(
         (estimate.robot_to_local.covariance - repeated.robot_to_local.covariance).amax() < 1.0e-10
     );
     // Crossing the knot boundary must retain observability.
     let boundary = Time::from_nanos(1_200_000_000);
     estimator.ingest_imu(boundary, ImuState::default()).unwrap();
-    assert_eq!(estimator.solve().estimate.unwrap().time, boundary);
+    assert_eq!(estimator.solve_motion().estimate.unwrap().time, boundary);
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn cached_covariance_matches_fresh_model_and_partial_solves_remain_usable() {
         .unwrap();
     estimator.parameters.solver.max_iterations = 1;
     estimator.parameters.solver.gradient_tolerance = 1e-30;
-    let partial = estimator.solve();
+    let partial = estimator.solve_motion();
     assert!(partial.estimate.is_some(), "{:?}", partial.diagnostics);
     assert!(!partial.converged);
     assert_eq!(partial.diagnostics.iterations, Some(1));
@@ -322,7 +322,7 @@ fn kinematic_odometry_stops_blind_motion_and_survives_marginalization() {
             if index == 0 {
                 continue;
             }
-            let solved = estimator.solve();
+            let solved = estimator.solve_motion();
             assert!(
                 solved.diagnostics.failure.is_none(),
                 "{:?}",
@@ -397,7 +397,7 @@ fn head_motion_odometry_does_not_move_stationary_body_without_ground_geometry() 
             previous = current;
         }
     }
-    let result = estimator.solve();
+    let result = estimator.solve_motion();
     assert!(
         result.diagnostics.failure.is_none(),
         "{:?}",
@@ -419,7 +419,7 @@ fn solve_retires_controls_outside_two_second_window() {
             )
             .unwrap();
     }
-    estimator.solve().estimate.unwrap();
+    estimator.solve_motion().estimate.unwrap();
     assert_eq!(estimator.controls.first_key_value().unwrap().0, &0);
     assert_eq!(estimator.segments(), 1..12);
     // Late data inside the retained window changes the graph, not the output time.
@@ -429,7 +429,7 @@ fn solve_retires_controls_outside_two_second_window() {
             .unwrap()
     );
     assert_eq!(
-        estimator.solve().estimate.unwrap().time,
+        estimator.solve_motion().estimate.unwrap().time,
         Time::from_nanos(3_200_000_000)
     );
 }
@@ -487,7 +487,7 @@ fn imu_bias_learns_from_motion_evidence_and_stays_bounded_across_retirement() {
                 .unwrap();
         }
         if index > 0 && index % 5 == 0 {
-            let solved = estimator.solve();
+            let solved = estimator.solve_motion();
             let estimate = solved.estimate.expect("biased but observable motion");
             last_pose = Some(estimate.robot_to_local.pose);
             last_bias = solved.diagnostics.imu_bias;
@@ -578,7 +578,7 @@ fn startup_replaces_drifted_height_prior_with_landmark_fit() {
             nalgebra::Translation3::new(100.0, -50.0, wrong_height),
             nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 0.0),
         ));
-        estimator = Estimator::new(
+        estimator = Estimator::new_motion(
             estimator.origin,
             estimator.epoch,
             wrong_pose,
@@ -627,7 +627,7 @@ fn startup_replaces_drifted_height_prior_with_landmark_fit() {
         let controls = control_keys(&estimator.controls, 0).unwrap();
         let seeded = estimator.spline(controls).unwrap().pose(0.0).unwrap();
         assert!((seeded.inner.translation.vector.z - 0.55).abs() < 1e-5);
-        let solved = estimator.solve();
+        let solved = estimator.solve_motion();
         assert!(
             solved.diagnostics.failure.is_none(),
             "{:?}",
@@ -692,7 +692,7 @@ fn recovery_fixture_with_timing(
         nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.05, 2.0),
     ));
     estimator.parameters.timing = timing;
-    estimator = Estimator::new(
+    estimator = Estimator::new_motion(
         estimator.origin,
         7,
         wrong_pose,
@@ -727,7 +727,7 @@ fn recovery_fixture_with_timing(
             )
             .unwrap();
         if index > 0 && index % 100 == 0 {
-            estimator.solve().estimate.unwrap();
+            estimator.solve_motion().estimate.unwrap();
         }
     }
     // This whole interval spans exposure and adjacent knots. Moving the knot
@@ -862,7 +862,7 @@ fn fractional_window_retains_support_for_late_samples_and_recovery() {
             .unwrap()
     );
     assert!(estimator.ingest_imu(cutoff, imu).unwrap());
-    let solved = estimator.solve();
+    let solved = estimator.solve_motion();
     assert_eq!(
         solved
             .estimate
@@ -909,7 +909,7 @@ fn imu_preparation_failure_does_not_retry_a_stale_graph_without_visuals() {
             )
             .unwrap();
     }
-    let result = candidate.solve();
+    let result = candidate.solve_motion();
     assert!(result.estimate.is_none());
     assert!(!result.visual_rejected);
     assert_eq!(result.diagnostics.iterations, None);
@@ -974,7 +974,7 @@ fn reconstruction_preserves_motion_and_admission_state() {
         candidate.segment_and_tau(delta.time).unwrap().0
     );
     let recovered = candidate
-        .solve()
+        .solve_motion()
         .estimate
         .unwrap()
         .robot_to_field
@@ -1033,7 +1033,7 @@ fn repeated_heading_rejection_keeps_the_window_bounded() {
         .bootstrap_candidate(frame, Some(&heading))
         .unwrap()
         .unwrap();
-    candidate.solve().estimate.unwrap();
+    candidate.solve_motion().estimate.unwrap();
     let wrong_heading = HeadingReference::new(
         candidate.latest_time,
         linear_algebra::Orientation2::new(-2.0),

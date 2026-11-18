@@ -277,7 +277,7 @@ impl Estimator {
         Ok(true)
     }
 
-    pub(crate) fn ingest_visual_odometry(
+    pub fn ingest_visual_odometry(
         &mut self,
         sample: VisualOdometer,
         previous_camera: Option<&CameraGeometry>,
