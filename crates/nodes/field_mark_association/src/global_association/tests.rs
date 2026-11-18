@@ -415,7 +415,7 @@ fn lifecycle_dispatch_uses_exposure_attitude_and_matches_generations() {
     // Startup must ignore an optimizer tilt that disagrees with the source IMU.
     assert_eq!(call(&status, Some(&wrong)).unwrap().associations.len(), 3);
     status.state = LocalizationState::LostTrack;
-    assert!(call(&status, None).is_none());
+    assert!(call(&status, None).is_some());
     status.heading = Some(FieldHeadingReference {
         time: status.time,
         imu_to_field: linear_algebra::Rotation2::new(-1.3),
@@ -441,8 +441,17 @@ fn lifecycle_dispatch_uses_exposure_attitude_and_matches_generations() {
         types::visual_localization::VisualAssociationSource::Global
     );
     assert_eq!(fallback.associations.len(), 3);
+    // Matching generations enter tracking, whose wrong tilt must still fall back identically.
+    status.generation = 0;
+    let fallback = call(&status, Some(&wrong)).unwrap();
+    assert_eq!(fallback.source, recovery.source);
+    assert_eq!(key(&fallback), key(&recovery));
+    assert_eq!(
+        fallback.debug.as_ref().unwrap().pairwise_distance_rms,
+        recovery.debug.as_ref().unwrap().pairwise_distance_rms
+    );
     status.heading = None;
-    assert!(call(&status, Some(&wrong)).is_none());
+    assert!(call(&status, Some(&wrong)).is_some());
 }
 
 #[test]
@@ -503,63 +512,42 @@ fn canonical_landmarks_do_not_select_the_robot_half() {
 }
 
 #[test]
-fn halfturn_equivalent_triangles_are_not_ambiguous() {
+fn halfturn_equivalence_survives_center_landmarks_and_detection_reordering() {
     let geometry = geometry();
     let field = FieldDimensions::SPL_2025;
+    let config = calibrated_parameters().global_localizer;
     // Swapping the two penalties and the circle crossing is exactly a field half-turn.
-    let features = project(
-        [
-            (
-                VisualFeatureClass::PenaltySpot,
-                field.penalty_spot(Half::Own),
-            ),
-            (
-                VisualFeatureClass::PenaltySpot,
-                field.penalty_spot(Half::Opponent),
-            ),
-            (VisualFeatureClass::XSpot, field.x_crossing(Side::Left)),
-        ],
-        &geometry,
-    );
-    let config = calibrated_parameters().global_localizer;
-    let result =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config))
-            .unwrap();
-    assert_eq!(result.associations.len(), 3);
-}
-
-#[test]
-fn field_center_does_not_hide_halfturn_equivalence() {
-    let geometry = geometry();
-    let field = FieldDimensions::SPL_2025;
-    let mut features = project(
-        [
-            (VisualFeatureClass::XSpot, field.center()),
-            (VisualFeatureClass::XSpot, field.x_crossing(Side::Left)),
-            (
-                VisualFeatureClass::PenaltySpot,
-                field.penalty_spot(Half::Own),
-            ),
-            (
-                VisualFeatureClass::PenaltySpot,
-                field.penalty_spot(Half::Opponent),
-            ),
-        ],
-        &geometry,
-    );
-    let config = calibrated_parameters().global_localizer;
-    let first =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config))
-            .unwrap();
-    assert_eq!(first.associations.len(), 4);
-    features.x_spots.reverse();
-    let second =
-        associate_global_visual_features(global_input(input(&features, &geometry), &config))
-            .unwrap();
-    let expected = key(&first);
-    let actual = key(&second);
-    assert_eq!(actual.len(), expected.len());
-    assert!(actual.iter().all(|pair| expected.contains(pair)));
+    for center in [None, Some((VisualFeatureClass::XSpot, field.center()))] {
+        let mut features = project(
+            center.into_iter().chain([
+                (
+                    VisualFeatureClass::PenaltySpot,
+                    field.penalty_spot(Half::Own),
+                ),
+                (
+                    VisualFeatureClass::PenaltySpot,
+                    field.penalty_spot(Half::Opponent),
+                ),
+                (VisualFeatureClass::XSpot, field.x_crossing(Side::Left)),
+            ]),
+            &geometry,
+        );
+        let first =
+            associate_global_visual_features(global_input(input(&features, &geometry), &config))
+                .unwrap();
+        assert_eq!(first.associations.len(), 3 + usize::from(center.is_some()));
+        if center.is_none() {
+            continue;
+        }
+        features.x_spots.reverse();
+        let second =
+            associate_global_visual_features(global_input(input(&features, &geometry), &config))
+                .unwrap();
+        let expected = key(&first);
+        let actual = key(&second);
+        assert_eq!(actual.len(), expected.len());
+        assert!(actual.iter().all(|pair| expected.contains(pair)));
+    }
 }
 
 #[test]
@@ -712,7 +700,21 @@ fn guided_matching_handles_crossing_class_errors_and_outliers() {
     features.t_spots.push(mislabeled);
     let outlier = project([(VisualFeatureClass::LSpot, point![15.0, 7.0])], &geometry).l_spots[0];
     features.l_spots.push(outlier);
-    let input = global_input(input(&features, &geometry), &config);
+    let mut input = global_input(input(&features, &geometry), &config);
+    let Some(startup) = associate_global_visual_features(input) else {
+        panic!("exact-class startup should retain the correctly classified landmarks");
+    };
+    assert_eq!(startup.associations.len(), map.landmarks.len() - 1);
+    assert!(
+        !startup
+            .associations
+            .iter()
+            .any(|a| a.detection == mislabeled.pixel)
+    );
+    input.heading = Some(crate::HeadingConstraint {
+        expected: linear_algebra::Orientation2::new(std::f64::consts::PI),
+        max_error: 0.3,
+    });
     let result = associate_global_visual_features(input).unwrap();
     assert_eq!(result.associations.len(), map.landmarks.len());
     assert!(
@@ -1206,83 +1208,5 @@ fn tracking_filters_duplicates_but_rejects_input_and_retained_overflow() {
             confidence: 0.95,
         }));
     assert_eq!(features.supported_feature_count(), 33);
-    assert!(associate_tracking_visual_features(input(&features, &geometry), &parameters).is_none());
-}
-
-#[test]
-#[ignore = "host runtime characterization; run explicitly with --ignored --nocapture"]
-fn runtime_characterization() {
-    use std::{hint::black_box, time::Instant};
-
-    let mut geometry = geometry();
-    let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
-    let sparse = (3..=5)
-        .map(|n| {
-            project(
-                stationary_three().into_iter().chain(
-                    map.landmarks
-                        .iter()
-                        .filter(|landmark| landmark.class == VisualFeatureClass::LSpot)
-                        .take(n - 3)
-                        .map(|landmark| (landmark.class, landmark.xy)),
-                ),
-                &geometry,
-            )
-        })
-        .collect::<Vec<_>>();
-    let rich = project(map.landmarks.iter().map(|l| (l.class, l.xy)), &geometry);
-    let parameters = calibrated_parameters();
-    let mut high_covariance = tracking_estimate(0.0);
-    high_covariance.covariance = sparse_retained_covariance();
-    for (mode, estimate) in [
-        ("global", tracking_estimate(0.0)),
-        ("tracking", tracking_estimate(1.0e-6)),
-        ("tracking-high-covariance", high_covariance),
-    ] {
-        geometry.estimate = estimate;
-        for (frame, features) in [
-            ("3", &sparse[0]),
-            ("4", &sparse[1]),
-            ("5", &sparse[2]),
-            ("rich", &rich),
-        ] {
-            if mode == "tracking-high-covariance" && frame == "rich" {
-                continue;
-            }
-            let mut input = input(features, &geometry);
-            if mode == "tracking-high-covariance" {
-                input.time = input.time + std::time::Duration::from_millis(3100);
-            }
-            let mut samples = Vec::with_capacity(500);
-            for iteration in 0..520 {
-                let started = Instant::now();
-                let result = black_box(if mode == "global" {
-                    associate_global_visual_features(global_input(
-                        black_box(input),
-                        black_box(&parameters.global_localizer),
-                    ))
-                } else {
-                    associate_tracking_visual_features(black_box(input), black_box(&parameters))
-                })
-                .unwrap();
-                let elapsed = started.elapsed();
-                assert_eq!(
-                    result.associations.len(),
-                    features.supported_feature_count()
-                );
-                if iteration >= 20 {
-                    samples.push(elapsed);
-                }
-            }
-            samples.sort_unstable();
-            eprintln!(
-                "{mode}/{frame}: n={} p50={:?} p95={:?} p99={:?} max={:?}",
-                samples.len(),
-                samples[250],
-                samples[475],
-                samples[495],
-                samples[499]
-            );
-        }
-    }
+    assert!(associate_visual_features(input(&features, &geometry), &parameters).is_none());
 }
