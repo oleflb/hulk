@@ -116,3 +116,127 @@ impl Localization {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use linear_algebra::{Isometry2, Isometry3};
+    use nalgebra::SMatrix;
+    use projection::intrinsic::Intrinsic;
+    use types::field_dimensions::FieldDimensions;
+
+    use crate::parameters::Localization3dParameters;
+
+    use super::*;
+
+    #[test]
+    fn shipped_short_tails_preserve_motion_without_overconfidence() -> Result<()> {
+        let parameters: Localization3dParameters = json5::from_str(include_str!(
+            "../../../../../etc/parameters/base/localization3d.json5"
+        ))?;
+        for (speed, expected) in [
+            (0.1, 1.0 / 3.0),
+            (1.0, 4.0 * (0.05 / 0.000075_f64.sqrt() - 1.0)),
+        ] {
+            let mut reference: Option<(nalgebra::Vector3<f64>, nalgebra::Matrix3<f64>)> = None;
+            for (index, batches) in [vec![50; 2], vec![48, 2, 50], vec![100], vec![2; 50]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut estimator = Localization::new_motion(
+                    Time::from_nanos(1_000_000_000),
+                    0,
+                    Isometry3::identity(),
+                    &Intrinsic::default(),
+                    parameters.clone(),
+                    &FieldDimensions::SPL_2025,
+                )?;
+                // Exactly 500 ms leaves this synthetic graph rank-deficient; use off-knot IMU support.
+                for milliseconds in (0..=510).step_by(2) {
+                    estimator.ingest_imu(
+                        estimator.origin + Duration::from_millis(milliseconds),
+                        booster::ImuState {
+                            linear_acceleration: linear_algebra::vector![0.0, 0.0, 9.81],
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                estimator.prepare_preintegration()?;
+                estimator.prepare_attitude()?;
+                let mut time = estimator.origin;
+                // Stops keep the nominal large-displacement case in Huber's tail.
+                for milliseconds in [50; 4].into_iter().chain(batches).chain([50; 4]) {
+                    let speed = if (estimator.origin + Duration::from_millis(200)
+                        ..estimator.origin + Duration::from_millis(300))
+                        .contains(&time)
+                    {
+                        speed
+                    } else {
+                        0.0
+                    };
+                    let sample = KinematicOdometryDelta {
+                        previous_time: time,
+                        time: time + Duration::from_millis(milliseconds),
+                        current_to_previous: Isometry2::wrap(nalgebra::Isometry2::translation(
+                            milliseconds as f32 * speed * 0.001,
+                            0.0,
+                        )),
+                    };
+                    assert!(estimator.ingest_kinematic_odometry(sample)?);
+                    assert!(!estimator.ingest_kinematic_odometry(sample)?);
+                    time = sample.time;
+                }
+                let options = estimator.solve_options();
+                let controls = estimator.ensure_segment(2)?;
+                let blocks = estimator.estimate_covariance_blocks(controls)?;
+                let (report, covariance) = estimator.optimizer.solve_batch_with_covariance(
+                    &mut estimator.graph,
+                    &options,
+                    &blocks,
+                    &Default::default(),
+                )?;
+                let covariance = SMatrix::<f64, 24, 24>::from_fn(|r, c| covariance[(r, c)]);
+                let spline = estimator.spline(controls)?;
+                let linearized = spline.linearize()?;
+                let (start, end) = (linearized.pose(0.0)?, linearized.pose(1.0)?);
+                let displacement =
+                    end.pose.inner.translation.vector - start.pose.inner.translation.vector;
+                let mut jacobian = SMatrix::<f64, 3, 24>::zeros();
+                for index in 0..4 {
+                    let a = start.pose.inner.rotation.to_rotation_matrix()
+                        * start.jacobians[index].fixed_rows::<3>(3);
+                    let b = end.pose.inner.rotation.to_rotation_matrix()
+                        * end.jacobians[index].fixed_rows::<3>(3);
+                    jacobian
+                        .fixed_view_mut::<3, 6>(0, index * 6)
+                        .copy_from(&(b - a));
+                }
+                let covariance = jacobian * covariance * jacobian.transpose();
+                assert!(covariance.cholesky().is_some());
+                assert!(displacement.x > 0.0 && displacement.x < speed as f64 * 0.1);
+                if let Some((motion, confidence)) = &reference {
+                    if index == 1 {
+                        assert!(
+                            (displacement.xy() - motion.xy()).norm() < 0.03 * motion.xy().norm()
+                        );
+                        let covariance = covariance.fixed_view::<2, 2>(0, 0);
+                        let confidence = confidence.fixed_view::<2, 2>(0, 0);
+                        assert!((covariance - confidence).norm() < 0.03 * confidence.norm());
+                    } else if index == 3 {
+                        // The retained per-delta floor does not claim sampling invariance.
+                        assert!(covariance[(0, 0)] > confidence[(0, 0)]);
+                        assert!(displacement.x < motion.x);
+                    }
+                } else {
+                    assert!((report.initial_cost - expected).abs() < 1e-5, "{report:?}");
+                    let residual =
+                        (speed as f64 * 0.1 - displacement.x) / (2.0 * 0.000075_f64.sqrt());
+                    assert_eq!(residual > parameters.model.huber_threshold, speed == 1.0);
+                    reference = Some((displacement, covariance));
+                }
+            }
+        }
+        Ok(())
+    }
+}
