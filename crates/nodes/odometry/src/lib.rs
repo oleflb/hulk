@@ -63,24 +63,19 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 inner: imu_state,
             },
         );
-        let maybe_robot_kinematics_wrapper = robot_kinematics_cache
-            .get_before(imu_time)
-            .filter(|sample| sample.time.abs_diff(imu_time) <= estimator::MAX_SAMPLE_GAP);
-        let aligned_imu = maybe_robot_kinematics_wrapper
-            .as_ref()
-            .and_then(|sample| imu_at(&imu_history, sample.time));
-        let maybe_fall_detection = fall_detection_cache.get_nearest(imu_time);
+        let robot_kinematics = robot_kinematics_cache.get_before(imu_time);
+        let (imu_state, robot_kinematics) =
+            align_input(imu_time, imu_state, &imu_history, robot_kinematics);
+        let fall_detection = fall_detection_cache.get_nearest(imu_time);
 
         if let Some(pose) = estimator.update(
             EstimatorInput {
                 time: imu_time,
-                imu_state: aligned_imu.as_ref().unwrap_or(&imu_state),
-                robot_kinematics: maybe_robot_kinematics_wrapper
+                imu_state: &imu_state,
+                robot_kinematics: robot_kinematics.as_deref(),
+                fall_detection: fall_detection
                     .as_deref()
-                    .filter(|_| aligned_imu.is_some()),
-                fall_detection: maybe_fall_detection
-                    .as_deref()
-                    .filter(|fall_detection| fall_detection.is_valid(node.clock().now())),
+                    .filter(|fall| fall.is_valid(node.clock().now())),
             },
             &parameters,
         ) {
@@ -94,6 +89,24 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             deltas.publish(&delta).await?;
         }
     }
+}
+
+/// Align attitude to the last encoder at or before `time`, admitting only bracketed fresh samples.
+pub fn align_input(
+    time: Time,
+    imu_state: ImuState,
+    imu_history: &CacheInner<TimeWrapper<ImuState>>,
+    robot_kinematics: Option<Arc<TimeWrapper<RobotKinematics>>>,
+) -> (ImuState, Option<Arc<TimeWrapper<RobotKinematics>>>) {
+    let robot_kinematics =
+        robot_kinematics.filter(|sample| sample.time.abs_diff(time) <= estimator::MAX_SAMPLE_GAP);
+    let aligned_imu = robot_kinematics
+        .as_ref()
+        .and_then(|sample| imu_at(imu_history, sample.time));
+    (
+        aligned_imu.unwrap_or(imu_state),
+        robot_kinematics.filter(|_| aligned_imu.is_some()),
+    )
 }
 
 fn imu_at(history: &CacheInner<TimeWrapper<ImuState>>, time: Time) -> Option<ImuState> {
