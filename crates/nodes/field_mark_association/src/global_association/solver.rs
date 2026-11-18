@@ -226,6 +226,7 @@ impl<'a> Search<'a> {
             observation.class,
             self.map.landmarks[landmark].class,
             config,
+            self.input.heading.is_some(),
         )?;
         let error = prediction.pixel - observation.pixel.inner.coords.cast::<f64>();
         let distance = error.dot(&(prediction.information * error)) + penalty;
@@ -408,11 +409,14 @@ fn class_penalty(
     observed: VisualFeatureClass,
     landmark: VisualFeatureClass,
     config: &GlobalAssociationConfig,
+    allow_substitution: bool,
 ) -> Option<f64> {
     use VisualFeatureClass::{LSpot, TSpot, XSpot};
     if observed == landmark {
         Some(0.0)
-    } else if matches!(observed, LSpot | TSpot | XSpot) && matches!(landmark, LSpot | TSpot | XSpot)
+    } else if allow_substitution
+        && matches!(observed, LSpot | TSpot | XSpot)
+        && matches!(landmark, LSpot | TSpot | XSpot)
     {
         Some(f64::from(config.class_mismatch_penalty))
     } else {
