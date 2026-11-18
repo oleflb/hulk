@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use types::{
     field_dimensions::FieldDimensions, time_wrapper::TimeWrapper,
-    visual_localization::VisualLocalizationFrame as FieldMarkAssociations,
+    visual_localization::VisualLocalizationFrame as FieldMarkAssociations, world_state::BallState,
 };
 
 use crate::{
@@ -28,6 +28,7 @@ use observation::Observation;
 use transforms::*;
 
 mod associations;
+mod ball;
 mod camera;
 mod field;
 #[cfg(test)]
@@ -43,6 +44,7 @@ struct Settings {
     robot: bool,
     camera: bool,
     associations: bool,
+    ball: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +54,7 @@ impl Default for Settings {
             robot: true,
             camera: true,
             associations: false,
+            ball: true,
         }
     }
 }
@@ -64,6 +67,7 @@ struct ViewerData {
     camera_matrix: Option<CameraMatrix>,
     camera_frame: Option<Arc<SampleRecord<RosImage>>>,
     field_mark_associations: Option<Arc<SampleRecord<TimeWrapper<FieldMarkAssociations>>>>,
+    ball: Option<BallState>,
 }
 
 struct Observations {
@@ -78,6 +82,7 @@ struct Observations {
     matrix: Observation<TimeWrapper<CameraMatrix>>,
     images: Option<Observation<RosImage>>,
     associations: Option<Observation<TimeWrapper<FieldMarkAssociations>>>,
+    ball: Observation<Option<BallState>>,
 }
 
 impl Observations {
@@ -115,6 +120,7 @@ impl Observations {
             matrix: Observation::new(context, "camera_matrix", 1024, Default::default())?,
             images: None,
             associations: None,
+            ball: Observation::new(context, "ball_state", 1, Default::default())?,
         })
     }
 
@@ -205,6 +211,7 @@ impl Observations {
             camera_matrix,
             camera_frame,
             field_mark_associations: association.cloned(),
+            ball: self.ball.latest(namespace).and_then(|record| record.value),
         }
     }
 }
@@ -250,6 +257,7 @@ impl Panel for Map3DPanel {
                 || observations.localization_status.is_querying()
                 || observations.kinematics.is_querying()
                 || observations.matrix.is_querying()
+                || observations.ball.is_querying()
                 || observations
                     .images
                     .as_ref()
@@ -289,6 +297,7 @@ impl Panel for Map3DPanel {
                         robot::setup,
                         camera::setup,
                         associations::setup,
+                        ball::setup,
                     ),
                 )
                 .add_systems(
@@ -302,6 +311,7 @@ impl Panel for Map3DPanel {
                         robot::update,
                         (camera::update_camera_image, camera::update_camera_viewport).chain(),
                         associations::update,
+                        ball::update,
                     ),
                 );
             widget.bevy_app.finish();
@@ -326,6 +336,7 @@ impl Panel for Map3DPanel {
                 ui.checkbox(&mut self.settings.robot, "Robot");
                 ui.checkbox(&mut self.settings.camera, "Camera");
                 ui.checkbox(&mut self.settings.associations, "Associations");
+                ui.checkbox(&mut self.settings.ball, "Ball");
             });
         });
         let Some(widget) = &mut self.widget else {
