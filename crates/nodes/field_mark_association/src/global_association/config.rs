@@ -5,12 +5,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, Message)]
 #[serde(default, deny_unknown_fields)]
 pub struct GlobalAssociationConfig {
-    /// Per-axis metric tolerance when matching half-turn landmark partners.
-    pub symmetry_epsilon: f32,
-    /// Minimum pair distance in unit-height projected coordinates before normalization.
-    pub min_pair_distance: f32,
-    /// Floor for the squared-edge denominator in normalized seed triangle quality.
-    pub min_triangle_denominator: f32,
     /// Maximum supported detections accepted before filtering.
     pub max_input_detections: usize,
     /// Maximum detections retained after filtering and de-duplication.
@@ -64,9 +58,6 @@ pub struct GlobalAssociationConfig {
 impl Default for GlobalAssociationConfig {
     fn default() -> Self {
         Self {
-            symmetry_epsilon: 1.0e-4,
-            min_pair_distance: 1.0e-6,
-            min_triangle_denominator: 1.0e-12,
             max_input_detections: 128,
             max_retained_detections: 32,
             seed_pool_size: 8,
@@ -110,9 +101,6 @@ impl GlobalAssociationConfig {
             return Err("invalid global detection limits".into());
         }
         for (name, value) in [
-            ("symmetry_epsilon", self.symmetry_epsilon),
-            ("min_pair_distance", self.min_pair_distance),
-            ("min_triangle_denominator", self.min_triangle_denominator),
             ("min_detection_baseline", self.min_detection_baseline),
             ("duplicate_pixel_distance", self.duplicate_pixel_distance),
             ("min_downward_ray_fraction", self.min_downward_ray_fraction),

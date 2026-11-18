@@ -5,6 +5,8 @@ use coordinate_systems::Field;
 
 use crate::features::{FEATURE_CLASSES, VisualFeatureClass};
 
+const SYMMETRY_EPSILON: f32 = 1.0e-4;
+
 #[derive(Clone, Debug)]
 pub(crate) struct LandmarkMap {
     pub landmarks: Vec<Landmark>,
@@ -20,9 +22,9 @@ pub(crate) struct Landmark {
 }
 
 impl LandmarkMap {
-    pub fn new(field: &FieldDimensions, symmetry_epsilon: f32) -> Self {
+    pub fn new(field: &FieldDimensions) -> Self {
         let mut landmarks = candidate_landmarks(field);
-        fill_symmetric_ids(&mut landmarks, symmetry_epsilon);
+        fill_symmetric_ids(&mut landmarks);
         let landmarks_by_class = landmarks_by_class(&landmarks);
         let class_rarity_weight = class_rarity_weights(&landmarks_by_class);
 
@@ -117,13 +119,13 @@ pub fn candidate_points(field: &FieldDimensions) -> Vec<(VisualFeatureClass, Poi
     points
 }
 
-fn fill_symmetric_ids(landmarks: &mut [Landmark], symmetry_epsilon: f32) {
+fn fill_symmetric_ids(landmarks: &mut [Landmark]) {
     for index in 0..landmarks.len() {
         let landmark = landmarks[index];
         if let Some(partner_id) = landmarks.iter().position(|candidate| {
             candidate.class == landmark.class
-                && (candidate.xy.x() + landmark.xy.x()).abs() <= symmetry_epsilon
-                && (candidate.xy.y() + landmark.xy.y()).abs() <= symmetry_epsilon
+                && (candidate.xy.x() + landmark.xy.x()).abs() <= SYMMETRY_EPSILON
+                && (candidate.xy.y() + landmark.xy.y()).abs() <= SYMMETRY_EPSILON
         }) {
             landmarks[index].symmetric_id = partner_id;
         }
@@ -148,22 +150,17 @@ mod tests {
                 xy: linear_algebra::point![-1.001, -2.0],
             },
         ];
-        fill_symmetric_ids(
-            &mut landmarks,
-            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
-        );
+        fill_symmetric_ids(&mut landmarks);
         assert_eq!(landmarks[0].symmetric_id, 0);
-        fill_symmetric_ids(&mut landmarks, 0.002);
+        landmarks[1].xy = linear_algebra::point![-1.00001, -2.0];
+        fill_symmetric_ids(&mut landmarks);
         assert_eq!(landmarks[0].symmetric_id, 1);
         assert_eq!(landmarks[1].symmetric_id, 0);
     }
 
     #[test]
     fn candidate_sets_match_field_feature_classes() {
-        let map = LandmarkMap::new(
-            &FieldDimensions::SPL_2025,
-            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
-        );
+        let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
         assert_eq!(
             map.landmarks.len(),
             candidate_points(&FieldDimensions::SPL_2025).len()

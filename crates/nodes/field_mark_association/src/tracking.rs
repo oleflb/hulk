@@ -12,6 +12,9 @@ use crate::{
     assignment::unique_assignment, features::filter_detections, map::LandmarkMap,
 };
 
+const COVARIANCE_SYMMETRY_TOLERANCE: f32 = 1.0e-5;
+const COVARIANCE_PSD_TOLERANCE: f32 = 1.0e-6;
+
 #[derive(Clone, Copy)]
 struct Prediction {
     pixel: Point2<Pixel>,
@@ -29,10 +32,7 @@ pub(crate) fn associate(
     parameters: &FieldMarkAssociationParameters,
 ) -> Option<AssociationResult> {
     let age = validated_age(input, parameters)?;
-    let map = LandmarkMap::new(
-        input.field_dimensions,
-        parameters.global_localizer.symmetry_epsilon,
-    );
+    let map = LandmarkMap::new(input.field_dimensions);
     if map
         .landmarks
         .iter()
@@ -104,17 +104,17 @@ fn valid_covariance(
     parameters: crate::TrackingAssociationParameters,
 ) -> bool {
     if !covariance.iter().all(|x| x.is_finite())
-        || (covariance - covariance.transpose()).amax()
-            > f64::from(parameters.covariance_symmetry_tolerance)
+        || (covariance - covariance.transpose()).amax() > f64::from(COVARIANCE_SYMMETRY_TOLERANCE)
     {
         return false;
     }
     covariance
         .try_symmetric_eigen(f64::EPSILON, parameters.covariance_eigen_max_iterations)
         .is_some_and(|eigen| {
-            eigen.eigenvalues.iter().all(|value| {
-                value.is_finite() && *value >= -f64::from(parameters.covariance_psd_tolerance)
-            })
+            eigen
+                .eigenvalues
+                .iter()
+                .all(|value| value.is_finite() && *value >= -f64::from(COVARIANCE_PSD_TOLERANCE))
         })
 }
 
@@ -487,25 +487,26 @@ mod tests {
     use crate::DetectedVisualFeatures;
 
     fn map() -> LandmarkMap {
-        LandmarkMap::new(
-            &types::field_dimensions::FieldDimensions::SPL_2025,
-            crate::GlobalLocalizerParameters::default().symmetry_epsilon,
-        )
+        LandmarkMap::new(&types::field_dimensions::FieldDimensions::SPL_2025)
     }
 
     #[test]
     fn covariance_numerical_tolerances_are_applied() {
-        let mut parameters = crate::TrackingAssociationParameters::default();
+        let parameters = crate::TrackingAssociationParameters::default();
         let mut covariance = Matrix6::identity();
         covariance[(0, 1)] = 5.0e-5;
         assert!(!valid_covariance(covariance, parameters));
-        parameters.covariance_symmetry_tolerance = 1.0e-4;
+        covariance[(0, 1)] = f64::from(COVARIANCE_SYMMETRY_TOLERANCE);
         assert!(valid_covariance(covariance, parameters));
+        covariance[(0, 1)] *= 1.000001;
+        assert!(!valid_covariance(covariance, parameters));
         covariance = Matrix6::identity();
         covariance[(0, 0)] = -5.0e-6;
         assert!(!valid_covariance(covariance, parameters));
-        parameters.covariance_psd_tolerance = 1.0e-5;
+        covariance[(0, 0)] = -f64::from(COVARIANCE_PSD_TOLERANCE);
         assert!(valid_covariance(covariance, parameters));
+        covariance[(0, 0)] *= 1.000001;
+        assert!(!valid_covariance(covariance, parameters));
     }
 
     #[test]
