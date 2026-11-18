@@ -81,7 +81,11 @@ pub(super) fn update_camera_viewport(
         return;
     };
 
-    let transform = camera_to_display_transform(&data, camera_matrix);
+    let Some(transform) = camera_to_display_transform(&data, camera_matrix) else {
+        *frustum.2 = Visibility::Hidden;
+        *image_plane.2 = Visibility::Hidden;
+        return;
+    };
     *frustum.1 = transform;
     *image_plane.1 = transform;
     *frustum.2 = Visibility::Visible;
@@ -147,11 +151,14 @@ pub(super) fn update_camera_image(
         .expect("camera texture exists");
     image_plane.valid = true;
 }
-fn camera_to_display_transform(data: &ViewerData, camera_matrix: &CameraMatrix) -> Transform {
-    let robot_to_display = robot_to_display(data);
+fn camera_to_display_transform(
+    data: &ViewerData,
+    camera_matrix: &CameraMatrix,
+) -> Option<Transform> {
+    let robot_to_display = robot_to_display(data)?;
     let camera_to_robot = robot_to_camera(camera_matrix).inverse();
 
-    transform_from_isometry(robot_to_display * camera_to_robot)
+    Some(transform_from_isometry(robot_to_display * camera_to_robot))
 }
 fn camera_frustum_mesh(camera_matrix: &CameraMatrix) -> Mesh {
     let corners = camera_viewport_corners(camera_matrix, CAMERA_VIEWPORT_DEPTH);

@@ -1,11 +1,10 @@
 use super::{CameraMatrix, ViewerData};
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*};
 
-pub(super) fn robot_to_display(data: &ViewerData) -> nalgebra::Isometry3<f32> {
+pub(super) fn robot_to_display(data: &ViewerData) -> Option<nalgebra::Isometry3<f32>> {
     data.localization
         .as_ref()
         .map(|field_to_robot| field_to_robot.inverse().inner)
-        .unwrap_or_else(nalgebra::Isometry3::identity)
 }
 
 pub(super) fn robot_to_camera(camera_matrix: &CameraMatrix) -> nalgebra::Isometry3<f32> {
@@ -65,8 +64,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            robot_to_display(&data).translation.vector,
+            robot_to_display(&data).unwrap().translation.vector,
             nalgebra::Vector3::new(-1.0, -2.0, -3.0)
         );
+    }
+
+    #[test]
+    fn missing_pose_is_not_replaced_by_the_field_origin() {
+        let data = ViewerData::default();
+        assert!(robot_to_display(&data).is_none());
     }
 }

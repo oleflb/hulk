@@ -350,14 +350,11 @@ pub(super) fn update(
     let robot_to_display = robot_to_display(&data);
 
     for (link, mut transform, mut visibility) in &mut links {
-        *visibility = if settings.robot {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
-        if !settings.robot {
+        let Some(robot_to_display) = robot_to_display.filter(|_| settings.robot) else {
+            *visibility = Visibility::Hidden;
             continue;
-        }
+        };
+        *visibility = Visibility::Visible;
         let link_to_robot = data
             .robot_kinematics
             .as_ref()
