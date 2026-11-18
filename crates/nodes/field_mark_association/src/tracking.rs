@@ -573,6 +573,62 @@ mod tests {
         }
     }
 
+    struct MatchingCase {
+        map: LandmarkMap,
+        noise: PredictionNoise,
+        predictions: Vec<Option<Prediction>>,
+        parameters: FieldMarkAssociationParameters,
+    }
+
+    impl MatchingCase {
+        fn new(pose_variance: f64) -> Self {
+            let map = map();
+            Self {
+                predictions: vec![None; map.landmarks.len()],
+                map,
+                noise: PredictionNoise {
+                    pose: Matrix6::identity() * pose_variance,
+                    pixel_variance: 4.0,
+                },
+                parameters: FieldMarkAssociationParameters::default(),
+            }
+        }
+
+        fn predict(
+            &mut self,
+            class: VisualFeatureClass,
+            index: usize,
+            pixel: Point2<Pixel>,
+            jacobian: Matrix2x6<f64>,
+        ) {
+            let id = self.map.landmarks_for_class(class)[index];
+            self.predictions[id] = Some(prediction(pixel, jacobian, &self.noise));
+        }
+
+        fn associate(
+            &self,
+            detections: &[(VisualFeatureClass, DetectedVisualFeature)],
+        ) -> Option<AssociationResult> {
+            match_predictions(
+                detections,
+                &self.map,
+                &self.predictions,
+                &self.noise,
+                &self.parameters,
+            )
+        }
+
+        fn gates(&self, detections: &[(VisualFeatureClass, DetectedVisualFeature)]) -> Array2<f32> {
+            prediction_log_likelihoods(
+                detections,
+                &self.map,
+                &self.predictions,
+                self.parameters.global_localizer.mahalanobis_gate,
+            )
+            .unwrap()
+        }
+    }
+
     #[test]
     fn joint_gate_preserves_the_configured_two_dimensional_tail_probability() {
         for (features, expected) in [
@@ -617,35 +673,28 @@ mod tests {
 
     #[test]
     fn joint_residual_uses_dimension_calibration_without_losing_its_absolute_gate() {
-        let map = map();
-        let noise = PredictionNoise {
-            pose: Matrix6::zeros(),
-            pixel_variance: 4.0,
-        };
-        let parameters = FieldMarkAssociationParameters::default();
         let class = VisualFeatureClass::LSpot;
         for n in 3..=5 {
             let detections = (0..n)
                 .map(|row| detection(class, point![30.0 * row as f32, 0.0]))
                 .collect::<Vec<_>>();
-            let marginal_gate = parameters.global_localizer.mahalanobis_gate;
+            let mut case = MatchingCase::new(0.0);
+            let marginal_gate = case.parameters.global_localizer.mahalanobis_gate;
             let joint_gate = joint_mahalanobis_gate(marginal_gate, n);
             for (total_error, accepted) in [
                 ((f64::from(marginal_gate) + joint_gate) / 2.0, true),
                 (joint_gate + 1.0, false),
             ] {
-                let shift = (noise.pixel_variance * total_error / n as f64).sqrt() as f32;
-                let mut predictions = vec![None; map.landmarks.len()];
+                let shift = (case.noise.pixel_variance * total_error / n as f64).sqrt() as f32;
                 for (row, (_, detection)) in detections.iter().enumerate() {
-                    predictions[map.landmarks_for_class(class)[row]] = Some(prediction(
+                    case.predict(
+                        class,
+                        row,
                         point![detection.pixel.x() + shift, 0.0],
                         Matrix2x6::zeros(),
-                        &noise,
-                    ));
+                    );
                 }
-                let gates =
-                    prediction_log_likelihoods(&detections, &map, &predictions, marginal_gate)
-                        .unwrap();
+                let gates = case.gates(&detections);
                 assert!(
                     gates.rows().into_iter().all(|row| row
                         .iter()
@@ -653,8 +702,7 @@ mod tests {
                         .count()
                         == 1)
                 );
-                let result =
-                    match_predictions(&detections, &map, &predictions, &noise, &parameters);
+                let result = case.associate(&detections);
                 assert_eq!(
                     result.is_some(),
                     accepted,
@@ -669,12 +717,7 @@ mod tests {
 
     #[test]
     fn covariance_volume_does_not_reward_a_distant_plausible_rival() {
-        let map = map();
-        let mut predictions = vec![None; map.landmarks.len()];
-        let noise = PredictionNoise {
-            pose: Matrix6::identity(),
-            pixel_variance: 4.0,
-        };
+        let mut case = MatchingCase::new(1.0);
         let mut detections = Vec::with_capacity(3);
         for (index, class) in [
             VisualFeatureClass::LSpot,
@@ -685,45 +728,36 @@ mod tests {
         .enumerate()
         {
             let pixel = point![100.0 + index as f32 * 100.0, 100.0];
-            predictions[map.landmarks_for_class(class)[0]] = Some(prediction(
+            case.predict(
+                class,
+                0,
                 point![pixel.x() + 1.0, pixel.y() + 1.0],
                 Matrix2x6::zeros(),
-                &noise,
-            ));
+            );
             detections.push(detection(class, pixel));
         }
         // Its Mahalanobis error (0.02) is smaller than the correct match's (0.5), solely
         // because of its enormous covariance. Gaussian uncertainty volume must penalize it.
-        predictions[map.landmarks_for_class(VisualFeatureClass::LSpot)[1]] = Some(prediction(
+        case.predict(
+            VisualFeatureClass::LSpot,
+            1,
             point![10100.0, 10100.0],
             Matrix2x6::identity() * 1.0e5,
-            &noise,
-        ));
-        let result = match_predictions(
-            &detections,
-            &map,
-            &predictions,
-            &noise,
-            &FieldMarkAssociationParameters::default(),
-        )
-        .unwrap();
+        );
+        let result = case.associate(&detections).unwrap();
         assert_eq!(result.associations.len(), 3);
         for (association, (class, feature)) in result.associations.iter().zip(detections) {
             assert_eq!(association.detection, feature.pixel);
             assert_eq!(
                 association.field_point.xy(),
-                map.landmarks[map.landmarks_for_class(class)[0]].xy
+                case.map.landmarks[case.map.landmarks_for_class(class)[0]].xy
             );
         }
     }
 
     #[test]
     fn joint_triples_distinguish_inconsistent_neighbors_but_reject_shared_ambiguity() {
-        let map = map();
-        let noise = PredictionNoise {
-            pose: Matrix6::identity() * 10000.0,
-            pixel_variance: 4.0,
-        };
+        let mut case = MatchingCase::new(10000.0);
         let classes = [
             VisualFeatureClass::LSpot,
             VisualFeatureClass::TSpot,
@@ -731,114 +765,90 @@ mod tests {
         ];
         let detections =
             classes.map(|class| detection(class, point![100.0 * class.index() as f32, 100.0]));
-        let parameters = FieldMarkAssociationParameters::default();
-        let mut predictions = vec![None; map.landmarks.len()];
         for (row, &(class, feature)) in detections.iter().enumerate() {
-            let ids = map.landmarks_for_class(class);
-            predictions[ids[0]] = Some(prediction(feature.pixel, Matrix2x6::identity(), &noise));
-            predictions[ids[1]] = Some(prediction(
+            case.predict(class, 0, feature.pixel, Matrix2x6::identity());
+            case.predict(
+                class,
+                1,
                 point![
                     feature.pixel.x() + [8.0, -8.0, 16.0][row],
                     feature.pixel.y()
                 ],
                 Matrix2x6::identity(),
-                &noise,
-            ));
+            );
         }
-        let result =
-            match_predictions(&detections, &map, &predictions, &noise, &parameters).unwrap();
+        let result = case.associate(&detections).unwrap();
         for (association, class) in result.associations.iter().zip(classes) {
             assert_eq!(
                 association.field_point.xy(),
-                map.landmarks[map.landmarks_for_class(class)[0]].xy
+                case.map.landmarks[case.map.landmarks_for_class(class)[0]].xy
             );
         }
 
         // Now an entire rival triple has the same shared shift: geometry cannot disambiguate it.
         for &(class, feature) in &detections {
-            predictions[map.landmarks_for_class(class)[1]] = Some(prediction(
+            case.predict(
+                class,
+                1,
                 point![feature.pixel.x() + 8.0, feature.pixel.y()],
                 Matrix2x6::identity(),
-                &noise,
-            ));
+            );
         }
-        assert!(match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none());
+        assert!(case.associate(&detections).is_none());
 
         // For a common 8-pixel x shift, delta log L = (3 * 8^2) / (2 * (4 + 3 * 10000)).
-        let mut threshold = parameters.clone();
-        threshold.tracking.score_ratio = 1.002;
-        assert!(match_predictions(&detections, &map, &predictions, &noise, &threshold).is_some());
-        threshold.tracking.score_ratio = 1.004;
-        assert!(match_predictions(&detections, &map, &predictions, &noise, &threshold).is_none());
+        let score_ratio = case.parameters.tracking.score_ratio;
+        case.parameters.tracking.score_ratio = 1.002;
+        assert!(case.associate(&detections).is_some());
+        case.parameters.tracking.score_ratio = 1.004;
+        assert!(case.associate(&detections).is_none());
+        case.parameters.tracking.score_ratio = score_ratio;
 
         // Rivals beyond the output ceiling still veto; removing them would falsely certify.
         for &(class, feature) in &detections {
             for (index, shift) in [-79.0, 81.0].into_iter().enumerate() {
-                predictions[map.landmarks_for_class(class)[index]] = Some(prediction(
+                case.predict(
+                    class,
+                    index,
                     point![feature.pixel.x() + shift, feature.pixel.y()],
                     Matrix2x6::identity(),
-                    &noise,
-                ));
+                );
             }
         }
-        assert!(match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none());
+        assert!(case.associate(&detections).is_none());
         for class in classes {
-            predictions[map.landmarks_for_class(class)[1]] = None;
+            case.predictions[case.map.landmarks_for_class(class)[1]] = None;
         }
-        assert_eq!(
-            match_predictions(&detections, &map, &predictions, &noise, &parameters)
-                .unwrap()
-                .associations
-                .len(),
-            3
-        );
+        assert_eq!(case.associate(&detections).unwrap().associations.len(), 3);
         let mut zero_confidence = detections;
         zero_confidence[0].1.confidence = 0.0;
-        assert!(
-            match_predictions(&zero_confidence, &map, &predictions, &noise, &parameters).is_none()
-        );
+        assert!(case.associate(&zero_confidence).is_none());
 
         // A unique triple with mutually inconsistent errors must not pass on likelihood gap alone.
         let class = classes[0];
-        predictions[map.landmarks_for_class(class)[0]]
+        case.predictions[case.map.landmarks_for_class(class)[0]]
             .as_mut()
             .unwrap()
             .pixel = detections[0].1.pixel;
-        assert!(match_predictions(&detections, &map, &predictions, &noise, &parameters).is_none());
+        assert!(case.associate(&detections).is_none());
     }
 
     #[test]
     fn joint_assignments_require_distinct_landmarks() {
-        let map = map();
-        let noise = PredictionNoise {
-            pose: Matrix6::zeros(),
-            pixel_variance: 4.0,
-        };
         let class = VisualFeatureClass::LSpot;
         for n in 3..=5 {
+            let mut case = MatchingCase::new(0.0);
             let mut detections = (0..n - 1)
                 .map(|row| detection(class, point![20.0 * row as f32, 0.0]))
                 .collect::<Vec<_>>();
-            let mut predictions = vec![None; map.landmarks.len()];
             for (row, &(_, feature)) in detections.iter().enumerate() {
-                predictions[map.landmarks_for_class(class)[row]] =
-                    Some(prediction(feature.pixel, Matrix2x6::zeros(), &noise));
+                case.predict(class, row, feature.pixel, Matrix2x6::zeros());
             }
             // Every row has exactly one gated ID, but the last two rows need the same one.
             let mut duplicate = detections[n - 2];
             duplicate.1.pixel = point![duplicate.1.pixel.x() + 2.0, 0.0];
             detections.push(duplicate);
-            assert!(
-                match_predictions(
-                    &detections,
-                    &map,
-                    &predictions,
-                    &noise,
-                    &FieldMarkAssociationParameters::default()
-                )
-                .is_none(),
-                "n={n}"
-            );
+            assert!(case.associate(&detections).is_none(), "n={n}");
         }
     }
 
