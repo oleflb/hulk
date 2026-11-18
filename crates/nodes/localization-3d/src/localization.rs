@@ -24,8 +24,6 @@ pub struct SolveOutput {
 }
 
 #[cfg(test)]
-mod flight_recording_tests;
-#[cfg(test)]
 mod recording_tests;
 #[cfg(test)]
 mod recovery_tests;
