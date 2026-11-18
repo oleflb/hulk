@@ -4,7 +4,7 @@ use color_eyre::Result;
 use coordinate_systems::{Field, ImuReference, Robot};
 use linear_algebra::{IntoTransform, Isometry3, Orientation3, Point3, Vector3};
 use localization_fagra::variables::{FieldAlignment, PoseControl, TrajectoryState};
-use nalgebra::{Matrix2, UnitQuaternion};
+use nalgebra::{Matrix2, SMatrix, UnitQuaternion};
 use projection::intrinsic::Intrinsic;
 use ros_z::time::Time;
 use types::{time_wrapper::TimeWrapper, visual_localization::VisualLocalizationFrame};
@@ -145,6 +145,161 @@ impl MotionRecord {
 }
 
 impl Localization {
+    fn conflict_fit(
+        &self,
+        frame: &mut TimeWrapper<VisualLocalizationFrame>,
+        heading: &HeadingReference,
+    ) -> Option<ConflictFit> {
+        if frame.inner.epoch != self.epoch
+            || frame.inner.generation != self.generation
+            || !valid_visual_frame(&frame.inner, &self.parameters.visual)
+            || !crate::alignment::informative_landmarks(
+                &frame
+                    .inner
+                    .associations
+                    .iter()
+                    .map(|a| a.field_point)
+                    .collect::<Vec<_>>(),
+                &self.parameters.visual,
+            )
+        {
+            return None;
+        }
+        let attitude = self.attitude_at(frame.time)?;
+        let (roll, pitch, _) = attitude.euler_angles();
+        let tilt = linear_algebra::Rotation3::from_euler_angles(roll as f32, pitch as f32, 0.0);
+        let (pose, alignment) = seed_recovery_alignment(
+            &mut frame.inner,
+            tilt,
+            Some(types::localization::HeadingConstraint {
+                expected: heading.expected(attitude),
+                max_error: self.parameters.max_heading_error,
+            }),
+            &self.parameters.visual,
+        )?;
+        let pose = (alignment.to_3d() * pose).inner.cast::<f64>();
+        let camera_to_robot = frame.inner.robot_to_camera.inner.cast::<f64>().inverse();
+        let camera_pose = pose * camera_to_robot;
+        let camera = localization_fagra::alignment::GravityCamera::new(
+            (tilt.inner.cast::<f64>() * camera_to_robot.rotation)
+                .to_rotation_matrix()
+                .into_inner(),
+            frame.inner.camera_intrinsic.focals.cast(),
+            frame
+                .inner
+                .camera_intrinsic
+                .optical_center
+                .inner
+                .coords
+                .cast(),
+            self.parameters.visual.min_reprojection_depth,
+        )?;
+        let ground = localization_fagra::alignment::GroundPose {
+            position: camera_pose.translation.vector.xy(),
+            yaw: pose.rotation.euler_angles().2,
+            height: camera_pose.translation.z,
+        };
+        // Marginalize shared tilt uncertainty instead of counting it once per landmark.
+        let mut information = SMatrix::<f64, 6, 6>::zeros();
+        for association in &frame.inner.associations {
+            let projection =
+                camera.project(ground, association.field_point.inner.coords.xy().cast())?;
+            let mut jacobian = SMatrix::<f64, 2, 6>::zeros();
+            jacobian
+                .fixed_view_mut::<2, 4>(0, 0)
+                .copy_from(&projection.jacobian);
+            jacobian
+                .fixed_view_mut::<2, 2>(0, 4)
+                .copy_from(&projection.tilt_jacobian);
+            information +=
+                jacobian.transpose() * jacobian / self.parameters.visual_feature_noise_variance;
+        }
+        for index in 4..6 {
+            information[(index, index)] += self.parameters.imu_preintegration.tilt_sigma.powi(-2);
+        }
+        let covariance = information.cholesky()?.inverse();
+        // Bound camera-to-body lever-arm uncertainty, including its correlation with position.
+        let orientation_variance = covariance[(2, 2)] + covariance[(4, 4)] + covariance[(5, 5)];
+        let position_covariance = covariance.fixed_view::<2, 2>(0, 0) * 2.0
+            + Matrix2::identity()
+                * (2.0 * camera_to_robot.translation.vector.norm_squared() * orientation_variance);
+        if !covariance.iter().all(|value| value.is_finite())
+            || position_covariance.symmetric_eigen().eigenvalues.max() > 1.0
+            || covariance[(2, 2)] > self.parameters.max_heading_error.powi(2)
+            || covariance[(3, 3)] > 1.0
+        {
+            return None;
+        }
+        Some(ConflictFit {
+            time: frame.time,
+            pose,
+            covariance: position_covariance,
+        })
+    }
+
+    fn contradicted_leg_interval(
+        &self,
+        first: &ConflictFit,
+        second: &ConflictFit,
+        heading: &HeadingReference,
+    ) -> Option<std::ops::Range<Time>> {
+        let (start, end) = (first.time, second.time);
+        let mut cursor = None;
+        let mut interval = None::<std::ops::Range<Time>>;
+        let mut displacement = nalgebra::Vector2::zeros();
+        let mut covariance = Matrix2::zeros();
+        for record in &self.history.records {
+            let MotionRecord::Kinematic {
+                previous_time,
+                time,
+                translation,
+                information_root,
+            } = record
+            else {
+                continue;
+            };
+            if *time <= start || *previous_time >= end {
+                continue;
+            }
+            if cursor.map_or(*previous_time > start, |cursor| *previous_time != cursor)
+                || !self
+                    .kinematic_factors
+                    .get(previous_time)
+                    .is_some_and(|(live_end, _)| live_end == time)
+            {
+                return None;
+            }
+            cursor = Some(*time);
+            // Preserve factors crossing exposure boundaries rather than discarding outside evidence.
+            if *previous_time < start || *time > end {
+                continue;
+            }
+            interval.get_or_insert(*previous_time..*time).end = *time;
+            let attitude = self.attitude_at(*previous_time)?;
+            let rotation = heading.expected(attitude).inner.to_rotation_matrix();
+            displacement += rotation * translation.inner;
+            let noise = (information_root.transpose() * information_root).try_inverse()?;
+            covariance += rotation.matrix() * noise * rotation.matrix().transpose();
+        }
+        if cursor.is_none_or(|cursor| cursor < end) {
+            return None;
+        }
+        let interval = interval?;
+        let fraction = interval.end.duration_since(interval.start).as_secs_f64()
+            / end.duration_since(start).as_secs_f64();
+        covariance += (first.covariance + second.covariance) * fraction.powi(2);
+        let heading_error = nalgebra::Vector2::new(-displacement.y, displacement.x);
+        covariance +=
+            heading_error * heading_error.transpose() * self.parameters.max_heading_error.powi(2);
+        let error = (second.pose.translation.vector.xy() - first.pose.translation.vector.xy())
+            * fraction
+            - displacement;
+        let root = covariance.cholesky()?;
+        let distance = error.dot(&root.solve(&error));
+        // The same exp(-9) chi-square tail bound used by visual innovation admission.
+        (distance.is_finite() && distance > 2.0 + 2.0 * 18.0_f64.sqrt() + 18.0).then_some(interval)
+    }
+
     pub(crate) fn informative_visual_window(&mut self, since: Option<Time>) -> bool {
         let cutoff = self.latest_time - self.parameters.timing.optimization_window;
         self.history.landmarks.retain(|time, _| *time >= cutoff);
@@ -378,5 +533,32 @@ impl Localization {
         candidate.history.clone_from(&self.history);
         candidate.latest_time = self.latest_time;
         Ok(candidate)
+    }
+}
+
+struct ConflictFit {
+    time: Time,
+    pose: nalgebra::Isometry3<f64>,
+    covariance: Matrix2<f64>,
+}
+
+impl ConflictFit {
+    fn corroborates(&self, first: &Self, second: &Self) -> bool {
+        let before = first.time.duration_since(self.time).as_secs_f64();
+        let after = second.time.duration_since(first.time).as_secs_f64();
+        let velocity_before =
+            (first.pose.translation.vector.xy() - self.pose.translation.vector.xy()) / before;
+        let velocity_after =
+            (second.pose.translation.vector.xy() - first.pose.translation.vector.xy()) / after;
+        let covariance = self.covariance / before.powi(2)
+            + first.covariance * (before.recip() + after.recip()).powi(2)
+            + second.covariance / after.powi(2);
+        let Some(root) = covariance.cholesky() else {
+            return false;
+        };
+        let error = velocity_after - velocity_before;
+        let distance = error.dot(&root.solve(&error));
+        // Fail closed on changing translation: a single displaced image must not explain away legs.
+        distance.is_finite() && distance <= 2.0 + 2.0 * 18.0_f64.sqrt() + 18.0
     }
 }
