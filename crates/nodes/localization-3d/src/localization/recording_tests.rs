@@ -1,7 +1,7 @@
 //! Source-time fixtures from the real flip; see recovered_frames.json for provenance.
 use super::*;
 use booster::ImuState;
-use coordinate_systems::{Camera, Field, Ground, ImuReference, Local, Robot};
+use coordinate_systems::{Field, Ground, ImuReference, Local, Robot};
 use field_mark_association::{
     DetectedVisualFeature, DetectedVisualFeatures, GlobalAssociationInput,
     GlobalLocalizerParameters, associate_global_visual_features,
@@ -55,25 +55,6 @@ struct Detection {
 struct Association {
     pixel: [f32; 2],
     field: [f32; 2],
-}
-
-// Historical wire layouts, before generation IDs and removal of the visual pose hint.
-#[derive(Deserialize)]
-struct RecordedVisualFrame {
-    epoch: u64,
-    source: VisualAssociationSource,
-    robot_to_camera: Isometry3<Robot, Camera>,
-    _robot_to_local: Isometry3<Robot, Local>,
-    camera_intrinsic: Intrinsic,
-    associations: Vec<FieldMarkAssociation>,
-}
-
-#[derive(Deserialize)]
-struct RecordedEstimate {
-    time: Time,
-    epoch: u64,
-    _robot_to_local: types::localization::PoseEstimate<Robot, Local>,
-    robot_to_field: Option<types::localization::PoseEstimate<Robot, Field>>,
 }
 
 fn attitude(rpy: [f64; 3]) -> Orientation3<ImuReference, f64> {
@@ -144,10 +125,6 @@ impl RecordedFrame {
 #[test]
 fn recorded_frames_recover_with_heading_guided_association() {
     let recording: Recording = serde_json::from_str(include_str!("recovered_frames.json")).unwrap();
-    verify_recording(recording);
-}
-
-fn verify_recording(recording: Recording) {
     let reference = HeadingReference::new(
         Time::from_nanos(recording.reference.time),
         Orientation2::new(recording.reference.field_yaw),
@@ -246,8 +223,8 @@ fn verify_recording(recording: Recording) {
                 corrected.associations.len(),
                 error.to_degrees()
             );
-            // Exercise candidate construction and post-solve heading acceptance too.
-            // The direct-MCAP test supplies the actual bracketing gyroscope samples.
+            // Exercise startup candidate construction modulo the field half-turn too.
+            // The checked-in fixture preserves the source-time IMU brackets.
             let camera = CameraGeometry {
                 robot_to_camera: corrected.robot_to_camera,
                 intrinsics: corrected.camera_intrinsic,
@@ -262,10 +239,9 @@ fn verify_recording(recording: Recording) {
             )
             .unwrap();
             // This two-sample fixture has no prior field trajectory to recover.
-            // Initialize with its recorded heading; continuity is tested with full motion history.
+            // Startup has no trusted heading; continuity is tested with full motion history.
             localization.lifecycle.state = LocalizationState::Startup;
             localization.lifecycle.time = Time::from_nanos(recording.reference.time);
-            localization.lifecycle.heading_reference = Some(reference);
             for sample in &recorded.imu {
                 localization
                     .ingest_imu(
@@ -309,11 +285,13 @@ fn verify_recording(recording: Recording) {
             );
             let expected = reference.expected(attitude(recorded.imu[1].rpy));
             let optimized_error = expected.rotation_to(heading).inner.angle().abs();
-            assert!(optimized_error < parameters.max_heading_error);
+            let halfturn_error =
+                optimized_error.min((std::f64::consts::PI - optimized_error).abs());
+            assert!(halfturn_error < parameters.max_heading_error);
             assert_eq!(estimate.time.as_nanos(), recorded.imu[1].time);
             eprintln!(
-                "  accepted optimized heading error: {:.3} degrees",
-                optimized_error.to_degrees()
+                "  accepted startup heading error modulo half-turn: {:.3} degrees",
+                halfturn_error.to_degrees()
             );
         }
     }

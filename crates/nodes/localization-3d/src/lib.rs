@@ -8,6 +8,9 @@ mod node;
 mod parameters;
 mod pose;
 
+#[cfg(test)]
+mod test_support;
+
 pub use diagnostics::{ImuBiasEstimate, SolveDiagnostics};
 pub use localization::{Localization, SolveOutput};
 pub use node::{run, run_boxed};
