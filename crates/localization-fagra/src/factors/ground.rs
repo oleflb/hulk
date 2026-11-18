@@ -8,18 +8,14 @@ use nalgebra::{RealField, SMatrix};
 use super::common;
 use crate::variables::PoseControl;
 
-/// Sole positions from kinematics at one observation time.
+/// Two sole origins transformed into Robot at one observation time.
 #[derive(Clone, Debug)]
 pub struct FootObservation<R: RealField + Copy = f64> {
     pub tau: R,
-    pub left_sole: Point3<Robot, R>,
-    pub right_sole: Point3<Robot, R>,
+    pub vertices: [Point3<Robot, R>; 2],
 }
 
-/// Two one-sided residuals per observation, penalizing soles below local z = 0.
-/// Each row is `max(0, -height) / sigma`, where height is the sole's local z
-/// after applying the interpolated robot pose. Emit both feet in one observation
-/// scope. At the hinge (`height = 0`), use the inactive branch with zero Jacobian.
+/// Penalize sole origins below local z = 0 without constraining airborne feet.
 #[derive(Clone, Debug)]
 pub struct FootGround<R: RealField + Copy = f64> {
     pub controls: [StateKey<PoseControl<R>>; 4],
@@ -51,7 +47,7 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>> FactorBatch<S> for Foot
         let mut cost = R::zero();
         for (_, observation) in factors {
             let pose = spline.pose(observation.tau)?;
-            let (residual, _) = foot_residuals(&pose.inner, observation, inverse_sigma)?;
+            let (residual, _) = foot_residual(&pose.inner, observation, inverse_sigma)?;
             cost += common::cost(&residual)?;
         }
         common::checked_cost(cost)
@@ -70,11 +66,9 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>> FactorBatch<S> for Foot
         let spline = common::spline(states, &self.controls, self.duration)?;
         let mut linearized = None;
         for (id, observation) in factors {
-            // Recheck activity and input validity at the current state. Inactive
-            // rows contribute no information; their factor scope still gets visited.
             let value = spline.pose(observation.tau)?;
-            let (residual, active) = foot_residuals(&value.inner, observation, inverse_sigma)?;
-            if !active[0] && !active[1] {
+            let (residual, vertices) = foot_residual(&value.inner, observation, inverse_sigma)?;
+            if vertices.iter().all(Option::is_none) {
                 sink.factor(id, |_| Ok(()))?;
                 continue;
             }
@@ -85,13 +79,10 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>> FactorBatch<S> for Foot
             let pose = prepared.pose(observation.tau)?;
             let rotation = pose.pose.inner.rotation.to_rotation_matrix().into_inner();
             let mut h = SMatrix::<R, 2, 6>::zeros();
-            for (row, sole) in [observation.left_sole, observation.right_sole]
-                .iter()
-                .enumerate()
-            {
-                if active[row] {
+            for (row, vertex) in vertices.iter().enumerate() {
+                if let Some(vertex) = vertex {
                     h.row_mut(row).copy_from(
-                        &(common::point_jacobian(rotation, sole.inner.coords).row(2)
+                        &(common::point_jacobian(rotation, vertex.inner.coords).row(2)
                             * -inverse_sigma),
                     );
                 }
@@ -105,25 +96,24 @@ impl<R: RealField + Copy, S: StateStore<PoseControl<R>>> FactorBatch<S> for Foot
     }
 }
 
-fn foot_residuals<R: RealField + Copy>(
+type FootResidual<R> = (nalgebra::Vector2<R>, [Option<Point3<Robot, R>>; 2]);
+
+fn foot_residual<R: RealField + Copy>(
     pose: &nalgebra::Isometry3<R>,
     observation: &FootObservation<R>,
     inverse_sigma: R,
-) -> Result<(nalgebra::Vector2<R>, [bool; 2]), EvaluationError> {
+) -> Result<FootResidual<R>, EvaluationError> {
     let mut residual = nalgebra::Vector2::zeros();
-    let mut active = [false; 2];
-    for (row, sole) in [observation.left_sole, observation.right_sole]
-        .iter()
-        .enumerate()
-    {
+    let mut active = [None; 2];
+    for (index, sole) in observation.vertices.iter().enumerate() {
         common::finite(sole.inner.coords.iter())?;
         let height = (pose * sole.inner).z;
         if !height.is_finite() {
             return Err(EvaluationError::InvalidEvaluation);
         }
-        active[row] = height < R::zero();
-        if active[row] {
-            residual[row] = -height * inverse_sigma;
+        if height < R::zero() {
+            residual[index] = -height * inverse_sigma;
+            active[index] = Some(*sole);
         }
     }
     Ok((residual, active))

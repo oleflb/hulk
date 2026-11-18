@@ -105,8 +105,7 @@ impl Estimator {
             batch,
             FootObservation {
                 tau,
-                left_sole: left,
-                right_sole: right,
+                vertices: [left, right],
             },
         )?;
         self.segment_factors
