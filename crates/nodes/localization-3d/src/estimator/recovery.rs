@@ -572,6 +572,28 @@ impl Localization {
     }
 
     pub(super) fn accept_motion(&mut self, record: MotionRecord) -> Result<bool> {
+        if matches!(record, MotionRecord::Kinematic { .. })
+            && let Some(support) = &mut self.supported_legs
+        {
+            let horizon = self.parameters.timing.trajectory_spacing * 2;
+            if support.pending.len() < 64
+                && record.end().duration_since(support.visual_time) <= horizon
+                && support.pending.first().is_none_or(|first| {
+                    record.end().duration_since(first.start())
+                        <= self.parameters.timing.trajectory_spacing * 6
+                })
+                && support
+                    .pending
+                    .last()
+                    .is_none_or(|last| last.end() == record.start())
+            {
+                let time = record.end();
+                support.pending.push(record);
+                self.commit_time(time);
+                return Ok(true);
+            }
+            self.restore_supported_legs()?;
+        }
         record.clone().insert(self)?;
         self.commit_time(record.end());
         let first = (self.oldest_window_segment() - 1).max(0);
@@ -579,6 +601,185 @@ impl Localization {
             Time::from_nanos(self.origin.as_nanos() + first * self.parameters.timing.knot_ns());
         self.history.push(record, start);
         Ok(true)
+    }
+
+    pub(super) fn restore_supported_legs(&mut self) -> Result<bool> {
+        let Some(mut support) = self.supported_legs.take() else {
+            return Ok(false);
+        };
+        // Retain uninserted records on error; a failed restoration must never lose evidence.
+        while let Some(record) = support.pending.first().cloned() {
+            if let Err(error) = self.accept_motion(record) {
+                self.supported_legs = Some(support);
+                return Err(error);
+            }
+            support.pending.remove(0);
+        }
+        Ok(true)
+    }
+
+    pub(super) fn expire_supported_legs(
+        &mut self,
+        heading: Option<&HeadingReference>,
+    ) -> Result<()> {
+        if self.supported_legs.as_ref().is_some_and(|support| {
+            heading.is_none()
+                || support.pending.first().is_some_and(|first| {
+                    self.latest_time.duration_since(first.start())
+                        > self.parameters.timing.trajectory_spacing * 6
+                })
+                || self.latest_time.duration_since(support.visual_time)
+                    > self.parameters.timing.trajectory_spacing * 2
+                || self.parameters.accelerometer.is_none()
+                || !self.has_continuous_force(
+                    support
+                        .pending
+                        .first()
+                        .map_or(support.visual_time, MotionRecord::start),
+                    self.latest_time,
+                )
+        }) {
+            tracing::debug!(source_time = ?self.latest_time, "expired supported leg admission");
+            self.restore_supported_legs()?;
+        }
+        Ok(())
+    }
+
+    /// Called only after a validated solve that excluded the buffered leg observations.
+    pub(super) fn resolve_supported_legs(
+        &mut self,
+        heading: Option<&HeadingReference>,
+    ) -> Result<bool> {
+        let Some(support) = &self.supported_legs else {
+            return Ok(false);
+        };
+        if heading.is_none_or(|heading| self.validate_heading(heading).is_err()) {
+            return self.restore_supported_legs();
+        }
+        // An uncertain extrapolated tail is not evidence that the legs agree, especially while braking.
+        let count = support
+            .pending
+            .iter()
+            .take_while(|record| record.end() <= support.visual_time)
+            .count();
+        let (Some(first), Some(last)) = (support.pending.first(), support.pending[..count].last())
+        else {
+            return Ok(false);
+        };
+        if last.end().duration_since(first.start()) < self.parameters.timing.trajectory_spacing * 3
+        {
+            return Ok(false);
+        }
+        let source_time = last.end();
+        let contradicted = self.pending_leg_contradiction(count);
+        tracing::debug!(
+            ?source_time,
+            ?contradicted,
+            "checked supported leg interval"
+        );
+        if contradicted.unwrap_or(false) {
+            if let Some(support) = &mut self.supported_legs {
+                tracing::debug!(
+                    ?source_time,
+                    factor_count = count,
+                    "discarding independently contradicted new leg interval"
+                );
+                support.pending.drain(..count);
+            }
+            Ok(false)
+        } else {
+            self.restore_supported_legs()
+        }
+    }
+
+    pub(super) fn renew_supported_legs(&mut self, heading: Option<&HeadingReference>) {
+        let (Some(support), Some(heading)) = (&self.supported_legs, heading) else {
+            return;
+        };
+        let Some(frame) = &self.latest_visual_frame else {
+            return;
+        };
+        if frame.time <= support.visual_time {
+            return;
+        }
+        let mut frame = frame.clone();
+        if self.conflict_fit(&mut frame, heading).is_some()
+            && let Some(support) = &mut self.supported_legs
+        {
+            support.visual_time = frame.time;
+        }
+    }
+
+    fn pending_leg_contradiction(&mut self, count: usize) -> Option<bool> {
+        let pending = &self.supported_legs.as_ref()?.pending[..count];
+        let start = pending.first()?.start();
+        let end = pending.last()?.end();
+        if !self.has_continuous_force(start, end) {
+            return None;
+        }
+        let yaw = self.attitude_at(start)?.euler_angles().2;
+        let mut displacement = nalgebra::Vector2::zeros();
+        let mut noise = Matrix2::zeros();
+        let mut path_length = 0.0;
+        for record in pending {
+            let MotionRecord::Kinematic {
+                previous_time,
+                translation,
+                information_root,
+                ..
+            } = record
+            else {
+                return None;
+            };
+            let rotation =
+                nalgebra::Rotation2::new(self.attitude_at(*previous_time)?.euler_angles().2 - yaw);
+            displacement += rotation * translation.inner;
+            path_length += translation.inner.norm();
+            noise += rotation.matrix()
+                * (information_root.transpose() * information_root).try_inverse()?
+                * rotation.matrix().transpose();
+        }
+        let (a, ta) = self.segment_and_tau(start).ok()?;
+        let (b, tb) = self.segment_and_tau(end).ok()?;
+        let ka = control_keys(&self.controls, a).ok()?;
+        let kb = control_keys(&self.controls, b).ok()?;
+        let a = self.spline(ka).ok()?.linearize().ok()?.pose(ta).ok()?;
+        let b = self.spline(kb).ok()?.linearize().ok()?.pose(tb).ok()?;
+        let rotation = nalgebra::Rotation2::new(a.pose.inner.rotation.euler_angles().2);
+        let displacement = rotation * displacement;
+        noise = rotation.matrix() * noise * rotation.matrix().transpose();
+        // Bound correlated endpoint-heading errors even when successive leg displacements cancel.
+        noise +=
+            Matrix2::identity() * (2.0 * path_length * self.parameters.max_heading_error).powi(2);
+        let [ha, hb] = leg_endpoint_jacobians(&a.pose.inner, &b.pose.inner, displacement)?;
+        let mut keys = ka.to_vec();
+        for key in kb {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        // Sum shared-control Jacobians before applying the joint covariance.
+        let mut jacobian = nalgebra::DMatrix::<f64>::zeros(2, keys.len() * 6);
+        for (endpoint_keys, sample, endpoint) in [(ka, &a, ha), (kb, &b, hb)] {
+            for (key, block) in endpoint_keys.into_iter().zip(&sample.jacobians) {
+                let column = keys.iter().position(|candidate| *candidate == key)?;
+                let sum = jacobian.fixed_view::<2, 6>(0, column * 6) + endpoint * block;
+                jacobian
+                    .fixed_view_mut::<2, 6>(0, column * 6)
+                    .copy_from(&sum);
+            }
+        }
+        let blocks: Vec<_> = keys.iter().map(|key| key.block_id()).collect();
+        let covariance = self.graph.joint_covariance(&blocks).ok()?;
+        let covariance =
+            nalgebra::DMatrix::from_fn(keys.len() * 6, keys.len() * 6, |r, c| covariance[(r, c)]);
+        let covariance = &jacobian * covariance * jacobian.transpose();
+        noise += Matrix2::from_fn(|r, c| covariance[(r, c)]);
+        let error =
+            (b.pose.inner.translation.vector - a.pose.inner.translation.vector).xy() - displacement;
+        let distance = error.dot(&noise.cholesky()?.solve(&error));
+        tracing::trace!(?start, ?end, distance, "independent leg innovation");
+        Some(distance.is_finite() && distance > 2.0 + 2.0 * 18.0_f64.sqrt() + 18.0)
     }
 
     fn has_continuous_force(&self, start: Time, end: Time) -> bool {
@@ -747,6 +948,36 @@ struct ConflictFit {
     time: Time,
     pose: nalgebra::Isometry3<f64>,
     covariance: Matrix2<f64>,
+}
+
+fn leg_endpoint_jacobians(
+    a: &nalgebra::Isometry3<f64>,
+    b: &nalgebra::Isometry3<f64>,
+    local_displacement: nalgebra::Vector2<f64>,
+) -> Option<[SMatrix<f64, 2, 6>; 2]> {
+    let ra = a.rotation.to_rotation_matrix();
+    let rb = b.rotation.to_rotation_matrix();
+    let x = ra[(0, 0)];
+    let y = ra[(1, 0)];
+    let denominator = x * x + y * y;
+    if denominator < 1e-6 {
+        return None;
+    }
+    let yaw_jacobian = nalgebra::RowVector3::new(
+        0.0,
+        (y * ra[(0, 2)] - x * ra[(1, 2)]) / denominator,
+        (x * ra[(1, 1)] - y * ra[(0, 1)]) / denominator,
+    );
+    let perpendicular = nalgebra::Vector2::new(-local_displacement.y, local_displacement.x);
+    let mut ha = SMatrix::<f64, 2, 6>::zeros();
+    ha.fixed_view_mut::<2, 3>(0, 0)
+        .copy_from(&(-perpendicular * yaw_jacobian));
+    ha.fixed_view_mut::<2, 3>(0, 3)
+        .copy_from(&(-ra.matrix().fixed_rows::<2>(0)));
+    let mut hb = SMatrix::<f64, 2, 6>::zeros();
+    hb.fixed_view_mut::<2, 3>(0, 3)
+        .copy_from(&rb.matrix().fixed_rows::<2>(0));
+    Some([ha, hb])
 }
 
 impl ConflictFit {
