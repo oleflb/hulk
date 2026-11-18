@@ -194,30 +194,6 @@ fn tracking_estimate(covariance: f64) -> PoseEstimate<Robot, Field> {
 }
 
 #[test]
-fn geometric_numerical_guards_are_applied() {
-    let geometry = geometry();
-    let features = project(stationary_three(), &geometry);
-    let baseline = GlobalAssociationConfig::default();
-    let associate = |config: &GlobalAssociationConfig| {
-        associate_global_visual_features(global_input(input(&features, &geometry), config))
-    };
-    assert_eq!(associate(&baseline).unwrap().associations.len(), 3);
-    for config in [
-        GlobalAssociationConfig {
-            min_pair_distance: 1.0e6,
-            ..baseline
-        },
-        GlobalAssociationConfig {
-            min_triangle_denominator: 1.0e12,
-            ..baseline
-        },
-    ] {
-        config.validate().unwrap();
-        assert!(associate(&config).is_none());
-    }
-}
-
-#[test]
 fn three_stationary_features_certify_without_history_or_pose() {
     let geometry = geometry();
     let features = project(stationary_three(), &geometry);
@@ -492,10 +468,7 @@ fn collinear_and_duplicate_seeds_do_not_certify() {
 #[test]
 fn rich_frame_has_bounded_search_and_budget_exhaustion_rejects() {
     let geometry = geometry();
-    let map = LandmarkMap::new(
-        &FieldDimensions::SPL_2025,
-        GlobalAssociationConfig::default().symmetry_epsilon,
-    );
+    let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
     let features = project(map.landmarks.iter().map(|l| (l.class, l.xy)), &geometry);
     let mut config = calibrated_parameters().global_localizer;
     let result =
@@ -574,7 +547,7 @@ fn tracking_covariance_and_age_widen_the_gate_but_not_the_distance_limit() {
 fn guided_matching_handles_crossing_class_errors_and_outliers() {
     let geometry = geometry();
     let config = calibrated_parameters().global_localizer;
-    let map = LandmarkMap::new(&FieldDimensions::SPL_2025, config.symmetry_epsilon);
+    let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
     let mut features = project(map.landmarks.iter().map(|l| (l.class, l.xy)), &geometry);
     let mislabeled = features.l_spots.remove(0);
     features.t_spots.push(mislabeled);
@@ -1083,10 +1056,7 @@ fn runtime_characterization() {
     use std::{hint::black_box, time::Instant};
 
     let mut geometry = geometry();
-    let map = LandmarkMap::new(
-        &FieldDimensions::SPL_2025,
-        GlobalAssociationConfig::default().symmetry_epsilon,
-    );
+    let map = LandmarkMap::new(&FieldDimensions::SPL_2025);
     let sparse = (3..=5)
         .map(|n| {
             project(

@@ -1,8 +1,5 @@
 {
   global_localizer: {
-    symmetry_epsilon: 0.0001,
-    min_pair_distance: 0.000001,
-    min_triangle_denominator: 0.000000000001,
     max_input_detections: 128,
     max_retained_detections: 32,
     seed_pool_size: 8,
@@ -27,8 +24,6 @@
     max_work: 100000,
   },
   tracking: {
-    covariance_symmetry_tolerance: 0.00001,
-    covariance_psd_tolerance: 0.000001,
     covariance_eigen_max_iterations: 64,
     // Output limit only; statistically plausible rivals beyond it still enter scoring.
     max_pixel_distance: 80.0,

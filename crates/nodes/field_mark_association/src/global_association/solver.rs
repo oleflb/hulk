@@ -19,6 +19,8 @@ const HYPOTHESES: usize = 128;
 const PROPOSALS: usize = HYPOTHESES * 16;
 const CANDIDATES: usize = 8;
 const MIN_PAIR_PIXELS: f32 = 20.0;
+const MIN_PAIR_DISTANCE: f32 = 1.0e-6;
+const MIN_TRIANGLE_DENOMINATOR: f32 = 1.0e-12;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Detection {
@@ -52,7 +54,7 @@ pub(crate) fn preprocess(
     {
         return None;
     }
-    let map = LandmarkMap::new(input.field_dimensions, config.symmetry_epsilon);
+    let map = LandmarkMap::new(input.field_dimensions);
     if map
         .landmarks
         .iter()
@@ -457,7 +459,7 @@ fn spread(
                     let u = points[1] - points[0];
                     let v = points[2] - points[0];
                     (u.x * v.y - u.y * v.x).abs()
-                        / (u.norm_squared() + v.norm_squared()).max(config.min_triangle_denominator)
+                        / (u.norm_squared() + v.norm_squared()).max(MIN_TRIANGLE_DENOMINATOR)
                 };
                 if quality(q) > config.min_seed_quality
                     && quality(p) > config.min_seed_quality
@@ -588,7 +590,7 @@ pub(crate) fn associate(input: GlobalAssociationInput<'_>) -> Option<Association
         let Some(pose) = GroundPose::from_pair(
             [detections[a].xy.cast(), detections[b].xy.cast()],
             field,
-            f64::from(input.parameters.min_pair_distance),
+            f64::from(MIN_PAIR_DISTANCE),
         ) else {
             continue;
         };

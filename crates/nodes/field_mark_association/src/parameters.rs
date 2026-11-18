@@ -37,7 +37,7 @@ impl Default for FieldMarkAssociationParameters {
 }
 
 impl FieldMarkAssociationParameters {
-    pub(crate) fn validate(&self) -> std::result::Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), String> {
         self.global_localizer.validate()?;
         self.tracking.validate()?;
         self.capacities.validate()?;
@@ -107,10 +107,6 @@ impl AssociationCapacities {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Message)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrackingAssociationParameters {
-    /// Maximum absolute entry of covariance minus its transpose.
-    pub covariance_symmetry_tolerance: f32,
-    /// Allowed negative eigenvalue magnitude from covariance roundoff.
-    pub covariance_psd_tolerance: f32,
     /// Bounded covariance eigensolver iterations; zero (unbounded) is rejected.
     pub covariance_eigen_max_iterations: usize,
     /// Pixel residual ceiling for winning edges. Plausible rivals beyond it still enter scoring.
@@ -131,8 +127,6 @@ pub struct TrackingAssociationParameters {
 impl Default for TrackingAssociationParameters {
     fn default() -> Self {
         Self {
-            covariance_symmetry_tolerance: 1.0e-5,
-            covariance_psd_tolerance: 1.0e-6,
             covariance_eigen_max_iterations: 64,
             max_pixel_distance: 80.0,
             position_sigma_per_second: 0.15,
@@ -146,16 +140,13 @@ impl Default for TrackingAssociationParameters {
 impl TrackingAssociationParameters {
     fn validate(&self) -> Result<(), String> {
         for value in [
-            self.covariance_symmetry_tolerance,
-            self.covariance_psd_tolerance,
             self.max_pixel_distance,
             self.position_sigma_per_second,
             self.yaw_sigma_per_second,
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(
-                    "tracking distance, uncertainty rates and tolerances must be finite and > 0"
-                        .into(),
+                    "tracking distance and uncertainty rates must be finite and > 0".into(),
                 );
             }
         }
@@ -173,8 +164,6 @@ impl TrackingAssociationParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ros_z::{context::ContextBuilder, parameter::NodeParametersExt};
-    use std::sync::Arc;
 
     #[test]
     fn guided_consensus_and_height_limits_are_validated() {
@@ -205,6 +194,21 @@ mod tests {
         let parameters: FieldMarkAssociationParameters = serde_json::from_str("{}").unwrap();
         parameters.validate().unwrap();
         assert_eq!(parameters.global_localizer.max_retained_detections, 32);
+        let serialized = serde_json::json!(&parameters);
+        for setting in [
+            "symmetry_epsilon",
+            "min_pair_distance",
+            "min_triangle_denominator",
+        ] {
+            assert!(serialized["global_localizer"].get(setting).is_none());
+            let json = serde_json::json!({"global_localizer": {(setting): 0.001}});
+            assert!(serde_json::from_value::<FieldMarkAssociationParameters>(json).is_err());
+        }
+        for setting in ["covariance_symmetry_tolerance", "covariance_psd_tolerance"] {
+            assert!(serialized["tracking"].get(setting).is_none());
+            let json = serde_json::json!({"tracking": {(setting): 0.001}});
+            assert!(serde_json::from_value::<FieldMarkAssociationParameters>(json).is_err());
+        }
         let mut config = parameters.global_localizer;
         config.max_retained_detections = 64;
         config.max_work = 2_000_000;
@@ -216,50 +220,13 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn capacity_updates_preserve_published_snapshot_and_live_settings_reload() {
-        let root =
-            std::env::temp_dir().join(format!("association-parameters-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let file = root.join("field_mark_association.json5");
+    #[test]
+    fn capacity_updates_require_restart_but_live_settings_do_not() {
         let mut config = FieldMarkAssociationParameters::default();
         config.capacities.imu_queue = 17;
-        std::fs::write(&file, serde_json::to_string(&config).unwrap()).unwrap();
-        let context = ContextBuilder::default()
-            .with_mode("peer")
-            .disable_multicast_scouting()
-            .with_parameter_layers([root.clone()])
-            .build()
-            .await
-            .unwrap();
-        let node = context
-            .create_node("association_parameters_test")
-            .build()
-            .await
-            .unwrap();
-        let parameters = node
-            .bind_parameter_as::<FieldMarkAssociationParameters>("field_mark_association")
-            .unwrap();
-        let capacities = parameters.snapshot().typed.capacities;
+        let capacities = config.capacities;
         assert_eq!(capacities.imu_queue, 17);
-        parameters
-            .add_validation_hook(move |candidate| candidate.validate_update(capacities))
-            .unwrap();
-        let original = parameters.snapshot();
-        let original_file = std::fs::read(&file).unwrap();
-        assert!(
-            parameters
-                .set_json(
-                    "capacities.imu_queue",
-                    serde_json::json!(18),
-                    root.to_string_lossy().into_owned(),
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("restart required")
-        );
-        assert_eq!(std::fs::read(&file).unwrap(), original_file);
-        assert!(Arc::ptr_eq(&original, &parameters.snapshot()));
+        config.validate_update(capacities).unwrap();
         for change in 0..7 {
             config.capacities = capacities;
             let capacity = match change {
@@ -272,27 +239,18 @@ mod tests {
                 _ => &mut config.capacities.detections_queue,
             };
             *capacity += 1;
-            std::fs::write(&file, serde_json::to_string(&config).unwrap()).unwrap();
             assert!(
-                parameters
-                    .reload()
+                config
+                    .validate_update(capacities)
                     .unwrap_err()
-                    .to_string()
                     .contains("restart required")
             );
-            assert!(Arc::ptr_eq(&original, &parameters.snapshot()));
         }
         config.capacities = capacities;
         config.max_imu_gap = Duration::from_millis(37);
-        config.global_localizer.symmetry_epsilon = 0.002;
-        std::fs::write(&file, serde_json::to_string(&config).unwrap()).unwrap();
-        parameters.reload().unwrap();
-        let updated = parameters.snapshot();
-        assert_eq!(updated.typed.max_imu_gap, config.max_imu_gap);
-        assert_eq!(updated.typed.global_localizer.symmetry_epsilon, 0.002);
-        assert!(!Arc::ptr_eq(&original.typed, &updated.typed));
+        config.global_localizer.detection_pixel_sigma = 3.0;
+        config.validate_update(capacities).unwrap();
         config.capacities.imu_queue = 0;
         assert!(config.validate().is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
