@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use color_eyre::Result;
+use color_eyre::{Result, eyre::eyre};
 use coordinate_systems::{Field, ImuReference, Robot};
 use linear_algebra::{IntoTransform, Isometry3, Orientation3, Point3, Vector3};
 use localization_fagra::variables::{FieldAlignment, PoseControl, TrajectoryState};
@@ -14,6 +14,19 @@ use crate::{
     alignment::{seed_alignment, seed_recovery_alignment, valid_visual_frame},
     heading::HeadingReference,
 };
+
+pub(crate) enum ConflictRecovery {
+    Rejected,
+    AwaitingMotion,
+    Recovered(Box<super::SolveResult>),
+}
+
+pub(super) struct SupportedLegs {
+    // Renewed only by an accepted, independently well-conditioned image.
+    visual_time: Time,
+    // At most 64 records / six knots: three for evidence, two for image age, one solve margin.
+    pending: Vec<MotionRecord>,
+}
 
 /// Source observations and admission cursors survive reconstruction; graph handles do not.
 #[derive(Clone)]
@@ -145,6 +158,181 @@ impl MotionRecord {
 }
 
 impl Localization {
+    /// Global frames must have passed association's ambiguity checks; motion agreement is not uniqueness.
+    /// Both intervals must contradict live leg factors; no evidence already in a prior is removable.
+    pub(crate) fn recover_conflict(
+        &mut self,
+        mut first: TimeWrapper<VisualLocalizationFrame>,
+        mut second: TimeWrapper<VisualLocalizationFrame>,
+        heading: &HeadingReference,
+    ) -> Result<ConflictRecovery> {
+        let Some(mut anchor) = self.latest_visual_frame.clone() else {
+            return Ok(ConflictRecovery::Rejected);
+        };
+        if !self.pending_visuals.is_empty()
+            || self.supported_legs.is_some()
+            || self.last_converged_time != Some(self.latest_time)
+            || anchor.time >= first.time
+            || first.time >= second.time
+            || second.time > self.latest_time
+            || [first.inner.source, second.inner.source]
+                .iter()
+                .any(|source| {
+                    *source != types::visual_localization::VisualAssociationSource::Global
+                })
+        {
+            return Ok(ConflictRecovery::Rejected);
+        }
+        tracing::debug!(source_time = ?second.time, first_time = ?first.time,
+            live_leg_count = self.kinematic_factors.len(), "checking kinematic conflict evidence");
+        let Some(anchor_fit) = self.conflict_fit(&mut anchor, heading) else {
+            return Ok(ConflictRecovery::Rejected);
+        };
+        let Some(first_fit) = self.conflict_fit(&mut first, heading) else {
+            return Ok(ConflictRecovery::Rejected);
+        };
+        let Some(second_fit) = self.conflict_fit(&mut second, heading) else {
+            return Ok(ConflictRecovery::Rejected);
+        };
+        if !anchor_fit.corroborates(&first_fit, &second_fit) {
+            return Ok(ConflictRecovery::Rejected);
+        }
+        let Some(before) = self.contradicted_leg_interval(&anchor_fit, &first_fit, heading) else {
+            return Ok(ConflictRecovery::Rejected);
+        };
+        let Some(after) = self.contradicted_leg_interval(&first_fit, &second_fit, heading) else {
+            return Ok(ConflictRecovery::AwaitingMotion);
+        };
+        let contradicted = |record: &MotionRecord| {
+            // The middle exposure is not an evidence boundary: both adjacent spans corroborate it.
+            matches!(record,
+            MotionRecord::Kinematic { previous_time, time, .. }
+            if *previous_time >= before.start && *time <= after.end)
+        };
+        let can_defer = self.parameters.accelerometer.is_some()
+            && self.parameters.timing.optimization_window
+                >= self.parameters.timing.trajectory_spacing * 7
+            && self.latest_time.duration_since(second.time)
+                <= self.parameters.timing.trajectory_spacing * 2
+            && self.has_continuous_force(after.end, self.latest_time);
+        // Delivery-time legs are not yet visual evidence. Hold them transactionally, not discard them.
+        let deferred = |record: &MotionRecord| {
+            can_defer
+                && matches!(record, MotionRecord::Kinematic { previous_time, .. }
+                if *previous_time >= after.end)
+        };
+        let tail: Vec<_> = self
+            .history
+            .records
+            .iter()
+            .filter(|record| deferred(record))
+            .cloned()
+            .collect();
+        if tail.len() > 64
+            || tail.windows(2).any(|pair| pair[0].end() != pair[1].start())
+            || tail.first().is_some_and(|first| {
+                self.latest_time.duration_since(first.start())
+                    > self.parameters.timing.trajectory_spacing * 6
+            })
+        {
+            return Ok(ConflictRecovery::Rejected);
+        }
+        let records: Vec<_> = self
+            .history
+            .records
+            .iter()
+            .filter(|record| contradicted(record) || deferred(record))
+            .cloned()
+            .collect();
+        // Prepare cached IMU factors before the transaction; conflict solves only
+        // edit visual/kinematic factors, so their rollback cannot stale this cache.
+        self.prepare_preintegration()?;
+        let checkpoint = self.graph.checkpoint();
+        let segments = self.segment_factors.clone();
+        let kinematics = self.kinematic_factors.clone();
+        let source_time = second.time;
+        let factor_count = records.len();
+        tracing::debug!(?source_time, first_time = ?first.time, anchor_time = ?anchor.time,
+            solve_time = ?self.latest_time, factor_count, deferred_factor_count = tail.len(),
+            "attempting kinematic conflict recovery");
+        let old_seed = self.recovery_seed.take();
+        let trial = (|| -> Result<Option<super::SolveResult>> {
+            for record in records {
+                let start = record.start();
+                let (_, factor) = self
+                    .kinematic_factors
+                    .get(&start)
+                    .copied()
+                    .ok_or_else(|| eyre!("missing live kinematic factor"))?;
+                factor.remove(&mut self.graph)?;
+                self.kinematic_factors.remove(&start);
+                let segment = self.segment_and_tau(start)?.0;
+                self.segment_factors
+                    .entry(segment)
+                    .or_default()
+                    .measurements -= 1;
+            }
+            self.recovery_seed = Some((second.time, second_fit.pose));
+            if !self.insert_visual(first, false)? || !self.insert_visual(second, false)? {
+                return Ok(None);
+            }
+            let start = std::time::Instant::now();
+            let mut diagnostics = self.solve_diagnostics();
+            let result = (|| {
+                let current_yaw = self.prepare_attitude()?;
+                let result = self.solve_graph(&mut diagnostics, Some(heading));
+                if let Some(key) = current_yaw {
+                    self.graph.remove_factor(key)?;
+                }
+                result
+            })();
+            let solved = self.finish_solve(result, diagnostics, start, false);
+            tracing::debug!(?source_time, converged = solved.estimate.is_some(),
+                anchor_rms = ?self.frame_rms(&anchor),
+                failure = ?solved.diagnostics.failure, termination = %solved.diagnostics.termination,
+                "validated kinematic conflict trial");
+            if !crate::alignment::valid_visual_rms(self.frame_rms(&anchor), &self.parameters.visual)
+                || solved
+                    .estimate
+                    .as_ref()
+                    .is_none_or(|estimate| estimate.robot_to_field.is_none())
+            {
+                return Ok(None);
+            }
+            Ok(Some(solved))
+        })();
+        self.recovery_seed = old_seed;
+        if matches!(trial, Ok(Some(_))) {
+            self.history
+                .records
+                .retain(|record| !contradicted(record) && !deferred(record));
+            self.accept_visuals();
+            self.last_converged_time = Some(self.latest_time);
+            // Leave enough live graph behind the bounded admission buffer for restoration.
+            if can_defer {
+                self.supported_legs = Some(SupportedLegs {
+                    visual_time: source_time,
+                    pending: tail,
+                });
+            }
+            tracing::debug!(
+                ?source_time,
+                factor_count,
+                "accepted kinematic conflict recovery"
+            );
+        } else {
+            self.graph.restore(checkpoint)?;
+            self.pending_visuals.clear();
+            self.segment_factors = segments;
+            self.kinematic_factors = kinematics;
+            tracing::debug!(?source_time, factor_count, error = ?trial.as_ref().err(),
+                "restored kinematic conflict recovery");
+        }
+        Ok(trial?.map_or(ConflictRecovery::Rejected, |solved| {
+            ConflictRecovery::Recovered(Box::new(solved))
+        }))
+    }
+
     fn conflict_fit(
         &self,
         frame: &mut TimeWrapper<VisualLocalizationFrame>,
@@ -391,6 +579,25 @@ impl Localization {
             Time::from_nanos(self.origin.as_nanos() + first * self.parameters.timing.knot_ns());
         self.history.push(record, start);
         Ok(true)
+    }
+
+    fn has_continuous_force(&self, start: Time, end: Time) -> bool {
+        let Some((&before, _)) = self.history.attitudes.range(..=start).next_back() else {
+            return false;
+        };
+        let mut cursor = before;
+        for (&time, _) in self.history.attitudes.range(start..=end) {
+            if time.duration_since(cursor) > self.parameters.timing.max_imu_gap {
+                return false;
+            }
+            cursor = time;
+        }
+        end.duration_since(cursor) <= self.parameters.timing.max_imu_gap
+            && !self.history.records.iter().any(|record| {
+                matches!(record,
+                MotionRecord::Imu { time, force, .. } if *time >= start && *time <= end
+                    && !force.inner.iter().all(|value| value.is_finite()))
+            })
     }
 
     /// Rebootstrap recent motion without carrying field-conditioned marginal priors.
