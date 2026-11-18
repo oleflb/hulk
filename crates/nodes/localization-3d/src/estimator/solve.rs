@@ -47,24 +47,44 @@ impl Localization {
         let start = Instant::now();
         let mut diagnostics = self.solve_diagnostics();
         let result = (|| -> Result<_> {
+            self.expire_supported_legs(heading)?;
             let mut current_yaw = None;
-            let result = self
-                .prepare_preintegration()
-                .and_then(|()| self.prepare_attitude())
-                .and_then(|yaw| {
-                    current_yaw = yaw;
-                    let mut result = self.solve_graph(&mut diagnostics, heading);
+            let mut support_snapshot = None;
+            let result = (|| {
+                self.prepare_preintegration()?;
+                current_yaw = self.prepare_attitude()?;
+                if self.supported_legs.is_some() {
+                    let segment = self.segment_and_tau(self.latest_time)?.0;
+                    self.ensure_segment(segment)?;
+                    self.ensure_biases(self.latest_time)?;
+                    support_snapshot = Some(self.graph.checkpoint_states());
+                }
+                let mut solve = |estimator: &mut Self| -> Result<_> {
+                    let result = estimator.solve_graph(&mut diagnostics, heading);
                     if result.is_err() && had_visual_update {
-                        self.discard_visuals()?;
+                        estimator.discard_visuals()?;
                         visual_rejected = true;
-                        result = self.solve_graph(&mut diagnostics, heading);
+                        estimator.solve_graph(&mut diagnostics, heading)
+                    } else {
+                        result
                     }
-                    result
-                });
+                };
+                let mut result = solve(self);
+                if result.is_ok() && self.resolve_supported_legs(heading)? {
+                    result = solve(self);
+                }
+                result
+            })();
             let result = if result.is_ok() {
                 self.accept_visuals();
+                if had_visual_update && !visual_rejected {
+                    self.renew_supported_legs(heading);
+                }
                 result
             } else {
+                if let Some(snapshot) = support_snapshot {
+                    self.graph.restore_states(snapshot)?;
+                }
                 self.discard_visuals().and(result)
             };
             if let Some(key) = current_yaw {
