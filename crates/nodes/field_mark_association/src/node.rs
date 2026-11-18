@@ -79,14 +79,14 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
 
-    let associations_publisher = node
+    let global_localization_publisher = node
+        .publisher::<Option<GlobalLocalizationDebug>>("debug/global_localization")
+        .build()
+        .await?;
+    let fixed_publisher = node
         .publisher::<TimeWrapper<VisualLocalizationFrame>>(
             "field_mark_association/visual_localization_local",
         )
-        .build()
-        .await?;
-    let global_localization_publisher = node
-        .publisher::<Option<GlobalLocalizationDebug>>("debug/global_localization")
         .build()
         .await?;
     let processing_context = DetectionProcessingContext {
@@ -96,7 +96,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         estimates: &estimates,
         status: &status,
         attitudes: std::sync::Mutex::new(ros_z::cache::CacheInner::new(capacities.attitudes)),
-        associations_publisher: Arc::new(associations_publisher),
+        fixed_publisher: Arc::new(fixed_publisher),
         global_localization_publisher: Arc::new(global_localization_publisher),
         clock: node.clock(),
     };
@@ -120,7 +120,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             None => tokio::select! {
                 sample = imu.recv_with_metadata() => {
                     let sample = sample?;
-                    processing_context.record_attitude(sample.source_time, &sample.message);
+                    processing_context.record_attitude(sample.source_time, &sample.message)?;
                     continue;
                 }
                 objects = detected_objects.recv() => objects?,
@@ -134,7 +134,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             tokio::select! {
                 sample = imu.recv_with_metadata() => {
                     let sample = sample?;
-                    processing_context.record_attitude(sample.source_time, &sample.message);
+                    processing_context.record_attitude(sample.source_time, &sample.message)?;
                 }
                 result = &mut processing => {
                     result?;
