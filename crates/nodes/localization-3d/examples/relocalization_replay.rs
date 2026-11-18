@@ -35,7 +35,7 @@ use types::{
     camera_geometry::{CameraGeometry, interpolate_camera_geometry},
     fall_detection::FallDetection,
     field_dimensions::FieldDimensions,
-    localization::{LocalizationEstimate, LocalizationStatus},
+    localization::{LocalizationEstimate, LocalizationState, LocalizationStatus},
     object_detection::{Object, RobocupObjectLabel},
     odometry::{KINEMATIC_ODOMETRY_TOPIC, KinematicOdometryDelta},
     time_wrapper::TimeWrapper,
@@ -160,6 +160,55 @@ fn tracking_geometry(
     geometry_for_image(image_time, snapshots, &latest, max_age)
 }
 
+type AuditEstimate = (LocalizationEstimate, LocalizationState);
+
+fn position_step(
+    before: &AuditEstimate,
+    after: &AuditEstimate,
+) -> Option<(f64, serde_json::Value)> {
+    if before.0.epoch != after.0.epoch {
+        return None;
+    }
+    let a = before.0.robot_to_field?.pose.inner.translation.vector;
+    let b = after.0.robot_to_field?.pose.inner.translation.vector;
+    let distance = (b - a).xy().norm();
+    let endpoint = |value: &AuditEstimate| {
+        serde_json::json!({
+            "time": value.0.time, "time_ns": value.0.time.as_nanos(),
+            "epoch": value.0.epoch, "generation": value.0.generation, "state": value.1,
+        })
+    };
+    Some((
+        distance,
+        serde_json::json!({
+            "distance_m": distance, "elapsed_s": after.0.time.abs_diff(before.0.time).as_secs_f64(),
+            "before": endpoint(before), "after": endpoint(after),
+        }),
+    ))
+}
+
+fn jump_diagnostics(output: &[AuditEstimate]) -> serde_json::Value {
+    let fields: Vec<_> = output
+        .iter()
+        .filter(|(estimate, _)| estimate.robot_to_field.is_some())
+        .collect();
+    let raw = fields
+        .windows(2)
+        .filter_map(|pair| position_step(pair[0], pair[1]))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, details)| details);
+    let continuous = output
+        .windows(2)
+        .filter(|pair| pair[0].0.generation == pair[1].0.generation)
+        .filter_map(|pair| position_step(&pair[0], &pair[1]))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, details)| details);
+    serde_json::json!({
+        "raw_same_epoch_field_steps": raw,
+        "same_generation_adjacent_outputs": continuous,
+        "interpretation": "Raw steps may cross generation replacements or missing field outputs. Adjacent-output steps require the same epoch/generation and two field poses; inspect elapsed_s for publication gaps.",
+    })
+}
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
@@ -198,6 +247,10 @@ fn main() -> Result<()> {
             }
             LinearReadEvent::Record { opcode, data } => match mcap::parse_record(opcode, data)? {
                 Record::Channel(c) => {
+                    ensure!(
+                        c.topic != replay::ESTIMATE_TOPIC && c.topic != replay::STATUS_TOPIC,
+                        "input already contains comparison channels"
+                    );
                     topics.insert(c.id, c.topic);
                 }
                 Record::Message { header, data } => {
@@ -250,6 +303,7 @@ fn main() -> Result<()> {
     let mut odometry = replay::odometry::OdometryReplay::new()?;
     let mut kinematic_deltas = 0;
     let mut admitted_kinematic_deltas = 0;
+    let mut comparison = Vec::new();
     let field = field.ok_or_else(|| eyre!("missing field_dimensions"))?;
     events.sort_by_key(|e| e.0);
     let parameters: Localization3dParameters = json5::from_str(include_str!(
@@ -272,8 +326,8 @@ fn main() -> Result<()> {
     let mut pending = Vec::new();
     let mut estimates: BTreeMap<Time, LocalizationEstimate> = BTreeMap::new();
     let mut output = Vec::new();
-    let mut comparison = Vec::new();
-    let mut audit_frames = Vec::new();
+    let mut audit_frames_queued = Vec::new();
+    let mut audit_solves = Vec::new();
     let mut solve_us = Vec::new();
     let mut association_us = Vec::new();
     let mut previous_status = None;
@@ -449,8 +503,8 @@ fn main() -> Result<()> {
                         }
                         Measurement::Visual(v) => {
                             let audit = v.clone();
-                            let admitted = l.ingest_visual_localization_frame(v)?;
-                            audit_frames.push((audit, admitted));
+                            let queued = l.ingest_visual_localization_frame(v)?;
+                            audit_frames_queued.push((audit, queued));
                         }
                         Measurement::Vo(v) => {
                             let previous = v.delta.as_ref().and_then(|d| {
@@ -474,8 +528,18 @@ fn main() -> Result<()> {
                     }
                 }
                 if let Some(l) = active.as_mut() {
-                    let solved = l.solve(now);
+                    let ingestion_duration = timer.elapsed();
+                    let mut solved = l.solve(now);
+                    solved.diagnostics.ingestion_duration = ingestion_duration;
                     let status = l.status();
+                    debug_assert!(
+                        solved.estimate.is_some() || solved.diagnostics.failure.is_some()
+                    );
+                    audit_solves.push(serde_json::json!({
+                        "time": now, "status": status, "has_estimate": solved.estimate.is_some(),
+                        "missing_estimate_reason": solved.diagnostics.failure,
+                        "diagnostics": solved.diagnostics,
+                    }));
                     comparison.push(replay::Comparison {
                         delivery,
                         status,
@@ -491,11 +555,17 @@ fn main() -> Result<()> {
                         estimates.insert(e.time, e);
                         estimates.retain(|t, _| t.saturating_add(Duration::from_secs(1)) >= now);
                     }
+                } else {
+                    audit_solves.push(serde_json::json!({
+                        "time": now, "status": null, "has_estimate": false,
+                        "missing_estimate_reason": "localization_not_initialized", "diagnostics": null,
+                    }));
                 }
                 solve_us.push(timer.elapsed().as_secs_f64() * 1e6);
             }
         }
     }
+    debug_assert_eq!(audit_solves.len(), solve_us.len());
     ensure!(!output.is_empty(), "replay produced no estimates");
     ensure!(
         admitted_kinematic_deltas > 0,
@@ -546,9 +616,13 @@ fn main() -> Result<()> {
             "admitted_vo": admitted_vo,
             "association": timing(&mut association_us), "localization": timing(&mut solve_us),
             "field_estimates": field_estimates.len(),
+            "field_height_above_1m": field_estimates.iter().filter(|(_, pose)| pose.pose.inner.translation.z > 1.0).count(),
+            "max_field_height_m": field_estimates.iter().map(|(_, pose)| pose.pose.inner.translation.z).reduce(f64::max),
             "longest_field_output_gap_s": transitions.iter().map(|(gap, _)| *gap).reduce(f64::max),
             "largest_position_step_m": transitions.iter().map(|(_, step)| *step).reduce(f64::max),
-            "lifecycle": lifecycle, "audit_frames": audit_frames, "audit_estimates": output,
+            "jump_diagnostics": jump_diagnostics(&output),
+            "lifecycle": lifecycle, "audit_frames_queued": audit_frames_queued,
+            "audit_solves": audit_solves, "audit_estimates": output,
         }))?
     );
     if let Some(output_path) = output_path {
@@ -575,24 +649,128 @@ fn timing(values: &mut [f64]) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    fn field_estimate(nanos: i64, x: f64, generation: u64) -> LocalizationEstimate {
+        LocalizationEstimate {
+            time: Time::from_nanos(nanos),
+            epoch: 0,
+            generation,
+            robot_to_local: types::localization::PoseEstimate {
+                pose: linear_algebra::Isometry3::identity(),
+                covariance: nalgebra::SMatrix::identity(),
+            },
+            robot_to_field: Some(types::localization::PoseEstimate {
+                pose: linear_algebra::Isometry3::wrap(nalgebra::Isometry3::translation(
+                    x, 0.0, 0.0,
+                )),
+                covariance: nalgebra::SMatrix::identity(),
+            }),
+        }
+    }
+
+    #[test]
+    fn newest_missing_field_pose_invalidates_pre_exposure_tracking_hint() {
+        let previous = field_estimate(1_000_000_000, 0.0, 0);
+        let mut latest = field_estimate(1_020_000_000, 0.0, 0);
+        let image_time = Time::from_nanos(1_010_000_000);
+        let status = LocalizationStatus {
+            time: previous.time,
+            epoch: 0,
+            generation: 0,
+            state: LocalizationState::Tracking,
+            heading: None,
+        };
+        let history = BTreeMap::from([(previous.time, previous)]);
+        let age = Duration::from_millis(250);
+        assert!(tracking_geometry(&latest, &history, &status, image_time, age).is_some());
+        latest.robot_to_field = None;
+        assert!(tracking_geometry(&latest, &history, &status, image_time, age).is_none());
+    }
+
+    #[test]
+    fn jump_report_separates_generation_replacements_and_missing_outputs() {
+        let output = [
+            (
+                field_estimate(1_000_000_000, 0.0, 0),
+                LocalizationState::Tracking,
+            ),
+            (
+                field_estimate(1_010_000_000, 10.0, 1),
+                LocalizationState::Tracking,
+            ),
+            (
+                field_estimate(1_020_000_000, 11.0, 1),
+                LocalizationState::LostTrack,
+            ),
+        ];
+        let report = jump_diagnostics(&output);
+        assert_eq!(report["raw_same_epoch_field_steps"]["distance_m"], 10.0);
+        let adjacent = &report["same_generation_adjacent_outputs"];
+        assert_eq!(adjacent["distance_m"], 1.0);
+        assert_eq!(adjacent["elapsed_s"], 0.01);
+        assert_eq!(adjacent["before"]["generation"], 1);
+        assert_eq!(adjacent["after"]["state"], "LostTrack");
+        assert_eq!(adjacent["after"]["time_ns"], 1_020_000_000_i64);
+        let mut missing = output[0];
+        missing.0.robot_to_field = None;
+        let report = jump_diagnostics(&[
+            output[0],
+            missing,
+            (
+                field_estimate(1_020_000_000, 11.0, 0),
+                LocalizationState::Tracking,
+            ),
+        ]);
+        assert!(report["same_generation_adjacent_outputs"].is_null());
+    }
+
     #[test]
     fn every_required_topic_needs_messages() {
         let mut seen: BTreeSet<_> = REQUIRED_TOPICS.iter().map(|s| s.to_string()).collect();
         assert!(require_topics(&seen).is_ok());
         for topic in REQUIRED_TOPICS {
             seen.remove(*topic);
-            assert!(
-                require_topics(&seen)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(topic)
-            );
+            assert!(require_topics(&seen).is_err_and(|error| error.to_string().contains(topic)));
             seen.insert(topic.to_string());
         }
     }
 
     #[test]
     fn camera_geometry_has_no_missing_data_fallback() {
-        assert!(camera_at(&BTreeMap::new(), Time::from_nanos(1), Duration::ZERO).is_none());
+        assert!(
+            camera_at(
+                &BTreeMap::new(),
+                Time::from_nanos(1),
+                Duration::from_millis(20)
+            )
+            .is_none()
+        );
+        let time = Time::from_nanos(1_000_000_000);
+        let after = time.saturating_add(Duration::from_millis(30));
+        let cache = BTreeMap::from([time, after].map(|time| {
+            (
+                time,
+                TimeWrapper {
+                    time,
+                    inner: CameraGeometry::default(),
+                },
+            )
+        }));
+        assert!(
+            camera_at(
+                &cache,
+                time.saturating_add(Duration::from_millis(5)),
+                Duration::from_millis(20)
+            )
+            .is_none()
+        );
+        assert!(
+            camera_at(
+                &cache,
+                time.saturating_sub(Duration::from_millis(1)),
+                Duration::from_millis(20)
+            )
+            .is_none()
+        );
+        assert!(camera_at(&cache, time, Duration::from_millis(20)).is_some());
     }
 }
