@@ -6,12 +6,40 @@ There is no GTSAM runtime dependency; GTSAM is used only to generate an independ
 
 For recorded-data workflows, see the [localization replay guide](https://github.com/HULKs/hulk/blob/main/crates/nodes/localization-3d/examples/README.md).
 
+## Runtime association
+
+`field_mark_association` and `localization3d` run as separate nodes. Association
+publishes fixed correspondences on `field_mark_association/visual_localization_local`;
+localization subscribes to that topic. `debug/global_localization` remains available
+for introspection, recording, and viewers.
+
+Live association and replay share exposure-attitude validation/interpolation,
+coherent pose selection, and tracking/global preparation. The adapters own only
+their subscriptions, caches, scheduling, and publication. Association retains one
+blocking worker and the newest pending detection, with stale-result checks before
+publication. Estimation, calibration, intrinsic optimization, and visual acceptance
+checks are unchanged.
+
 ## Configuration
 
 The shipped timing, calibration, noise, and bias settings are in [`localization3d.json5`](https://github.com/HULKs/hulk/blob/main/etc/parameters/base/localization3d.json5).
 [`TimingParameters`](https://github.com/HULKs/hulk/blob/main/crates/nodes/localization-3d/src/parameters.rs) defines backward-compatible defaults for omitted fields, which are not necessarily the shipped values.
 Trajectory spacing and preintegration interval are distinct settings; interval boundaries also respect pose and bias knots.
 Use a fresh localization epoch after changing physical calibration: retained samples can be recalibrated, but a marginalized prior cannot.
+
+Association's symmetry and numerical degeneracy/covariance guards are now internal
+constants with unchanged values. Remove `global_localizer.symmetry_epsilon`,
+`global_localizer.min_pair_distance`, `global_localizer.min_triangle_denominator`,
+`tracking.covariance_symmetry_tolerance`, and `tracking.covariance_psd_tolerance`
+from external configuration overrides; strict parsing rejects these obsolete keys.
+Operational noise, geometry gates, age limits, eigensolver limits, and work budgets
+remain configurable.
+
+Runtime bounds remain in `field_mark_association.capacities` and
+`localization3d.inputs`, including `localization3d.inputs.visual_queue` for matching
+results. These capacities require a restart, while association tuning remains live.
+The discarded integrated-node settings
+`localization3d.inputs.{detections_queue,attitude_cache,estimate_cache}` are not used.
 
 ## Model and covariance
 
@@ -118,21 +146,22 @@ Separate finite differences test both interpolated bias Jacobians.
 f32/f64 automatic differentiation covers both factor modes and nonzero mounting offsets.
 A physical 4 rad/s offset-IMU test distinguishes rotation about the Robot origin from spurious body translation.
 
-Additional checks cover late-data cost/information equivalence, partial prefixes, missing force/free fall, impulses, gaps/late bridges, calibration changes, bias boundaries and reintegration, retirement, rollback/recovery, double flight, and allocation-free factor evaluation after workspace preparation.
+Additional checks cover late-data cost/information equivalence, partial prefixes, missing force/free fall, impulses, gaps/late bridges, calibration changes, bias boundaries and reintegration, retirement, rollback/recovery, double flight, and allocation-free spline evaluation. The old synthetic all-factor workload/allocation harness was removed; it did not represent the replay workload.
 
 ```sh
 cargo test --locked -p localization-fagra -p localization-3d
 cargo clippy --locked -p localization-fagra -p localization-3d --all-targets --no-deps -- -D warnings
 ```
 
-External-recording and GPU tests remain explicitly ignored; the normal suite does not establish their results.
+These localization crates have no ignored tests. Historical recordings remain
+available for manual replay; the normal suite does not establish hardware or GPU results.
 
 ## Profiling
 
-The synthetic tracking benchmark needs no external recording:
+Profile the actual replay pipeline with an input recording without comparison channels:
 
 ```sh
-cargo test --locked --release -p localization-3d benchmark_tracking_estimation -- --ignored --nocapture --test-threads=1
+cargo run --locked --release -p localization-3d --example relocalization_replay -- input-only.mcap > replay.json
 ```
 
 Compare the same inputs, parameters, build settings, and solve schedule, with one benchmark process at a time.
