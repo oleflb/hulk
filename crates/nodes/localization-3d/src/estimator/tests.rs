@@ -815,10 +815,7 @@ fn nondefault_grids_survive_bias_retirement_and_recovery() {
     assert_eq!(estimator.biases.len(), 4);
     assert!(estimator.preintegration.interval_count() <= 49);
     let bias = estimator.bias_at(frame.time).unwrap();
-    let mut candidate = estimator
-        .bootstrap_candidate(frame, Some(&heading))
-        .unwrap()
-        .unwrap();
+    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
     assert_eq!(candidate.origin, origin);
     assert_eq!(candidate.parameters.timing, timing);
     assert_eq!(candidate.segment_and_tau(latest).unwrap().0, 9);
@@ -874,10 +871,7 @@ fn fractional_window_retains_support_for_late_samples_and_recovery() {
             .time,
         latest
     );
-    let mut candidate = estimator
-        .bootstrap_candidate(frame, Some(&heading))
-        .unwrap()
-        .unwrap();
+    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
     assert!(candidate.ingest_imu(cutoff, imu).unwrap());
     let solved = candidate.solve_with_heading(Some(&heading));
     assert!(solved.estimate.is_some(), "{:?}", solved.diagnostics);
@@ -887,10 +881,7 @@ fn fractional_window_retains_support_for_late_samples_and_recovery() {
 #[test]
 fn imu_preparation_failure_does_not_retry_a_stale_graph_without_visuals() {
     let (estimator, frame, heading) = recovery_fixture();
-    let mut candidate = estimator
-        .bootstrap_candidate(frame, Some(&heading))
-        .unwrap()
-        .unwrap();
+    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
     assert!(!candidate.pending_visuals.is_empty());
     let mut parameters = candidate.parameters.clone();
     parameters.accelerometer = Some(crate::parameters::AccelerometerParameters {
@@ -958,10 +949,7 @@ fn reconstruction_preserves_motion_and_admission_state() {
     };
     assert!(estimator.history.records.len() < 1200);
     assert!(estimator.controls.len() < 20);
-    let mut candidate = estimator
-        .bootstrap_candidate(frame, Some(&heading))
-        .unwrap()
-        .unwrap();
+    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
     assert_eq!(candidate.latest_time, estimator.latest_time);
     candidate.prepare_preintegration().unwrap();
     assert!(candidate.preintegration.interval_count() > 0);
@@ -999,10 +987,7 @@ fn reconstruction_preserves_motion_and_admission_state() {
 #[test]
 fn bootstrap_height_is_not_a_millimetre_prior() {
     let (estimator, frame, heading) = recovery_fixture();
-    let mut candidate = estimator
-        .bootstrap_candidate(frame, Some(&heading))
-        .unwrap()
-        .unwrap();
+    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
     let evaluate = OptimizeOptions {
         gradient_tolerance: f64::MAX,
         ..candidate.solve_options()
@@ -1033,10 +1018,7 @@ fn bootstrap_height_is_not_a_millimetre_prior() {
 #[test]
 fn repeated_heading_rejection_keeps_the_window_bounded() {
     let (estimator, frame, heading) = recovery_fixture();
-    let mut candidate = estimator
-        .bootstrap_candidate(frame, Some(&heading))
-        .unwrap()
-        .unwrap();
+    let mut candidate = estimator.bootstrap_candidate(frame).unwrap().unwrap();
     candidate.solve_motion().estimate.unwrap();
     let wrong_heading = HeadingReference::new(
         candidate.latest_time,
