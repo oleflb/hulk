@@ -35,7 +35,6 @@ use crate::{
     panel::{Panel, PanelCreationContext, PanelUiContext},
     repaint::ObservationContext,
 };
-use observation::Observation;
 use transforms::*;
 
 mod associations;
@@ -44,7 +43,6 @@ mod camera;
 mod field;
 #[cfg(test)]
 mod gpu_test;
-mod observation;
 mod robot;
 mod transforms;
 
@@ -81,12 +79,12 @@ struct ViewerData {
     ball: Option<BallState>,
 }
 
-struct FrameObservations {
+struct Observations {
     settings: Settings,
     frame: MapObservation,
 }
 
-impl FrameObservations {
+impl Observations {
     fn new(context: &impl ObservationContext, settings: &Settings) -> Result<Self> {
         let target = TargetIdentity::new(context.backend().namespace())?;
         let payload_time = TimeProjection::field(".time", TimeEncoding::RosZTime)?;
@@ -282,183 +280,10 @@ fn localization_at<'a>(
     Some(Isometry3::wrap(pose.cast::<f32>().inverse()))
 }
 
-struct Observations {
-    presentation_identity: (u64, u64),
-    namespace: String,
-    frame_id: Option<(u64, u64)>,
-    last_anchor: Option<Time>,
-    dimensions: Observation<FieldDimensions>,
-    localization: Observation<types::localization::LocalizationEstimate>,
-    localization_status: Observation<types::localization::LocalizationStatus>,
-    kinematics: Observation<TimeWrapper<RobotKinematics>>,
-    matrix: Observation<TimeWrapper<CameraMatrix>>,
-    images: Option<Observation<RosImage>>,
-    associations: Option<Observation<TimeWrapper<FieldMarkAssociations>>>,
-    ball: Observation<Option<BallState>>,
-}
-
-impl Observations {
-    fn new(context: &impl ObservationContext) -> color_eyre::Result<Self> {
-        Ok(Self {
-            presentation_identity: (0, 0),
-            namespace: String::new(),
-            frame_id: None,
-            last_anchor: None,
-            dimensions: Observation::new(
-                context,
-                "field_dimensions",
-                1,
-                ObservationPolicy::default().with_subscriber_qos(QosProfile {
-                    durability: QosDurability::TransientLocal,
-                    ..Default::default()
-                }),
-            )?,
-            localization: Observation::new(
-                context,
-                "localization/estimate",
-                1,
-                Default::default(),
-            )?,
-            localization_status: Observation::new(
-                context,
-                "localization/status",
-                1,
-                ObservationPolicy::default().with_subscriber_qos(QosProfile {
-                    durability: QosDurability::TransientLocal,
-                    ..Default::default()
-                }),
-            )?,
-            kinematics: Observation::new(context, "robot_kinematics", 1024, Default::default())?,
-            matrix: Observation::new(context, "camera_matrix", 1024, Default::default())?,
-            images: None,
-            associations: None,
-            ball: Observation::new(context, "ball_state", 1, Default::default())?,
-        })
-    }
-
-    fn update_layers(
-        &mut self,
-        context: &impl ObservationContext,
-        settings: &Settings,
-    ) -> color_eyre::Result<()> {
-        if !settings.camera {
-            self.images = None;
-        }
-        if !settings.associations {
-            self.associations = None;
-        }
-        if settings.camera && self.images.is_none() {
-            self.images = Some(Observation::new(
-                context,
-                "inputs/left_image",
-                12,
-                Default::default(),
-            )?);
-        }
-        if settings.associations && self.associations.is_none() {
-            self.associations = Some(Observation::new(
-                context,
-                "field_mark_association/visual_localization_local",
-                64,
-                Default::default(),
-            )?);
-        }
-        Ok(())
-    }
-
-    fn snapshot(&mut self, namespace: &str, settings: &Settings) -> ViewerData {
-        let frame_id = self
-            .localization_status
-            .latest(namespace)
-            .map(|status| (status.value.epoch, status.value.generation));
-        if self.namespace != namespace
-            || self.frame_id != frame_id
-            || (!settings.camera && !settings.associations)
-        {
-            self.namespace = namespace.to_owned();
-            self.frame_id = frame_id;
-            self.last_anchor = None;
-        }
-        let images = self
-            .images
-            .as_ref()
-            .map(|images| images.all(namespace))
-            .unwrap_or_default();
-        let mut associations = self
-            .associations
-            .as_ref()
-            .map(|associations| associations.all(namespace))
-            .unwrap_or_default();
-        associations.retain(|frame| {
-            Some((frame.value.inner.epoch, frame.value.inner.generation)) == frame_id
-        });
-        let anchor = select_anchor(
-            images.iter().map(|record| image_time(record)),
-            associations.iter().map(|record| record.value.time),
-            self.last_anchor,
-            settings,
-        );
-        self.last_anchor = anchor;
-        let association = associations
-            .iter()
-            .find(|record| settings.associations && Some(record.value.time) == anchor);
-        let camera_frame = images
-            .iter()
-            .find(|image| Some(image_time(image)) == anchor)
-            .cloned();
-        let camera_matrix = self
-            .matrix
-            .aligned(namespace, anchor)
-            .map(|record| record.value.inner.clone());
-        ViewerData {
-            field_dimensions: self.dimensions.latest(namespace),
-            // ponytail: latest solve pose; use estimate history for image-aligned rendering.
-            localization: self
-                .localization
-                .latest(namespace)
-                .filter(|record| frame_id == Some((record.value.epoch, record.value.generation)))
-                .and_then(|record| record.value.robot_to_field)
-                .map(|field| Isometry3::wrap(field.pose.inner.cast::<f32>().inverse())),
-            robot_kinematics: self.kinematics.aligned(namespace, anchor),
-            camera_matrix,
-            camera_frame,
-            field_mark_associations: association.cloned(),
-            ball: self.ball.latest(namespace).and_then(|record| record.value),
-        }
-    }
-}
-
-fn select_anchor(
-    images: impl Iterator<Item = Time> + Clone,
-    associations: impl Iterator<Item = Time>,
-    last: Option<Time>,
-    settings: &Settings,
-) -> Option<Time> {
-    let latest_image = images.clone().filter(|time| Some(*time) >= last).max();
-    let association = associations
-        .filter(|_| settings.associations)
-        .filter(|time| Some(*time) >= last)
-        .filter(|time| {
-            latest_image.is_none_or(|latest| {
-                *time <= latest
-                    && latest.abs_diff(*time) <= std::time::Duration::from_secs(1)
-                    && images.clone().any(|image| image == *time)
-                    // An already displayed association must not hold back newer images.
-                    && (Some(*time) > last || Some(latest) == last)
-            })
-        })
-        .max();
-    association.or(latest_image).or(last)
-}
-
-fn image_time(record: &SampleRecord<RosImage>) -> Time {
-    record.value.header.stamp.into()
-}
-
 pub struct Map3DPanel {
     settings: Settings,
     widget: Option<BevyWidget>,
-    observations: Result<FrameObservations, String>,
+    observations: Result<Observations, String>,
 }
 
 impl Panel for Map3DPanel {
@@ -478,7 +303,7 @@ impl Panel for Map3DPanel {
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default();
         let observations =
-            FrameObservations::new(&context, &settings).map_err(|error| error.to_string());
+            Observations::new(&context, &settings).map_err(|error| error.to_string());
         let widget = context.render_state.clone().map(|render_state| {
             let mut widget = BevyWidget::new(render_state);
             widget
@@ -558,7 +383,7 @@ impl Panel for Map3DPanel {
             binding_changed || observations.settings != self.settings
         }) {
             self.observations =
-                FrameObservations::new(&context, &self.settings).map_err(|error| error.to_string());
+                Observations::new(&context, &self.settings).map_err(|error| error.to_string());
         }
         let result = match &mut self.observations {
             Ok(observations) => {
