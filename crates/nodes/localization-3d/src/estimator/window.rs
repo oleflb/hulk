@@ -11,7 +11,7 @@ use localization_fagra::{
 use ros_z::time::Time;
 
 /// Handles and diagnostics retired together after their segment is marginalized.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SegmentFactors {
     pub measurements: usize,
     pub yaw: Option<FactorKey<RelativeYaw>>,
@@ -151,6 +151,9 @@ impl Localization {
                 .map(|(_, key)| key.block_id()),
         );
         self.graph.marginalize(&old_states)?;
+        let cutoff = self.origin.as_nanos() + oldest * self.parameters.timing.knot_ns();
+        self.kinematic_factors
+            .retain(|time, _| time.as_nanos() >= cutoff);
         self.biases.retain(|index, _| *index >= oldest_bias);
         self.controls.retain(|index, _| *index >= oldest - 1);
         self.retire_preintegration(oldest);

@@ -91,6 +91,7 @@ pub struct Localization {
     pub(super) lifecycle: Lifecycle,
     field_half_extents: Vector2<Field, f64>,
     history: recovery::MotionHistory,
+    kinematic_factors: BTreeMap<Time, (Time, kinematic_odometry::KinematicFactor)>,
 }
 
 impl Localization {
@@ -177,6 +178,7 @@ impl Localization {
             parameters,
             field_half_extents,
             history: recovery::MotionHistory::new(origin),
+            kinematic_factors: BTreeMap::new(),
             lifecycle: Lifecycle::new(origin),
         })
     }
