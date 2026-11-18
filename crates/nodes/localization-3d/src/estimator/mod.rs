@@ -220,14 +220,6 @@ impl Localization {
         Ok(())
     }
 
-    pub(crate) fn latest_time(&self) -> Time {
-        self.latest_time
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     fn segments(&self) -> Range<i64> {
         // Four consecutive controls support each segment. Growth and retirement
         // only change the ends of this contiguous range.

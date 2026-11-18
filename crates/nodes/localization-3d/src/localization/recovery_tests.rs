@@ -262,7 +262,7 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
                 .unwrap()
         );
         assert_eq!(localization.lifecycle.state, LocalizationState::LostTrack);
-        assert_eq!(localization.latest_time(), before.time);
+        assert_eq!(localization.latest_time, before.time);
         assert_eq!(localization.status().generation, before.generation);
         ingest_motion(&mut localization, 361, with_vo);
         let now = Time::from_nanos(4_610_000_000);
@@ -308,7 +308,7 @@ fn delayed_recovery_preserves_motion_and_publishes_only_after_acceptance() {
             ingest_motion(&mut localization, index, with_vo);
         }
         let mut tracking = frame(3.7, false);
-        tracking.inner.generation = localization.generation();
+        tracking.inner.generation = localization.generation;
         tracking.inner.source = VisualAssociationSource::Tracking;
         assert!(
             localization
@@ -487,7 +487,7 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
         ingest_motion(&mut localization, index, false);
     }
     let mut wrong = frame(3.7, true);
-    wrong.inner.generation = localization.generation();
+    wrong.inner.generation = localization.generation;
     wrong.inner.source = VisualAssociationSource::Tracking;
     assert!(
         localization
@@ -496,7 +496,6 @@ fn wrong_half_tracking_update_is_removed_before_publication_or_marginalization()
     );
     let rejected = localization.solve(Time::from_nanos(4_700_000_000));
     assert!(rejected.estimate.is_some(), "{:?}", rejected.diagnostics);
-    assert!(!rejected.diagnostics.motion_rebuilt);
     assert!(localization.lifecycle.pending_visual.is_none());
     assert_eq!(
         localization.lifecycle.latest_visual,
@@ -651,11 +650,6 @@ fn field_inconsistency_does_not_stop_local_motion_or_forget_heading() {
     localization.lifecycle.heading_reference = Some(reference);
     ingest_motion(&mut localization, 361, true);
     let output = localization.solve(Time::from_nanos(4_610_000_000));
-    assert!(
-        !output.diagnostics.motion_rebuilt,
-        "{:?}",
-        output.diagnostics
-    );
     let estimate = output.estimate.unwrap();
     assert!(estimate.robot_to_field.is_none());
     assert_eq!(estimate.generation, before.generation);
@@ -665,7 +659,6 @@ fn field_inconsistency_does_not_stop_local_motion_or_forget_heading() {
         let output =
             localization.solve(Time::from_nanos(1_000_000_000) + Duration::from_millis(index * 10));
         assert!(output.estimate.is_some(), "{:?}", output.diagnostics);
-        assert!(!output.diagnostics.motion_rebuilt);
     }
     let imu = linear_algebra::Orientation3::from_euler_angles(0.0, 0.0, 3.3);
     assert!(

@@ -605,20 +605,17 @@ fn startup_replaces_drifted_height_prior_with_landmark_fit() {
         }
         let origin = estimator.origin;
         estimator = estimator
-            .bootstrap_candidate(
-                TimeWrapper {
-                    time,
-                    inner: VisualLocalizationFrame {
-                        epoch: 7,
-                        source: types::visual_localization::VisualAssociationSource::Tracking,
-                        generation: 0,
-                        robot_to_camera: camera.robot_to_camera,
-                        camera_intrinsic: camera.intrinsics,
-                        associations: associations.clone(),
-                    },
+            .bootstrap_candidate(TimeWrapper {
+                time,
+                inner: VisualLocalizationFrame {
+                    epoch: 7,
+                    source: types::visual_localization::VisualAssociationSource::Tracking,
+                    generation: 0,
+                    robot_to_camera: camera.robot_to_camera,
+                    camera_intrinsic: camera.intrinsics,
+                    associations: associations.clone(),
                 },
-                None,
-            )
+            })
             .unwrap()
             .unwrap();
         assert_eq!(estimator.origin, origin);

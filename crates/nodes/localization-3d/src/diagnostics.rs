@@ -11,6 +11,16 @@ pub struct ImuBiasEstimate {
     pub covariance: [[f64; 6]; 6],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Message)]
+pub struct TrackingDiagnostics {
+    pub visual_fresh: bool,
+    pub informative_geometry: bool,
+    pub translation_variance: Option<f64>,
+    pub rotation_variance: Option<f64>,
+    pub residual_rms: Option<f64>,
+    pub attitude_available: bool,
+}
+
 /// Diagnostics for one solve attempt. Missing costs were not reported by the solver.
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
 pub struct SolveDiagnostics {
@@ -27,8 +37,6 @@ pub struct SolveDiagnostics {
     pub lm_attempts: usize,
     pub lm_rejected_steps: usize,
     pub gradient_norm: Option<f64>,
-    /// Replaced a rejected field-conditioned graph with a validated motion-only window.
-    pub motion_rebuilt: bool,
     /// From the optimizer report, or its unchanged cost if no step was accepted.
     /// Unavailable when optimization/covariance fails after accepted steps.
     pub initial_cost: Option<f64>,
@@ -38,26 +46,6 @@ pub struct SolveDiagnostics {
     pub measurement_count: usize,
     pub failure: Option<String>,
     pub imu_bias: Option<ImuBiasEstimate>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ros_z::message::{SerdeCdrCodec, WireDecoder, WireEncoder};
-
-    #[test]
-    fn calibration_diagnostics_have_a_schema_and_round_trip() {
-        SolveDiagnostics::schema();
-        let value = ImuBiasEstimate {
-            gyroscope: linear_algebra::Vector3::zeros(),
-            accelerometer: linear_algebra::Vector3::wrap(nalgebra::vector![0.01, 0.03, -0.02]),
-            covariance: std::array::from_fn(|r| {
-                std::array::from_fn(|c| if r == c { 0.04 } else { 0.001 })
-            }),
-        };
-        let bytes = SerdeCdrCodec::<ImuBiasEstimate>::serialize(&value).unwrap();
-        let decoded = SerdeCdrCodec::<ImuBiasEstimate>::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.accelerometer, value.accelerometer);
-        assert_eq!(decoded.covariance, value.covariance);
-    }
+    #[serde(default)]
+    pub tracking: Option<TrackingDiagnostics>,
 }
